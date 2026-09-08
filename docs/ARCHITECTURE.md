@@ -1,15 +1,11 @@
-# Cairn — Architecture
-
-> **Cairn** is a placeholder name (a cairn is a waypoint built by many travellers each
-> adding one stone — which is the federation model). Rename with a single `sed` across
-> the workspace before first release; nothing depends on it.
+# BNET Command Center — Architecture
 
 A clean-slate, federated Classic Battle.net server in Rust. Two roles, one codebase:
 
-- **`cairnd`** — a *node*. Terminates game and chat-gateway client connections, owns its
+- **`bnetccd`** — a *node*. Terminates game and chat-gateway client connections, owns its
   local channels, hosts game advertisements, serves BNFTP. This is what a community
   operator runs.
-- **`cairn-hub`** — the *hub*. Authoritative for identity, the global channel directory,
+- **`bnetcc-hub`** — the *hub*. Authoritative for identity, the global channel directory,
   ladder, and network-wide bans. Relays federated traffic between nodes.
 
 ---
@@ -38,7 +34,7 @@ the admin API.
 (`icons.bni` over BNFTP) and advertisement banners. Icons are not optional — a client that
 gets no `SID_GETICONDATA` answer before `SID_ENTERCHAT` terminates the connection — and ad
 banners are the only in-client announcement surface a private server has. Both are
-implemented as data the *operator* supplies; Cairn ships no Blizzard assets.
+implemented as data the *operator* supplies; Command Center ships no Blizzard assets.
 
 ---
 
@@ -49,7 +45,7 @@ This is not folklore — it comes from reading both codebases. Sources in
 
 ### PvPGN (GPL-2.0-or-later, ~114k LOC, effectively dormant since 2021)
 
-| Finding | Consequence for Cairn |
+| Finding | Consequence for Command Center |
 |---|---|
 | **Single process, single thread, one event loop.** No thread pool, no async storage. Every packet parse, channel broadcast, account read/write and ladder rebuild runs on the socket thread. | Tokio multi-threaded runtime; **all storage behind an actor with a bounded channel**, never inline. |
 | **`sd_tcpinput()` contains no loop** — one `recv()` per readiness event, so at most one packet per epoll wakeup. | Read until `WouldBlock`, decode every complete frame in the buffer. |
@@ -71,7 +67,7 @@ seams belong.
 
 ### Atlas (MIT, ~16k LOC, C#/.NET)
 
-| Finding | Consequence for Cairn |
+| Finding | Consequence for Command Center |
 |---|---|
 | **There is no persistence.** `AccountsDb` is a `ConcurrentDictionary` that is never serialized. Every account, friend list and clan evaporates on restart. | This is *why* it seems stable — a server with no persistence layer has no persistence bugs. It is not a model to copy, but it is the honest explanation. |
 | **Per-key ACLs on account attributes** (`ReadLevel`/`WriteLevel` ∈ `{Any, Owner, Internal}`). | **Steal this.** PvPGN has no equivalent and its 2004 CVE (CVE-2004-2705, arbitrary attribute read incl. password hash via crafted statsreq) was exactly a missing check of this kind. |
@@ -86,7 +82,7 @@ seams belong.
 
 ```
                         ┌───────────────────────────────────────────┐
-                        │  cairnd  (one node, one process)          │
+                        │  bnetccd  (one node, one process)          │
                         │                                           │
    TCP :6112 ──┐        │  ┌─────────────┐                          │
    TCP :6113 ──┼──accept┼─▶│ per-conn    │  one tokio task per      │
@@ -106,7 +102,7 @@ seams belong.
                         │     │            └──────────────┘         │
                         │     ▼                                     │
                         │  ┌─────────────┐   mTLS, one outbound     │
-                        │  │ Fed client  │══ connection ════════════╪══▶ cairn-hub
+                        │  │ Fed client  │══ connection ════════════╪══▶ bnetcc-hub
                         │  └─────────────┘                          │
                         └───────────────────────────────────────────┘
 ```
@@ -149,21 +145,21 @@ from the fanout, not blocking it.
 
 | Crate | Responsibility | Depends on I/O? |
 |---|---|---|
-| `cairn-crypto` | XSHA-1 ("Broken SHA-1"), BSHA-1, NLS/SRP-6 (Blizzard variant), CD-key decode, CheckRevision. Pure functions, heavily tested against known-answer vectors. | No |
-| `cairn-proto` | Wire framing and packet types for BNCS, MCP, W3GS, chat gateway. Codecs only — `Decoder`/`Encoder`, zero policy, zero I/O. Fuzz targets live here. | No |
-| `cairn-core` | Domain model: accounts, sessions, channels, game ads, policy engine, the state machines. Pure logic over traits. | No |
-| `cairn-storage` | `Storage` trait, per-key attribute ACLs, write-behind batching, in-memory reference backend, and the conformance suite every backend must pass. Dependency-free. | No |
-| `cairn-storage-sqlite` | SQLite backend. The only place a database driver appears. | Yes |
-| `cairn-bridge` | External chat bridges — Discord, game addons, anything not speaking BNCS. Virtual presences rather than relayed text; see `docs/BRIDGES.md`. | Yes |
-| `cairn-fed` | Federation: node↔hub protocol, mTLS transport, message types, reconnect and partition handling. | Yes |
-| `cairn-gateway-bncs` | Protocol-byte demux and the BNCS session driver. | Yes |
-| `cairn-gateway-chat` | Telnet / chat-gateway (protocol bytes `0x03`/`0x43`/`0x63`), with per-IP admission control. | Yes |
-| `cairn-gateway-mcp` | Diablo II realm (MCP), **linked into `cairnd` as a module, not a daemon** — see §11. Phase 4. | Yes |
-| `cairnd` | Node binary: config, listeners, wiring, observability. | Yes |
-| `cairn-hub` | Hub binary: directory, identity, ladder, ban authority, relay. | Yes |
-| `cairnctl` | Admin CLI over the local admin socket. | Yes |
+| `bnetcc-crypto` | XSHA-1 ("Broken SHA-1"), BSHA-1, NLS/SRP-6 (Blizzard variant), CD-key decode, CheckRevision. Pure functions, heavily tested against known-answer vectors. | No |
+| `bnetcc-proto` | Wire framing and packet types for BNCS, MCP, W3GS, chat gateway. Codecs only — `Decoder`/`Encoder`, zero policy, zero I/O. Fuzz targets live here. | No |
+| `bnetcc-core` | Domain model: accounts, sessions, channels, game ads, policy engine, the state machines. Pure logic over traits. | No |
+| `bnetcc-storage` | `Storage` trait, per-key attribute ACLs, write-behind batching, in-memory reference backend, and the conformance suite every backend must pass. Dependency-free. | No |
+| `bnetcc-storage-sqlite` | SQLite backend. The only place a database driver appears. | Yes |
+| `bnetcc-bridge` | External chat bridges — Discord, game addons, anything not speaking BNCS. Virtual presences rather than relayed text; see `docs/BRIDGES.md`. | Yes |
+| `bnetcc-fed` | Federation: node↔hub protocol, mTLS transport, message types, reconnect and partition handling. | Yes |
+| `bnetcc-gateway-bncs` | Protocol-byte demux and the BNCS session driver. | Yes |
+| `bnetcc-gateway-chat` | Telnet / chat-gateway (protocol bytes `0x03`/`0x43`/`0x63`), with per-IP admission control. | Yes |
+| `bnetcc-gateway-mcp` | Diablo II realm (MCP), **linked into `bnetccd` as a module, not a daemon** — see §11. Phase 4. | Yes |
+| `bnetccd` | Node binary: config, listeners, wiring, observability. | Yes |
+| `bnetcc-hub` | Hub binary: directory, identity, ladder, ban authority, relay. | Yes |
+| `bnetcc` | Admin CLI over the local admin socket. | Yes |
 
-The layering rule is enforced by the dependency graph: **`cairn-proto` and `cairn-core`
+The layering rule is enforced by the dependency graph: **`bnetcc-proto` and `bnetcc-core`
 must not depend on `tokio`.** That keeps the protocol and the domain logic testable
 without a runtime, and it is what makes fuzzing the decoders cheap.
 
@@ -209,7 +205,7 @@ CVE-2004-2705's whole class.
 ## 6. Storage
 
 A `Storage` trait — the one genuinely good idea in PvPGN's design (its 19-function-pointer
-vtable) expressed properly. **Built and tested; see `crates/cairn-storage`.**
+vtable) expressed properly. **Built and tested; see `crates/bnetcc-storage`.**
 
 The trait is **synchronous**, which is deliberate. Storage sits behind an actor: async
 tasks send commands over a bounded channel and a dedicated thread runs plain blocking code
@@ -237,14 +233,14 @@ runs on **every** iteration, writing up to 100 dirty accounts synchronously on t
 thread, paying write-through latency for write-behind durability.
 
 Every backend proves itself against one **conformance suite**
-(`cairn_storage::conformance::run`) rather than its own tests. That is what makes swapping
+(`bnetcc_storage::conformance::run`) rather than its own tests. That is what makes swapping
 SQLite for Postgres a decision rather than a rewrite, and it is what catches the
 divergences that otherwise surface in production on one backend only: case folding on
 names and attribute keys, merge-versus-replace on attribute writes, and which ban scope
 wins when both are present.
 
 **Two implementations.** SQLite is the default — a community node operator should be able
-to run `cairnd` with zero external services. Postgres is for the hub and for nodes past a
+to run `bnetccd` with zero external services. Postgres is for the hub and for nodes past a
 few thousand accounts.
 
 **Explicitly not inherited from PvPGN:**
@@ -349,7 +345,7 @@ reports connection setup latency, steady-state RSS, and p50/p99 chat round-trip.
 
 PvPGN ships four processes for Diablo II: `bnetd` (6112), `d2cs` (the MCP/realm server,
 6113), `d2dbs` (the character database, 6114), and a third-party `d2gs` (the actual game
-server, 4000). Cairn folds the first three into `cairnd`.
+server, 4000). Command Center folds the first three into `bnetccd`.
 
 ### Why the split is not worth keeping
 
@@ -369,7 +365,7 @@ server, 4000). Cairn folds the first three into `cairnd`.
   port 6112 and argues that this is closer to what real Battle.net actually did than
   PvPGN's split.
 
-So in Cairn the realm is a **gateway module**, exactly like BNCS and the chat gateway:
+So in Command Center the realm is a **gateway module**, exactly like BNCS and the chat gateway:
 it owns MCP framing (`len:u16le` first, **no** `0xFF` magic — the classic mistake) and its
 own session state machine, and it reaches the character store through the `Storage` trait
 as a normal function call. One process, one config, one binary to supervise.
@@ -395,7 +391,7 @@ pub trait GameHost: Send + Sync {
 ```
 
 - **`ExternalGameHost`** speaks to an existing D2GS for operators who already run one. It
-  is a client of that process, not a sibling daemon of ours — `cairnd` is still the only
+  is a client of that process, not a sibling daemon of ours — `bnetccd` is still the only
   thing you install and supervise.
 - **`EmbeddedGameHost`** is where an in-process game server plugs in if one is ever
   written. It becomes a module, not a fourth daemon.

@@ -35,9 +35,9 @@ that did establish kept working.
 Reproduce with:
 
 ```
-cargo build --release -p cairn-smoke
+cargo build --release -p bnetcc-smoke
 ulimit -n 20000
-./target/release/cairn-smoke 2500 40
+./target/release/bnetcc-smoke 2500 40
 ```
 
 ### What these numbers do and do not prove
@@ -51,15 +51,15 @@ to 4,000, so nothing is O(n²) in connection count.
 
 **They prove nothing about tokio.** The harness is thread-per-connection because it has
 to build without an async runtime, so its RSS includes two thread stacks per connection
-that `cairnd` does not pay. 30 KiB per connection here is an **upper bound with a large
+that `bnetccd` does not pay. 30 KiB per connection here is an **upper bound with a large
 known constant in it** — a tokio task is a few hundred bytes plus its buffers. Re-measure
-`cairnd` itself on the target host before quoting anything.
+`bnetccd` itself on the target host before quoting anything.
 
 One more caveat worth stating: the harness opens connections in waves of 100. `std`'s
 `TcpListener` has a fixed 128-entry accept backlog, and 2,500 simultaneous `connect`
 calls overrun it regardless of how the server is written. The requirement is 2,000+
 connections *held concurrently*, which is what the table measures; accept-storm
-resilience is a separate property that needs a tuned backlog and is a `cairnd` concern.
+resilience is a separate property that needs a tuned backlog and is a `bnetccd` concern.
 
 ---
 
@@ -108,8 +108,8 @@ lesson for this workload.
 
 | Ceiling | Symptom | Fix |
 |---|---|---|
-| **File descriptors** | `EMFILE`, refused connections | Raise `ulimit -n` / `LimitNOFILE=`; on macOS also `kern.maxfilesperproc`. `cairnd` derives `max_connections` from `RLIMIT_NOFILE` and **logs the effective ceiling at startup** — PvPGN ships a hard-coded 1000 and refuses silently past it, which is why operators concluded it could not scale. |
-| **Accept backlog** | Connection resets during a login storm | Tune the listen backlog; `cairnd` should expose it. Matters after a netsplit, when everyone reconnects at once. |
+| **File descriptors** | `EMFILE`, refused connections | Raise `ulimit -n` / `LimitNOFILE=`; on macOS also `kern.maxfilesperproc`. `bnetccd` derives `max_connections` from `RLIMIT_NOFILE` and **logs the effective ceiling at startup** — PvPGN ships a hard-coded 1000 and refuses silently past it, which is why operators concluded it could not scale. |
+| **Accept backlog** | Connection resets during a login storm | Tune the listen backlog; `bnetccd` should expose it. Matters after a netsplit, when everyone reconnects at once. |
 | **Channel fanout** | Rising p99 chat latency | Cap channel size (real Battle.net used 40); shard large channels. |
 | **Storage in the request path** | Global latency spikes | Never. Storage is behind a write-behind actor; account creation, password change and bans are write-through and everything else is batched. This is the single biggest thing PvPGN got wrong — a synchronous `mysql_query()` on the event-loop thread freezes every other connection for the duration. |
 | **Ephemeral ports** | Only ever the load generator | Generate load from more than one source address. |
@@ -118,7 +118,7 @@ lesson for this workload.
 
 ## 5. What to measure on the real thing
 
-Once `cairnd` builds with tokio, the numbers that matter:
+Once `bnetccd` builds with tokio, the numbers that matter:
 
 - Connection setup latency, p50/p99, under a reconnect storm of 2,000.
 - Steady-state RSS at 2,000 idle connections. Expect **well under** 30 KiB each.

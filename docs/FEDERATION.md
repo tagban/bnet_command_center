@@ -1,4 +1,4 @@
-# Cairn — Federation
+# BNET Command Center — Federation
 
 There is **no working precedent for this** in the Battle.net emulator ecosystem. PvPGN has
 a fire-and-forget UDP stats beacon to a master list (`tracker.cpp`) — a server *directory*,
@@ -17,7 +17,7 @@ them.
 ```
         node-eu ────┐
         node-na ────┤
-        node-sa ────┼──── cairn-hub ──── Postgres
+        node-sa ────┼──── bnetcc-hub ──── Postgres
         node-asia ──┤        │
         node-bob ───┘        └── admin / web
 ```
@@ -81,7 +81,7 @@ preshared key with SHA-1 challenge-response; that is 2003 thinking and we are no
 repeating it.
 
 - Each node has a long-lived **Ed25519 identity key**. The public key *is* the node id.
-- Enrolment is a one-time bootstrap token issued by a hub admin (`cairnctl node invite`).
+- Enrolment is a one-time bootstrap token issued by a hub admin (`bnetcc node invite`).
   The node presents it once, registers its public key, and the token burns.
 - The hub pins node public keys; the node pins the hub's. A rotated key requires an admin
   action, never an automatic accept.
@@ -138,7 +138,7 @@ Per-node, opt-in, and honest about the cost:
 - **SRP accounts**: keep working, no caveat. The node already has `(s, v)`.
 - **XSHA-1 accounts**: only work if the operator enabled `offline_login = true`, which
   causes the hub to push `h1` for *recently-active-on-this-node* accounts only. Enabling it
-  is a deliberate trade of credential exposure for availability, and `cairnctl` says so at
+  is a deliberate trade of credential exposure for availability, and `bnetcc` says so at
   the moment you enable it.
 - Sessions established during a partition are flagged `unverified`. Their game results go
   to a **quarantine pool** and are only merged into the ladder after the hub reconciles.

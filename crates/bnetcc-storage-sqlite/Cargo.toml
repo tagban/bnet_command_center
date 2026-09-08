@@ -1,0 +1,21 @@
+[package]
+name = "bnetcc-storage-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SQLite backend for bnetcc-storage"
+
+# Excluded from the default workspace members because `rusqlite` could not be fetched in
+# the environment this was authored in — an optional dependency still forces registry
+# resolution, so it lives in its own crate rather than behind a feature flag. Add it to
+# the workspace `members` once crates.io is reachable; it proves itself by passing
+# bnetcc_storage::conformance::run.
+[dependencies]
+bnetcc-core = { path = "../bnetcc-core" }
+bnetcc-storage = { path = "../bnetcc-storage" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

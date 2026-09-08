@@ -1,0 +1,19 @@
+[package]
+name = "bnetcc-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Classic Battle.net wire protocol: framing, packet types, checked codecs"
+
+# Deliberately zero dependencies.
+#
+# This crate is the only place attacker-controlled bytes are parsed, so it is the crate
+# that gets fuzzed, audited and pinned. Keeping it dependency-free means its supply
+# chain is the compiler, its build is instant, and `cargo fuzz` has nothing else to
+# compile. The tokio adapters live in `bnetccd` where the runtime already is.
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

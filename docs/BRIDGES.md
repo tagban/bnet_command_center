@@ -71,7 +71,7 @@ recognise it.
 
 We do not copy its limits, which are implementation accidents rather than design: one key,
 one channel, no game listings, no clan or friends visibility, and no kick/ban reasons. A
-Cairn bridge token can be scoped to several channels, and bridged users can see the game
+Command Center bridge token can be scoped to several channels, and bridged users can see the game
 list.
 
 Two things to steal exactly:
@@ -237,7 +237,7 @@ presence, and the channel model has to be finished and federated first or bridge
 built against a moving target.
 
 1. **The presence model.** Virtual accounts, reserved prefix namespaces, stable identity
-   mapping, per-identity flood control. No transport yet — this is all `cairn-core`, and
+   mapping, per-identity flood control. No transport yet — this is all `bnetcc-core`, and
    all testable without a socket.
 2. **The extended line protocol**, since it is the smaller transport and it doubles as the
    telnet-gateway improvement. Capability handshake, UTF-8 negotiation, presence commands.

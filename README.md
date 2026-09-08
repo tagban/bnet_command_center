@@ -1,35 +1,39 @@
-# Cairn
+# BNET Command Center
 
-A federated Classic Battle.net server in Rust.
+A federated Classic Battle.net server in Rust. **[bnet.cc](https://bnet.cc)**
 
 Built clean-slate, informed by what PvPGN and BNETDocs Atlas got right and wrong. Two
-roles from one codebase: **`cairnd`**, the node a community operator runs, and
-**`cairn-hub`**, which is authoritative for identity, the channel directory, ladder and
+roles from one codebase: **`bnetccd`**, the node a community operator runs, and
+**`bnetcc-hub`**, which is authoritative for identity, the channel directory, ladder and
 network-wide bans.
 
-> **`Cairn` is a placeholder name** — a cairn is a waypoint built by many travellers each
-> adding one stone, which is the federation model. Rename with one `sed` before release;
-> nothing depends on it.
+Referred to as **Command Center** in prose, `bnetcc` in code and on the command line.
+
+| | |
+|---|---|
+| `bnetccd` | the node daemon — what an operator installs |
+| `bnetcc-hub` | the hub: identity, directory, ladder, ban authority |
+| `bnetcc` | the admin CLI |
 
 ---
 
 ## Status
 
 **Phase 0 complete.** The protocol core, cryptography, domain rules and a concurrency
-harness are written, tested and measured. `cairnd` is written but not yet compiled — see
+harness are written, tested and measured. `bnetccd` is written but not yet compiled — see
 [Building](#building).
 
 | Crate | State | Tests |
 |---|---|---|
-| `cairn-crypto` | X-SHA-1 verified against known-answer vectors | 7 |
-| `cairn-proto` | BNCS + chat-gateway framing, wire codecs, BNI icons, BNFTP | 70 |
-| `cairn-core` | Policy, channels, admission, flood, key registry, ads, session FSM | 80 |
-| `cairn-storage` | `Storage` trait, attribute ACLs, write-behind, conformance suite | 32 |
-| `cairn-smoke` | Real handshake at 4,000 concurrent connections | — |
-| `cairnd` | Written; needs a dependency-resolving build | — |
-| `cairn-storage-sqlite` | Written; needs `rusqlite` | — |
+| `bnetcc-crypto` | X-SHA-1 verified against known-answer vectors | 7 |
+| `bnetcc-proto` | BNCS + chat-gateway framing, wire codecs, BNI icons, BNFTP | 70 |
+| `bnetcc-core` | Policy, channels, admission, flood, key registry, ads, bridged identities, session FSM | 98 |
+| `bnetcc-storage` | `Storage` trait, attribute ACLs, write-behind, conformance suite | 33 |
+| `bnetcc-smoke` | Real handshake at 4,000 concurrent connections | — |
+| `bnetccd` | Written; needs a dependency-resolving build | — |
+| `bnetcc-storage-sqlite` | Written; needs `rusqlite` | — |
 
-189 tests, `cargo clippy -D warnings` clean, **zero third-party dependencies** in the four
+208 tests, `cargo clippy -D warnings` clean, **zero third-party dependencies** in the four
 library crates — which is deliberate: the crates that parse attacker-controlled bytes and
 hold the domain rules are the ones you want cheap to fuzz and cheap to audit. Database
 drivers and the async runtime live only in the crates that cannot avoid them.
@@ -86,36 +90,42 @@ The full evidence table is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §2
 
 ```sh
 cargo test                                  # the four library crates + harness
-cargo build --release -p cairn-smoke
+cargo build --release -p bnetcc-smoke
 ulimit -n 20000
-./target/release/cairn-smoke 2500 40        # 2500 concurrent real handshakes
+./target/release/bnetcc-smoke 2500 40        # 2500 concurrent real handshakes
 ```
 
-**`crates/cairnd` and `crates/cairn-storage-sqlite` are excluded from the workspace.** They
+**`crates/bnetccd` and `crates/bnetcc-storage-sqlite` are excluded from the workspace.** They
 need `tokio` and `rusqlite`, and the environment this scaffold was authored in had no access
 to `crates.io`. To build them:
 
 ```diff
   members = [
-      "crates/cairn-crypto",
-      "crates/cairn-proto",
-      "crates/cairn-core",
-      "crates/cairn-storage",
+      "crates/bnetcc-crypto",
+      "crates/bnetcc-proto",
+      "crates/bnetcc-core",
+      "crates/bnetcc-storage",
       "crates/smoke",
-+     "crates/cairnd",
-+     "crates/cairn-storage-sqlite",
++     "crates/bnetccd",
++     "crates/bnetcc-storage-sqlite",
   ]
-- exclude = ["crates/cairnd", "crates/cairn-storage-sqlite"]
+- exclude = ["crates/bnetccd", "crates/bnetcc-storage-sqlite"]
 ```
 
-then `cargo build`. Both are real code, not stubs, but neither has been through a
-compiler — expect to fix what `rustc` finds. The four library crates they depend on are
-fully tested. (`cairn-storage-sqlite` is a separate crate rather than a feature flag
-because an *optional* dependency still forces registry resolution.)
+**`./scripts/verify.sh` does all of that for you** — it enables both crates, runs build,
+test and clippy, and writes `verify.log` with the full compiler output. If the build
+fails it restores the reduced workspace so the library crates still build, and
+`verify.log` is the file to send back: it has the actual errors rather than a summary of
+them.
+
+Both are real code, not stubs, but neither has been through a compiler — expect to fix
+what `rustc` finds. The four library crates they depend on are fully tested.
+(`bnetcc-storage-sqlite` is a separate crate rather than a feature flag because an
+*optional* dependency still forces registry resolution.)
 
 ```sh
-cairnd --config cairnd.toml --check   # validate configuration and exit
-cairnd --config cairnd.toml
+bnetccd --config bnetccd.toml --check   # validate configuration and exit
+bnetccd --config bnetccd.toml
 ```
 
 ---
@@ -123,7 +133,7 @@ cairnd --config cairnd.toml
 ## Configuration
 
 Every field has a default, so a minimal config is a few lines. See
-[`cairnd.example.toml`](cairnd.example.toml).
+[`bnetccd.example.toml`](bnetccd.example.toml).
 
 ```toml
 [server]
@@ -177,7 +187,7 @@ PvPGN's direct ancestor — held that emulating Battle.net violated the DMCA's
 anti-circumvention provisions. That is a lawyer conversation, not an engineering one, and
 it is independent of which open-source licence you pick.
 
-Cairn ships no Blizzard assets, no CD keys, and no client patches, and it should stay
+Command Center ships no Blizzard assets, no CD keys, and no client patches, and it should stay
 that way.
 
 ---

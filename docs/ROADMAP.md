@@ -10,22 +10,22 @@ team for this project?".
 
 ## Phase 0 — Foundations ✅ done
 
-- **`cairn-crypto`** — X-SHA-1 ported and verified against known-answer vectors, including
+- **`bnetcc-crypto`** — X-SHA-1 ported and verified against known-answer vectors, including
   the full `SID_LOGONRESPONSE2` double-hash chain.
-- **`cairn-proto`** — BNCS framing, chat-gateway line framing, checked wire
+- **`bnetcc-proto`** — BNCS framing, chat-gateway line framing, checked wire
   readers/writers, chat events and limits, product/auth-family classification, **the BNI
   icon format** (parse, build, validate, icon selection) and **BNFTP v1** with a hardened
   filename sanitiser. Zero dependencies.
-- **`cairn-core`** — policy engine (gaming/warnet/both), per-client-type connection limits
+- **`bnetcc-core`** — policy engine (gaming/warnet/both), per-client-type connection limits
   with two-stage product classification, channel operator rules, CD-key session
   uniqueness, flood control, **advertisement rotation**, session state machine. Zero
   dependencies.
-- **`cairn-storage`** — `Storage` trait, per-key attribute ACLs, write-behind batching with
+- **`bnetcc-storage`** — `Storage` trait, per-key attribute ACLs, write-behind batching with
   a tested durability contract, in-memory reference backend, and a conformance suite every
   backend must pass. Zero dependencies.
-- **`cairn-storage-sqlite`** — SQLite backend with migrations. Written; excluded from the
+- **`bnetcc-storage-sqlite`** — SQLite backend with migrations. Written; excluded from the
   workspace pending `rusqlite`.
-- **`cairnd`** — node daemon. Written; excluded pending `tokio`.
+- **`bnetccd`** — node daemon. Written; excluded pending `tokio`.
 - **`crates/smoke`** — real handshake over real sockets at 4,000 concurrent connections.
 - 189 tests, `clippy -D warnings` clean.
 
@@ -33,14 +33,14 @@ team for this project?".
 
 The milestone is a screenshot of Brood War sitting in a channel. Nothing else counts.
 
-- [ ] **Resolve dependencies and build `cairnd` and `cairn-storage-sqlite`.** Both are
+- [ ] **Resolve dependencies and build `bnetccd` and `bnetcc-storage-sqlite`.** Both are
       written and excluded only because `crates.io` was unreachable where this was
       authored. Add them to `members`, build, fix what the compiler finds.
 - [ ] **Test against a real client.** Expect surprises; `docs/PROTOCOL-NOTES.md` marks each
       with ⚠️ or 🛑. The likeliest: the zero-game `SID_GETADVLISTEX` shape, four-character
       code byte order, the BNI code-list-when-flags-are-set question, and the ad extension
       tag's wire bytes.
-- [ ] **Wire storage into `cairnd`** behind the actor: a bounded channel to a dedicated
+- [ ] **Wire storage into `bnetccd`** behind the actor: a bounded channel to a dedicated
       thread, `WriteBehind` on top, `AttrSchema::filter_readable` on every client-facing
       read path.
 - [ ] **BNFTP serving** (protocol byte `0x02`). The codec exists; it needs the file server
@@ -48,7 +48,7 @@ The milestone is a screenshot of Brood War sitting in a channel. Nothing else co
       placeholders in the repo, never Blizzard assets (`docs/LEGAL.md` §2).
 - [ ] **Icon serving**: answer `SID_GETICONDATA` per product before `SID_ENTERCHAT` (a
       client that does not get this **terminates the connection**), plus `SID_GETFILETIME`
-      for revalidation. Ship a `cairnctl icons` subcommand wrapping the existing
+      for revalidation. Ship a `bnetcc icons` subcommand wrapping the existing
       parse/build/validate so an operator can check an icon pack before deploying it.
 - [ ] **Advertisement serving**: `SID_CHECKAD`/`SID_CLICKAD`/`SID_DISPLAYAD`, plus
       `SID_QUERYADURL` for WarCraft III. Rotation logic is done and stateless; this is the
@@ -66,8 +66,8 @@ The milestone is a screenshot of Brood War sitting in a channel. Nothing else co
 
 ## Phase 2 — Federation, and Diablo II Open
 
-- [ ] `cairn-hub`: directory, identity, ladder, ban authority.
-- [ ] `cairn-fed`: mTLS transport (`rustls`), Ed25519 node identities, one-time enrolment
+- [ ] `bnetcc-hub`: directory, identity, ladder, ban authority.
+- [ ] `bnetcc-fed`: mTLS transport (`rustls`), Ed25519 node identities, one-time enrolment
       tokens, CBOR message framing, reconnect with jittered backoff.
 - [ ] **Hub-proxied X-SHA-1 verification** and **edge SRP verification** — the asymmetry in
       `docs/FEDERATION.md` §4, which is the load-bearing part of the identity design.
@@ -78,7 +78,7 @@ The milestone is a screenshot of Brood War sitting in a channel. Nothing else co
       in this ecosystem has fixed.
 - [ ] Ladder submission with session attestation, plausibility checks, rate limits and
       per-node reputation.
-- [ ] `cairnctl`: node enrolment, moderation, policy push, icon-pack validation.
+- [ ] `bnetcc`: node enrolment, moderation, policy push, icon-pack validation.
 - [ ] **Diablo II *Open*.** Open games are peer-to-peer, exactly like StarCraft and
       Warcraft II — the client dials the host directly and characters live client-side. So
       D2 players get a working server here with **no game server of any kind**: it is
@@ -101,7 +101,7 @@ The milestone is a screenshot of Brood War sitting in a channel. Nothing else co
       Document that WC3 needs a patched client because of the 128-byte RSA server
       signature, and do not distribute that patch.
 - [ ] **Bridges** — `docs/BRIDGES.md`. In its build order: the presence model first (all
-      `cairn-core`, no transport), then the extended line protocol (which doubles as the
+      `bnetcc-core`, no transport), then the extended line protocol (which doubles as the
       telnet-gateway improvement), then the WebSocket transport, then an in-tree Discord
       bridge as the reference consumer, then a minimal Lua example for game addons.
       Bridges come after federation because a bridged user *is* a channel presence, and
@@ -109,7 +109,7 @@ The milestone is a screenshot of Brood War sitting in a channel. Nothing else co
 
 ## Phase 4 — Diablo II closed realms, in one binary
 
-Realms run **inside `cairnd`**, not as separate daemons — `docs/ARCHITECTURE.md` §11 has the
+Realms run **inside `bnetccd`**, not as separate daemons — `docs/ARCHITECTURE.md` §11 has the
 reasoning, including that PvPGN's `d2dbs` still uses `select()` capped at `FD_SETSIZE` and
 never received the fix `bnetd` got in 2003.
 
@@ -184,7 +184,7 @@ undocumented one, in a jurisdiction where the 8th Circuit has already ruled on e
 that" (`docs/LEGAL.md` §2).
 
 **What the architecture does instead:** the gateway boundary. A protocol front-end is a
-crate implementing one trait over `cairn-core`; it owns its framing, its auth and its
+crate implementing one trait over `bnetcc-core`; it owns its framing, its auth and its
 session state machine, and knows nothing about channels or storage. If a modern protocol is
-ever documented, it becomes `cairn-gateway-bgs` and the core does not change. A seam, not a
+ever documented, it becomes `bnetcc-gateway-bgs` and the core does not change. A seam, not a
 stub.

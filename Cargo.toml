@@ -1,27 +1,27 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/cairn-crypto",
-    "crates/cairn-proto",
-    "crates/cairn-core",
-    "crates/cairn-storage",
+    "crates/bnetcc-crypto",
+    "crates/bnetcc-proto",
+    "crates/bnetcc-core",
+    "crates/bnetcc-storage",
     "crates/smoke",
 ]
 
-# NOTE: crates/cairnd (tokio) and crates/cairn-storage-sqlite (rusqlite) are excluded
+# NOTE: crates/bnetccd (tokio) and crates/bnetcc-storage-sqlite (rusqlite) are excluded
 # from the default workspace members because crates.io was unreachable from the
 # environment this scaffold was authored in. An *optional* dependency still forces
 # registry resolution, which is why the SQLite backend is its own crate rather than a
 # feature flag. Add both back once dependencies can be fetched:
-#   members = [..., "crates/cairnd", "crates/cairn-storage-sqlite"]
-exclude = ["crates/cairnd", "crates/cairn-storage-sqlite"]
+#   members = [..., "crates/bnetccd", "crates/bnetcc-storage-sqlite"]
+exclude = ["crates/bnetccd", "crates/bnetcc-storage-sqlite"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/YOURORG/cairn"
+repository = "https://github.com/YOURORG/bnet-command-center"
 
 [workspace.dependencies]
 bytes = "1"

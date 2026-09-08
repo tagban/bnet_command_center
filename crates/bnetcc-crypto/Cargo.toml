@@ -1,0 +1,12 @@
+[package]
+name = "bnetcc-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Battle.net cryptographic primitives: XSHA-1, BSHA-1, NLS/SRP"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"

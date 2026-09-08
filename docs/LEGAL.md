@@ -11,15 +11,15 @@ one of them is serious enough that you should talk to a lawyer before publishing
 |---|---|---|
 | **[BNETDocs](https://bnetdocs.org/)** — packet layouts, IDs, flows | Community protocol reference, independent of any codebase | ✅ **Primary source.** Protocol facts are not copyrightable. Cite it; don't bulk-copy its prose. |
 | **[BNETDocs/Atlas](https://github.com/BNETDocs/Atlas)** | **MIT** | ✅ **Readable and adaptable with attribution.** Its `Protocols/Game/Messages/SID_*.cs` are effectively an MIT-licensed executable specification of the same wire protocol. This is a large and under-appreciated advantage. |
-| **[wjlafrance/broken-sha1](https://github.com/wjlafrance/broken-sha1)** / MBNCSUtil | BSD-3-clause style | ✅ Readable with attribution. Used as the reference for `cairn-crypto`'s XSHA-1 (see `crates/cairn-crypto/src/xsha1.rs` header). |
-| **[pvpgn/pvpgn-server](https://github.com/pvpgn/pvpgn-server)** — general source | **GPL-2.0-or-later** (386 of 405 files carry the header) | ⚠️ **Do not copy.** Reading it to learn *design* is fine; copying any function, struct, table, or distinctive parser makes Cairn a derivative and forces GPL on the whole binary. Rust's static linking means there is no "mere aggregation" escape. |
+| **[wjlafrance/broken-sha1](https://github.com/wjlafrance/broken-sha1)** / MBNCSUtil | BSD-3-clause style | ✅ Readable with attribution. Used as the reference for `bnetcc-crypto`'s XSHA-1 (see `crates/bnetcc-crypto/src/xsha1.rs` header). |
+| **[pvpgn/pvpgn-server](https://github.com/pvpgn/pvpgn-server)** — general source | **GPL-2.0-or-later** (386 of 405 files carry the header) | ⚠️ **Do not copy.** Reading it to learn *design* is fine; copying any function, struct, table, or distinctive parser makes Command Center a derivative and forces GPL on the whole binary. Rust's static linking means there is no "mere aggregation" escape. |
 | **`pvpgn/src/common/bnetsrp3.{cpp,h}`, `bigint.{cpp,h}`** | **AGPL-3.0-or-later** | 🛑 **Do not open.** This is the WarCraft III SRP-3 implementation — precisely the file a reimplementer is most tempted to read. AGPL §13 adds a network-use source-disclosure obligation, which is fatal for a hosted service. |
 | PvPGN `conf/*.conf.in`, `versioncheck.json`, `lua/`, `bnxplevel.conf` | GPL | ⚠️ The *values* (version hashes, XP tables) are facts and are free. The *files* are GPL works. Regenerate; don't copy. |
 
 ### Where to get the cryptography
 
 - **XSHA-1 / "Broken SHA-1"** — BNETDocs, plus the BSD-licensed `wjlafrance/broken-sha1`.
-  Already ported and verified against known-answer vectors in `cairn-crypto`.
+  Already ported and verified against known-answer vectors in `bnetcc-crypto`.
 - **NLS / SRP-6 (Blizzard variant)** — the [javaop SRP write-up](http://www.javaop.com/@ron/documents/SRP.html)
   and [SkullSecurity's SRP page](https://www.skullsecurity.org/wiki/SRP), plus RFC 2945 for
   baseline SRP. **Never from `bnetsrp3.cpp`.** Note that PvPGN's own AGPL header points at
@@ -83,7 +83,7 @@ is implementable normally.
 
 ---
 
-## 4. What Cairn itself should be licensed as
+## 4. What Command Center itself should be licensed as
 
 Your call, but the considerations:
 

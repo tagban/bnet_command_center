@@ -92,7 +92,7 @@ session per CD key** — which is exactly why real Battle.net answers `SID_AUTH_
 result `0x201` "CD key in use" and names the current holder in the additional-information
 string.
 
-`cairn_core::limits::KeyRegistry` implements this: keys are tracked by the 20-byte hash the
+`bnetcc_core::limits::KeyRegistry` implements this: keys are tracked by the 20-byte hash the
 client sends (never a usable key), a second claim on a live key returns
 `KeyVerdict::InUse { by }`, and banned keys return `0x202`. It also reproduces the
 **~500 ms cooldown** after a session ends, during which the key still reports as in use —

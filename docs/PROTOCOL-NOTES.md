@@ -81,7 +81,7 @@ status makes the client show a default error and disconnect.
 
 ### XSHA-1 itself
 
-Implemented and known-answer-tested in `cairn-crypto`. It differs from real SHA-1 in three
+Implemented and known-answer-tested in `bnetcc-crypto`. It differs from real SHA-1 in three
 ways, and the first one is the actual "break":
 
 1. **Message expansion has its operands swapped.** Standard SHA-1 computes
@@ -216,7 +216,7 @@ freshness on them.
 
 ### The BNI format ✅
 
-Implemented in `cairn_proto::bni`. 16-byte little-endian header (`header_size = 16`,
+Implemented in `bnetcc_proto::bni`. 16-byte little-endian header (`header_size = 16`,
 `version = 1`, `icon_count`, `data_offset`), **no magic number**; then one entry per icon
 (`flags`, `width`, `height`, zero-terminated list of four-character codes); then a single
 embedded TGA — type 10 (RLE true-colour), 24 bpp — with every icon stacked vertically, so
@@ -227,7 +227,7 @@ bitwise AND against the user's chat flags; an entry with zero flags matches a st
 icon code.
 
 🛑 **`icons-WAR3.bni` and `WAR3.bni` are not BNI files.** They are MPQ archives of `.blp`
-images with a misleading extension, so a BNI parser produces nonsense. `cairn_proto::bni`
+images with a misleading extension, so a BNI parser produces nonsense. `bnetcc_proto::bni`
 detects the MPQ magic and says so. WarCraft III icon support therefore needs an MPQ reader,
 not a BNI reader.
 
@@ -251,7 +251,7 @@ convention for its bundled icon MPQ, **not** protocol.
 
 ### BNFTP ✅
 
-Protocol byte `0x02`, one file per connection. Implemented in `cairn_proto::bnftp` (v1).
+Protocol byte `0x02`, one file per connection. Implemented in `bnetcc_proto::bnftp` (v1).
 
 ```
 request   u16 length | u16 version (0x0100) | u32 platform | u32 product
@@ -265,7 +265,7 @@ is fetched: they are 0 for ordinary files. v2 (`0x0200`) inserts a CD-key challe
 the transfer; not implemented, and not needed for anything a private server serves.
 
 The filename comes from an unauthenticated peer and is about to be joined to a directory.
-`cairn_proto::bnftp::sanitize_filename` is the security boundary — see its tests for the
+`bnetcc_proto::bnftp::sanitize_filename` is the security boundary — see its tests for the
 traversal forms it refuses.
 
 ### Advertisement packets ✅
@@ -281,7 +281,7 @@ traversal forms it refuses.
 Clients send `SID_CHECKAD` roughly **every 15 seconds**, and the server answers only when
 something changed. Because the request carries the client's current banner id, **rotation
 needs no server-side per-connection state at all** — it is a pure function of (previous id,
-product, language). Implemented that way in `cairn_core::ads`; it survives restarts and
+product, language). Implemented that way in `bnetcc_core::ads`; it survives restarts and
 cannot drift between federated nodes.
 
 WarCraft III gets a random pick; every other product rotates sequentially.
@@ -334,7 +334,7 @@ port is hardcoded, so you cannot run two per host.** Plan realms as containers/V
 | 4000 | TCP | D2GS — hardcoded, unchangeable |
 | 6200 | TCP | WC3 game routing (PvPGN's `w3routeaddr`) |
 
-Cairn defaults: BNCS 6112, MCP 6113, admin/metrics 6115, federation outbound 7112.
+Command Center defaults: BNCS 6112, MCP 6113, admin/metrics 6115, federation outbound 7112.
 
 ---
 
@@ -378,9 +378,9 @@ the work is not "implement a documented protocol", it is "reverse-engineer an un
 one, in a jurisdiction where the 8th Circuit has already ruled on that" (see `LEGAL.md`).
 
 **What the architecture does about it:** the gateway boundary. A protocol front-end is a
-crate implementing one trait over `cairn-core`; it owns its framing, its auth, and its
+crate implementing one trait over `bnetcc-core`; it owns its framing, its auth, and its
 session state machine, and knows nothing about channels or storage. If a modern protocol is
-ever documented, it becomes `cairn-gateway-bgs` and the core does not change. That is the
+ever documented, it becomes `bnetcc-gateway-bgs` and the core does not change. That is the
 correct amount to invest in a maybe — a seam, not a stub.
 
 Target for real work: **StarCraft/BW ≤ 1.16.1, Diablo I, Warcraft II BNE, Diablo II/LoD ≤

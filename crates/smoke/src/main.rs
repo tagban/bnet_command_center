@@ -15,12 +15,12 @@
 //!
 //! **Does not prove anything about tokio.** This harness is thread-per-connection
 //! because it must build without a dependency on an async runtime. Its memory figures
-//! therefore include ~128 KiB of thread stack per connection that `cairnd` does not pay
+//! therefore include ~128 KiB of thread stack per connection that `bnetccd` does not pay
 //! — a tokio task is a few hundred bytes plus its buffers. Read the RSS number as an
-//! upper bound with a large, known constant in it, and re-measure `cairnd` itself on the
+//! upper bound with a large, known constant in it, and re-measure `bnetccd` itself on the
 //! target host.
 //!
-//! Usage: `cairn-smoke [connections] [channel_size]` (defaults 2500 and 40).
+//! Usage: `bnetcc-smoke [connections] [channel_size]` (defaults 2500 and 40).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -31,15 +31,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cairn_core::channel::{Channel, ChannelClass};
-use cairn_core::session::SessionState;
-use cairn_crypto::{logon_proof, password_hash, proofs_match};
-use cairn_proto::bncs::{
+use bnetcc_core::channel::{Channel, ChannelClass};
+use bnetcc_core::session::SessionState;
+use bnetcc_crypto::{logon_proof, password_hash, proofs_match};
+use bnetcc_proto::bncs::{
     decode_frame, encode_frame, logon_status, sid, Frame, DEFAULT_MAX_FRAME,
 };
-use cairn_proto::buf::{RecvBuf, Writer};
-use cairn_proto::chat::{chat_event, normalize_channel_name, EventId, USERNAME_MAX};
-use cairn_proto::product;
+use bnetcc_proto::buf::{RecvBuf, Writer};
+use bnetcc_proto::chat::{chat_event, normalize_channel_name, EventId, USERNAME_MAX};
+use bnetcc_proto::product;
 
 const READ_CHUNK: usize = 4096;
 const STACK: usize = 128 * 1024;
@@ -135,7 +135,7 @@ fn serve(mut sock: TcpStream, shared: Arc<Shared>) {
                         _ => break 'outer,
                     };
                     if product::always_no_udp(prod) {
-                        flags |= cairn_proto::chat::user_flags::NO_UDP;
+                        flags |= bnetcc_proto::chat::user_flags::NO_UDP;
                     }
                     server_token = server_token.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                     let mut w = Writer::with_capacity(64);
@@ -312,7 +312,7 @@ fn serve(mut sock: TcpStream, shared: Arc<Shared>) {
                     };
                     let mut r = frame.reader();
                     let Ok(text) = r.cstr(224) else { break 'outer };
-                    let text = cairn_proto::chat::sanitize_chat_text(text);
+                    let text = bnetcc_proto::chat::sanitize_chat_text(text);
                     broadcast(
                         &shared,
                         key,
@@ -429,7 +429,7 @@ impl Client {
         // SID_AUTH_INFO
         let mut w = Writer::new();
         w.u32(0)
-            .fourcc(cairn_proto::FourCc::from_ascii(b"IX86"))
+            .fourcc(bnetcc_proto::FourCc::from_ascii(b"IX86"))
             .fourcc(product::SEXP)
             .u32(0xCD)
             .u32(0)
@@ -501,7 +501,7 @@ impl Client {
     }
 }
 
-fn bad(e: cairn_proto::ProtoError) -> std::io::Error {
+fn bad(e: bnetcc_proto::ProtoError) -> std::io::Error {
     other(&e.to_string())
 }
 
@@ -539,7 +539,7 @@ fn main() {
         .unwrap_or(2500);
     let channel_size: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(40);
 
-    println!("cairn-smoke: {target} concurrent connections, channels of {channel_size}");
+    println!("bnetcc-smoke: {target} concurrent connections, channels of {channel_size}");
     println!("(thread-per-connection harness; see the module docs on what this proves)\n");
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");

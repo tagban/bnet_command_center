@@ -1,0 +1,17 @@
+[package]
+name = "bnetcc-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Command Center domain model: policy, channels, sessions, admission control"
+
+# Also dependency-free. The domain rules — who gets operator, what warnet mode gates,
+# when a connection is admitted — are pure functions over pure data, which is what makes
+# them testable without a socket or a clock.
+[dependencies]
+bnetcc-proto = { path = "../bnetcc-proto" }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

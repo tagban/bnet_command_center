@@ -3,32 +3,32 @@
 version = 3
 
 [[package]]
-name = "cairn-core"
+name = "bnetcc-core"
 version = "0.1.0"
 dependencies = [
- "cairn-proto",
+ "bnetcc-proto",
 ]
 
 [[package]]
-name = "cairn-crypto"
+name = "bnetcc-crypto"
 version = "0.1.0"
 
 [[package]]
-name = "cairn-proto"
+name = "bnetcc-proto"
 version = "0.1.0"
 
 [[package]]
-name = "cairn-smoke"
+name = "bnetcc-smoke"
 version = "0.1.0"
 dependencies = [
- "cairn-core",
- "cairn-crypto",
- "cairn-proto",
+ "bnetcc-core",
+ "bnetcc-crypto",
+ "bnetcc-proto",
 ]
 
 [[package]]
-name = "cairn-storage"
+name = "bnetcc-storage"
 version = "0.1.0"
 dependencies = [
- "cairn-core",
+ "bnetcc-core",
 ]
