@@ -75,6 +75,7 @@ The full evidence table is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §2
 
 | Document | What it covers |
 |---|---|
+| [`docs/HANDOFF.md`](docs/HANDOFF.md) | **Start here.** Current state, decisions already made and why, landmines, what to do next |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Process model, crate map, connection lifecycle, backpressure, storage, observability, cross-platform notes |
 | [`docs/FEDERATION.md`](docs/FEDERATION.md) | Star topology, trust model, mTLS transport, the X-SHA-1/SRP identity asymmetry, channel sequencing, ladder validation, partition behaviour |
 | [`docs/WARNET.md`](docs/WARNET.md) | Warnet vs gaming mode, what each gates, connection limits for bot fleets, operator semantics, ordering fairness, flood control |
