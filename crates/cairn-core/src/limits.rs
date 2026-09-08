@@ -3,7 +3,7 @@
 //! Both are pure data structures driven by an explicit clock, so their behaviour is
 //! deterministic and testable without sleeping. Nothing here touches a socket.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 
 use crate::channel::AccountId;
@@ -234,6 +234,114 @@ impl FloodTracker {
     }
 }
 
+/// A hashed CD key, as it arrives in `SID_AUTH_CHECK`.
+///
+/// We store the 20-byte hash the client sends, never a raw key. There is no reason for
+/// a server to hold a usable CD key, and every reason not to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct KeyId(pub [u8; 20]);
+
+/// The outcome of trying to claim a CD key for a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyVerdict {
+    /// The key is now claimed by this session.
+    Ok,
+    /// Another live session holds it — `SID_AUTH_CHECK` result `0x201`.
+    InUse {
+        /// The account currently holding it, for the result string.
+        by: AccountId,
+    },
+    /// The key is banned — `SID_AUTH_CHECK` result `0x202`.
+    Banned,
+}
+
+/// One live session per CD key.
+///
+/// **This is the real economic gate on bot fleets.** Addresses are cheap to rent; keys
+/// are not. A per-IP limit can be sidestepped by anyone with a handful of proxies, but
+/// running twenty simultaneous bots genuinely requires twenty keys if the server
+/// enforces uniqueness — which is exactly why real Battle.net answers `SID_AUTH_CHECK`
+/// with `0x201` "CD key in use" and names the holder.
+///
+/// The cooldown reproduces a real Battle.net quirk that clients and bots already expect:
+/// a key stays marked in use for a short window after a session ends, so reconnecting
+/// too fast reports "key in use" rather than succeeding. Replicating it means bots
+/// written against real Battle.net behave identically here.
+#[derive(Debug)]
+pub struct KeyRegistry {
+    active: HashMap<KeyId, AccountId>,
+    /// Recently released keys: holder and release time.
+    cooling: HashMap<KeyId, (AccountId, u64)>,
+    banned: BTreeSet<KeyId>,
+    cooldown_ms: u64,
+}
+
+impl KeyRegistry {
+    /// New registry. A cooldown of 500 ms matches observed Battle.net behaviour.
+    #[must_use]
+    pub fn new(cooldown_ms: u64) -> Self {
+        Self {
+            active: HashMap::new(),
+            cooling: HashMap::new(),
+            banned: BTreeSet::new(),
+            cooldown_ms,
+        }
+    }
+
+    /// Keys currently held by a live session.
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        self.active.len()
+    }
+
+    /// Ban a key network-wide.
+    pub fn ban(&mut self, key: KeyId) {
+        self.banned.insert(key);
+        self.active.remove(&key);
+    }
+
+    /// Lift a key ban.
+    pub fn unban(&mut self, key: KeyId) -> bool {
+        self.banned.remove(&key)
+    }
+
+    /// Try to claim a key for a session.
+    pub fn claim(&mut self, key: KeyId, account: AccountId, now_ms: u64) -> KeyVerdict {
+        if self.banned.contains(&key) {
+            return KeyVerdict::Banned;
+        }
+        if let Some(&holder) = self.active.get(&key) {
+            return KeyVerdict::InUse { by: holder };
+        }
+        // Expire stale cooldown entries lazily, so the map tracks live churn rather
+        // than growing for the lifetime of the process.
+        let cooldown = self.cooldown_ms;
+        self.cooling
+            .retain(|_, (_, at)| now_ms.saturating_sub(*at) < cooldown);
+        if let Some(&(holder, at)) = self.cooling.get(&key) {
+            if now_ms.saturating_sub(at) < cooldown {
+                return KeyVerdict::InUse { by: holder };
+            }
+        }
+        self.cooling.remove(&key);
+        self.active.insert(key, account);
+        KeyVerdict::Ok
+    }
+
+    /// Release a key when its session ends, starting the cooldown.
+    pub fn release(&mut self, key: KeyId, now_ms: u64) {
+        if let Some(holder) = self.active.remove(&key) {
+            self.cooling.insert(key, (holder, now_ms));
+        }
+    }
+
+    /// Entries currently held in the cooldown map, for leak checking.
+    #[must_use]
+    pub fn cooling_count(&self) -> usize {
+        self.cooling.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,13 +366,38 @@ mod tests {
     }
 
     #[test]
-    fn warnet_permits_a_bot_fleet_from_one_ip() {
+    fn a_bot_fleet_costs_one_address_per_bot_even_on_a_warnet() {
+        // The entry cost, stated as a test: twenty bots means twenty addresses. Warnet
+        // mode does not relax this — it only raises the global ceiling.
         let limits = Policy::for_mode(ServerMode::Warnet).gateway_limits;
         let mut t = AdmissionTable::new();
-        for i in 0..limits.per_ip {
-            assert!(t.admit_ip(ip(1), limits).is_ok(), "connection {i} refused");
+        assert!(t.admit_ip(ip(1), limits).is_ok());
+        assert_eq!(
+            t.admit_ip(ip(1), limits),
+            Err(Rejection::PerIp { limit: 1 }),
+            "a second bot from the same address must be refused"
+        );
+        // Twenty bots from twenty addresses is fine.
+        for i in 2..=21u8 {
+            assert!(t.admit_ip(ip(i), limits).is_ok(), "bot {i} refused");
         }
-        assert!(t.admit_ip(ip(1), limits).is_err());
+        assert_eq!(t.total(), 21);
+    }
+
+    #[test]
+    fn the_allowlist_is_the_operators_deliberate_exception() {
+        // The escape hatch exists, but it is an explicit act by the server owner for a
+        // named host — never a mode default that quietly makes every fleet free.
+        let limits = Policy::for_mode(ServerMode::Warnet).gateway_limits;
+        let mut t = AdmissionTable::new();
+        assert!(t.admit_ip(ip(9), limits).is_ok());
+        assert!(t.admit_ip(ip(9), limits).is_err());
+
+        let mut t = AdmissionTable::new();
+        t.set_allowlist(vec![ip(9)]);
+        for _ in 0..20 {
+            assert!(t.admit_ip(ip(9), limits).is_ok());
+        }
     }
 
     #[test]
@@ -432,5 +565,87 @@ mod tests {
         f.check(10_000);
         // Time travels backwards (NTP step, or a federated node with a bad clock).
         assert!(matches!(f.check(0), FloodVerdict::Exceeded(_)));
+    }
+
+    fn key(n: u8) -> KeyId {
+        KeyId([n; 20])
+    }
+
+    #[test]
+    fn a_key_can_only_be_live_once() {
+        // The gate that actually makes a fleet expensive: addresses are cheap, keys are
+        // not. Twenty simultaneous bots requires twenty keys.
+        let mut r = KeyRegistry::new(500);
+        assert_eq!(r.claim(key(1), 100, 0), KeyVerdict::Ok);
+        assert_eq!(r.claim(key(1), 200, 0), KeyVerdict::InUse { by: 100 });
+        // A different key is unaffected.
+        assert_eq!(r.claim(key(2), 200, 0), KeyVerdict::Ok);
+        assert_eq!(r.active_count(), 2);
+    }
+
+    #[test]
+    fn twenty_bots_needs_twenty_keys() {
+        let mut r = KeyRegistry::new(500);
+        for i in 1..=20u8 {
+            assert_eq!(r.claim(key(i), u64::from(i), 0), KeyVerdict::Ok);
+        }
+        assert_eq!(r.active_count(), 20);
+        // Reusing any of them for a 21st bot fails.
+        for i in 1..=20u8 {
+            assert!(matches!(
+                r.claim(key(i), 999, 0),
+                KeyVerdict::InUse { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn a_released_key_stays_in_use_through_the_cooldown() {
+        // Real Battle.net reports "key in use" if you reconnect within ~500 ms. Bots are
+        // written against that behaviour, so we reproduce it rather than being subtly
+        // faster and confusing them.
+        let mut r = KeyRegistry::new(500);
+        r.claim(key(1), 100, 1_000);
+        r.release(key(1), 1_000);
+        assert_eq!(r.claim(key(1), 100, 1_100), KeyVerdict::InUse { by: 100 });
+        assert_eq!(r.claim(key(1), 100, 1_499), KeyVerdict::InUse { by: 100 });
+        assert_eq!(r.claim(key(1), 100, 1_500), KeyVerdict::Ok);
+    }
+
+    #[test]
+    fn banned_keys_are_refused_even_when_free() {
+        let mut r = KeyRegistry::new(500);
+        r.ban(key(3));
+        assert_eq!(r.claim(key(3), 1, 0), KeyVerdict::Banned);
+        assert!(r.unban(key(3)));
+        assert_eq!(r.claim(key(3), 1, 0), KeyVerdict::Ok);
+    }
+
+    #[test]
+    fn banning_a_live_key_evicts_it() {
+        let mut r = KeyRegistry::new(500);
+        r.claim(key(4), 7, 0);
+        assert_eq!(r.active_count(), 1);
+        r.ban(key(4));
+        assert_eq!(r.active_count(), 0);
+        assert_eq!(r.claim(key(4), 7, 0), KeyVerdict::Banned);
+    }
+
+    #[test]
+    fn cooldown_entries_do_not_accumulate() {
+        // A long-running server churns through millions of sessions; the cooldown map
+        // must track live churn, not the whole history.
+        let mut r = KeyRegistry::new(500);
+        for i in 0..2_000u64 {
+            let k = KeyId([(i % 251) as u8; 20]);
+            r.claim(k, i, i * 1_000);
+            r.release(k, i * 1_000);
+        }
+        r.claim(KeyId([255; 20]), 0, 2_000_000);
+        assert!(
+            r.cooling_count() <= 2,
+            "cooldown map holds {} entries",
+            r.cooling_count()
+        );
     }
 }

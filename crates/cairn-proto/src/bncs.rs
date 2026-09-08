@@ -223,6 +223,35 @@ pub mod logon_status {
     pub const ACCOUNT_CLOSED: u32 = 0x06;
 }
 
+/// `SID_AUTH_CHECK` (0x51) server result codes.
+///
+/// **Unknown result codes are treated as success by the client**, so never invent one.
+pub mod auth_check_status {
+    /// Passed the version and key challenge.
+    pub const PASSED: u32 = 0x000;
+    /// Old game version; the additional-information string is a patch MPQ filename.
+    pub const OLD_VERSION: u32 = 0x100;
+    /// Invalid version.
+    pub const INVALID_VERSION: u32 = 0x101;
+    /// Game version must be downgraded; additional information is a patch filename.
+    pub const MUST_DOWNGRADE: u32 = 0x102;
+    /// Invalid CD key.
+    pub const INVALID_KEY: u32 = 0x200;
+    /// **CD key is already in use by a live session.**
+    ///
+    /// The additional-information string carries the holder's username. This is the
+    /// response that makes a bot fleet cost one key per bot — see
+    /// `cairn_core::limits::KeyRegistry`.
+    pub const KEY_IN_USE: u32 = 0x201;
+    /// Banned CD key.
+    pub const KEY_BANNED: u32 = 0x202;
+    /// The key is for a different product.
+    pub const WRONG_PRODUCT: u32 = 0x203;
+    /// OR this into a `0x2xx` result to indicate the **second** CD key rather than the
+    /// first (Warcraft III sends two).
+    pub const SECOND_KEY: u32 = 0x010;
+}
+
 /// `SID_STARTADVEX3` (0x1C) server status codes.
 pub mod advertise_status {
     /// Game created.

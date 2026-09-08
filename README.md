@@ -23,11 +23,11 @@ harness are written, tested and measured. `cairnd` is written but not yet compil
 |---|---|---|
 | `cairn-crypto` | X-SHA-1 verified against known-answer vectors | 7 |
 | `cairn-proto` | BNCS + chat-gateway framing, checked wire codecs | 41 |
-| `cairn-core` | Policy, channels, admission, flood, session FSM | 50 |
+| `cairn-core` | Policy, channels, admission, flood, key registry, session FSM | 58 |
 | `cairn-smoke` | Real handshake at 4,000 concurrent connections | — |
 | `cairnd` | Written; needs a dependency-resolving build | — |
 
-98 tests, `cargo clippy -D warnings` clean, zero third-party dependencies in the three
+106 tests, `cargo clippy -D warnings` clean, zero third-party dependencies in the three
 library crates.
 
 Measured on 2 vCPU / 8 GB: **4,000/4,000 concurrent connections**, every one through a
@@ -128,8 +128,11 @@ hub = "hub.example.net:7112"
 
 `mode = "warnet"` refuses game hosting with `SID_STARTADVEX3` status `0x02` (the client's
 own "game type currently unavailable" message), returns an empty game list, does not bind
-the realm or WarCraft III listeners, switches channel ordering to hub-sequenced, and
-relaxes chat-gateway connection limits so bot fleets work. `docs/WARNET.md` has the
+the realm or WarCraft III listeners, and switches channel ordering to hub-sequenced.
+
+It does **not** relax the one-bot-per-IP cap — that cap is the entry cost for a fleet, and
+together with CD-key session uniqueness it means N simultaneous bots requires N keys and N
+addresses. Only the global ceiling rises. `docs/WARNET.md` §2 has the reasoning and the
 complete matrix.
 
 ---

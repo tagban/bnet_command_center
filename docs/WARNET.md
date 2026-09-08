@@ -38,7 +38,7 @@ never widen it. A hub in `warnet` mode cannot have a node quietly re-enabling ga
 | W3 route listener (`:6200`) | on | **not bound** | on |
 | MCP / D2CS listener | on | **not bound** | on |
 | Channel ordering | `LocalFirst` | **`HubSerialized`** | per-channel |
-| Chat-gateway connections | tight limits | **relaxed, per-account** | per-class |
+| Chat-gateway connections | 1 per IP | **1 per IP, higher global ceiling** | 1 per IP |
 | Flood control | human-tuned | **bot-tuned** | per-class |
 | Ladder | game results | **channel/war stats only** | both |
 
@@ -48,38 +48,61 @@ the user blames the server.
 
 ---
 
-## 2. Connection limits — resolving the tension in your requirement
+## 2. Connection limits — one bot per address, in every mode
 
-You asked for the telnet/chat gateway to be limited to **one connection per IP**. That is
-exactly right for a gaming server, where a chat-gateway connection is a bot and one bot per
-IP is a reasonable anti-abuse default.
+The chat gateway is capped at **one connection per IP address**, and warnet mode does not
+relax it. This looks like an anti-abuse limit and is not.
 
-It is exactly wrong for a warnet, where the *entire point* is that operators run fleets of
-bots, frequently from one box. A hard 1-per-IP cap makes a warnet unusable.
+**The limit is the entry cost, and the entry cost is the point.** One bot per address
+means a twenty-bot fleet costs twenty CD keys and twenty addresses. That expense is what
+makes a large fleet worth having: it is a visible demonstration that someone actually went
+and acquired the keys and the infrastructure. Raise the cap so one box can hold twenty
+bots and fleets become free — and a fleet that costs nothing displays nothing. The limit
+is what the achievement is *made of*.
 
-So the limit is a policy with mode-dependent defaults, not a constant:
+What warnet mode raises is the **global** ceiling, because a warnet legitimately carries
+far more gateway connections in total. They simply have to arrive from distinct addresses.
 
 ```toml
 [limits.chat_gateway]
-per_ip       = 1      # gaming default
+per_ip       = 1        # every mode, never relaxed by a mode default
 per_account  = 1
-global       = 256
+global       = 256      # gaming
 
-[limits.chat_gateway.warnet]   # applied when mode = "warnet"
-per_ip       = 16
-per_account  = 4
-global       = 2048
-allowlist    = []     # IPs or CIDRs exempt from per_ip, for known bot hosts
+[limits.chat_gateway.warnet]
+per_ip       = 1        # unchanged
+per_account  = 1        # unchanged
+global       = 2048     # the only limit that moves
+allowlist    = []       # operator's explicit exception, see below
 ```
 
-`per_account` is the more meaningful control in a warnet: it limits how much presence one
-*identity* can project regardless of how many addresses they have, which is what you
-actually want to bound. IP limits only inconvenience the honest.
+### The stronger half: CD-key session uniqueness
 
-Recommended warnet posture: modest `per_ip`, strict `per_account`, and an explicit
-allowlist for known bot hosts — plus a **registered-bot flag** on the account, so a bot
-account is a first-class thing the server knows about rather than a human account behaving
-oddly.
+Addresses are cheap to rent. Keys are not. A per-IP limit alone is sidestepped by anyone
+with a handful of proxies, so the gate that actually makes a fleet expensive is **one live
+session per CD key** — which is exactly why real Battle.net answers `SID_AUTH_CHECK` with
+result `0x201` "CD key in use" and names the current holder in the additional-information
+string.
+
+`cairn_core::limits::KeyRegistry` implements this: keys are tracked by the 20-byte hash the
+client sends (never a usable key), a second claim on a live key returns
+`KeyVerdict::InUse { by }`, and banned keys return `0x202`. It also reproduces the
+**~500 ms cooldown** after a session ends, during which the key still reports as in use —
+a real Battle.net quirk that bots are already written against, so replicating it means
+they behave here exactly as they do there.
+
+Together the two gates mean: *N simultaneous bots requires N keys and N addresses.*
+
+### The allowlist
+
+An operator who wants to exempt their own bot host can add it to
+`limits.gateway_allowlist`. That is a deliberate, visible act by the server owner for a
+named host — not a mode default that quietly devalues everyone else's fleet. The key
+registry still applies to allowlisted hosts, which is the right ordering: the operator can
+waive the address cost, not the key cost.
+
+Worth adding alongside this: a **registered-bot flag** on the account, so a bot is a
+first-class thing the server knows about rather than a human account behaving oddly.
 
 ---
 

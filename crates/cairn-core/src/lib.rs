@@ -17,6 +17,9 @@ pub mod policy;
 pub mod session;
 
 pub use channel::{AccountId, Channel, ChannelClass, JoinDenial, JoinOutcome, LeaveOutcome};
-pub use limits::{AdmissionTable, ConnClass, FloodTracker, FloodVerdict, Rejection};
+pub use limits::{
+    AdmissionTable, ConnClass, FloodTracker, FloodVerdict, KeyId, KeyRegistry, KeyVerdict,
+    Rejection,
+};
 pub use policy::{ChatOrdering, ConnLimits, FloodPenalty, FloodPolicy, Gate, Policy, ServerMode};
 pub use session::{Deadlines, SessionState};

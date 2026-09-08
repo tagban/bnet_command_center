@@ -144,13 +144,29 @@ pub struct Policy {
 impl Policy {
     /// The default policy for a mode.
     ///
-    /// The connection limits are where the two modes genuinely disagree. A gaming server
-    /// wants one gateway connection per IP, because a gateway connection is a bot and one
-    /// bot per address is a sane anti-abuse default. A warnet wants the opposite, because
-    /// operators running fleets of bots from one box *is the product* — a hard 1-per-IP
-    /// cap makes a warnet unusable. `per_account` is the more meaningful control there:
-    /// it bounds how much presence one identity can project regardless of how many
-    /// addresses they have.
+    /// # Why one gateway connection per IP, in every mode
+    ///
+    /// This looks like an anti-abuse limit and is not. **It is the entry cost, and it is
+    /// deliberate in warnet mode above all.**
+    ///
+    /// One bot per address means a twenty-bot fleet costs twenty CD keys and twenty
+    /// addresses. That expense is the point: a large fleet is a visible demonstration
+    /// that someone actually acquired the keys and the infrastructure. Raising the cap so
+    /// that one box can hold twenty bots makes fleets free, and a fleet that costs
+    /// nothing displays nothing. The limit is what the achievement is *made of*.
+    ///
+    /// So warnet mode does **not** relax `per_ip`. What it raises is `global`, because a
+    /// warnet legitimately carries far more gateway connections in total — they simply
+    /// have to arrive from distinct addresses.
+    ///
+    /// The stronger half of the gate is elsewhere: CD-key session uniqueness (see
+    /// [`crate::limits::KeyRegistry`]). Addresses are cheap to rent; keys are not.
+    /// Enforcing one live session per key is what actually makes a fleet expensive, and
+    /// it is why real Battle.net answers `SID_AUTH_CHECK` with `0x201` "key in use".
+    ///
+    /// An operator who wants to exempt their own bot host can still do it explicitly via
+    /// the allowlist on [`crate::limits::AdmissionTable`]. That is a deliberate, visible
+    /// act by the server owner, not a default that quietly devalues everyone's fleet.
     #[must_use]
     pub const fn for_mode(mode: ServerMode) -> Self {
         match mode {
@@ -194,9 +210,12 @@ impl Policy {
                     per_account: 2,
                     global: 4096,
                 },
+                // per_ip stays at 1: the cost of a fleet is the point. Only `global`
+                // rises, because a warnet carries more bots in total — from more
+                // addresses, not more per address.
                 gateway_limits: ConnLimits {
-                    per_ip: 16,
-                    per_account: 4,
+                    per_ip: 1,
+                    per_account: 1,
                     global: 2048,
                 },
                 game_flood: FloodPolicy {
@@ -223,8 +242,8 @@ impl Policy {
                     global: 4096,
                 },
                 gateway_limits: ConnLimits {
-                    per_ip: 4,
-                    per_account: 2,
+                    per_ip: 1,
+                    per_account: 1,
                     global: 1024,
                 },
                 game_flood: FloodPolicy {
@@ -323,17 +342,38 @@ mod tests {
     }
 
     #[test]
-    fn warnet_relaxes_gateway_limits_but_keeps_a_per_account_bound() {
+    fn one_gateway_connection_per_ip_in_every_mode() {
+        // This is the entry cost for a bot fleet and it must never be relaxed by a mode
+        // default. Twenty bots should mean twenty keys and twenty addresses; that
+        // expense is what makes a large fleet worth showing off. An operator can exempt
+        // a specific host through the allowlist — deliberately, and only their own.
+        for mode in [ServerMode::Gaming, ServerMode::Warnet, ServerMode::Both] {
+            let p = Policy::for_mode(mode);
+            assert_eq!(
+                p.gateway_limits.per_ip, 1,
+                "{mode:?} must keep one gateway connection per address"
+            );
+            assert_eq!(
+                p.gateway_limits.per_account, 1,
+                "{mode:?} must keep one gateway connection per account"
+            );
+        }
+    }
+
+    #[test]
+    fn warnet_raises_only_the_global_gateway_ceiling() {
+        // A warnet carries far more bots in total — from more addresses, not more per
+        // address. `global` is the only gateway limit that may move.
         let gaming = Policy::for_mode(ServerMode::Gaming);
         let warnet = Policy::for_mode(ServerMode::Warnet);
-        assert_eq!(gaming.gateway_limits.per_ip, 1, "one bot per IP by default");
         assert!(
-            warnet.gateway_limits.per_ip > gaming.gateway_limits.per_ip,
-            "a 1-per-IP cap makes a warnet unusable"
+            warnet.gateway_limits.global > gaming.gateway_limits.global,
+            "a warnet needs headroom for many bots in total"
         );
-        assert!(
-            warnet.gateway_limits.per_account <= 4,
-            "per-account is the meaningful bound in warnet mode"
+        assert_eq!(warnet.gateway_limits.per_ip, gaming.gateway_limits.per_ip);
+        assert_eq!(
+            warnet.gateway_limits.per_account,
+            gaming.gateway_limits.per_account
         );
     }
 
@@ -365,8 +405,14 @@ mod tests {
     fn narrowing_takes_the_tighter_limits() {
         let hub = Policy::for_mode(ServerMode::Warnet);
         let mut node = Policy::for_mode(ServerMode::Warnet);
-        node.gateway_limits.per_ip = 2;
-        assert_eq!(hub.narrowed_by(node).gateway_limits.per_ip, 2);
+        // A node with less capacity than the hub allows caps itself.
+        node.gateway_limits.global = 128;
+        node.game_limits.per_ip = 2;
+        let effective = hub.narrowed_by(node);
+        assert_eq!(effective.gateway_limits.global, 128);
+        assert_eq!(effective.game_limits.per_ip, 2);
+        // And per_ip on the gateway is already 1 everywhere, so it cannot move at all.
+        assert_eq!(effective.gateway_limits.per_ip, 1);
     }
 
     #[test]

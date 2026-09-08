@@ -15,9 +15,10 @@ titled "A new team for this project?".
 - `cairn-proto`: BNCS framing, chat-gateway line framing, checked wire readers/writers,
   chat events and limits, product/auth-family classification. Zero dependencies.
 - `cairn-core`: policy engine (gaming/warnet/both), channel operator rules, admission
-  control, flood control, session state machine. Zero dependencies.
+  control, flood control, CD-key session uniqueness, session state machine. Zero
+  dependencies.
 - `crates/smoke`: real handshake over real sockets at 4,000 concurrent connections.
-- 98 tests, `clippy -D warnings` clean.
+- 106 tests, `clippy -D warnings` clean.
 
 ## Phase 1 — A single-node gaming server that a real client can use
 
@@ -40,6 +41,10 @@ The milestone is a screenshot of Brood War sitting in a channel. Nothing else co
 - [ ] **BNFTP** (protocol byte `0x02`). Clients fetch `icons.bni`, `tos.txt` and patch
       MPQs; without it some clients hang. Serve **only operator-supplied files** — ship
       placeholders, never Blizzard assets (`docs/LEGAL.md` §2).
+- [ ] **Wire `KeyRegistry` into the `SID_AUTH_CHECK` handler.** The registry and the
+      `auth_check_status` codes exist; the handler still accepts every key unconditionally.
+      One live session per CD key (result `0x201`, holder named in the info string) is the
+      real economic gate on bot fleets — addresses are cheap, keys are not.
 - [ ] **Real randomness for server tokens.** Currently a time-and-counter mix with a TODO.
 - [ ] **`rlimit` crate**: read and raise `RLIMIT_NOFILE` on all three platforms, replacing
       the `/proc/self/limits` fallback.
@@ -77,6 +82,8 @@ The milestone is a screenshot of Brood War sitting in a channel. Nothing else co
       moderated channels, `EID_USERFLAGS` propagation.
 - [ ] Registered-bot accounts as a first-class concept, so a bot is something the server
       knows about rather than a human account behaving oddly.
+- [ ] Key-registry admin surface: list live keys and holders, ban/unban, and a report of
+      how many distinct keys a fleet operator is running.
 - [ ] NLS/SRP-6 (Blizzard variant) — implement from the javaop write-up and RFC 2945,
       **never** from PvPGN's `bnetsrp3.cpp`, which is AGPL-3.0 (`docs/LEGAL.md` §1).
 - [ ] WarCraft III: clans (`0x70`–`0x82`), `SID_WARCRAFTGENERAL`, W3 route listener.
