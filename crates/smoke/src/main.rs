@@ -579,38 +579,48 @@ fn main() {
         let ready_tx = ready_tx.clone();
         let talk_tx = talk_tx.clone();
         let channel = format!("chan{}", i / channel_size);
-        let handle = thread::Builder::new()
-            .stack_size(STACK)
-            .spawn(move || {
-                let mut c = match Client::connect(addr) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(format!("connect: {e}")));
-                        return;
-                    }
-                };
-                let user = format!("user{i}");
-                if let Err(e) = c.handshake(&user, "hunter2", &channel) {
-                    let _ = ready_tx.send(Err(format!("handshake: {e}")));
+        let spawned = thread::Builder::new().stack_size(STACK).spawn(move || {
+            let mut c = match Client::connect(addr) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!("connect: {e}")));
                     return;
                 }
-                let _ = ready_tx.send(Ok(i));
-                // Hold the connection open and timestamp any channel talk we receive.
-                loop {
-                    match c.recv() {
-                        Ok(f) if f.id == sid::CHATEVENT => {
-                            let mut r = f.reader();
-                            if r.u32() == Ok(EventId::Talk as u32) {
-                                let _ = talk_tx.send(Instant::now());
-                            }
+            };
+            let user = format!("user{i}");
+            if let Err(e) = c.handshake(&user, "hunter2", &channel) {
+                let _ = ready_tx.send(Err(format!("handshake: {e}")));
+                return;
+            }
+            let _ = ready_tx.send(Ok(i));
+            // Hold the connection open and timestamp any channel talk we receive.
+            loop {
+                match c.recv() {
+                    Ok(f) if f.id == sid::CHATEVENT => {
+                        let mut r = f.reader();
+                        if r.u32() == Ok(EventId::Talk as u32) {
+                            let _ = talk_tx.send(Instant::now());
                         }
-                        Ok(_) => {}
-                        Err(_) => break,
                     }
+                    Ok(_) => {}
+                    Err(_) => break,
                 }
-            })
-            .expect("client thread");
-        handles.push(handle);
+            }
+        });
+        // Two threads per connection (this harness's own client, plus the server's
+        // handler thread — see the module docs) means the *host's* thread ceiling, not
+        // the server, is usually what caps `target` in practice. Report what was
+        // actually held rather than crashing the whole run over it.
+        match spawned {
+            Ok(handle) => handles.push(handle),
+            Err(e) => {
+                eprintln!(
+                    "stopped spawning after {i}/{target} connections: {e} \
+                     (this host's per-process thread limit, not a server limit)"
+                );
+                break;
+            }
+        }
     }
     drop(ready_tx);
     drop(talk_tx);
@@ -664,6 +674,12 @@ fn main() {
     match Client::connect(addr) {
         Err(e) => println!("fanout probe            : could not connect ({e})"),
         Ok(mut prober) => {
+            // Unlike the held-open connections above (each in its own throwaway
+            // thread, where blocking forever is fine), this runs on the main thread:
+            // a stalled read here — e.g. the server refusing the thread it needed to
+            // handle this very connection, because the run above already parked the
+            // host at its thread ceiling — must not hang the whole harness.
+            let _ = prober.sock.set_read_timeout(Some(Duration::from_secs(10)));
             if let Err(e) = prober.handshake("prober", "hunter2", "chan0") {
                 println!("fanout probe            : handshake failed ({e})");
             } else {

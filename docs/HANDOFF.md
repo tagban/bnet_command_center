@@ -27,8 +27,9 @@ III ≤1.26/1.28. Linux, macOS, Windows. 2,000+ concurrent connections per node.
 
 ## 2. State of the tree
 
-**227 tests, `clippy -D warnings` clean**, four library crates with **zero third-party
-dependencies**.
+**Full workspace builds clean, `clippy -D warnings` clean, all tests pass.** Both crates
+below were run through the compiler for the first time on 2026-09-08 (native macOS,
+crates.io reachable) via `scripts/verify.sh`, and are now enabled in `Cargo.toml`.
 
 | Crate | State |
 |---|---|
@@ -36,34 +37,48 @@ dependencies**.
 | `bnetcc-proto` | ✅ Built and tested. BNCS + MCP + chat-gateway framing, BNI icons, BNFTP v1, statstrings. |
 | `bnetcc-core` | ✅ Built and tested. Policy, channels, admission, flood, CD-key registry, ads, bridged identities, session FSM. |
 | `bnetcc-storage` | ✅ Built and tested. Trait, attribute ACLs, write-behind, in-memory backend, conformance suite. |
-| `smoke` | ✅ Built and run. 4,000/4,000 concurrent real handshakes on Linux. |
-| **`bnetccd`** | ⚠️ **Never compiled.** Written in full. Needs `tokio`. |
-| **`bnetcc-storage-sqlite`** | ⚠️ **Never compiled.** Written in full. Needs `rusqlite`. |
+| `bnetcc-storage-sqlite` | ✅ Built and tested. See below — two real bugs found and fixed. |
+| `bnetccd` | ✅ Builds clean. Compiled on the first attempt — no borrow errors; the §2 guess in the prior revision of this doc was wrong. |
+| `smoke` | ✅ Built and run. 1,433/1,433 concurrent real handshakes on this Mac (thread ceiling below Linux's — see `OPERATIONS.md`-worthy note in §6). |
 
-Both uncompiled crates **parse cleanly** (checked with `rustfmt`), so syntax errors are
-ruled out. What remains is types and borrows. My guess at where the errors are: the
-borrow of `buf` across the `timeout(deadline, rd.read(tail))` await in
-`bnetccd/src/session.rs`, and the `stream` move into the protocol-selector closure in
-`handle()`.
+Bugs found by that first real compile-and-test pass, now fixed:
 
-They are **excluded from the workspace** in `Cargo.toml` because the environment they were
-written in had no crates.io access. `bnetcc-storage-sqlite` is a separate crate rather
-than a feature flag because an *optional* dependency still forces registry resolution.
+- **Ban precedence was inverted.** `bnetcc-storage-sqlite`'s `ban_get` picked the active
+  ban with `ORDER BY scope DESC`, intending 'network' to sort first. It doesn't —
+  `'node' > 'network'` lexicographically — so a node ban was silently outranking a
+  network ban. Fixed with an explicit `CASE scope WHEN 'network' THEN 0 ELSE 1 END`.
+- **One bad account could block flushing every other account.** The `attrs` FK
+  constraint correctly rejects writes for a deleted/nonexistent account, but
+  `WriteBehind::flush_now` treated any single account's failure as reason to stop
+  processing the rest of the batch and return early. A single stale write-behind entry
+  would therefore wedge storage for the whole node. Fixed on both ends: the SQLite
+  backend now drops (rather than errors on) a write for a vanished account, since every
+  row in one `attrs_put` batch shares the same account id and so fails identically; and
+  `flush_now` now attempts every dirty account before returning, regardless of any one
+  failure.
+
+They were **excluded from the workspace** in `Cargo.toml` because the environment they
+were originally written in had no crates.io access; that exclusion is now lifted.
+`bnetcc-storage-sqlite` is a separate crate rather than a feature flag because an
+*optional* dependency still forces registry resolution.
 
 ---
 
 ## 3. Do this first
+
+`scripts/verify.sh` has already been run successfully — the full workspace builds,
+tests, and lints clean (see §2). Re-run it after any change with:
 
 ```sh
 cd /Volumes/AppStorage/bnet_command_center
 bash scripts/verify.sh
 ```
 
-That enables both excluded crates, runs build/test/clippy and the 2,500-connection load
-test, and writes `verify.log`. If the build fails it restores the reduced workspace so the
-library crates still build. Work through the compiler errors from that log.
+It enables both crates (now on by default), runs build/test/clippy and a load test sized
+to the host's thread ceiling, and writes `verify.log`. If the build fails it restores the
+reduced workspace so the library crates still build.
 
-Then, in order, from `docs/ROADMAP.md` phase 1:
+Next, in order, from `docs/ROADMAP.md` phase 1:
 
 1. **Test against a real Brood War client.** Everything else is theory until a client sits
    in a channel. Expect surprises at the ⚠️/🛑 items in §5.
@@ -151,8 +166,22 @@ Do not relitigate these without a reason; the reasoning is in the linked docs.
   and the sandbox cannot mount it.** Worth testing by connecting a folder under `~`.
 - **Terminal is granted click-only** through computer use, so a cloud session cannot type
   commands into it either.
+- **Confirmed:** connecting a folder under `~` was not needed — a native Claude Code
+  session on the Mac, even on the external volume, has full shell and crates.io access.
+  That's what unblocked the rest of this section.
 - **macOS defaults to `ulimit -n 256`**, far below what 2,500 connections need.
   `verify.sh` raises it; anything else running the load test must too.
+- **macOS's per-process thread ceiling (`kern.num_taskthreads`) is much lower than
+  Linux's**, typically a few thousand rather than effectively unlimited. The `smoke`
+  harness needs ~2 OS threads per connection (its own client plus the server's handler —
+  see the crate's module docs), so 2,500 connections needs ~5,000 threads — more than
+  this ceiling. Two things came out of hitting that in practice, both now fixed: (1)
+  `verify.sh` reads `kern.num_taskthreads` and scales its load-test target down to what
+  the host can sustain with headroom, since running right at the ceiling doesn't just
+  refuse new threads, it makes the scheduler sluggish enough to look like a hang; and (2)
+  the harness itself now degrades gracefully (reports what it held) instead of
+  panicking if a thread spawn fails anyway, and the fanout probe carries a read timeout
+  so a stalled connection can't block the whole run forever.
 
 ---
 

@@ -6,6 +6,16 @@ members = [
     "crates/bnetcc-core",
     "crates/bnetcc-storage",
     "crates/smoke",
+    "crates/bnetccd",
+    "crates/bnetcc-storage-sqlite",
+    "crates/bnetccd",
+    "crates/bnetcc-storage-sqlite",
+    "crates/bnetccd",
+    "crates/bnetcc-storage-sqlite",
+    "crates/bnetccd",
+    "crates/bnetcc-storage-sqlite",
+    "crates/bnetccd",
+    "crates/bnetcc-storage-sqlite",
 ]
 
 # NOTE: crates/bnetccd (tokio) and crates/bnetcc-storage-sqlite (rusqlite) are excluded
@@ -14,7 +24,7 @@ members = [
 # registry resolution, which is why the SQLite backend is its own crate rather than a
 # feature flag. Add both back once dependencies can be fetched:
 #   members = [..., "crates/bnetccd", "crates/bnetcc-storage-sqlite"]
-exclude = ["crates/bnetccd", "crates/bnetcc-storage-sqlite"]
+exclude = []
 
 [workspace.package]
 version = "0.1.0"

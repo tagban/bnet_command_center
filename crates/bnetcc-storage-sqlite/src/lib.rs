@@ -68,6 +68,14 @@ fn map_err(e: rusqlite::Error) -> StorageError {
     StorageError::Backend(e.to_string())
 }
 
+fn is_foreign_key_violation(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, _)
+            if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
+    )
+}
+
 /// A SQLite-backed store.
 pub struct SqliteStorage {
     conn: Connection,
@@ -317,8 +325,15 @@ impl Storage for SqliteStorage {
                 )
                 .map_err(map_err)?;
             for (k, v) in &attrs {
-                stmt.execute(params![id as i64, k.as_str(), v])
-                    .map_err(map_err)?;
+                match stmt.execute(params![id as i64, k.as_str(), v]) {
+                    Ok(_) => {}
+                    // The account was deleted (or never existed). Every row in this
+                    // batch shares `id`, so the FK check fails identically for all of
+                    // them; drop the whole write rather than surfacing a backend error
+                    // that write-behind would retry forever.
+                    Err(e) if is_foreign_key_violation(&e) => return Ok(()),
+                    Err(e) => return Err(map_err(e)),
+                }
             }
         }
         tx.commit().map_err(map_err)
@@ -347,12 +362,13 @@ impl Storage for SqliteStorage {
     }
 
     fn ban_get(&mut self, id: AccountId, now: u64) -> Result<Option<Ban>> {
-        // Network scope outranks node scope; ordering by scope DESC puts 'network' first.
+        // Network scope outranks node scope. Ordering the strings themselves is wrong —
+        // 'node' sorts after 'network' lexicographically — so rank explicitly instead.
         self.conn
             .prepare_cached(
                 "SELECT scope, reason, applied_at, expires_at FROM bans
                  WHERE account_id = ?1 AND (expires_at IS NULL OR expires_at > ?2)
-                 ORDER BY scope DESC LIMIT 1",
+                 ORDER BY CASE scope WHEN 'network' THEN 0 ELSE 1 END LIMIT 1",
             )
             .map_err(map_err)?
             .query_row(params![id as i64, now as i64], |row| {

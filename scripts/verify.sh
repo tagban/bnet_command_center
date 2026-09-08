@@ -76,8 +76,29 @@ if [ "$BUILD" -eq 0 ]; then
   # soft limit does not require sudo; the ceiling is kern.maxfilesperproc.
   ulimit -n 20000 2>/dev/null || ulimit -n 10240 2>/dev/null || true
   note "open file limit: $(ulimit -n)"
+
+  # This harness is thread-per-connection on both ends (its own client plus the
+  # server's handler — see the module docs), so N connections costs the host roughly
+  # 2N OS threads. Linux hosts default to a very high thread ceiling, but macOS
+  # (kern.num_taskthreads) is often just a few thousand per process — and running
+  # right up against that ceiling doesn't just refuse new threads, it makes the
+  # scheduler sluggish enough that the harness can sit for minutes waiting on
+  # messages from connections that were never spawned. Scale the target down to what
+  # this host can sustain with headroom, rather than finding out the hard way.
+  SMOKE_TARGET=2500
+  TASK_THREAD_CAP=$(sysctl -n kern.num_taskthreads 2>/dev/null || true)
+  if [ -n "$TASK_THREAD_CAP" ]; then
+    SAFE_TARGET=$((TASK_THREAD_CAP * 70 / 100 / 2))
+    if [ "$SAFE_TARGET" -lt "$SMOKE_TARGET" ]; then
+      note "host thread ceiling (kern.num_taskthreads=$TASK_THREAD_CAP) is below" \
+           "what $SMOKE_TARGET connections need at ~2 threads each;" \
+           "scaling the load test down to $SAFE_TARGET."
+      SMOKE_TARGET=$SAFE_TARGET
+    fi
+  fi
+
   if cargo build --release -p bnetcc-smoke >>"$LOG" 2>&1; then
-    ./target/release/bnetcc-smoke 2500 40 2>&1 | tee -a "$LOG"
+    ./target/release/bnetcc-smoke "$SMOKE_TARGET" 40 2>&1 | tee -a "$LOG"
     SMOKE="ran"
   else
     note "smoke harness failed to build; see above"

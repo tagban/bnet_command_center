@@ -8,13 +8,14 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
+#[cfg(test)]
 use bnetcc_core::limits::ClientClass;
 use bnetcc_core::policy::{ClientLimits, ConnLimitsPatch, Policy, ServerMode};
 use bnetcc_proto::FourCc;
 use serde::Deserialize;
 
 /// Top-level node configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// Server identity and mode.
@@ -25,17 +26,6 @@ pub struct Config {
     pub limits: LimitsConfig,
     /// Federation link to the hub.
     pub federation: FederationConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            listen: ListenConfig::default(),
-            limits: LimitsConfig::default(),
-            federation: FederationConfig::default(),
-        }
-    }
 }
 
 /// Server identity and behaviour.
@@ -320,15 +310,6 @@ impl Config {
         Ok(policy)
     }
 
-    /// The limits in force for a client class, after config overrides.
-    ///
-    /// # Errors
-    ///
-    /// A bad mode or a malformed product code.
-    pub fn limits_for(&self, class: ClientClass) -> Result<bnetcc_core::ConnLimits, String> {
-        Ok(self.policy()?.clients.for_class(class))
-    }
-
     /// Resolve the effective connection ceiling.
     ///
     /// When `max_connections` is 0 the ceiling is derived from the process file
@@ -465,11 +446,14 @@ mod tests {
     #[test]
     fn the_gateway_limit_is_configurable_but_defaults_to_one() {
         assert_eq!(
-            Config::default().limits_for(ClientClass::Gateway).unwrap().per_ip,
+            Config::default().policy().unwrap().clients.for_class(ClientClass::Gateway).per_ip,
             1
         );
         let cfg = Config::from_toml("[limits.clients.gateway]\nper_ip = 4").unwrap();
-        assert_eq!(cfg.limits_for(ClientClass::Gateway).unwrap().per_ip, 4);
+        assert_eq!(
+            cfg.policy().unwrap().clients.for_class(ClientClass::Gateway).per_ip,
+            4
+        );
     }
 
     #[test]

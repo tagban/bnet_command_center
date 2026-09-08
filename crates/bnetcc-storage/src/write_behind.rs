@@ -148,9 +148,11 @@ impl<B: Storage> WriteBehind<B> {
         // Drain into a local first so that a mid-way backend failure cannot leave the
         // buffer holding writes it already applied.
         let pending: Vec<(AccountId, AttrMap)> = self.dirty.drain().collect();
-        let count = self.dirty_attrs;
-        self.dirty_attrs = 0;
 
+        // Attempt every dirty account rather than stopping at the first failure — one
+        // account the backend refuses (a stale id, a lock) must not strand every other
+        // account's writes in the buffer until it is resolved.
+        let mut first_err = None;
         for (id, attrs) in pending {
             if let Err(e) = self.backend.attrs_put(id, attrs.clone()) {
                 // Put it back so the next attempt retries rather than losing it.
@@ -158,11 +160,15 @@ impl<B: Storage> WriteBehind<B> {
                 for (k, v) in attrs {
                     slot.insert(k, v);
                 }
-                self.dirty_attrs = self.dirty.values().map(BTreeLen::len_of).sum();
-                return Err(e);
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
             }
         }
-        let _ = count;
+        self.dirty_attrs = self.dirty.values().map(BTreeLen::len_of).sum();
+        if let Some(e) = first_err {
+            return Err(e);
+        }
         self.last_flush_ms = now_ms;
         self.flushes += 1;
         self.backend.flush()

@@ -282,9 +282,7 @@ impl Node {
     /// Leave a channel, destroying it if it is now empty and not persistent.
     pub fn leave_channel(&self, key: &[u8], account: AccountId) -> Option<AccountId> {
         let mut inner = self.inner.lock().expect("node lock");
-        let Some(channel) = inner.channels.get_mut(key) else {
-            return None;
-        };
+        let channel = inner.channels.get_mut(key)?;
         let outcome = channel.leave(account);
         if let Some(subs) = inner.subscribers.get_mut(key) {
             subs.retain(|(id, _)| *id != account);
