@@ -1,147 +1,190 @@
 # Roadmap
 
-The governing rule: **get one real StarCraft 1.16.1 client into a channel before writing
-a single line of realm, ladder, or clan code.** Every prior project in this space that
-started with breadth ended at a hundred thousand lines. PvPGN has fourteen connection
-classes and Westwood Online support; it also has a dormant repository and an open issue
-titled "A new team for this project?".
+The governing rule: **get one real StarCraft 1.16.1 client into a channel before writing a
+single line of realm, ladder, or clan code.** Every prior project in this space that started
+with breadth ended at a hundred thousand lines. PvPGN has fourteen connection classes and
+Westwood Online support; it also has a dormant repository and an open issue titled "A new
+team for this project?".
 
 ---
 
 ## Phase 0 — Foundations ✅ done
 
-- `cairn-crypto`: X-SHA-1 ported and verified against known-answer vectors, including the
-  full `SID_LOGONRESPONSE2` double-hash chain.
-- `cairn-proto`: BNCS framing, chat-gateway line framing, checked wire readers/writers,
-  chat events and limits, product/auth-family classification. Zero dependencies.
-- `cairn-core`: policy engine (gaming/warnet/both), channel operator rules, admission
-  control, flood control, CD-key session uniqueness, session state machine. Zero
+- **`cairn-crypto`** — X-SHA-1 ported and verified against known-answer vectors, including
+  the full `SID_LOGONRESPONSE2` double-hash chain.
+- **`cairn-proto`** — BNCS framing, chat-gateway line framing, checked wire
+  readers/writers, chat events and limits, product/auth-family classification, **the BNI
+  icon format** (parse, build, validate, icon selection) and **BNFTP v1** with a hardened
+  filename sanitiser. Zero dependencies.
+- **`cairn-core`** — policy engine (gaming/warnet/both), per-client-type connection limits
+  with two-stage product classification, channel operator rules, CD-key session
+  uniqueness, flood control, **advertisement rotation**, session state machine. Zero
   dependencies.
-- `crates/smoke`: real handshake over real sockets at 4,000 concurrent connections.
-- 106 tests, `clippy -D warnings` clean.
+- **`cairn-storage`** — `Storage` trait, per-key attribute ACLs, write-behind batching with
+  a tested durability contract, in-memory reference backend, and a conformance suite every
+  backend must pass. Zero dependencies.
+- **`cairn-storage-sqlite`** — SQLite backend with migrations. Written; excluded from the
+  workspace pending `rusqlite`.
+- **`cairnd`** — node daemon. Written; excluded pending `tokio`.
+- **`crates/smoke`** — real handshake over real sockets at 4,000 concurrent connections.
+- 189 tests, `clippy -D warnings` clean.
 
-## Phase 1 — A single-node gaming server that a real client can use
+## Phase 1 — A single-node gaming server a real client can use
 
 The milestone is a screenshot of Brood War sitting in a channel. Nothing else counts.
 
-- [ ] **Resolve dependencies and build `cairnd`.** It is written and excluded from the
-      workspace only because `crates.io` was unreachable where this was authored. Add it
-      back to `members`, run `cargo build`, fix what the compiler finds.
-- [ ] **Test against a real client.** Expect surprises; `docs/PROTOCOL-NOTES.md` marks
-      the two most likely, both flagged 🛑: the zero-game `SID_GETADVLISTEX` response
-      shape, and whether four-character codes really are byte-reversed on the wire.
-      Capture the traffic and settle both.
-- [ ] **Storage** (`cairn-storage`): `Storage` trait, SQLite implementation, migrations,
-      write-behind actor. Account creation, password change and bans write through;
-      everything else batches. **Do not ship without this** — Atlas has no persistence at
-      all and loses every account on restart, which is most of why it looks stable.
-- [ ] **Per-key attribute ACLs** (`Any`/`Owner`/`Internal`), lifted from Atlas's model.
-      `System\Password Digest` becomes unreachable from any client-facing read path by
-      construction. This is the structural fix for CVE-2004-2705's class.
-- [ ] **BNFTP** (protocol byte `0x02`). Clients fetch `icons.bni`, `tos.txt` and patch
-      MPQs; without it some clients hang. Serve **only operator-supplied files** — ship
-      placeholders, never Blizzard assets (`docs/LEGAL.md` §2).
-- [ ] **Wire `KeyRegistry` into the `SID_AUTH_CHECK` handler.** The registry and the
-      `auth_check_status` codes exist; the handler still accepts every key unconditionally.
-      One live session per CD key (result `0x201`, holder named in the info string) is the
-      real economic gate on bot fleets — addresses are cheap, keys are not.
+- [ ] **Resolve dependencies and build `cairnd` and `cairn-storage-sqlite`.** Both are
+      written and excluded only because `crates.io` was unreachable where this was
+      authored. Add them to `members`, build, fix what the compiler finds.
+- [ ] **Test against a real client.** Expect surprises; `docs/PROTOCOL-NOTES.md` marks each
+      with ⚠️ or 🛑. The likeliest: the zero-game `SID_GETADVLISTEX` shape, four-character
+      code byte order, the BNI code-list-when-flags-are-set question, and the ad extension
+      tag's wire bytes.
+- [ ] **Wire storage into `cairnd`** behind the actor: a bounded channel to a dedicated
+      thread, `WriteBehind` on top, `AttrSchema::filter_readable` on every client-facing
+      read path.
+- [ ] **BNFTP serving** (protocol byte `0x02`). The codec exists; it needs the file server
+      behind it, serving **only operator-supplied files** from a configured directory —
+      placeholders in the repo, never Blizzard assets (`docs/LEGAL.md` §2).
+- [ ] **Icon serving**: answer `SID_GETICONDATA` per product before `SID_ENTERCHAT` (a
+      client that does not get this **terminates the connection**), plus `SID_GETFILETIME`
+      for revalidation. Ship a `cairnctl icons` subcommand wrapping the existing
+      parse/build/validate so an operator can check an icon pack before deploying it.
+- [ ] **Advertisement serving**: `SID_CHECKAD`/`SID_CLICKAD`/`SID_DISPLAYAD`, plus
+      `SID_QUERYADURL` for WarCraft III. Rotation logic is done and stateless; this is the
+      packet handlers, the config, and the BNFTP delivery path.
+- [ ] **Wire `KeyRegistry` into `SID_AUTH_CHECK`** — one live session per CD key, result
+      `0x201` with the holder named. The economic gate on game-client bot fleets.
 - [ ] **Real randomness for server tokens.** Currently a time-and-counter mix with a TODO.
-- [ ] **`rlimit` crate**: read and raise `RLIMIT_NOFILE` on all three platforms, replacing
-      the `/proc/self/limits` fallback.
-- [ ] **Metrics and `tracing`**: Prometheus on the admin listener; connection counts by
-      class and state, per-packet decode/error counters, outbound queue depth histogram,
-      login latency. Plus `/debug/slow`, listing the deepest queues — "it's laggy" should
-      take thirty seconds to diagnose, not a week.
-- [ ] **`cargo fuzz` targets** for `decode_frame`, `decode_line` and every packet reader.
-      The in-tree pseudo-random tests are a stand-in, not a substitute.
-- [ ] **Packaging**: systemd unit, launchd plist, Windows service wrapper. A node operator
-      on Windows is a real user here.
+- [ ] **`rlimit` crate**: read and raise `RLIMIT_NOFILE` on all three platforms.
+- [ ] **Metrics and `tracing`**: Prometheus on the admin listener; connections by class and
+      state, per-packet decode/error counters, outbound queue depth histogram, login
+      latency split by edge-verified and hub-proxied. Plus `/debug/slow`.
+- [ ] **`cargo fuzz`** targets for `decode_frame`, `decode_line`, `bni::parse` and
+      `bnftp::decode_request`. The in-tree pseudo-random tests are a stand-in.
+- [ ] **Packaging**: systemd unit, launchd plist, Windows service wrapper.
 
-## Phase 2 — Federation v1
+## Phase 2 — Federation, and Diablo II Open
 
 - [ ] `cairn-hub`: directory, identity, ladder, ban authority.
 - [ ] `cairn-fed`: mTLS transport (`rustls`), Ed25519 node identities, one-time enrolment
       tokens, CBOR message framing, reconnect with jittered backoff.
 - [ ] **Hub-proxied X-SHA-1 verification** and **edge SRP verification** — the asymmetry in
       `docs/FEDERATION.md` §4, which is the load-bearing part of the identity design.
-- [ ] Federated channels with hub sequencing; netsplit synthesises `EID_LEAVE` so no
-      ghosts remain; reconnect sends a roster snapshot with a fresh sequence base.
-- [ ] Federated game list, with hub-side reachability probing so dead ads are
-      de-prioritised. "The game list is full of dead games" is a perennial complaint that
-      nobody in this ecosystem has fixed.
+- [ ] Federated channels with hub sequencing; netsplit synthesises `EID_LEAVE`; reconnect
+      sends a roster snapshot with a fresh sequence base.
+- [ ] Federated game list with hub-side reachability probing, so dead ads are
+      de-prioritised. "The game list is full of dead games" is a perennial complaint nobody
+      in this ecosystem has fixed.
 - [ ] Ladder submission with session attestation, plausibility checks, rate limits and
       per-node reputation.
-- [ ] Ban scopes: node / network / IP-range, with approval for network scope.
-- [ ] `cairnctl`: node enrolment, moderation, policy push.
+- [ ] `cairnctl`: node enrolment, moderation, policy push, icon-pack validation.
+- [ ] **Diablo II *Open*.** Open games are peer-to-peer, exactly like StarCraft and
+      Warcraft II — the client dials the host directly and characters live client-side. So
+      D2 players get a working server here with **no game server of any kind**: it is
+      `SID_STARTADVEX3` and `SID_GETADVLISTEX` with D2's statstring passed through
+      verbatim. This is the cheap 80% of Diablo II support and it belongs early.
 
-## Phase 3 — Warnet hardening and WarCraft III
+## Phase 3 — Warnet hardening, WarCraft III, and bridges
 
 - [ ] `HubSerialized` ordering end to end, with the optional `arrival_jitter_window_ms`
-      fairness window (default off) described in `docs/WARNET.md` §4.
+      fairness window (default off) from `docs/WARNET.md` §4.
 - [ ] Full operator command set: `/designate`, `/kick`, `/ban`, `/squelch`, `/rejoin`,
       moderated channels, `EID_USERFLAGS` propagation.
-- [ ] Registered-bot accounts as a first-class concept, so a bot is something the server
-      knows about rather than a human account behaving oddly.
-- [ ] Key-registry admin surface: list live keys and holders, ban/unban, and a report of
-      how many distinct keys a fleet operator is running.
+- [ ] Registered-bot accounts as a first-class concept.
+- [ ] Key-registry admin surface: live keys and holders, ban/unban, and a report of how
+      many distinct keys a fleet operator is running.
 - [ ] NLS/SRP-6 (Blizzard variant) — implement from the javaop write-up and RFC 2945,
       **never** from PvPGN's `bnetsrp3.cpp`, which is AGPL-3.0 (`docs/LEGAL.md` §1).
-- [ ] WarCraft III: clans (`0x70`–`0x82`), `SID_WARCRAFTGENERAL`, W3 route listener.
-      Document clearly that WC3 needs a patched client because of the 128-byte RSA server
-      signature, and do not distribute that patch (`docs/LEGAL.md` §3).
+- [ ] WarCraft III: clans (`0x70`–`0x82`), `SID_WARCRAFTGENERAL`, W3 route listener, and an
+      **MPQ reader** for `icons-WAR3.bni` — which is an MPQ of `.blp` images, not a BNI.
+      Document that WC3 needs a patched client because of the 128-byte RSA server
+      signature, and do not distribute that patch.
+- [ ] **Bridges** — `docs/BRIDGES.md`. In its build order: the presence model first (all
+      `cairn-core`, no transport), then the extended line protocol (which doubles as the
+      telnet-gateway improvement), then the WebSocket transport, then an in-tree Discord
+      bridge as the reference consumer, then a minimal Lua example for game addons.
+      Bridges come after federation because a bridged user *is* a channel presence, and
+      building against a channel model that is still moving would mean building it twice.
 
-## Phase 4 — Diablo II realms, and hub availability
+## Phase 4 — Diablo II closed realms, in one binary
 
-Realms run **inside `cairnd`**, not as separate daemons — see `docs/ARCHITECTURE.md` §11
-for why, including the fact that PvPGN's `d2dbs` still uses `select()` capped at
-`FD_SETSIZE` and never got the fix `bnetd` received in 2003.
+Realms run **inside `cairnd`**, not as separate daemons — `docs/ARCHITECTURE.md` §11 has the
+reasoning, including that PvPGN's `d2dbs` still uses `select()` capped at `FD_SETSIZE` and
+never received the fix `bnetd` got in 2003.
 
 - [ ] MCP gateway as an in-process module. Its framing differs from BNCS — `len:u16le`
-      first, **no** `0xFF` magic. This is the single most common bug in D2 realm
-      implementations.
+      first, **no** `0xFF` magic — which is the most common bug in D2 realm implementations.
 - [ ] Character store behind the `Storage` trait, called as a function rather than over a
-      socket. This replaces `d2cs` **and** `d2dbs`, and the custom `bnetd`↔`d2cs` binary
-      protocol goes away with them.
-- [ ] `GameHost` trait with an `External` implementation, so operators who already run the
-      closed-source D2GS can point at it while still installing and supervising exactly
-      one binary.
+      socket. Replaces `d2cs` **and** `d2dbs`, and the custom `bnetd`↔`d2cs` binary protocol
+      goes away with them.
+- [ ] `GameHost` trait with an `External` implementation, so operators running the existing
+      closed-source D2GS can point at it while still supervising exactly one binary.
 - [ ] Document the realm constraint precisely: **port 4000 is hardcoded in the client**, so
-      one realm per IP address (additional addresses are fine; additional processes on one
-      address are not). Embedding a game server would not lift this — the constraint lives
-      in the client.
+      one realm per IP address. Additional addresses are fine; additional processes on one
+      address are not.
 - [ ] Realms are **not federated**: a character lives in one realm's database. The realm
       menu can be shared across nodes; the characters cannot.
 - [ ] Hub HA: active/standby over shared Postgres with a virtual IP. Do not build a
       consensus protocol for a network that will have twelve nodes.
 
-An `Embedded` `GameHost` — an actual in-process Diablo II simulation — is deliberately not
-on this roadmap. It is not a protocol problem; it is monsters, items, skills, map
-generation and save handling, which is why no open project in this ecosystem has one. The
-trait exists so that it could plug in as a module rather than a daemon, not because it is
-scheduled.
+## Phase 5 — An in-house Diablo II game server
+
+**Committed, not scheduled.** This is the one part of the project that is a game engine
+rather than a protocol server, so it runs as its own long track and blocks nothing. The
+`GameHost` trait exists so it lands as a module, not a fourth daemon.
+
+Why own it: PvPGN stopped receiving updates and the existing D2GS is closed-source,
+Windows-only, crash-loops on modern Windows, and hardcodes port 4000. Every closed realm in
+the world currently depends on a binary nobody can fix.
+
+The work decomposes, and the ordering matters because the risk is front-loaded:
+
+1. **Protocol shim first, simulation second.** Implement the D2GS accept sequence
+   (`D2GS_NEGOTIATECOMPRESSION` `0xAF` → `D2GS_GAMELOGON` `0x68` → `D2GS_STARTGAME` `0x5C`
+   → `D2GS_ENTERGAMEENVIRONMENT` `0x6A`, then compressed) and get **two clients standing in
+   town, seeing each other, with nothing else working.** That single milestone answers the
+   only question that can kill the project — will the client accept packets we generate —
+   before any simulation exists. Everything after it is incremental.
+2. **Game data tables.** Item affixes, treasure classes, monster stats and skill tables all
+   live in the client's MPQs. Read them **at runtime from the operator's own install**;
+   never redistribute them. This is both the legally clean path and the one that keeps us
+   correct across patches.
+3. **Deterministic world generation** from the game seed, so every client in a game agrees
+   on the map without us shipping map data.
+4. **Entity and state model** — spawning, movement, visibility, the update packets the
+   client expects and their cadence. Desync is the failure mode; a golden-capture test
+   harness against a real client is worth building before this, not after.
+5. **Combat, skills, items.** The largest surface, and the most amenable to being driven
+   from the data tables in step 2 rather than hand-written.
+6. **Quests and act progression.**
+7. **The D2S save format**, read and write, so characters survive and can be inspected.
+
+Realistic framing: this is a multi-year track measured against a moving target of client
+expectations, and it should be resourced as its own project with its own contributors. The
+value of writing it down now is that phases 1–4 leave the seam in the right place.
 
 ## Not scheduled, and why
 
 **StarCraft: Remastered (1.18+), WarCraft III Reforged, Diablo II: Resurrected.**
 
-These are not "later" items; they are blocked on facts outside our control:
+These are blocked on facts outside our control, not on effort:
 
-- Public protocol documentation for this family effectively stops in 2017. Patch 1.18
-  made major changes that broke all bot compatibility, and PvPGN states plainly it will
-  not support 1.18+.
+- Public protocol documentation stops in 2017. Patch 1.18 broke all bot compatibility, and
+  PvPGN states plainly it will not support 1.18+.
 - Reforged did the same in 2020. gowarcraft3, the best-maintained WC3 library, says BNCS
   "works up until patch 1.32" without saying what replaced it.
 - D2R shipped with no TCP/IP or LAN mode at all. BNETDocs has no D2R entry, community
   projects publish no spec, and Blizzard has issued takedowns in this area.
 - Blizzard's own answer to the 2017 break was CAPI — chat-only, key-gated — explicitly so
-  bots would stop emulating the game protocol.
+  bots would stop emulating the game protocol. That endpoint is now itself reported dead.
 
 The work is therefore not "implement a documented protocol"; it is "reverse-engineer an
 undocumented one, in a jurisdiction where the 8th Circuit has already ruled on exactly
 that" (`docs/LEGAL.md` §2).
 
-**What the architecture does about it instead:** the gateway boundary. A protocol
-front-end is a crate implementing one trait over `cairn-core`; it owns its framing, its
-auth and its session state machine, and knows nothing about channels or storage. If a
-modern protocol is ever documented, it becomes `cairn-gateway-bgs` and the core does not
-change. That is the correct amount to invest in a maybe: a seam, not a stub.
+**What the architecture does instead:** the gateway boundary. A protocol front-end is a
+crate implementing one trait over `cairn-core`; it owns its framing, its auth and its
+session state machine, and knows nothing about channels or storage. If a modern protocol is
+ever documented, it becomes `cairn-gateway-bgs` and the core does not change. A seam, not a
+stub.

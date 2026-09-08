@@ -25,3 +25,10 @@ dependencies = [
  "cairn-crypto",
  "cairn-proto",
 ]
+
+[[package]]
+name = "cairn-storage"
+version = "0.1.0"
+dependencies = [
+ "cairn-core",
+]

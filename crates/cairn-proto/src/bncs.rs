@@ -165,6 +165,14 @@ pub mod sid {
     pub const GETADVLISTEX: u8 = 0x09;
     /// Client enters chat.
     pub const ENTERCHAT: u8 = 0x0A;
+    /// Client asks whether a new advertisement is available.
+    ///
+    /// Sent roughly every 15 seconds, carrying the id of the banner currently displayed.
+    /// The server answers only when something changed, which is why rotation needs no
+    /// per-connection state — see `cairn_core::ads`.
+    pub const CHECKAD: u8 = 0x15;
+    /// Client reports that an advertisement was clicked.
+    pub const CLICKAD: u8 = 0x16;
     /// Client requests the channel list.
     pub const GETCHANNELLIST: u8 = 0x0B;
     /// Client joins a channel.
@@ -181,8 +189,23 @@ pub mod sid {
     pub const LEAVEGAME: u8 = 0x1F;
     /// Client joined a game.
     pub const NOTIFYJOIN: u8 = 0x22;
+    /// Client reports which advertisement it is displaying. Telemetry only.
+    pub const DISPLAYAD: u8 = 0x21;
     /// Keepalive, either direction.
     pub const PING: u8 = 0x25;
+    /// Icon file negotiation.
+    ///
+    /// The client asks; the server answers with a filetime and a **filename**, which the
+    /// client then fetches over BNFTP. The filename is the server's choice, which is how
+    /// one server serves `icons.bni` to Diablo and `icons_STAR.bni` to StarCraft.
+    ///
+    /// **Must be answered before `SID_ENTERCHAT`** or the client terminates the
+    /// connection.
+    pub const GETICONDATA: u8 = 0x2D;
+    /// Client asks for a file's modification time, to decide whether to re-download it.
+    pub const GETFILETIME: u8 = 0x33;
+    /// Client reports a hash of a game data file.
+    pub const CHECKDATAFILE2: u8 = 0x3C;
     /// Legacy logon (Diablo I, Warcraft II BNE, shareware StarCraft).
     pub const LOGONRESPONSE: u8 = 0x29;
     /// Account creation, second generation.
@@ -197,6 +220,8 @@ pub mod sid {
     pub const WARCRAFTGENERAL: u8 = 0x44;
     /// WarCraft III announces its game hosting port.
     pub const NETGAMEPORT: u8 = 0x45;
+    /// WarCraft III asks for an advertisement's click URL. WAR3/W3XP only.
+    pub const QUERYADURL: u8 = 0x41;
     /// Version and platform negotiation.
     pub const AUTH_INFO: u8 = 0x50;
     /// Version check and CD-key verdict.

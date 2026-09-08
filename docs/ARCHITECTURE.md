@@ -29,10 +29,16 @@ A clean-slate, federated Classic Battle.net server in Rust. Two roles, one codeb
 
 ### Non-goals (explicit)
 
-Westwood Online, the IRC client gateway, Lua scripting, SMK/MNG ad banners, tournaments,
-in-server mail, news, the BNI icon toolchain, anongame matchmaking. Every one of these
-lives in PvPGN and every one is a reason it is 114k lines. If you want them, they belong
-in a separate process talking to the node over the admin API.
+Westwood Online, the IRC client gateway, Lua scripting, tournaments, in-server mail,
+news, anongame matchmaking. Every one of these lives in PvPGN and every one is a reason it
+is 114k lines. If you want them, they belong in a separate process talking to the node over
+the admin API.
+
+**Deliberately *in* scope, despite being on PvPGN's "extras" pile:** icon serving
+(`icons.bni` over BNFTP) and advertisement banners. Icons are not optional — a client that
+gets no `SID_GETICONDATA` answer before `SID_ENTERCHAT` terminates the connection — and ad
+banners are the only in-client announcement surface a private server has. Both are
+implemented as data the *operator* supplies; Cairn ships no Blizzard assets.
 
 ---
 
@@ -146,7 +152,9 @@ from the fanout, not blocking it.
 | `cairn-crypto` | XSHA-1 ("Broken SHA-1"), BSHA-1, NLS/SRP-6 (Blizzard variant), CD-key decode, CheckRevision. Pure functions, heavily tested against known-answer vectors. | No |
 | `cairn-proto` | Wire framing and packet types for BNCS, MCP, W3GS, chat gateway. Codecs only — `Decoder`/`Encoder`, zero policy, zero I/O. Fuzz targets live here. | No |
 | `cairn-core` | Domain model: accounts, sessions, channels, game ads, policy engine, the state machines. Pure logic over traits. | No |
-| `cairn-storage` | `Storage` trait + SQLite and Postgres implementations, migrations, the write-behind actor. | Yes |
+| `cairn-storage` | `Storage` trait, per-key attribute ACLs, write-behind batching, in-memory reference backend, and the conformance suite every backend must pass. Dependency-free. | No |
+| `cairn-storage-sqlite` | SQLite backend. The only place a database driver appears. | Yes |
+| `cairn-bridge` | External chat bridges — Discord, game addons, anything not speaking BNCS. Virtual presences rather than relayed text; see `docs/BRIDGES.md`. | Yes |
 | `cairn-fed` | Federation: node↔hub protocol, mTLS transport, message types, reconnect and partition handling. | Yes |
 | `cairn-gateway-bncs` | Protocol-byte demux and the BNCS session driver. | Yes |
 | `cairn-gateway-chat` | Telnet / chat-gateway (protocol bytes `0x03`/`0x43`/`0x63`), with per-IP admission control. | Yes |
@@ -201,18 +209,39 @@ CVE-2004-2705's whole class.
 ## 6. Storage
 
 A `Storage` trait — the one genuinely good idea in PvPGN's design (its 19-function-pointer
-vtable) expressed properly:
+vtable) expressed properly. **Built and tested; see `crates/cairn-storage`.**
 
-```rust
-#[async_trait]
-pub trait Storage: Send + Sync + 'static {
-    async fn account_by_name(&self, name: &AccountName) -> Result<Option<Account>>;
-    async fn account_create(&self, req: NewAccount) -> Result<AccountId>;
-    async fn attrs_get(&self, id: AccountId, keys: &[AttrKey]) -> Result<AttrMap>;
-    async fn attrs_put(&self, id: AccountId, attrs: AttrMap) -> Result<()>;
-    // clans, teams, ladder, bans …
-}
+The trait is **synchronous**, which is deliberate. Storage sits behind an actor: async
+tasks send commands over a bounded channel and a dedicated thread runs plain blocking code
+against the database. Once that boundary exists, making the trait `async` buys nothing and
+costs a great deal — `async fn` in traits is not dyn-compatible, so every backend would
+need `async_trait` boxing.
+
+The failure this avoids is precise. PvPGN calls `mysql_query()` — the *synchronous*
+libmysqlclient API — directly on its single event-loop thread, so a cold login freezes
+every other connection for a network round trip. The problem was never that the call
+blocked; it was that it blocked **on the reactor**.
+
+```text
+  handlers ──▶ WriteBehind<B> ──▶ B: Storage ──▶ SQLite / Postgres / memory
+                    │
+                    └── batches attribute writes; account creation,
+                        credential changes and bans are write-through
 ```
+
+That split is the durability contract, and it is tested rather than asserted
+(`losing_the_buffer_loses_only_attributes`): an unclean shutdown costs at most one flush
+interval of profile edits and ladder records, and never an account registration, a
+password change, or a ban. PvPGN gets both halves wrong in one loop — `accountlist_save()`
+runs on **every** iteration, writing up to 100 dirty accounts synchronously on the socket
+thread, paying write-through latency for write-behind durability.
+
+Every backend proves itself against one **conformance suite**
+(`cairn_storage::conformance::run`) rather than its own tests. That is what makes swapping
+SQLite for Postgres a decision rather than a rewrite, and it is what catches the
+divergences that otherwise surface in production on one backend only: case folding on
+names and attribute keys, merge-versus-replace on attribute writes, and which ban scope
+wins when both are present.
 
 **Two implementations.** SQLite is the default — a community node operator should be able
 to run `cairnd` with zero external services. Postgres is for the hub and for nodes past a

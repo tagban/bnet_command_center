@@ -11,11 +11,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod ads;
 pub mod channel;
 pub mod limits;
 pub mod policy;
 pub mod session;
 
+pub use ads::{AdBanner, AdRotation};
 pub use channel::{AccountId, Channel, ChannelClass, JoinDenial, JoinOutcome, LeaveOutcome};
 pub use limits::{
     AdmissionTable, ClientClass, FloodTracker, FloodVerdict, KeyId, KeyRegistry, KeyVerdict,

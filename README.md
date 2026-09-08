@@ -22,13 +22,17 @@ harness are written, tested and measured. `cairnd` is written but not yet compil
 | Crate | State | Tests |
 |---|---|---|
 | `cairn-crypto` | X-SHA-1 verified against known-answer vectors | 7 |
-| `cairn-proto` | BNCS + chat-gateway framing, checked wire codecs | 41 |
-| `cairn-core` | Policy, channels, admission, flood, key registry, session FSM | 58 |
+| `cairn-proto` | BNCS + chat-gateway framing, wire codecs, BNI icons, BNFTP | 70 |
+| `cairn-core` | Policy, channels, admission, flood, key registry, ads, session FSM | 80 |
+| `cairn-storage` | `Storage` trait, attribute ACLs, write-behind, conformance suite | 32 |
 | `cairn-smoke` | Real handshake at 4,000 concurrent connections | — |
 | `cairnd` | Written; needs a dependency-resolving build | — |
+| `cairn-storage-sqlite` | Written; needs `rusqlite` | — |
 
-106 tests, `cargo clippy -D warnings` clean, zero third-party dependencies in the three
-library crates.
+189 tests, `cargo clippy -D warnings` clean, **zero third-party dependencies** in the four
+library crates — which is deliberate: the crates that parse attacker-controlled bytes and
+hold the domain rules are the ones you want cheap to fuzz and cheap to audit. Database
+drivers and the async runtime live only in the crates that cannot avoid them.
 
 Measured on 2 vCPU / 8 GB: **4,000/4,000 concurrent connections**, every one through a
 real handshake with a verified X-SHA-1 logon proof, 30 KiB RSS per connection (an upper
@@ -70,6 +74,7 @@ The full evidence table is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §2
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Process model, crate map, connection lifecycle, backpressure, storage, observability, cross-platform notes |
 | [`docs/FEDERATION.md`](docs/FEDERATION.md) | Star topology, trust model, mTLS transport, the X-SHA-1/SRP identity asymmetry, channel sequencing, ladder validation, partition behaviour |
 | [`docs/WARNET.md`](docs/WARNET.md) | Warnet vs gaming mode, what each gates, connection limits for bot fleets, operator semantics, ordering fairness, flood control |
+| [`docs/BRIDGES.md`](docs/BRIDGES.md) | Chat from outside Battle.net — Discord, Ragnarok, FFXI addons. Why bridged users are presences rather than relayed text, naming, encoding, loop prevention, moderation |
 | [`docs/PROTOCOL-NOTES.md`](docs/PROTOCOL-NOTES.md) | Wire reference with confidence markers — ✅ verified, ⚠️ single-source, 🛑 unknown |
 | [`docs/CAPACITY.md`](docs/CAPACITY.md) | Measured numbers, what they prove, where the real ceilings are |
 | [`docs/LEGAL.md`](docs/LEGAL.md) | Licence contamination map, clean-room guidance, *Davidson v. Jung*, the WarCraft III signature problem |
@@ -80,29 +85,33 @@ The full evidence table is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §2
 ## Building
 
 ```sh
-cargo test                                  # the three library crates + harness
+cargo test                                  # the four library crates + harness
 cargo build --release -p cairn-smoke
 ulimit -n 20000
 ./target/release/cairn-smoke 2500 40        # 2500 concurrent real handshakes
 ```
 
-**`crates/cairnd` is currently excluded from the workspace.** It needs `tokio`, and the
-environment this scaffold was authored in had no access to `crates.io`. To build it:
+**`crates/cairnd` and `crates/cairn-storage-sqlite` are excluded from the workspace.** They
+need `tokio` and `rusqlite`, and the environment this scaffold was authored in had no access
+to `crates.io`. To build them:
 
 ```diff
   members = [
       "crates/cairn-crypto",
       "crates/cairn-proto",
       "crates/cairn-core",
+      "crates/cairn-storage",
       "crates/smoke",
 +     "crates/cairnd",
++     "crates/cairn-storage-sqlite",
   ]
-- exclude = ["crates/cairnd"]
+- exclude = ["crates/cairnd", "crates/cairn-storage-sqlite"]
 ```
 
-then `cargo build`. It is real code, not a stub, but it has never been through a
-compiler — expect to fix what `rustc` finds. The three library crates it depends on are
-fully tested.
+then `cargo build`. Both are real code, not stubs, but neither has been through a
+compiler — expect to fix what `rustc` finds. The four library crates they depend on are
+fully tested. (`cairn-storage-sqlite` is a separate crate rather than a feature flag
+because an *optional* dependency still forces registry resolution.)
 
 ```sh
 cairnd --config cairnd.toml --check   # validate configuration and exit

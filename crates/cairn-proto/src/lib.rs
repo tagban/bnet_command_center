@@ -26,6 +26,8 @@
 #![warn(missing_docs)]
 
 pub mod bncs;
+pub mod bnftp;
+pub mod bni;
 pub mod buf;
 pub mod chat;
 pub mod error;

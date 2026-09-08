@@ -199,6 +199,103 @@ logoff **even when not in a game**. Handle it as a no-op, never an error.
 
 ---
 
+## 5a. Icons, files and advertisements
+
+### Icon negotiation — the client does not hardcode the filename
+
+```
+C→S  0x2D SID_GETICONDATA   (empty)
+S→C  0x2D SID_GETICONDATA   (FILETIME) filetime, (STRING) filename
+```
+
+⚠️ **Must be answered before `SID_ENTERCHAT`, or the client terminates the connection.**
+The *server* chooses the filename, which is how one server hands `icons_STAR.bni` to
+StarCraft and `icons.bni` to Diablo. `0x33 SID_GETFILETIME` lets a client revalidate a
+cached copy. `SID_CHECKDATAFILE`/`CHECKDATAFILE2` are **not** icon-related — do not build
+freshness on them.
+
+### The BNI format ✅
+
+Implemented in `cairn_proto::bni`. 16-byte little-endian header (`header_size = 16`,
+`version = 1`, `icon_count`, `data_offset`), **no magic number**; then one entry per icon
+(`flags`, `width`, `height`, zero-terminated list of four-character codes); then a single
+embedded TGA — type 10 (RLE true-colour), 24 bpp — with every icon stacked vertically, so
+`tga.width == max(icon.width)` and `tga.height == sum(icon.height)`.
+
+Matching is **file order, first match wins**: an entry with non-zero flags matches a
+bitwise AND against the user's chat flags; an entry with zero flags matches a statstring
+icon code.
+
+🛑 **`icons-WAR3.bni` and `WAR3.bni` are not BNI files.** They are MPQ archives of `.blp`
+images with a misleading extension, so a BNI parser produces nonsense. `cairn_proto::bni`
+detects the MPQ magic and says so. WarCraft III icon support therefore needs an MPQ reader,
+not a BNI reader.
+
+⚠️ Several shipped files are malformed: `icons_clan.bni` and `icons_lag.bni` put
+`data_offset - 4` in the header-size field and `0xFFFFFFFF` in the data offset;
+`classic_icons.bni` has entries whose code list opens with a NULL, breaking a naive
+zero-terminated read. The entry table must end exactly at `data_offset`, which is the check
+that catches all of them.
+
+⚠️ Whether the zero-terminated code list is present on entries with non-zero flags is
+**inferred** from PvPGN's parser, which always consumes one trailing DWORD. Verify against
+a hex dump of a real `icons.bni` before release.
+
+### WarCraft III icon codes ✅
+
+The statstring icon field is `Level + Tier + "3W"` — e.g. `2H3W` is level 2 Human. Tier
+letters: `R` random, `H` human, `U` undead, `N` night elf, `O` orc, `D` tournament. Added
+in patch 1.03; some W3XP statstrings carry a level and clan tag with **no** icon field at
+all, so parse defensively. PvPGN's own `KBKB`/`KBKE`/`WCYB` codes are its private
+convention for its bundled icon MPQ, **not** protocol.
+
+### BNFTP ✅
+
+Protocol byte `0x02`, one file per connection. Implemented in `cairn_proto::bnftp` (v1).
+
+```
+request   u16 length | u16 version (0x0100) | u32 platform | u32 product
+          u32 ad_id | u32 ad_extension | u32 start_position | u64 filetime | cstr filename
+response  u16 header_length | u16 type | u32 file_size
+          u32 ad_id | u32 ad_extension | u64 filetime | cstr filename | file data
+```
+
+The **ad-banner fields living in the file-transfer header** is how an advertisement image
+is fetched: they are 0 for ordinary files. v2 (`0x0200`) inserts a CD-key challenge before
+the transfer; not implemented, and not needed for anything a private server serves.
+
+The filename comes from an unauthenticated peer and is about to be joined to a directory.
+`cairn_proto::bnftp::sanitize_filename` is the security boundary — see its tests for the
+traversal forms it refuses.
+
+### Advertisement packets ✅
+
+| ID | Dir | Name | Payload |
+|---|---|---|---|
+| `0x15` | C→S | `SID_CHECKAD` | platform, product, **id of the banner currently displayed**, current time |
+| `0x15` | S→C | `SID_CHECKAD` | ad id, file extension tag, filetime, filename, link URL |
+| `0x16` | C→S | `SID_CLICKAD` | ad id, request type (`0` = obtained via `SID_QUERYADURL`) |
+| `0x21` | C→S | `SID_DISPLAYAD` | platform, product, ad id, filename, URL. Telemetry only |
+| `0x41` | both | `SID_QUERYADURL` | ad id → ad URL. **WarCraft III only** |
+
+Clients send `SID_CHECKAD` roughly **every 15 seconds**, and the server answers only when
+something changed. Because the request carries the client's current banner id, **rotation
+needs no server-side per-connection state at all** — it is a pure function of (previous id,
+product, language). Implemented that way in `cairn_core::ads`; it survives restarts and
+cannot drift between federated nodes.
+
+WarCraft III gets a random pick; every other product rotates sequentially.
+
+**Formats and dimensions**: 468 × 60, mandatory. StarCraft/Warcraft II/Diablo take PCX and
+SMK; Diablo II takes SMK; WarCraft III takes MNG and PNG. PvPGN announces `.png` under the
+MNG extension tag, which we reproduce deliberately.
+
+⚠️ The extension tag is a `u32` whose little-endian wire bytes read `.smk` / `.mng` /
+`.pcx`. This is **inferred** from PvPGN's tag encoding, not from a capture — verify before
+relying on it. The failure mode is a client that silently shows no ad.
+
+---
+
 ## 6. Diablo II realm (MCP)
 
 ```

@@ -62,7 +62,22 @@ impl SessionState {
         if matches!(self, Self::Closing) {
             return false;
         }
-        if matches!(id, sid::PING | sid::STOPADV) {
+        // Accepted in every open state:
+        //   PING       a keepalive, arrives unprompted
+        //   STOPADV    every Battle.snp client sends it on logoff, and StarCraft
+        //              1.16.1 may send it before login completes
+        //   CHECKAD/CLICKAD/DISPLAYAD/QUERYADURL
+        //              advertisement traffic, which real clients emit on a 15-second
+        //              timer regardless of where they are in the handshake
+        if matches!(
+            id,
+            sid::PING
+                | sid::STOPADV
+                | sid::CHECKAD
+                | sid::CLICKAD
+                | sid::DISPLAYAD
+                | sid::QUERYADURL
+        ) {
             return true;
         }
         match self {
@@ -80,6 +95,10 @@ impl SessionState {
             Self::LoggedIn => matches!(
                 id,
                 sid::ENTERCHAT
+                    // Must be served before ENTERCHAT or the client disconnects.
+                    | sid::GETICONDATA
+                    | sid::GETFILETIME
+                    | sid::CHECKDATAFILE2
                     | sid::GETCHANNELLIST
                     | sid::QUERYREALMS2
                     | sid::LOGONREALMEX
@@ -89,6 +108,9 @@ impl SessionState {
             Self::Chatting | Self::InChannel => matches!(
                 id,
                 sid::ENTERCHAT
+                    | sid::GETICONDATA
+                    | sid::GETFILETIME
+                    | sid::CHECKDATAFILE2
                     | sid::JOINCHANNEL
                     | sid::CHATCOMMAND
                     | sid::GETCHANNELLIST
@@ -257,6 +279,10 @@ mod tests {
             sid::AUTH_ACCOUNTLOGONPROOF,
             sid::PING,
             sid::STOPADV,
+            sid::CHECKAD,
+            sid::CLICKAD,
+            sid::DISPLAYAD,
+            sid::QUERYADURL,
         ];
         for state in [
             SessionState::Connected,
