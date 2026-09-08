@@ -19,8 +19,8 @@
 //! Chat   line-oriented, CRLF
 //! ```
 //!
-//! Only BNCS and the chat gateway are implemented so far; MCP and W3GS follow in later
-//! phases. See `docs/PROTOCOL-NOTES.md`.
+//! BNCS, MCP and the chat gateway are implemented; W3GS follows in a later phase.
+//! See `docs/PROTOCOL-NOTES.md`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -32,6 +32,8 @@ pub mod buf;
 pub mod chat;
 pub mod error;
 pub mod line;
+pub mod mcp;
+pub mod statstring;
 
 pub use error::{FourCc, ProtoError, Result};
 

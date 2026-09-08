@@ -26,14 +26,14 @@ harness are written, tested and measured. `bnetccd` is written but not yet compi
 | Crate | State | Tests |
 |---|---|---|
 | `bnetcc-crypto` | X-SHA-1 verified against known-answer vectors | 7 |
-| `bnetcc-proto` | BNCS + chat-gateway framing, wire codecs, BNI icons, BNFTP | 70 |
+| `bnetcc-proto` | BNCS, MCP and chat-gateway framing, wire codecs, BNI icons, BNFTP, statstrings | 89 |
 | `bnetcc-core` | Policy, channels, admission, flood, key registry, ads, bridged identities, session FSM | 98 |
 | `bnetcc-storage` | `Storage` trait, attribute ACLs, write-behind, conformance suite | 33 |
 | `bnetcc-smoke` | Real handshake at 4,000 concurrent connections | — |
 | `bnetccd` | Written; needs a dependency-resolving build | — |
 | `bnetcc-storage-sqlite` | Written; needs `rusqlite` | — |
 
-208 tests, `cargo clippy -D warnings` clean, **zero third-party dependencies** in the four
+227 tests, `cargo clippy -D warnings` clean, **zero third-party dependencies** in the four
 library crates — which is deliberate: the crates that parse attacker-controlled bytes and
 hold the domain rules are the ones you want cheap to fuzz and cheap to audit. Database
 drivers and the async runtime live only in the crates that cannot avoid them.
@@ -80,6 +80,7 @@ The full evidence table is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §2
 | [`docs/WARNET.md`](docs/WARNET.md) | Warnet vs gaming mode, what each gates, connection limits for bot fleets, operator semantics, ordering fairness, flood control |
 | [`docs/BRIDGES.md`](docs/BRIDGES.md) | Chat from outside Battle.net — Discord, Ragnarok, FFXI addons. Why bridged users are presences rather than relayed text, naming, encoding, loop prevention, moderation |
 | [`docs/PROTOCOL-NOTES.md`](docs/PROTOCOL-NOTES.md) | Wire reference with confidence markers — ✅ verified, ⚠️ single-source, 🛑 unknown |
+| [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Which database and why, inspecting a live SQLite file safely, why a website should not query it directly, file descriptor limits |
 | [`docs/CAPACITY.md`](docs/CAPACITY.md) | Measured numbers, what they prove, where the real ceilings are |
 | [`docs/LEGAL.md`](docs/LEGAL.md) | Licence contamination map, clean-room guidance, *Davidson v. Jung*, the WarCraft III signature problem |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phases, and why modern clients are not on them |

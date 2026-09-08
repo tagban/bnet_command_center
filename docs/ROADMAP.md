@@ -12,14 +12,17 @@ team for this project?".
 
 - **`bnetcc-crypto`** — X-SHA-1 ported and verified against known-answer vectors, including
   the full `SID_LOGONRESPONSE2` double-hash chain.
-- **`bnetcc-proto`** — BNCS framing, chat-gateway line framing, checked wire
-  readers/writers, chat events and limits, product/auth-family classification, **the BNI
-  icon format** (parse, build, validate, icon selection) and **BNFTP v1** with a hardened
-  filename sanitiser. Zero dependencies.
+- **`bnetcc-proto`** — BNCS framing, **MCP framing** (length-first, no magic — the
+  classic D2 realm bug, with a test that names it), chat-gateway line framing, checked
+  wire readers/writers, chat events and limits, product/auth-family classification,
+  **statstring parsing** including WarCraft III icon codes, **the BNI icon format**
+  (parse, build, validate, icon selection) and **BNFTP v1** with a hardened filename
+  sanitiser. Zero dependencies.
 - **`bnetcc-core`** — policy engine (gaming/warnet/both), per-client-type connection limits
   with two-stage product classification, channel operator rules, CD-key session
-  uniqueness, flood control, **advertisement rotation**, session state machine. Zero
-  dependencies.
+  uniqueness, flood control, **advertisement rotation**, **bridged identities** (name
+  derivation, reserved namespace, stable mapping, loop prevention), session state machine.
+  Zero dependencies.
 - **`bnetcc-storage`** — `Storage` trait, per-key attribute ACLs, write-behind batching with
   a tested durability contract, in-memory reference backend, and a conformance suite every
   backend must pass. Zero dependencies.
@@ -27,7 +30,7 @@ team for this project?".
   workspace pending `rusqlite`.
 - **`bnetccd`** — node daemon. Written; excluded pending `tokio`.
 - **`crates/smoke`** — real handshake over real sockets at 4,000 concurrent connections.
-- 189 tests, `clippy -D warnings` clean.
+- 227 tests, `clippy -D warnings` clean.
 
 ## Phase 1 — A single-node gaming server a real client can use
 
@@ -60,6 +63,13 @@ The milestone is a screenshot of Brood War sitting in a channel. Nothing else co
 - [ ] **Metrics and `tracing`**: Prometheus on the admin listener; connections by class and
       state, per-packet decode/error counters, outbound queue depth histogram, login
       latency split by edge-verified and hub-proxied. Plus `/debug/slow`.
+- [ ] **Read-only admin API** (JSON over HTTP on the admin listener): who is online,
+      channels and rosters, game list, server status — filtered through the same
+      `AttrSchema` as every other read path, so it cannot return what a client could not
+      see. This is the supported integration surface for a website or monitoring, and it
+      exists so that nobody points a dashboard at the database: that bypasses the
+      attribute ACLs and welds a site to a schema that will change. See
+      `docs/OPERATIONS.md` §3.
 - [ ] **`cargo fuzz`** targets for `decode_frame`, `decode_line`, `bni::parse` and
       `bnftp::decode_request`. The in-tree pseudo-random tests are a stand-in.
 - [ ] **Packaging**: systemd unit, launchd plist, Windows service wrapper.
@@ -113,8 +123,10 @@ Realms run **inside `bnetccd`**, not as separate daemons — `docs/ARCHITECTURE.
 reasoning, including that PvPGN's `d2dbs` still uses `select()` capped at `FD_SETSIZE` and
 never received the fix `bnetd` got in 2003.
 
-- [ ] MCP gateway as an in-process module. Its framing differs from BNCS — `len:u16le`
-      first, **no** `0xFF` magic — which is the most common bug in D2 realm implementations.
+- [ ] MCP gateway as an in-process module. **The framing codec is done**
+      (`bnetcc_proto::mcp`), including a test asserting that a BNCS frame fed to the MCP
+      decoder does not silently succeed. What remains is the session state machine and the
+      realm handlers.
 - [ ] Character store behind the `Storage` trait, called as a function rather than over a
       socket. Replaces `d2cs` **and** `d2dbs`, and the custom `bnetd`↔`d2cs` binary protocol
       goes away with them.
