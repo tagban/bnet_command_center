@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cairn-crypto",
+    "crates/cairn-proto",
+    "crates/cairn-core",
+    "crates/smoke",
+]
+
+# NOTE: crates/cairnd is intentionally excluded from the default workspace members in
+# this tree because it needs tokio, and crates.io was unreachable from the environment
+# this scaffold was authored in. Add it back once dependencies can be fetched:
+#   members = [..., "crates/cairnd"]
+exclude = ["crates/cairnd"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/YOURORG/cairn"
+
+[workspace.dependencies]
+bytes = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+# A panic in one connection task must not take the process down. We use
+# panic = "abort" in release so that a panic is a loud crash in testing,
+# and every connection task is additionally wrapped so a bug in one
+# session cannot poison shared state. See ARCHITECTURE.md section 3.

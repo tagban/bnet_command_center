@@ -1,0 +1,200 @@
+//! `cairnd` — the Cairn node daemon.
+
+#![forbid(unsafe_code)]
+
+mod config;
+mod node;
+mod session;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use cairn_core::policy::Policy;
+use clap::Parser;
+use tokio::net::TcpListener;
+use tracing::{error, info, warn};
+
+use crate::config::Config;
+use crate::node::Node;
+use crate::session::SessionLimits;
+
+#[derive(Parser, Debug)]
+#[command(name = "cairnd", version, about = "Cairn node daemon")]
+struct Args {
+    /// Path to the TOML configuration file.
+    #[arg(short, long, default_value = "cairnd.toml")]
+    config: PathBuf,
+
+    /// Validate the configuration and exit without binding anything.
+    #[arg(long)]
+    check: bool,
+}
+
+fn main() -> std::process::ExitCode {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let args = Args::parse();
+
+    let cfg = if args.config.exists() {
+        match Config::load(&args.config) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("{e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    } else {
+        warn!(
+            path = %args.config.display(),
+            "no config file found; running with defaults"
+        );
+        Config::default()
+    };
+
+    if args.check {
+        info!("configuration is valid");
+        return std::process::ExitCode::SUCCESS;
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(r) => r,
+        Err(e) => {
+            error!("cannot start the async runtime: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    match runtime.block_on(run(cfg)) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            error!("{e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(cfg: Config) -> Result<(), String> {
+    let mode = cfg.server.parsed_mode()?;
+    let policy = Policy::for_mode(mode);
+
+    let fd_limit = file_descriptor_limit();
+    let max_connections = cfg.effective_max_connections(fd_limit);
+
+    // Log the effective ceiling loudly. PvPGN ships a hard-coded 1000 and silently
+    // refuses connections past it; operators who never found that knob concluded the
+    // software could not scale. Nobody should have to guess.
+    info!(
+        mode = mode.as_str(),
+        fd_limit,
+        max_connections,
+        game_hosting = ?policy.game_hosting,
+        chat_ordering = ?policy.chat_ordering,
+        gateway_per_ip = policy.gateway_limits.per_ip,
+        "starting cairnd"
+    );
+    if max_connections < 2000 {
+        warn!(
+            max_connections,
+            fd_limit,
+            "connection ceiling is below 2000; raise the file descriptor limit \
+             (ulimit -n, LimitNOFILE=, or kern.maxfilesperproc on macOS) \
+             or set limits.max_connections explicitly"
+        );
+    }
+
+    let node = Arc::new(Node::new(
+        policy,
+        cfg.server.name.clone(),
+        cfg.server.motd.clone(),
+        cfg.limits.gateway_allowlist.clone(),
+    ));
+
+    let limits = SessionLimits {
+        max_frame: cfg.limits.max_frame_bytes,
+        max_line: cfg.limits.max_line_bytes,
+        outbound_queue: cfg.limits.outbound_queue,
+        handshake_timeout: Duration::from_secs(cfg.limits.handshake_timeout_secs),
+        idle_timeout: Duration::from_secs(cfg.limits.idle_timeout_secs),
+    };
+
+    let listener = TcpListener::bind(cfg.listen.bncs)
+        .await
+        .map_err(|e| format!("cannot bind {}: {e}", cfg.listen.bncs))?;
+    info!(addr = %cfg.listen.bncs, "listening for BNCS and chat-gateway clients");
+
+    if cfg.federation.enabled {
+        // Phase 2. The link is one outbound mTLS connection to the hub; a node never
+        // accepts inbound federation traffic, which is what lets a node behind NAT
+        // participate. See docs/FEDERATION.md.
+        warn!(hub = %cfg.federation.hub, "federation is configured but not yet implemented");
+    }
+
+    let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, peer)) => {
+                        if node.connection_count() >= u64::from(max_connections) {
+                            // Refuse at the door rather than accepting and failing later.
+                            drop(stream);
+                            continue;
+                        }
+                        let node = Arc::clone(&node);
+                        tokio::spawn(async move {
+                            session::handle(stream, peer, node, limits).await;
+                        });
+                    }
+                    Err(e) => {
+                        // A per-connection accept error (EMFILE, a peer that vanished)
+                        // must never end the accept loop.
+                        warn!(error = %e, "accept failed");
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+            }
+            _ = &mut shutdown => {
+                info!("shutdown signal received");
+                break;
+            }
+        }
+    }
+
+    info!(connections = node.connection_count(), "stopping");
+    Ok(())
+}
+
+/// Best-effort file descriptor limit for this process.
+///
+/// Reads `/proc/self/limits` on Linux. On macOS and Windows there is no dependency-free
+/// way to ask, so we return a conservative value and rely on the startup warning to tell
+/// the operator to set `limits.max_connections` explicitly.
+///
+/// TODO: replace with the `rlimit` crate, which handles all three platforms and can also
+/// raise the soft limit to the hard limit at startup. Tracked in `docs/ROADMAP.md`.
+fn file_descriptor_limit() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(text) = std::fs::read_to_string("/proc/self/limits") {
+            for line in text.lines() {
+                if line.starts_with("Max open files") {
+                    if let Some(soft) = line.split_whitespace().nth(3) {
+                        if let Ok(n) = soft.parse::<u64>() {
+                            return n;
+                        }
+                        if soft == "unlimited" {
+                            return 1_048_576;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    1024
+}

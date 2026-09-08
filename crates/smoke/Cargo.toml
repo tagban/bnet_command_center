@@ -1,0 +1,15 @@
+[package]
+name = "cairn-smoke"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Dependency-free integration and concurrency harness for cairn-proto/core/crypto"
+
+[dependencies]
+cairn-core = { path = "../cairn-core" }
+cairn-crypto = { path = "../cairn-crypto" }
+cairn-proto = { path = "../cairn-proto" }
+
+[lints.rust]
+unsafe_code = "forbid"
