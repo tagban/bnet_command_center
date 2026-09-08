@@ -113,11 +113,14 @@ to `crates.io`. To build them:
 - exclude = ["crates/bnetccd", "crates/bnetcc-storage-sqlite"]
 ```
 
-**`./scripts/verify.sh` does all of that for you** — it enables both crates, runs build,
-test and clippy, and writes `verify.log` with the full compiler output. If the build
-fails it restores the reduced workspace so the library crates still build, and
-`verify.log` is the file to send back: it has the actual errors rather than a summary of
-them.
+**`bash scripts/verify.sh` does all of that for you.** It enables both crates, runs
+build, test, clippy and the 2,500-connection load test, and writes `verify.log`. If the
+build fails it restores the reduced workspace so the library crates still build.
+
+`verify.log` is the file to send back — it carries the actual compiler output rather than
+a summary of it. The script needs only `awk` and `cargo`, finds `cargo` via
+`~/.cargo/env` if it is not on `PATH`, and raises the open-file limit before the load
+test (macOS defaults to 256, far below what 2,500 connections need).
 
 Both are real code, not stubs, but neither has been through a compiler — expect to fix
 what `rustc` finds. The four library crates they depend on are fully tested.
