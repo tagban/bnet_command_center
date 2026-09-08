@@ -4,10 +4,13 @@
 //! across `bnetd.conf` plus fifteen side files. Every field has a default, so a minimal
 //! config is a handful of lines and an operator only writes what they want to change.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
-use cairn_core::policy::ServerMode;
+use cairn_core::limits::ClientClass;
+use cairn_core::policy::{ClientLimits, ConnLimitsPatch, Policy, ServerMode};
+use cairn_proto::FourCc;
 use serde::Deserialize;
 
 /// Top-level node configuration.
@@ -115,8 +118,90 @@ pub struct LimitsConfig {
     pub handshake_timeout_secs: u64,
     /// Idle seconds after authentication before the connection is closed.
     pub idle_timeout_secs: u64,
-    /// Addresses exempt from the per-IP gateway ceiling.
+    /// Addresses exempt from per-IP ceilings.
+    ///
+    /// Global and per-account ceilings still apply, and so does the CD-key registry —
+    /// an operator can waive the address cost for their own host, not the key cost.
     pub gateway_allowlist: Vec<IpAddr>,
+
+    /// Connection limits, per client type.
+    pub clients: ClientLimitsConfig,
+}
+
+/// A partial override of one client type's connection limits.
+///
+/// Only the fields you set are changed; the rest keep the built-in default. So
+/// `per_ip = 2` for WarCraft III is a one-line change that does not silently reset that
+/// product's global ceiling.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LimitsPatchConfig {
+    /// Concurrent connections of this type from one address.
+    pub per_ip: Option<u32>,
+    /// Concurrent connections of this type for one account.
+    pub per_account: Option<u32>,
+    /// Concurrent connections of this type server-wide.
+    pub global: Option<u32>,
+}
+
+impl LimitsPatchConfig {
+    const fn to_patch(self) -> ConnLimitsPatch {
+        ConnLimitsPatch {
+            per_ip: self.per_ip,
+            per_account: self.per_account,
+            global: self.global,
+        }
+    }
+}
+
+/// Per-client-type connection limits.
+///
+/// Each client type is limited independently, because they cost their operator different
+/// things. The telnet/chat gateway has no CD-key step, so the address is the only cost
+/// available to charge and it stays at one per address. Game clients already pay in CD
+/// keys, so their per-IP number is loose enough not to break households and LAN cafés,
+/// and each product can be tuned separately — eight Brood War from a café but only two
+/// WarCraft III, say.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClientLimitsConfig {
+    /// Telnet / chat gateway.
+    pub gateway: LimitsPatchConfig,
+    /// BNFTP file transfer.
+    pub bnftp: LimitsPatchConfig,
+    /// Game connections whose product is not yet known (accept to `SID_AUTH_INFO`).
+    pub game_pending: LimitsPatchConfig,
+    /// Fallback for any game product without its own entry.
+    pub game_default: LimitsPatchConfig,
+    /// Per-product overrides, keyed by four-character product code (`SEXP`, `WAR3`, …).
+    pub products: BTreeMap<String, LimitsPatchConfig>,
+}
+
+impl ClientLimitsConfig {
+    /// Apply these overrides to a base set of limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming any product key that is not exactly four ASCII
+    /// characters — a typo here would otherwise create a product nothing ever matches.
+    pub fn apply(&self, base: &mut ClientLimits) -> Result<(), String> {
+        base.gateway = self.gateway.to_patch().apply(base.gateway);
+        base.bnftp = self.bnftp.to_patch().apply(base.bnftp);
+        base.game_pending = self.game_pending.to_patch().apply(base.game_pending);
+        base.game_default = self.game_default.to_patch().apply(base.game_default);
+        for (code, patch) in &self.products {
+            let bytes = code.as_bytes();
+            if bytes.len() != 4 || !code.is_ascii() {
+                return Err(format!(
+                    "limits.clients.products.{code:?}: product codes are exactly four \
+                     ASCII characters, such as SEXP, D2XP or WAR3"
+                ));
+            }
+            let fourcc = FourCc::from_ascii(&[bytes[0], bytes[1], bytes[2], bytes[3]]);
+            base.patch_product(fourcc, patch.to_patch());
+        }
+        Ok(())
+    }
 }
 
 impl Default for LimitsConfig {
@@ -129,6 +214,7 @@ impl Default for LimitsConfig {
             handshake_timeout_secs: 30,
             idle_timeout_secs: 1200,
             gateway_allowlist: Vec::new(),
+            clients: ClientLimitsConfig::default(),
         }
     }
 }
@@ -195,6 +281,7 @@ impl Config {
     /// Returns a message describing the first problem found.
     pub fn validate(&self) -> Result<(), String> {
         self.server.parsed_mode()?;
+        self.policy()?;
         if self.limits.outbound_queue == 0 {
             return Err("limits.outbound_queue must be at least 1".into());
         }
@@ -205,6 +292,41 @@ impl Config {
             return Err("federation.enabled is true but federation.hub is empty".into());
         }
         Ok(())
+    }
+
+    /// Build the effective policy: the mode's defaults with config overrides applied.
+    ///
+    /// # Errors
+    ///
+    /// A bad mode or a malformed product code.
+    pub fn policy(&self) -> Result<Policy, String> {
+        let mut policy = Policy::for_mode(self.server.parsed_mode()?);
+        self.limits.clients.apply(&mut policy.clients)?;
+        // The pending class only bounds a connect flood before SID_AUTH_INFO identifies
+        // the client; if an operator tightened it below a product's limit it would
+        // reject connections that product would have allowed, which is confusing and
+        // always a mistake. Widen it rather than failing to start.
+        let widest = policy
+            .clients
+            .products
+            .values()
+            .map(|l| l.per_ip)
+            .chain(std::iter::once(policy.clients.game_default.per_ip))
+            .max()
+            .unwrap_or(0);
+        if policy.clients.game_pending.per_ip < widest {
+            policy.clients.game_pending.per_ip = widest;
+        }
+        Ok(policy)
+    }
+
+    /// The limits in force for a client class, after config overrides.
+    ///
+    /// # Errors
+    ///
+    /// A bad mode or a malformed product code.
+    pub fn limits_for(&self, class: ClientClass) -> Result<cairn_core::ConnLimits, String> {
+        Ok(self.policy()?.clients.for_class(class))
     }
 
     /// Resolve the effective connection ceiling.
@@ -297,5 +419,85 @@ mod tests {
     fn a_tiny_fd_limit_does_not_underflow() {
         let cfg = Config::default();
         assert_eq!(cfg.effective_max_connections(10), 0);
+    }
+
+    #[test]
+    fn client_limits_default_to_the_mode_defaults() {
+        let p = Config::default().policy().unwrap();
+        assert_eq!(p.clients.gateway.per_ip, 1);
+        assert!(p.clients.game_default.per_ip > 1);
+    }
+
+    #[test]
+    fn a_product_limit_can_be_set_from_config() {
+        let cfg = Config::from_toml(
+            r#"
+            [limits.clients.products.WAR3]
+            per_ip = 2
+            "#,
+        )
+        .unwrap();
+        let p = cfg.policy().unwrap();
+        assert_eq!(
+            p.clients
+                .for_class(ClientClass::Game(cairn_proto::product::WAR3))
+                .per_ip,
+            2
+        );
+        // Other products are untouched.
+        assert_eq!(
+            p.clients
+                .for_class(ClientClass::Game(cairn_proto::product::SEXP))
+                .per_ip,
+            p.clients.game_default.per_ip
+        );
+    }
+
+    #[test]
+    fn a_partial_product_override_keeps_the_global_ceiling() {
+        let cfg = Config::from_toml("[limits.clients.products.D2XP]\nper_ip = 3").unwrap();
+        let p = cfg.policy().unwrap();
+        let d2 = p.clients.for_class(ClientClass::Game(cairn_proto::product::D2XP));
+        assert_eq!(d2.per_ip, 3);
+        assert_eq!(d2.global, p.clients.game_default.global);
+    }
+
+    #[test]
+    fn the_gateway_limit_is_configurable_but_defaults_to_one() {
+        assert_eq!(
+            Config::default().limits_for(ClientClass::Gateway).unwrap().per_ip,
+            1
+        );
+        let cfg = Config::from_toml("[limits.clients.gateway]\nper_ip = 4").unwrap();
+        assert_eq!(cfg.limits_for(ClientClass::Gateway).unwrap().per_ip, 4);
+    }
+
+    #[test]
+    fn a_malformed_product_code_is_rejected_with_a_useful_message() {
+        // A typo here would otherwise create a product nothing ever matches, and the
+        // operator would never learn the setting had no effect.
+        let err = Config::from_toml("[limits.clients.products.WARCRAFT3]\nper_ip = 2")
+            .unwrap_err();
+        assert!(err.contains("WARCRAFT3"), "{err}");
+        assert!(err.contains("four"), "{err}");
+    }
+
+    #[test]
+    fn pending_limits_are_widened_to_cover_the_loosest_product() {
+        // The pending class only bounds a connect flood before SID_AUTH_INFO identifies
+        // the client. If it were tighter than a product it would reject connections that
+        // product allows, which is always a misconfiguration rather than an intent.
+        let cfg = Config::from_toml(
+            r#"
+            [limits.clients.game_pending]
+            per_ip = 2
+
+            [limits.clients.products.SEXP]
+            per_ip = 12
+            "#,
+        )
+        .unwrap();
+        let p = cfg.policy().unwrap();
+        assert!(p.clients.game_pending.per_ip >= 12);
     }
 }

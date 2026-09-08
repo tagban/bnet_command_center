@@ -150,7 +150,7 @@ from the fanout, not blocking it.
 | `cairn-fed` | Federation: node↔hub protocol, mTLS transport, message types, reconnect and partition handling. | Yes |
 | `cairn-gateway-bncs` | Protocol-byte demux and the BNCS session driver. | Yes |
 | `cairn-gateway-chat` | Telnet / chat-gateway (protocol bytes `0x03`/`0x43`/`0x63`), with per-IP admission control. | Yes |
-| `cairn-gateway-mcp` | Diablo II realm (MCP). Phase 3. | Yes |
+| `cairn-gateway-mcp` | Diablo II realm (MCP), **linked into `cairnd` as a module, not a daemon** — see §11. Phase 4. | Yes |
 | `cairnd` | Node binary: config, listeners, wiring, observability. | Yes |
 | `cairn-hub` | Hub binary: directory, identity, ladder, ban authority, relay. | Yes |
 | `cairnctl` | Admin CLI over the local admin socket. | Yes |
@@ -316,7 +316,70 @@ reports connection setup latency, steady-state RSS, and p50/p99 chat round-trip.
 
 ---
 
-## 11. Build order
+## 11. One binary — why the Diablo II realm is not separate daemons
+
+PvPGN ships four processes for Diablo II: `bnetd` (6112), `d2cs` (the MCP/realm server,
+6113), `d2dbs` (the character database, 6114), and a third-party `d2gs` (the actual game
+server, 4000). Cairn folds the first three into `cairnd`.
+
+### Why the split is not worth keeping
+
+- **It costs a wire protocol that should be a function call.** `bnetd` and `d2cs` talk
+  over a custom binary protocol (`d2cs_bnetd_protocol.h`) with its own connection class,
+  retry interval, timeout and keepalive settings. All of that is machinery to move a
+  character list between two parts of one server.
+- **`d2dbs` never got the fdwatch treatment.** It still calls `psock_select()` directly,
+  rebuilding `fd_set`s by walking every connection each iteration — O(n) per loop, hard
+  capped at `FD_SETSIZE` (1024 on Linux). `bnetd` and `d2cs` were fixed in 2003; the
+  character database was not, and it is a 2003-era hole that has never been patched.
+  Folding it in deletes that entire class of problem rather than porting it.
+- **Three processes means three configs, three supervision units, three log streams, and
+  three ways to have a version mismatch.** For a community operator that is the difference
+  between "install the server" and "install the server, four times, in the right order".
+- There is precedent: `jaenster/d2-dedicated-server` collapses BNCS and MCP onto a single
+  port 6112 and argues that this is closer to what real Battle.net actually did than
+  PvPGN's split.
+
+So in Cairn the realm is a **gateway module**, exactly like BNCS and the chat gateway:
+it owns MCP framing (`len:u16le` first, **no** `0xFF` magic — the classic mistake) and its
+own session state machine, and it reaches the character store through the `Storage` trait
+as a normal function call. One process, one config, one binary to supervise.
+
+### The exception, stated honestly
+
+**D2GS cannot simply be "part of the main app", because it is not a protocol server.** It
+runs the actual Diablo II simulation: monsters, items, skills, map generation, save
+handling. PvPGN does not ship one and says so plainly; the D2GS people use is
+closed-source, Windows-only, and prone to crash-looping on modern Windows. Writing our own
+means writing a Diablo II game simulation, which is an enormous project in its own right
+and the reason nobody in this ecosystem has one.
+
+What the architecture does instead is make the *operator's* experience single-binary
+regardless, through one trait:
+
+```rust
+pub trait GameHost: Send + Sync {
+    /// Allocate a game and return the endpoint the client should dial.
+    async fn create(&self, req: CreateGame) -> Result<GameEndpoint>;
+    async fn destroy(&self, id: GameId) -> Result<()>;
+}
+```
+
+- **`ExternalGameHost`** speaks to an existing D2GS for operators who already run one. It
+  is a client of that process, not a sibling daemon of ours — `cairnd` is still the only
+  thing you install and supervise.
+- **`EmbeddedGameHost`** is where an in-process game server plugs in if one is ever
+  written. It becomes a module, not a fourth daemon.
+
+One constraint survives either way and is worth knowing before planning realms: **port
+4000 is hardcoded in the Diablo II client**, so the client always dials 4000 on the
+address the realm hands it. That caps you at **one realm per IP address** — not per host,
+since additional addresses work fine. Embedding the game server does not lift this,
+because the constraint lives in the client.
+
+---
+
+## 12. Build order
 
 Phases are in `docs/ROADMAP.md`. The short version: get one real StarCraft 1.16.1 client
 into a channel before writing a single line of realm, ladder, or clan code. Every prior

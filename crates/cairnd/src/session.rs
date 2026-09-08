@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use cairn_core::limits::ClientClass;
 use cairn_core::policy::Gate;
 use cairn_core::session::SessionState;
 use cairn_crypto::{logon_proof, proofs_match};
@@ -125,23 +126,27 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr, node: Arc<Node>, limits
 
     match ProtocolSelector::from_byte(selector) {
         Some(ProtocolSelector::Game) => {
-            if let Err(reason) = node.admit_game(ip) {
+            // The selector says "a game client"; it does not say *which* game. The
+            // product only arrives in SID_AUTH_INFO, so we admit under the pending
+            // class and promote once we know. See ClientClass.
+            if let Err(reason) = node.admit(ClientClass::GamePending, ip) {
                 debug!(%peer, ?reason, "game connection refused by admission control");
                 return;
             }
-            let result = bncs_session(stream, peer, Arc::clone(&node), limits).await;
-            node.release_game(ip);
+            let (result, final_class) =
+                bncs_session(stream, peer, Arc::clone(&node), limits).await;
+            node.release(final_class, ip);
             if let Err(e) = result {
                 debug!(%peer, error = %e, "bncs session ended");
             }
         }
         Some(ProtocolSelector::Chat) => {
-            if let Err(reason) = node.admit_gateway(ip) {
+            if let Err(reason) = node.admit(ClientClass::Gateway, ip) {
                 debug!(%peer, ?reason, "gateway connection refused by admission control");
                 return;
             }
             let result = gateway_session(stream, peer, Arc::clone(&node), limits).await;
-            node.release_gateway(ip);
+            node.release(ClientClass::Gateway, ip);
             if let Err(e) = result {
                 debug!(%peer, error = %e, "gateway session ended");
             }
@@ -187,6 +192,9 @@ struct Bncs {
     node: Arc<Node>,
     out: Outbound,
     peer: SocketAddr,
+    /// Starts as `GamePending`; promoted to `Game(product)` by `SID_AUTH_INFO`. The
+    /// caller releases whichever class we end in.
+    class: ClientClass,
     state: SessionState,
     server_token: u32,
     product: Option<FourCc>,
@@ -200,7 +208,7 @@ async fn bncs_session(
     peer: SocketAddr,
     node: Arc<Node>,
     limits: SessionLimits,
-) -> std::io::Result<()> {
+) -> (std::io::Result<()>, ClientClass) {
     let (mut rd, wr) = stream.into_split();
     let (tx, rx) = mpsc::channel::<Wire>(limits.outbound_queue);
     let writer = spawn_writer(wr, rx);
@@ -209,6 +217,7 @@ async fn bncs_session(
         node,
         out: Outbound::new(tx.clone()),
         peer,
+        class: ClientClass::GamePending,
         state: SessionState::Connected,
         server_token: next_server_token(),
         product: None,
@@ -230,7 +239,12 @@ async fn bncs_session(
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {
                 buf.commit(0, READ_CHUNK);
-                return Err(e);
+                let class = s.class;
+                s.cleanup();
+                drop(tx);
+                drop(s);
+                let _ = writer.await;
+                return (Err(e), class);
             }
             Err(_) => {
                 buf.commit(0, READ_CHUNK);
@@ -278,11 +292,12 @@ async fn bncs_session(
         }
     }
 
+    let class = s.class;
     s.cleanup();
     drop(tx);
     drop(s);
     let _ = writer.await;
-    Ok(())
+    (Ok(()), class)
 }
 
 impl Bncs {
@@ -355,6 +370,21 @@ impl Bncs {
             return Step::Close;
         };
         self.product = Some(product);
+
+        // Now that the product is known, move this connection onto that product's
+        // limits. On refusal we close: there is no BNCS status meaning "too many
+        // connections", and real Battle.net simply drops in this situation too.
+        let target = ClientClass::Game(product);
+        if let Err(reason) = self.node.reclassify(self.peer.ip(), self.class, target) {
+            debug!(
+                peer = %self.peer,
+                product = %product,
+                ?reason,
+                "refused by the per-product connection limit"
+            );
+            return Step::Close;
+        }
+        self.class = target;
 
         if product::always_no_udp(product) {
             // Real Battle.net never answers UDP for these, so their clients always show

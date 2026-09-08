@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cairn_core::channel::{AccountId, Channel, ChannelClass, JoinDenial};
-use cairn_core::limits::AdmissionTable;
+use cairn_core::limits::{AdmissionTable, ClientClass, Rejection};
 use cairn_core::policy::Policy;
 use cairn_proto::bncs::{encode_frame, Frame};
 use cairn_proto::chat::normalize_channel_name;
@@ -99,8 +99,10 @@ pub struct Node {
     /// Maximum users per channel.
     pub channel_max_users: usize,
     inner: Mutex<Inner>,
-    game_admission: Mutex<AdmissionTable>,
-    gateway_admission: Mutex<AdmissionTable>,
+    /// One table for every client class. Counts are keyed by `(class, address)`, so a
+    /// Brood War client and a chat-gateway bot from the same address are accounted
+    /// separately — which is the entire point of per-type limits.
+    admission: Mutex<AdmissionTable>,
     connections: AtomicU64,
 }
 
@@ -108,16 +110,15 @@ impl Node {
     /// Build a node.
     #[must_use]
     pub fn new(policy: Policy, name: String, motd: String, gateway_allowlist: Vec<IpAddr>) -> Self {
-        let mut gateway = AdmissionTable::new();
-        gateway.set_allowlist(gateway_allowlist);
+        let mut admission = AdmissionTable::new();
+        admission.set_allowlist(gateway_allowlist);
         Self {
             policy,
             name,
             motd,
             channel_max_users: 40,
             inner: Mutex::new(Inner::default()),
-            game_admission: Mutex::new(AdmissionTable::new()),
-            gateway_admission: Mutex::new(gateway),
+            admission: Mutex::new(admission),
             connections: AtomicU64::new(0),
         }
     }
@@ -128,56 +129,55 @@ impl Node {
         self.connections.load(Ordering::Relaxed)
     }
 
-    /// Admit a game-client connection.
+    /// Admit a connection of `class` from `ip`.
     ///
     /// # Errors
     ///
     /// The rejection reason, for logging and metrics.
-    pub fn admit_game(&self, ip: IpAddr) -> Result<(), cairn_core::limits::Rejection> {
+    pub fn admit(&self, class: ClientClass, ip: IpAddr) -> Result<(), Rejection> {
+        let limits = self.policy.clients.for_class(class);
         let r = self
-            .game_admission
+            .admission
             .lock()
             .expect("admission lock")
-            .admit_ip(ip, self.policy.game_limits);
+            .admit(class, ip, limits);
         if r.is_ok() {
             self.connections.fetch_add(1, Ordering::Relaxed);
         }
         r
     }
 
-    /// Admit a chat-gateway connection.
+    /// Release a connection of `class`.
+    ///
+    /// The caller must pass the class the connection currently holds, which may differ
+    /// from the one it was admitted under if it was promoted — see [`Self::reclassify`].
+    pub fn release(&self, class: ClientClass, ip: IpAddr) {
+        self.admission
+            .lock()
+            .expect("admission lock")
+            .release(class, ip);
+        self.connections.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Promote a connection once `SID_AUTH_INFO` reveals its product.
+    ///
+    /// On rejection the connection stays in its original class, so the caller can close
+    /// it without corrupting the counts.
     ///
     /// # Errors
     ///
-    /// The rejection reason, for logging and metrics.
-    pub fn admit_gateway(&self, ip: IpAddr) -> Result<(), cairn_core::limits::Rejection> {
-        let r = self
-            .gateway_admission
+    /// The rejection reason for the target class.
+    pub fn reclassify(
+        &self,
+        ip: IpAddr,
+        from: ClientClass,
+        to: ClientClass,
+    ) -> Result<(), Rejection> {
+        let limits = self.policy.clients.for_class(to);
+        self.admission
             .lock()
             .expect("admission lock")
-            .admit_ip(ip, self.policy.gateway_limits);
-        if r.is_ok() {
-            self.connections.fetch_add(1, Ordering::Relaxed);
-        }
-        r
-    }
-
-    /// Release a game-client connection.
-    pub fn release_game(&self, ip: IpAddr) {
-        self.game_admission
-            .lock()
-            .expect("admission lock")
-            .release_ip(ip);
-        self.connections.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    /// Release a chat-gateway connection.
-    pub fn release_gateway(&self, ip: IpAddr) {
-        self.gateway_admission
-            .lock()
-            .expect("admission lock")
-            .release_ip(ip);
-        self.connections.fetch_sub(1, Ordering::Relaxed);
+            .reclassify(ip, from, to, limits)
     }
 
     /// Look up an account by name, case-insensitively.
@@ -441,9 +441,9 @@ mod tests {
     fn admission_counts_are_released() {
         let n = node();
         let ip: IpAddr = "10.1.2.3".parse().unwrap();
-        n.admit_game(ip).unwrap();
+        n.admit(ClientClass::GamePending, ip).unwrap();
         assert_eq!(n.connection_count(), 1);
-        n.release_game(ip);
+        n.release(ClientClass::GamePending, ip);
         assert_eq!(n.connection_count(), 0);
     }
 
@@ -451,7 +451,24 @@ mod tests {
     fn gateway_admission_honours_the_one_per_ip_default() {
         let n = node();
         let ip: IpAddr = "10.1.2.4".parse().unwrap();
-        assert!(n.admit_gateway(ip).is_ok());
-        assert!(n.admit_gateway(ip).is_err(), "gaming mode allows one bot per IP");
+        assert!(n.admit(ClientClass::Gateway, ip).is_ok());
+        assert!(
+            n.admit(ClientClass::Gateway, ip).is_err(),
+            "the gateway is keyless, so the address is the only cost"
+        );
+        // A game client from the same address is a separate budget entirely.
+        assert!(n.admit(ClientClass::GamePending, ip).is_ok());
+    }
+
+    #[test]
+    fn a_promoted_connection_is_not_double_counted() {
+        let n = node();
+        let ip: IpAddr = "10.1.2.5".parse().unwrap();
+        n.admit(ClientClass::GamePending, ip).unwrap();
+        let target = ClientClass::Game(cairn_proto::product::SEXP);
+        n.reclassify(ip, ClientClass::GamePending, target).unwrap();
+        assert_eq!(n.connection_count(), 1);
+        n.release(target, ip);
+        assert_eq!(n.connection_count(), 0);
     }
 }

@@ -92,15 +92,33 @@ The milestone is a screenshot of Brood War sitting in a channel. Nothing else co
 
 ## Phase 4 — Diablo II realms, and hub availability
 
-- [ ] MCP gateway. Note its framing differs from BNCS — `len:u16le` first, **no** `0xFF`
-      magic. This is the single most common bug in D2 realm implementations.
-- [ ] Character storage and the realm/game-server split.
-- [ ] Decide the D2GS story. It is closed-source, Windows-only, and its port 4000 is
-      hardcoded client-side, so you cannot run two per host — realms mean containers or
-      VMs. Realms are **not federated**: a character lives in one realm's database. The
-      realm menu can be shared; the characters cannot.
+Realms run **inside `cairnd`**, not as separate daemons — see `docs/ARCHITECTURE.md` §11
+for why, including the fact that PvPGN's `d2dbs` still uses `select()` capped at
+`FD_SETSIZE` and never got the fix `bnetd` received in 2003.
+
+- [ ] MCP gateway as an in-process module. Its framing differs from BNCS — `len:u16le`
+      first, **no** `0xFF` magic. This is the single most common bug in D2 realm
+      implementations.
+- [ ] Character store behind the `Storage` trait, called as a function rather than over a
+      socket. This replaces `d2cs` **and** `d2dbs`, and the custom `bnetd`↔`d2cs` binary
+      protocol goes away with them.
+- [ ] `GameHost` trait with an `External` implementation, so operators who already run the
+      closed-source D2GS can point at it while still installing and supervising exactly
+      one binary.
+- [ ] Document the realm constraint precisely: **port 4000 is hardcoded in the client**, so
+      one realm per IP address (additional addresses are fine; additional processes on one
+      address are not). Embedding a game server would not lift this — the constraint lives
+      in the client.
+- [ ] Realms are **not federated**: a character lives in one realm's database. The realm
+      menu can be shared across nodes; the characters cannot.
 - [ ] Hub HA: active/standby over shared Postgres with a virtual IP. Do not build a
       consensus protocol for a network that will have twelve nodes.
+
+An `Embedded` `GameHost` — an actual in-process Diablo II simulation — is deliberately not
+on this roadmap. It is not a protocol problem; it is monsters, items, skills, map
+generation and save handling, which is why no open project in this ecosystem has one. The
+trait exists so that it could plug in as a module rather than a daemon, not because it is
+scheduled.
 
 ## Not scheduled, and why
 

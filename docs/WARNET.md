@@ -63,18 +63,26 @@ is what the achievement is *made of*.
 What warnet mode raises is the **global** ceiling, because a warnet legitimately carries
 far more gateway connections in total. They simply have to arrive from distinct addresses.
 
-```toml
-[limits.chat_gateway]
-per_ip       = 1        # every mode, never relaxed by a mode default
-per_account  = 1
-global       = 256      # gaming
+Every client type has its own limits, and each is configurable:
 
-[limits.chat_gateway.warnet]
-per_ip       = 1        # unchanged
-per_account  = 1        # unchanged
-global       = 2048     # the only limit that moves
-allowlist    = []       # operator's explicit exception, see below
+```toml
+[limits.clients.gateway]      # telnet / chat gateway — keyless, so the address is the cost
+per_ip      = 1               # default in every mode, including warnet
+per_account = 1
+# global defaults to 256 (gaming) / 2048 (warnet) / 1024 (both)
+
+[limits.clients.game_default] # any game product without its own entry
+per_ip      = 8               # households, LAN cafés and shared NATs are real
+
+[limits.clients.products.WAR3]
+per_ip      = 2               # WarCraft III keys are scarcer; tighten just this one
+
+[limits]
+gateway_allowlist = []        # operator's explicit exception, see below
 ```
+
+Unset fields keep their default, so `per_ip = 2` for WarCraft III does not silently reset
+that product's global ceiling.
 
 ### The stronger half: CD-key session uniqueness
 

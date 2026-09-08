@@ -6,29 +6,58 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 
+use cairn_proto::FourCc;
+
 use crate::channel::AccountId;
 use crate::policy::{ConnLimits, FloodPenalty, FloodPolicy};
 
-/// Connection classes, which have independent limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ConnClass {
-    /// A game client on the BNCS protocol.
-    Game,
-    /// A bot on the telnet/chat gateway.
+/// What kind of client a connection is, for limit purposes.
+///
+/// # Why this is two-stage
+///
+/// The protocol selector byte tells us *game vs gateway vs BNFTP* the instant a
+/// connection is accepted, but **not which game** — the product code only arrives in
+/// `SID_AUTH_INFO`, several packets later. So a game connection starts as
+/// [`Self::GamePending`] and is promoted to [`Self::Game`] via
+/// [`AdmissionTable::reclassify`] once the product is known.
+///
+/// The pending limits exist only to bound a connect flood in that window and should be
+/// at least as loose as any product's, so that reclassification never rejects a client
+/// the product itself would have allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ClientClass {
+    /// Telnet / chat gateway (`0x03`, `0x43`, `0x63`). No CD-key step exists here.
     Gateway,
-    /// A BNFTP file transfer.
+    /// BNFTP file transfer (`0x02`).
     Bnftp,
+    /// A game connection (`0x01`) whose product is not yet known.
+    GamePending,
+    /// A game client, identified by product code.
+    Game(FourCc),
+}
+
+impl ClientClass {
+    /// A short label for logs and metrics.
+    #[must_use]
+    pub fn label(self) -> String {
+        match self {
+            Self::Gateway => "gateway".into(),
+            Self::Bnftp => "bnftp".into(),
+            Self::GamePending => "game:pending".into(),
+            Self::Game(p) => format!("game:{p}"),
+        }
+    }
 }
 
 /// Why a connection was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rejection {
-    /// Too many concurrent connections from this address.
+    /// Too many concurrent connections of this class from this address.
     PerIp {
         /// The configured ceiling.
         limit: u32,
     },
-    /// Too many concurrent connections for this account.
+    /// Too many concurrent connections of this class for this account.
     PerAccount {
         /// The configured ceiling.
         limit: u32,
@@ -40,13 +69,16 @@ pub enum Rejection {
     },
 }
 
-/// Tracks concurrent connections per address, per account, and in total.
+/// Tracks concurrent connections per client class, address, and account.
 ///
-/// One instance per connection class.
+/// One instance per node. Counts are keyed by `(class, address)` so that a Brood War
+/// client and a chat-gateway bot from the same address are accounted separately — which
+/// is the whole point of per-type limits.
 #[derive(Debug, Default)]
 pub struct AdmissionTable {
-    per_ip: HashMap<IpAddr, u32>,
-    per_account: HashMap<AccountId, u32>,
+    per_ip: HashMap<(ClientClass, IpAddr), u32>,
+    per_account: HashMap<(ClientClass, AccountId), u32>,
+    per_class: HashMap<ClientClass, u32>,
     total: u32,
     allowlist: Vec<IpAddr>,
 }
@@ -58,107 +90,173 @@ impl AdmissionTable {
         Self::default()
     }
 
-    /// Addresses exempt from the per-IP ceiling.
+    /// Addresses exempt from **per-IP** ceilings.
     ///
-    /// A warnet operator's known bot hosts belong here; the per-account ceiling still
-    /// applies to them, which is the bound that actually matters.
+    /// An operator's own bot host belongs here. Global and per-account ceilings still
+    /// apply, and so does the CD-key registry — the operator can waive the address cost,
+    /// not the key cost.
     pub fn set_allowlist(&mut self, ips: Vec<IpAddr>) {
         self.allowlist = ips;
     }
 
-    /// Current connections from an address.
+    /// Current connections of a class from an address.
     #[must_use]
-    pub fn ip_count(&self, ip: IpAddr) -> u32 {
-        self.per_ip.get(&ip).copied().unwrap_or(0)
+    pub fn ip_count(&self, class: ClientClass, ip: IpAddr) -> u32 {
+        self.per_ip.get(&(class, ip)).copied().unwrap_or(0)
     }
 
-    /// Current connections for an account.
+    /// Current connections of a class for an account.
     #[must_use]
-    pub fn account_count(&self, account: AccountId) -> u32 {
-        self.per_account.get(&account).copied().unwrap_or(0)
+    pub fn account_count(&self, class: ClientClass, account: AccountId) -> u32 {
+        self.per_account
+            .get(&(class, account))
+            .copied()
+            .unwrap_or(0)
     }
 
-    /// Total connections of this class.
+    /// Current connections of a class, server-wide.
+    #[must_use]
+    pub fn class_count(&self, class: ClientClass) -> u32 {
+        self.per_class.get(&class).copied().unwrap_or(0)
+    }
+
+    /// Total live connections across every class.
     #[must_use]
     pub const fn total(&self) -> u32 {
         self.total
     }
 
-    /// Admit a connection from `ip`, or explain why not.
-    ///
-    /// Checked at accept time, before a single byte is read, so an address spraying
-    /// connections costs us one `accept` and one hash lookup each.
-    ///
-    /// # Errors
-    ///
-    /// [`Rejection`] naming the ceiling that was hit.
-    pub fn admit_ip(&mut self, ip: IpAddr, limits: ConnLimits) -> Result<(), Rejection> {
-        if self.total >= limits.global {
+    fn would_admit(
+        &self,
+        class: ClientClass,
+        ip: IpAddr,
+        limits: ConnLimits,
+    ) -> Result<(), Rejection> {
+        if self.class_count(class) >= limits.global {
             return Err(Rejection::Global {
                 limit: limits.global,
             });
         }
-        if !self.allowlist.contains(&ip) {
-            let n = self.ip_count(ip);
-            if n >= limits.per_ip {
-                return Err(Rejection::PerIp {
-                    limit: limits.per_ip,
-                });
-            }
+        if !self.allowlist.contains(&ip) && self.ip_count(class, ip) >= limits.per_ip {
+            return Err(Rejection::PerIp {
+                limit: limits.per_ip,
+            });
         }
-        *self.per_ip.entry(ip).or_insert(0) += 1;
-        self.total += 1;
         Ok(())
     }
 
-    /// Release a connection previously admitted from `ip`.
-    pub fn release_ip(&mut self, ip: IpAddr) {
-        if let Some(n) = self.per_ip.get_mut(&ip) {
+    fn add(&mut self, class: ClientClass, ip: IpAddr) {
+        *self.per_ip.entry((class, ip)).or_insert(0) += 1;
+        *self.per_class.entry(class).or_insert(0) += 1;
+        self.total += 1;
+    }
+
+    fn remove(&mut self, class: ClientClass, ip: IpAddr) {
+        if let Some(n) = self.per_ip.get_mut(&(class, ip)) {
             *n = n.saturating_sub(1);
             if *n == 0 {
-                self.per_ip.remove(&ip);
+                self.per_ip.remove(&(class, ip));
+            }
+        }
+        if let Some(n) = self.per_class.get_mut(&class) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.per_class.remove(&class);
             }
         }
         self.total = self.total.saturating_sub(1);
     }
 
-    /// Bind an authenticated account to a connection.
+    /// Admit a connection of `class` from `ip`, or explain why not.
     ///
-    /// Separate from [`Self::admit_ip`] because the account is unknown at accept time.
+    /// Checked at accept time, before a byte is read, so an address spraying connections
+    /// costs one `accept` and two hash lookups each.
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection`] naming the ceiling that was hit.
+    pub fn admit(
+        &mut self,
+        class: ClientClass,
+        ip: IpAddr,
+        limits: ConnLimits,
+    ) -> Result<(), Rejection> {
+        self.would_admit(class, ip, limits)?;
+        self.add(class, ip);
+        Ok(())
+    }
+
+    /// Release a connection previously admitted.
+    pub fn release(&mut self, class: ClientClass, ip: IpAddr) {
+        self.remove(class, ip);
+    }
+
+    /// Promote a connection from one class to another once more is known about it.
+    ///
+    /// Used when `SID_AUTH_INFO` reveals the product: the connection moves from
+    /// [`ClientClass::GamePending`] to [`ClientClass::Game`] and is re-checked against
+    /// that product's limits.
+    ///
+    /// On rejection the connection **stays in its original class** so the caller can
+    /// close it cleanly without corrupting the counts.
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection`] if the target class is already at a ceiling.
+    pub fn reclassify(
+        &mut self,
+        ip: IpAddr,
+        from: ClientClass,
+        to: ClientClass,
+        to_limits: ConnLimits,
+    ) -> Result<(), Rejection> {
+        if from == to {
+            return Ok(());
+        }
+        self.would_admit(to, ip, to_limits)?;
+        self.remove(from, ip);
+        self.add(to, ip);
+        Ok(())
+    }
+
+    /// Bind an authenticated account to a connection of this class.
+    ///
+    /// Separate from [`Self::admit`] because the account is unknown at accept time.
     ///
     /// # Errors
     ///
     /// [`Rejection::PerAccount`] when the account already holds its maximum.
     pub fn bind_account(
         &mut self,
+        class: ClientClass,
         account: AccountId,
         limits: ConnLimits,
     ) -> Result<(), Rejection> {
-        if self.account_count(account) >= limits.per_account {
+        if self.account_count(class, account) >= limits.per_account {
             return Err(Rejection::PerAccount {
                 limit: limits.per_account,
             });
         }
-        *self.per_account.entry(account).or_insert(0) += 1;
+        *self.per_account.entry((class, account)).or_insert(0) += 1;
         Ok(())
     }
 
     /// Release an account binding.
-    pub fn release_account(&mut self, account: AccountId) {
-        if let Some(n) = self.per_account.get_mut(&account) {
+    pub fn release_account(&mut self, class: ClientClass, account: AccountId) {
+        if let Some(n) = self.per_account.get_mut(&(class, account)) {
             *n = n.saturating_sub(1);
             if *n == 0 {
-                self.per_account.remove(&account);
+                self.per_account.remove(&(class, account));
             }
         }
     }
 
-    /// Number of distinct addresses currently tracked.
+    /// Number of `(class, address)` pairs currently tracked.
     ///
-    /// Exposed because unbounded growth here would be a slow leak; the invariant is that
-    /// it returns to zero when every connection closes.
+    /// Unbounded growth here would be a slow leak; the invariant is that it returns to
+    /// zero when every connection closes.
     #[must_use]
-    pub fn tracked_addresses(&self) -> usize {
+    pub fn tracked_entries(&self) -> usize {
         self.per_ip.len()
     }
 }
@@ -185,7 +283,6 @@ pub struct FloodTracker {
     per_10s: u64,
     last_ms: u64,
     penalty: FloodPenalty,
-    /// Total messages suppressed, for metrics.
     suppressed: u64,
 }
 
@@ -257,16 +354,19 @@ pub enum KeyVerdict {
 
 /// One live session per CD key.
 ///
-/// **This is the real economic gate on bot fleets.** Addresses are cheap to rent; keys
-/// are not. A per-IP limit can be sidestepped by anyone with a handful of proxies, but
-/// running twenty simultaneous bots genuinely requires twenty keys if the server
-/// enforces uniqueness — which is exactly why real Battle.net answers `SID_AUTH_CHECK`
+/// **This is the real economic gate on game-client bot fleets.** Addresses are cheap to
+/// rent; keys are not. A per-IP limit alone is sidestepped by anyone with a handful of
+/// proxies, but running twenty simultaneous bots genuinely requires twenty keys if the
+/// server enforces uniqueness — which is why real Battle.net answers `SID_AUTH_CHECK`
 /// with `0x201` "CD key in use" and names the holder.
 ///
-/// The cooldown reproduces a real Battle.net quirk that clients and bots already expect:
-/// a key stays marked in use for a short window after a session ends, so reconnecting
-/// too fast reports "key in use" rather than succeeding. Replicating it means bots
-/// written against real Battle.net behave identically here.
+/// Note that this does **not** apply to the telnet/chat gateway, which has no CD-key step
+/// at all. There the address is the only cost available to charge, which is why the
+/// gateway is capped at one connection per address in every mode.
+///
+/// The cooldown reproduces a real Battle.net quirk that bots already expect: a key stays
+/// marked in use for a short window after a session ends, so reconnecting too fast
+/// reports "key in use" rather than succeeding.
 #[derive(Debug)]
 pub struct KeyRegistry {
     active: HashMap<KeyId, AccountId>,
@@ -346,124 +446,249 @@ impl KeyRegistry {
 mod tests {
     use super::*;
     use crate::policy::{Policy, ServerMode};
+    use cairn_proto::product;
     use std::net::Ipv4Addr;
 
     fn ip(n: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(10, 0, 0, n))
     }
 
+    fn gateway_limits(mode: ServerMode) -> ConnLimits {
+        Policy::for_mode(mode).clients.gateway
+    }
+
     #[test]
-    fn gateway_defaults_to_one_connection_per_ip_when_gaming() {
-        let limits = Policy::for_mode(ServerMode::Gaming).gateway_limits;
+    fn the_gateway_is_one_per_ip() {
+        let limits = gateway_limits(ServerMode::Gaming);
         let mut t = AdmissionTable::new();
-        assert!(t.admit_ip(ip(1), limits).is_ok());
+        assert!(t.admit(ClientClass::Gateway, ip(1), limits).is_ok());
         assert_eq!(
-            t.admit_ip(ip(1), limits),
+            t.admit(ClientClass::Gateway, ip(1), limits),
             Err(Rejection::PerIp { limit: 1 })
         );
-        // A different address is unaffected.
-        assert!(t.admit_ip(ip(2), limits).is_ok());
+        assert!(t.admit(ClientClass::Gateway, ip(2), limits).is_ok());
     }
 
     #[test]
-    fn a_bot_fleet_costs_one_address_per_bot_even_on_a_warnet() {
-        // The entry cost, stated as a test: twenty bots means twenty addresses. Warnet
-        // mode does not relax this — it only raises the global ceiling.
-        let limits = Policy::for_mode(ServerMode::Warnet).gateway_limits;
+    fn a_gateway_bot_fleet_costs_one_address_per_bot_even_on_a_warnet() {
+        // The entry cost, stated as a test. The gateway is keyless, so the address is
+        // the only cost available to charge — and warnet mode does not waive it.
+        let limits = gateway_limits(ServerMode::Warnet);
         let mut t = AdmissionTable::new();
-        assert!(t.admit_ip(ip(1), limits).is_ok());
+        assert!(t.admit(ClientClass::Gateway, ip(1), limits).is_ok());
         assert_eq!(
-            t.admit_ip(ip(1), limits),
-            Err(Rejection::PerIp { limit: 1 }),
-            "a second bot from the same address must be refused"
+            t.admit(ClientClass::Gateway, ip(1), limits),
+            Err(Rejection::PerIp { limit: 1 })
         );
-        // Twenty bots from twenty addresses is fine.
         for i in 2..=21u8 {
-            assert!(t.admit_ip(ip(i), limits).is_ok(), "bot {i} refused");
+            assert!(t.admit(ClientClass::Gateway, ip(i), limits).is_ok());
         }
-        assert_eq!(t.total(), 21);
+        assert_eq!(t.class_count(ClientClass::Gateway), 21);
     }
 
     #[test]
-    fn the_allowlist_is_the_operators_deliberate_exception() {
-        // The escape hatch exists, but it is an explicit act by the server owner for a
-        // named host — never a mode default that quietly makes every fleet free.
-        let limits = Policy::for_mode(ServerMode::Warnet).gateway_limits;
+    fn game_clients_are_not_subject_to_the_gateway_cap() {
+        // A household or LAN café shares one address across several real players.
+        let p = Policy::for_mode(ServerMode::Gaming);
+        let game = p.clients.for_class(ClientClass::Game(product::SEXP));
         let mut t = AdmissionTable::new();
-        assert!(t.admit_ip(ip(9), limits).is_ok());
-        assert!(t.admit_ip(ip(9), limits).is_err());
-
-        let mut t = AdmissionTable::new();
-        t.set_allowlist(vec![ip(9)]);
-        for _ in 0..20 {
-            assert!(t.admit_ip(ip(9), limits).is_ok());
+        for i in 0..game.per_ip {
+            assert!(
+                t.admit(ClientClass::Game(product::SEXP), ip(1), game).is_ok(),
+                "player {i} from a shared address refused"
+            );
         }
+        // And a gateway bot from that same address is counted separately.
+        assert!(t
+            .admit(ClientClass::Gateway, ip(1), p.clients.gateway)
+            .is_ok());
+    }
+
+    #[test]
+    fn classes_are_counted_independently() {
+        let p = Policy::for_mode(ServerMode::Gaming);
+        let mut t = AdmissionTable::new();
+        t.admit(ClientClass::Gateway, ip(1), p.clients.gateway).unwrap();
+        t.admit(
+            ClientClass::Game(product::SEXP),
+            ip(1),
+            p.clients.game_default,
+        )
+        .unwrap();
+        t.admit(ClientClass::Bnftp, ip(1), p.clients.bnftp).unwrap();
+        assert_eq!(t.ip_count(ClientClass::Gateway, ip(1)), 1);
+        assert_eq!(t.ip_count(ClientClass::Game(product::SEXP), ip(1)), 1);
+        assert_eq!(t.ip_count(ClientClass::Bnftp, ip(1)), 1);
+        assert_eq!(t.total(), 3);
+    }
+
+    #[test]
+    fn products_are_limited_separately_from_each_other() {
+        // An operator may allow eight Brood War from a café but only two WarCraft III.
+        let mut p = Policy::for_mode(ServerMode::Gaming);
+        p.clients.set_product(
+            product::WAR3,
+            ConnLimits {
+                per_ip: 2,
+                per_account: 1,
+                global: 512,
+            },
+        );
+        let mut t = AdmissionTable::new();
+        let w3 = p.clients.for_class(ClientClass::Game(product::WAR3));
+        let bw = p.clients.for_class(ClientClass::Game(product::SEXP));
+
+        t.admit(ClientClass::Game(product::WAR3), ip(1), w3).unwrap();
+        t.admit(ClientClass::Game(product::WAR3), ip(1), w3).unwrap();
+        assert_eq!(
+            t.admit(ClientClass::Game(product::WAR3), ip(1), w3),
+            Err(Rejection::PerIp { limit: 2 })
+        );
+        // Brood War from the same address is unaffected by WarCraft III's ceiling.
+        for _ in 0..bw.per_ip {
+            assert!(t.admit(ClientClass::Game(product::SEXP), ip(1), bw).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_pending_connection_is_promoted_once_the_product_is_known() {
+        let p = Policy::for_mode(ServerMode::Gaming);
+        let mut t = AdmissionTable::new();
+        t.admit(ClientClass::GamePending, ip(1), p.clients.game_pending)
+            .unwrap();
+        assert_eq!(t.class_count(ClientClass::GamePending), 1);
+
+        let target = ClientClass::Game(product::SEXP);
+        t.reclassify(
+            ip(1),
+            ClientClass::GamePending,
+            target,
+            p.clients.for_class(target),
+        )
+        .unwrap();
+        assert_eq!(t.class_count(ClientClass::GamePending), 0);
+        assert_eq!(t.class_count(target), 1);
+        assert_eq!(t.total(), 1, "promotion must not double-count");
+    }
+
+    #[test]
+    fn a_rejected_promotion_leaves_the_connection_in_its_original_class() {
+        // Otherwise a refused reclassification corrupts the counts and slowly leaks.
+        let mut p = Policy::for_mode(ServerMode::Gaming);
+        p.clients.set_product(
+            product::WAR3,
+            ConnLimits {
+                per_ip: 1,
+                per_account: 1,
+                global: 512,
+            },
+        );
+        let w3 = ClientClass::Game(product::WAR3);
+        let w3_limits = p.clients.for_class(w3);
+        let mut t = AdmissionTable::new();
+
+        t.admit(w3, ip(1), w3_limits).unwrap();
+        t.admit(ClientClass::GamePending, ip(1), p.clients.game_pending)
+            .unwrap();
+        assert_eq!(
+            t.reclassify(ip(1), ClientClass::GamePending, w3, w3_limits),
+            Err(Rejection::PerIp { limit: 1 })
+        );
+        assert_eq!(t.class_count(ClientClass::GamePending), 1);
+        assert_eq!(t.class_count(w3), 1);
+        assert_eq!(t.total(), 2);
+
+        // And releasing the pending connection still balances the books.
+        t.release(ClientClass::GamePending, ip(1));
+        t.release(w3, ip(1));
+        assert_eq!(t.total(), 0);
+        assert_eq!(t.tracked_entries(), 0);
+    }
+
+    #[test]
+    fn reclassify_to_the_same_class_is_a_no_op() {
+        let p = Policy::for_mode(ServerMode::Gaming);
+        let c = ClientClass::Game(product::SEXP);
+        let mut t = AdmissionTable::new();
+        t.admit(c, ip(1), p.clients.game_default).unwrap();
+        t.reclassify(ip(1), c, c, p.clients.game_default).unwrap();
+        assert_eq!(t.total(), 1);
     }
 
     #[test]
     fn releasing_frees_a_slot_and_leaks_nothing() {
-        let limits = Policy::for_mode(ServerMode::Gaming).gateway_limits;
+        let limits = gateway_limits(ServerMode::Gaming);
         let mut t = AdmissionTable::new();
-        t.admit_ip(ip(1), limits).unwrap();
-        assert_eq!(t.tracked_addresses(), 1);
-        t.release_ip(ip(1));
-        assert_eq!(t.ip_count(ip(1)), 0);
+        t.admit(ClientClass::Gateway, ip(1), limits).unwrap();
+        assert_eq!(t.tracked_entries(), 1);
+        t.release(ClientClass::Gateway, ip(1));
+        assert_eq!(t.ip_count(ClientClass::Gateway, ip(1)), 0);
         assert_eq!(t.total(), 0);
-        assert_eq!(
-            t.tracked_addresses(),
-            0,
-            "the address entry must be reclaimed, not left at zero"
-        );
-        assert!(t.admit_ip(ip(1), limits).is_ok());
+        assert_eq!(t.tracked_entries(), 0, "entries must be reclaimed");
+        assert!(t.admit(ClientClass::Gateway, ip(1), limits).is_ok());
     }
 
     #[test]
     fn churn_does_not_grow_the_table() {
-        let limits = Policy::for_mode(ServerMode::Gaming).gateway_limits;
+        let limits = gateway_limits(ServerMode::Gaming);
         let mut t = AdmissionTable::new();
         for i in 0..5_000u32 {
             let addr = IpAddr::V4(Ipv4Addr::from(i.to_be_bytes()));
-            t.admit_ip(addr, limits).unwrap();
-            t.release_ip(addr);
+            t.admit(ClientClass::Gateway, addr, limits).unwrap();
+            t.release(ClientClass::Gateway, addr);
         }
-        assert_eq!(t.tracked_addresses(), 0);
+        assert_eq!(t.tracked_entries(), 0);
         assert_eq!(t.total(), 0);
+        assert_eq!(t.class_count(ClientClass::Gateway), 0);
     }
 
     #[test]
-    fn the_allowlist_exempts_per_ip_only() {
-        let limits = Policy::for_mode(ServerMode::Gaming).gateway_limits;
+    fn the_allowlist_is_the_operators_deliberate_exception() {
+        let limits = gateway_limits(ServerMode::Warnet);
         let mut t = AdmissionTable::new();
-        t.set_allowlist(vec![ip(7)]);
-        for _ in 0..50 {
-            assert!(t.admit_ip(ip(7), limits).is_ok());
+        assert!(t.admit(ClientClass::Gateway, ip(9), limits).is_ok());
+        assert!(t.admit(ClientClass::Gateway, ip(9), limits).is_err());
+
+        let mut t = AdmissionTable::new();
+        t.set_allowlist(vec![ip(9)]);
+        for _ in 0..20 {
+            assert!(t.admit(ClientClass::Gateway, ip(9), limits).is_ok());
         }
-        // The global ceiling still applies to allowlisted hosts.
+        // The class ceiling still applies to allowlisted hosts.
         let tight = ConnLimits {
             per_ip: 1,
             per_account: 1,
-            global: 50,
+            global: 20,
         };
-        assert_eq!(t.admit_ip(ip(7), tight), Err(Rejection::Global { limit: 50 }));
+        assert_eq!(
+            t.admit(ClientClass::Gateway, ip(9), tight),
+            Err(Rejection::Global { limit: 20 })
+        );
     }
 
     #[test]
-    fn per_account_limits_are_independent_of_address() {
-        // The bound that actually matters in a warnet: one identity, many addresses.
-        let limits = Policy::for_mode(ServerMode::Warnet).gateway_limits;
+    fn per_account_limits_are_independent_of_address_and_class() {
+        let p = Policy::for_mode(ServerMode::Gaming);
         let mut t = AdmissionTable::new();
-        for i in 0..limits.per_account {
-            t.admit_ip(ip(i as u8), limits).unwrap();
-            assert!(t.bind_account(42, limits).is_ok());
-        }
+        assert!(t
+            .bind_account(ClientClass::Gateway, 42, p.clients.gateway)
+            .is_ok());
         assert_eq!(
-            t.bind_account(42, limits),
-            Err(Rejection::PerAccount {
-                limit: limits.per_account
-            })
+            t.bind_account(ClientClass::Gateway, 42, p.clients.gateway),
+            Err(Rejection::PerAccount { limit: 1 })
         );
-        t.release_account(42);
-        assert!(t.bind_account(42, limits).is_ok());
+        // The same account on a game client is a separate budget.
+        assert!(t
+            .bind_account(
+                ClientClass::Game(product::SEXP),
+                42,
+                p.clients.game_default
+            )
+            .is_ok());
+        t.release_account(ClientClass::Gateway, 42);
+        assert!(t
+            .bind_account(ClientClass::Gateway, 42, p.clients.gateway)
+            .is_ok());
     }
 
     #[test]
@@ -474,9 +699,19 @@ mod tests {
             global: 2,
         };
         let mut t = AdmissionTable::new();
-        t.admit_ip(ip(1), limits).unwrap();
-        t.admit_ip(ip(2), limits).unwrap();
-        assert_eq!(t.admit_ip(ip(3), limits), Err(Rejection::Global { limit: 2 }));
+        t.admit(ClientClass::Gateway, ip(1), limits).unwrap();
+        t.admit(ClientClass::Gateway, ip(2), limits).unwrap();
+        assert_eq!(
+            t.admit(ClientClass::Gateway, ip(3), limits),
+            Err(Rejection::Global { limit: 2 })
+        );
+    }
+
+    #[test]
+    fn class_labels_are_readable() {
+        assert_eq!(ClientClass::Gateway.label(), "gateway");
+        assert_eq!(ClientClass::Game(product::SEXP).label(), "game:SEXP");
+        assert_eq!(ClientClass::GamePending.label(), "game:pending");
     }
 
     #[test]
@@ -490,10 +725,7 @@ mod tests {
         for i in 0..5 {
             assert_eq!(f.check(0), FloodVerdict::Allow, "burst message {i}");
         }
-        assert_eq!(
-            f.check(0),
-            FloodVerdict::Exceeded(FloodPenalty::DropMessage)
-        );
+        assert_eq!(f.check(0), FloodVerdict::Exceeded(FloodPenalty::DropMessage));
         assert_eq!(f.suppressed(), 1);
     }
 
@@ -509,7 +741,6 @@ mod tests {
             f.check(0);
         }
         assert!(matches!(f.check(0), FloodVerdict::Exceeded(_)));
-        // One second later, exactly one token is back.
         assert_eq!(f.check(1000), FloodVerdict::Allow);
         assert!(matches!(f.check(1000), FloodVerdict::Exceeded(_)));
     }
@@ -531,15 +762,11 @@ mod tests {
 
     #[test]
     fn a_warnet_bot_pace_is_within_budget() {
-        // 20 messages/second sustained, which a war bot genuinely does.
         let policy = Policy::for_mode(ServerMode::Warnet).gateway_flood;
         let mut f = FloodTracker::new(policy, 0);
-        let mut allowed = 0;
-        for i in 0..200u64 {
-            if f.check(i * 50) == FloodVerdict::Allow {
-                allowed += 1;
-            }
-        }
+        let allowed = (0..200u64)
+            .filter(|i| f.check(i * 50) == FloodVerdict::Allow)
+            .count();
         assert_eq!(allowed, 200, "warnet policy must not throttle a normal bot");
     }
 
@@ -563,7 +790,7 @@ mod tests {
         let mut f = FloodTracker::new(policy, 10_000);
         f.check(10_000);
         f.check(10_000);
-        // Time travels backwards (NTP step, or a federated node with a bad clock).
+        // Time travels backwards (NTP step, or a node with a bad clock).
         assert!(matches!(f.check(0), FloodVerdict::Exceeded(_)));
     }
 
@@ -573,37 +800,27 @@ mod tests {
 
     #[test]
     fn a_key_can_only_be_live_once() {
-        // The gate that actually makes a fleet expensive: addresses are cheap, keys are
-        // not. Twenty simultaneous bots requires twenty keys.
         let mut r = KeyRegistry::new(500);
         assert_eq!(r.claim(key(1), 100, 0), KeyVerdict::Ok);
         assert_eq!(r.claim(key(1), 200, 0), KeyVerdict::InUse { by: 100 });
-        // A different key is unaffected.
         assert_eq!(r.claim(key(2), 200, 0), KeyVerdict::Ok);
         assert_eq!(r.active_count(), 2);
     }
 
     #[test]
-    fn twenty_bots_needs_twenty_keys() {
+    fn twenty_game_bots_needs_twenty_keys() {
         let mut r = KeyRegistry::new(500);
         for i in 1..=20u8 {
             assert_eq!(r.claim(key(i), u64::from(i), 0), KeyVerdict::Ok);
         }
         assert_eq!(r.active_count(), 20);
-        // Reusing any of them for a 21st bot fails.
         for i in 1..=20u8 {
-            assert!(matches!(
-                r.claim(key(i), 999, 0),
-                KeyVerdict::InUse { .. }
-            ));
+            assert!(matches!(r.claim(key(i), 999, 0), KeyVerdict::InUse { .. }));
         }
     }
 
     #[test]
     fn a_released_key_stays_in_use_through_the_cooldown() {
-        // Real Battle.net reports "key in use" if you reconnect within ~500 ms. Bots are
-        // written against that behaviour, so we reproduce it rather than being subtly
-        // faster and confusing them.
         let mut r = KeyRegistry::new(500);
         r.claim(key(1), 100, 1_000);
         r.release(key(1), 1_000);
@@ -633,8 +850,6 @@ mod tests {
 
     #[test]
     fn cooldown_entries_do_not_accumulate() {
-        // A long-running server churns through millions of sessions; the cooldown map
-        // must track live churn, not the whole history.
         let mut r = KeyRegistry::new(500);
         for i in 0..2_000u64 {
             let k = KeyId([(i % 251) as u8; 20]);

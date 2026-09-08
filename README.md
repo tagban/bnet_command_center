@@ -130,10 +130,28 @@ hub = "hub.example.net:7112"
 own "game type currently unavailable" message), returns an empty game list, does not bind
 the realm or WarCraft III listeners, and switches channel ordering to hub-sequenced.
 
-It does **not** relax the one-bot-per-IP cap — that cap is the entry cost for a fleet, and
-together with CD-key session uniqueness it means N simultaneous bots requires N keys and N
-addresses. Only the global ceiling rises. `docs/WARNET.md` §2 has the reasoning and the
-complete matrix.
+It does **not** relax the one-bot-per-IP cap on the telnet/chat gateway. That cap is the
+entry cost for a fleet: the gateway has no CD-key step, so the address is the only cost
+available to charge, and together with CD-key session uniqueness on the game path it means
+N simultaneous bots requires N keys and N addresses. Only the global ceiling rises.
+
+Every client type is limited independently and every limit is configurable — the gateway,
+BNFTP, a default for game clients, and per-product overrides:
+
+```toml
+[limits.clients.gateway]
+per_ip = 1                     # keyless path, so the address is the cost
+
+[limits.clients.game_default]
+per_ip = 8                     # households and LAN cafés are real
+
+[limits.clients.products.WAR3]
+per_ip = 2                     # tighten one product without touching the rest
+```
+
+The product only arrives in `SID_AUTH_INFO`, so a game connection is admitted under a
+pending class and promoted once it identifies itself. `docs/WARNET.md` §2 has the reasoning
+and the complete matrix.
 
 ---
 

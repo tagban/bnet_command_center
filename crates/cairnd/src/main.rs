@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cairn_core::policy::Policy;
 use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
@@ -81,7 +80,7 @@ fn main() -> std::process::ExitCode {
 
 async fn run(cfg: Config) -> Result<(), String> {
     let mode = cfg.server.parsed_mode()?;
-    let policy = Policy::for_mode(mode);
+    let policy = cfg.policy()?;
 
     let fd_limit = file_descriptor_limit();
     let max_connections = cfg.effective_max_connections(fd_limit);
@@ -95,7 +94,8 @@ async fn run(cfg: Config) -> Result<(), String> {
         max_connections,
         game_hosting = ?policy.game_hosting,
         chat_ordering = ?policy.chat_ordering,
-        gateway_per_ip = policy.gateway_limits.per_ip,
+        gateway_per_ip = policy.clients.gateway.per_ip,
+        game_per_ip = policy.clients.game_default.per_ip,
         "starting cairnd"
     );
     if max_connections < 2000 {
@@ -109,7 +109,7 @@ async fn run(cfg: Config) -> Result<(), String> {
     }
 
     let node = Arc::new(Node::new(
-        policy,
+        policy.clone(),
         cfg.server.name.clone(),
         cfg.server.motd.clone(),
         cfg.limits.gateway_allowlist.clone(),

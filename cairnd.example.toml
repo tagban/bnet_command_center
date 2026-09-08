@@ -54,10 +54,49 @@ outbound_queue = 64
 handshake_timeout_secs = 30
 idle_timeout_secs = 1200
 
-# Addresses exempt from the per-IP chat-gateway ceiling. Use this for known bot hosts on
-# a warnet; the per-account ceiling still applies to them, and that is the bound that
-# actually matters — IP limits only inconvenience the honest.
+# Addresses exempt from per-IP ceilings. Use this for your own bot host. Global and
+# per-account ceilings still apply, and so does CD-key uniqueness — you can waive the
+# address cost, not the key cost.
 gateway_allowlist = []
+
+# --- Per-client-type connection limits -------------------------------------------------
+#
+# Each client type is limited independently, because they cost their operator different
+# things. Unset fields keep their default, so changing per_ip does not reset global.
+
+# Telnet / chat gateway. There is no CD-key step in this protocol at all, so a gateway bot
+# needs an account and nothing else — the address is the only cost available to charge,
+# and it is charged. One per address, in every mode. Twenty gateway bots means twenty
+# addresses, and that is the point.
+[limits.clients.gateway]
+per_ip = 1
+per_account = 1
+# global = 256      # 2048 in warnet mode, 1024 in both
+
+# BNFTP file transfer. Not a bot path; clients fetch icons.bni, tos.txt and patch MPQs.
+[limits.clients.bnftp]
+per_ip = 4
+
+# Fallback for any game product without its own entry below. Deliberately loose: game
+# clients already pay in CD keys, and one household, LAN café or shared NAT carries
+# several legitimate players.
+[limits.clients.game_default]
+per_ip = 8
+per_account = 2
+
+# Game connections between accept and SID_AUTH_INFO, before the product is known. This
+# only bounds a connect flood; it is widened automatically if you set a product looser.
+[limits.clients.game_pending]
+per_ip = 16
+
+# Per-product overrides, keyed by the four-character product code. STAR SEXP SSHR JSTR
+# DRTL DSHR W2BN D2DV D2XP WAR3 W3XP.
+#
+# [limits.clients.products.WAR3]
+# per_ip = 2                     # WarCraft III keys are scarcer than Brood War keys
+#
+# [limits.clients.products.SEXP]
+# per_ip = 12                    # a café full of Brood War is fine
 
 [federation]
 # A standalone node is a valid deployment. Leave this false until you have a hub.
