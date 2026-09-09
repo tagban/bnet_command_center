@@ -5,6 +5,7 @@
 mod config;
 mod node;
 mod session;
+mod storage;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -108,11 +109,26 @@ async fn run(cfg: Config) -> Result<(), String> {
         );
     }
 
+    let storage_backend: Box<dyn bnetcc_storage::Storage + Send> = if cfg.storage.path.is_empty()
+    {
+        warn!(
+            "no storage.path configured; accounts are in-memory only and will not \
+             survive a restart"
+        );
+        Box::new(bnetcc_storage::memory::MemoryStorage::new())
+    } else {
+        bnetcc_storage_sqlite::SqliteStorage::open(std::path::Path::new(&cfg.storage.path))
+            .map(|s| Box::new(s) as Box<dyn bnetcc_storage::Storage + Send>)
+            .map_err(|e| format!("cannot open storage.path {}: {e}", cfg.storage.path))?
+    };
+    let storage = storage::spawn(storage_backend);
+
     let node = Arc::new(Node::new(
         policy.clone(),
         cfg.server.name.clone(),
         cfg.server.motd.clone(),
         cfg.limits.gateway_allowlist.clone(),
+        storage,
     ));
 
     let limits = SessionLimits {

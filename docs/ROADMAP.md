@@ -26,26 +26,30 @@ team for this project?".
 - **`bnetcc-storage`** — `Storage` trait, per-key attribute ACLs, write-behind batching with
   a tested durability contract, in-memory reference backend, and a conformance suite every
   backend must pass. Zero dependencies.
-- **`bnetcc-storage-sqlite`** — SQLite backend with migrations. Written; excluded from the
-  workspace pending `rusqlite`.
-- **`bnetccd`** — node daemon. Written; excluded pending `tokio`.
-- **`crates/smoke`** — real handshake over real sockets at 4,000 concurrent connections.
-- 227 tests, `clippy -D warnings` clean.
+- **`bnetcc-storage-sqlite`** — SQLite backend with migrations. Built and tested as of
+  2026-09-08; two real bugs found by that first compile (ban precedence, a stale write
+  blocking the rest of a flush batch) and fixed — see `docs/HANDOFF.md` §2.
+- **`bnetccd`** — node daemon. Built and tested as of 2026-09-08; part of the workspace.
+- **`crates/smoke`** — real handshake over real sockets, thread-per-connection (client and
+  server side), sized to whatever the host's thread ceiling can sustain.
+- Full workspace builds, tests, and lints (`clippy -D warnings`) clean.
 
 ## Phase 1 — A single-node gaming server a real client can use
 
 The milestone is a screenshot of Brood War sitting in a channel. Nothing else counts.
 
-- [ ] **Resolve dependencies and build `bnetccd` and `bnetcc-storage-sqlite`.** Both are
-      written and excluded only because `crates.io` was unreachable where this was
-      authored. Add them to `members`, build, fix what the compiler finds.
+- [x] **Resolve dependencies and build `bnetccd` and `bnetcc-storage-sqlite`.** Done
+      2026-09-08 — both compiled clean on the first real attempt.
 - [ ] **Test against a real client.** Expect surprises; `docs/PROTOCOL-NOTES.md` marks each
       with ⚠️ or 🛑. The likeliest: the zero-game `SID_GETADVLISTEX` shape, four-character
       code byte order, the BNI code-list-when-flags-are-set question, and the ad extension
       tag's wire bytes.
-- [ ] **Wire storage into `bnetccd`** behind the actor: a bounded channel to a dedicated
-      thread, `WriteBehind` on top, `AttrSchema::filter_readable` on every client-facing
-      read path.
+- [x] **Wire account storage into `bnetccd`** — done 2026-09-08. A dedicated thread
+      (`bnetccd::storage`) owns the `Storage` backend and is reached over a channel;
+      `SID_CREATEACCOUNT2`/`SID_LOGONRESPONSE2` go through it, so accounts persist and get
+      real name validation for the first time. **Still open:** everything about attribute
+      storage — `WriteBehind` isn't wired to anything client-facing yet, so there is no
+      `AttrSchema::filter_readable` read path to guard. That's the rest of this item.
 - [ ] **BNFTP serving** (protocol byte `0x02`). The codec exists; it needs the file server
       behind it, serving **only operator-supplied files** from a configured directory —
       placeholders in the repo, never Blizzard assets (`docs/LEGAL.md` §2).
@@ -56,8 +60,14 @@ The milestone is a screenshot of Brood War sitting in a channel. Nothing else co
 - [ ] **Advertisement serving**: `SID_CHECKAD`/`SID_CLICKAD`/`SID_DISPLAYAD`, plus
       `SID_QUERYADURL` for WarCraft III. Rotation logic is done and stateless; this is the
       packet handlers, the config, and the BNFTP delivery path.
-- [ ] **Wire `KeyRegistry` into `SID_AUTH_CHECK`** — one live session per CD key, result
-      `0x201` with the holder named. The economic gate on game-client bot fleets.
+- [x] **Wire `KeyRegistry` into `SID_AUTH_CHECK`** — done 2026-09-08: one live session per
+      CD key, result `0x201` with the holder named once known, `0x202` for a banned key.
+      **Caveat:** the request-side wire layout it parses is this project's best-confidence
+      reconstruction, never confirmed against a real client capture — see
+      `docs/PROTOCOL-NOTES.md` §3. A parse failure fails open (accepts, skips the key
+      check) rather than disconnecting, specifically because of that. Version checking
+      itself is still unenforced by design (`auth_info`'s comment) — only key uniqueness
+      is real.
 - [ ] **Real randomness for server tokens.** Currently a time-and-counter mix with a TODO.
 - [ ] **`rlimit` crate**: read and raise `RLIMIT_NOFILE` on all three platforms.
 - [ ] **Metrics and `tracing`**: Prometheus on the admin listener; connections by class and

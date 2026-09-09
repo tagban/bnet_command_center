@@ -3,5 +3,8 @@
 *.pdb
 bnetccd.toml
 node.key
+*.db
+*.db-wal
+*.db-shm
 /verify.log
 /.claude/

@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
 #
-# Full verification, including the two crates that need crates.io.
-#
-# The workspace ships with `bnetccd` and `bnetcc-storage-sqlite` excluded, because the
-# environment this was scaffolded in had no registry access — so those two have never
-# been through a compiler. This script enables them, builds, tests, lints, and writes
-# verify.log.
+# Full verification: build, test, lint and load-test every crate in the workspace,
+# including `bnetccd` and `bnetcc-storage-sqlite` (both need crates.io, and both are
+# regular workspace members as of 2026-09-08 — see docs/HANDOFF.md §2). Writes
+# verify.log with the actual compiler output rather than a summary of it.
 #
 # Run it with:      bash scripts/verify.sh
 # Then send back:   verify.log
-#
-# That log is the useful artifact: it carries the actual compiler output rather than a
-# summary of it. Written for macOS and Linux with no dependencies beyond awk and cargo.
 
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -34,29 +29,6 @@ fi
 
 say "environment"
 { cargo --version; rustc --version; uname -sm; } 2>&1 | tee -a "$LOG"
-
-# --- Enable the two excluded crates -------------------------------------------------
-# awk rather than sed -i, because BSD sed on macOS and GNU sed disagree about both the
-# -i flag and newlines in a replacement.
-cp Cargo.toml Cargo.toml.bak
-awk '
-  /^    "crates\/smoke",$/ {
-    print
-    print "    \"crates/bnetccd\","
-    print "    \"crates/bnetcc-storage-sqlite\","
-    next
-  }
-  /^exclude = \[/ { print "exclude = []"; next }
-  { print }
-' Cargo.toml.bak > Cargo.toml
-
-if ! grep -q 'crates/bnetccd' Cargo.toml; then
-  note "Could not enable the excluded crates automatically; Cargo.toml may have changed."
-  note "Add \"crates/bnetccd\" and \"crates/bnetcc-storage-sqlite\" to members by hand."
-  mv Cargo.toml.bak Cargo.toml
-  exit 1
-fi
-note "Enabled bnetccd and bnetcc-storage-sqlite in the workspace."
 
 # --- Build, test, lint ---------------------------------------------------------------
 say "cargo build --workspace"
@@ -114,16 +86,5 @@ say "summary"
   [ "$TEST"   -eq 0 ] && echo "TESTS OK"  || echo "TESTS FAILED"
   [ "$CLIPPY" -eq 0 ] && echo "CLIPPY OK" || echo "CLIPPY FAILED"
 } | tee -a "$LOG"
-
-if [ "$BUILD" -ne 0 ]; then
-  note ""
-  note "Build failed, so the reduced workspace has been restored — the four library"
-  note "crates still build and test on their own."
-  mv Cargo.toml.bak Cargo.toml
-else
-  rm -f Cargo.toml.bak
-  note ""
-  note "Full workspace left enabled: bnetccd and the SQLite backend now build."
-fi
 
 printf '\nWrote %s\n' "$LOG"

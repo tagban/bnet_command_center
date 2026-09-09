@@ -26,6 +26,18 @@ pub struct Config {
     pub limits: LimitsConfig,
     /// Federation link to the hub.
     pub federation: FederationConfig,
+    /// Account persistence.
+    pub storage: StorageConfig,
+}
+
+/// Account persistence.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StorageConfig {
+    /// Path to the SQLite database file. Empty means in-memory: accounts do not survive
+    /// a restart. Fine for a quick local test, never for a real node — see
+    /// `bnetccd::node::Account`'s doc comment.
+    pub path: String,
 }
 
 /// Server identity and behaviour.

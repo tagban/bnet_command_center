@@ -1,9 +1,13 @@
 //! Shared node state.
 //!
-//! Channels, subscribers and accounts live behind a `std::sync::Mutex` with **no `await`
-//! inside any critical section** — every lock is taken, mutated, and released without
-//! yielding. That is deliberate: a `tokio::sync::Mutex` invites holding a lock across an
-//! await point, which is how a chat server acquires a global stall.
+//! Channels and subscribers live behind a `std::sync::Mutex` with **no `await` inside any
+//! critical section** — every lock is taken, mutated, and released without yielding. That
+//! is deliberate: a `tokio::sync::Mutex` invites holding a lock across an await point,
+//! which is how a chat server acquires a global stall.
+//!
+//! Accounts are not in that lock — they live behind the storage actor (`crate::storage`),
+//! reached over a channel, since persistence is exactly the kind of `await`-shaped work
+//! the rule above exists to keep out.
 //!
 //! Fanout encodes each frame **once** and hands every subscriber an `Arc` of the same
 //! bytes. A 200-user channel therefore costs one encode and 200 pointer clones, not 200
@@ -16,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use bnetcc_core::ads::AdRotation;
 use bnetcc_core::channel::{AccountId, Channel, ChannelClass, JoinDenial};
-use bnetcc_core::limits::{AdmissionTable, ClientClass, Rejection};
+use bnetcc_core::limits::{AdmissionTable, ClientClass, KeyId, KeyRegistry, KeyVerdict, Rejection};
 use bnetcc_core::policy::Policy;
 use bnetcc_proto::bncs::{encode_frame, Frame};
 use bnetcc_proto::chat::normalize_channel_name;
@@ -60,12 +64,28 @@ impl Outbound {
     }
 }
 
+/// The outcome of trying to claim a CD key at `SID_AUTH_CHECK` time.
+#[derive(Debug, Clone)]
+pub enum KeyClaim {
+    /// Nobody else holds this key right now.
+    Ok,
+    /// Another live session holds it. `holder` is empty if that session has not logged
+    /// in yet.
+    InUse {
+        /// Best-known account name of the current holder.
+        holder: String,
+    },
+    /// The key is banned network-wide.
+    Banned,
+}
+
 /// A registered account.
 ///
-/// In-memory for now. This is the seam `bnetcc-storage` plugs into: replace the map with
-/// the `Storage` trait and keep this as a write-through cache. **Do not ship without
-/// persistence** — that is exactly Atlas's situation, where every account evaporates on
-/// restart, and it is the main reason Atlas appears more stable than it is.
+/// A write-through view of whatever `bnetcc_storage::model::Account` the storage actor
+/// holds (see `crate::storage`) — persisted if `storage.path` is configured, in-memory
+/// and gone on restart otherwise. **Configure `storage.path` before relying on this** —
+/// an unset one is exactly Atlas's situation, where every account evaporates on restart,
+/// and it is the main reason Atlas appears more stable than it is.
 #[derive(Debug, Clone)]
 pub struct Account {
     /// Stable identifier.
@@ -84,9 +104,6 @@ struct Inner {
     channels: HashMap<Vec<u8>, Channel>,
     /// Subscribers per channel, keyed by normalised channel name.
     subscribers: HashMap<Vec<u8>, Vec<(AccountId, Outbound)>>,
-    /// Accounts by lowercased name.
-    accounts: HashMap<String, Account>,
-    next_account_id: AccountId,
 }
 
 /// Everything one node shares between connections.
@@ -108,12 +125,29 @@ pub struct Node {
     /// separately — which is the entire point of per-type limits.
     admission: Mutex<AdmissionTable>,
     connections: AtomicU64,
+    /// Accounts live behind this actor, not the `Mutex<Inner>` above — persistence is a
+    /// disk write, and a disk write must never happen inside a lock that channel fanout
+    /// also takes. See `crate::storage`.
+    storage: crate::storage::StorageHandle,
+    /// One live session per CD key — see `KeyClaim` and `docs/WARNET.md`.
+    key_registry: Mutex<KeyRegistry>,
+    /// Best-known display name for whoever currently holds each claimed key, so a
+    /// rejection can name the holder. Populated once a claiming session logs in
+    /// (`record_key_holder_name`); empty until then, since `SID_AUTH_CHECK` happens
+    /// before the account is known.
+    key_holder_names: Mutex<HashMap<KeyId, String>>,
 }
 
 impl Node {
     /// Build a node.
     #[must_use]
-    pub fn new(policy: Policy, name: String, motd: String, gateway_allowlist: Vec<IpAddr>) -> Self {
+    pub fn new(
+        policy: Policy,
+        name: String,
+        motd: String,
+        gateway_allowlist: Vec<IpAddr>,
+        storage: crate::storage::StorageHandle,
+    ) -> Self {
         let mut admission = AdmissionTable::new();
         admission.set_allowlist(gateway_allowlist);
         Self {
@@ -125,6 +159,10 @@ impl Node {
             inner: Mutex::new(Inner::default()),
             admission: Mutex::new(admission),
             connections: AtomicU64::new(0),
+            storage,
+            // 500ms matches observed real-Battle.net behaviour — see KeyRegistry's docs.
+            key_registry: Mutex::new(KeyRegistry::new(500)),
+            key_holder_names: Mutex::new(HashMap::new()),
         }
     }
 
@@ -186,35 +224,65 @@ impl Node {
     }
 
     /// Look up an account by name, case-insensitively.
-    #[must_use]
-    pub fn account(&self, name: &str) -> Option<Account> {
-        self.inner
-            .lock()
-            .expect("node lock")
-            .accounts
-            .get(&name.to_ascii_lowercase())
-            .cloned()
+    pub async fn account(&self, name: &str) -> Option<Account> {
+        self.storage.account_by_name(name).await
     }
 
     /// Create an account.
     ///
     /// # Errors
     ///
-    /// Returns `()` if the name is already taken.
-    pub fn create_account(&self, name: &str, password_hash: [u8; 20]) -> Result<Account, ()> {
-        let key = name.to_ascii_lowercase();
-        let mut inner = self.inner.lock().expect("node lock");
-        if inner.accounts.contains_key(&key) {
-            return Err(());
+    /// [`crate::storage::CreateAccountError::NameTaken`] if the name is already
+    /// registered, or [`crate::storage::CreateAccountError::Invalid`] if it fails
+    /// validation (see `bnetcc_storage::validate_account_name`).
+    pub async fn create_account(
+        &self,
+        name: &str,
+        password_hash: [u8; 20],
+    ) -> Result<Account, crate::storage::CreateAccountError> {
+        self.storage.create_account(name, password_hash).await
+    }
+
+    /// Try to claim a CD key for a session that has not logged in yet.
+    ///
+    /// `SID_AUTH_CHECK` happens before `SID_LOGONRESPONSE2`, so there is no account to
+    /// record as the holder — that gets filled in later by
+    /// [`Self::record_key_holder_name`] if this session goes on to log in. Until then a
+    /// rejection names whichever account most recently logged in while holding the key,
+    /// or an empty string if nobody has yet.
+    pub fn claim_key(&self, key: KeyId, now_ms: u64) -> KeyClaim {
+        let verdict = self
+            .key_registry
+            .lock()
+            .expect("key registry lock")
+            .claim(key, 0, now_ms);
+        match verdict {
+            KeyVerdict::Ok => KeyClaim::Ok,
+            KeyVerdict::Banned => KeyClaim::Banned,
+            KeyVerdict::InUse { .. } => KeyClaim::InUse {
+                holder: self
+                    .key_holder_names
+                    .lock()
+                    .expect("key holder names lock")
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default(),
+            },
         }
-        inner.next_account_id += 1;
-        let account = Account {
-            id: inner.next_account_id,
-            name: name.to_string(),
-            password_hash,
-        };
-        inner.accounts.insert(key, account.clone());
-        Ok(account)
+    }
+
+    /// Release a key a session claimed, whether or not it ever logged in.
+    pub fn release_key(&self, key: KeyId, now_ms: u64) {
+        self.key_registry.lock().expect("key registry lock").release(key, now_ms);
+        self.key_holder_names.lock().expect("key holder names lock").remove(&key);
+    }
+
+    /// Record which account is holding a claimed key, once its session logs in.
+    pub fn record_key_holder_name(&self, key: KeyId, name: String) {
+        self.key_holder_names
+            .lock()
+            .expect("key holder names lock")
+            .insert(key, name);
     }
 
     /// Names of all live channels, for `SID_GETCHANNELLIST`.
@@ -341,19 +409,27 @@ pub struct JoinedChannel {
     pub outcome: bnetcc_core::channel::JoinOutcome,
 }
 
+/// An in-memory-backed node for tests. Exposed beyond this module so `session`'s own
+/// tests can drive a real `Node` without a database.
+#[cfg(test)]
+pub(crate) fn test_node() -> Node {
+    let storage = crate::storage::spawn(Box::new(bnetcc_storage::memory::MemoryStorage::new()));
+    Node::new(
+        Policy::for_mode(bnetcc_core::policy::ServerMode::Gaming),
+        "Test".into(),
+        "motd".into(),
+        Vec::new(),
+        storage,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bnetcc_core::policy::ServerMode;
     use bnetcc_proto::chat::user_flags;
 
     fn node() -> Node {
-        Node::new(
-            Policy::for_mode(ServerMode::Gaming),
-            "Test".into(),
-            "motd".into(),
-            Vec::new(),
-        )
+        test_node()
     }
 
     fn outbound(cap: usize) -> (Outbound, mpsc::Receiver<Wire>) {
@@ -361,13 +437,13 @@ mod tests {
         (Outbound::new(tx), rx)
     }
 
-    #[test]
-    fn accounts_are_case_insensitive_and_unique() {
+    #[tokio::test]
+    async fn accounts_are_case_insensitive_and_unique() {
         let n = node();
-        let a = n.create_account("Zealot", [1u8; 20]).unwrap();
-        assert_eq!(n.account("zealot").unwrap().id, a.id);
-        assert_eq!(n.account("ZEALOT").unwrap().id, a.id);
-        assert!(n.create_account("zEaLoT", [2u8; 20]).is_err());
+        let a = n.create_account("Zealot", [1u8; 20]).await.unwrap();
+        assert_eq!(n.account("zealot").await.unwrap().id, a.id);
+        assert_eq!(n.account("ZEALOT").await.unwrap().id, a.id);
+        assert!(n.create_account("zEaLoT", [2u8; 20]).await.is_err());
     }
 
     #[test]

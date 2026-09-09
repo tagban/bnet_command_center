@@ -74,19 +74,30 @@ cd /Volumes/AppStorage/bnet_command_center
 bash scripts/verify.sh
 ```
 
-It enables both crates (now on by default), runs build/test/clippy and a load test sized
-to the host's thread ceiling, and writes `verify.log`. If the build fails it restores the
-reduced workspace so the library crates still build.
+Both crates are permanent workspace members now (no more runtime `Cargo.toml` patching —
+that machinery was removed 2026-09-08 after it turned out not to be idempotent and had
+quietly duplicated the members list across several verify.sh runs). It builds, tests,
+lints, and runs a load test sized to the host's thread ceiling, writing `verify.log`.
+
+Also done since the first pass (2026-09-08, same day): account storage is wired
+end-to-end (`bnetccd::storage`, a dedicated thread reached over a channel — see
+`ROADMAP.md` phase 1), and `KeyRegistry` is wired into `SID_AUTH_CHECK` (see the same
+file for its wire-format caveat). Both have real test coverage in
+`crates/bnetccd/src/session.rs`'s `#[cfg(test)]` module — the CD-key one is worth reading
+before touching `auth_check` again, since it's the only thing currently proving the
+unverified wire-format guess doesn't silently break real logins.
 
 Next, in order, from `docs/ROADMAP.md` phase 1:
 
 1. **Test against a real Brood War client.** Everything else is theory until a client sits
    in a channel. Expect surprises at the ⚠️/🛑 items in §5.
-2. Wire storage into `bnetccd` behind the actor (bounded channel → dedicated thread →
-   `WriteBehind`), with `AttrSchema::filter_readable` on every client-facing read.
+2. Finish wiring storage: attribute reads/writes still don't go through `WriteBehind` or
+   `AttrSchema::filter_readable` anywhere client-facing — only accounts do so far.
 3. BNFTP file serving, then `SID_GETICONDATA` icon serving.
-4. `KeyRegistry` into `SID_AUTH_CHECK`.
-5. Real randomness for server tokens (currently a time-and-counter mix with a TODO).
+4. Real randomness for server tokens (currently a time-and-counter mix with a TODO).
+5. Confirm the `SID_AUTH_CHECK` request layout against a real client capture (see
+   `PROTOCOL-NOTES.md` §3) and, if it holds up, make a parse failure closed instead of
+   open.
 
 ---
 
@@ -152,6 +163,10 @@ Do not relitigate these without a reason; the reasoning is in the linked docs.
   makes the client hang rather than error).
 - Whether a BNI icon entry's code list is present when `flags != 0`.
 - The ad extension tag's wire bytes (`.smk`/`.mng`/`.pcx`).
+- `SID_AUTH_CHECK`'s request-side layout (client token, exe version/hash, key count,
+  spawn flag, exe info, per-key fields, owner name) — implemented and covered by tests,
+  but never checked against a real client capture. `bnetccd` fails open on a parse
+  failure specifically because of this; see `PROTOCOL-NOTES.md` §3.
 
 ---
 

@@ -126,6 +126,8 @@ dependencies = [
  "bnetcc-core",
  "bnetcc-crypto",
  "bnetcc-proto",
+ "bnetcc-storage",
+ "bnetcc-storage-sqlite",
  "clap",
  "serde",
  "tokio",

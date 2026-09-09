@@ -79,6 +79,46 @@ Status codes: `0x00` success · `0x01` no such account · `0x02` wrong password 
 `0x03` account corrupted (D2 only) · `0x06` account closed (+ reason string). An unknown
 status makes the client show a default error and disconnect.
 
+🛑 **`SID_CREATEACCOUNT2`'s own status codes were never researched here.** BNETDocs is
+commonly cited as `0x00` success · `0x02` invalid characters · `0x03` banned word ·
+`0x04` name exists · `0x06` too few alphanumeric characters · `0x07` adjacent
+punctuation · `0x08` too much punctuation — this project has only confirmed `0x00` and
+`0x04` against its own tests. Do not extend `bnetccd::session::create_account`'s status
+mapping past those two without checking a real client's reaction first.
+
+### `SID_AUTH_CHECK` (`0x51`) request — 🛑 unverified layout
+
+Never captured against a real client here; this is `bnetcc-crypto`/`session.rs`'s
+best-confidence reconstruction of the commonly-cited BNETDocs layout:
+
+```
+(UINT32) Client Token
+(UINT32) EXE Version
+(UINT32) EXE Hash
+(UINT32) Number of CD keys           1 normally, 2 for D2XP/W3XP (base + expansion)
+(UINT32) Using Spawn (bool)
+(STRING) EXE Information
+For each key:
+    (UINT32) Key Length
+    (UINT32) Key Product Value
+    (UINT32) Key Public Value
+    (UINT32) Unknown (0)
+    (VOID×20) Key Hash               session-specific, see below — not a stable id
+(STRING) CD Key Owner
+```
+
+⚠️ **The per-key `Hash` field is not a stable fingerprint of the physical key** — it is
+mixed with the client and server tokens specifically so it changes every session (replay
+protection). `bnetcc_core::limits::KeyId` — the type `KeyRegistry` uses for "one live
+session per key" — must be derived from the session-independent `Key Product Value` /
+`Key Public Value` pair instead (`session::key_fingerprint` hashes those two together).
+Using the wire `Hash` directly would make every session look like a different key and
+silently defeat the whole feature.
+
+`bnetccd`'s parser fails **open** (accepts, no key check) rather than closed if this
+layout doesn't match what arrives, specifically because it is unverified — see
+`session::auth_check`'s doc comment.
+
 ### XSHA-1 itself
 
 Implemented and known-answer-tested in `bnetcc-crypto`. It differs from real SHA-1 in three

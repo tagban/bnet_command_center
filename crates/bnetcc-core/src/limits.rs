@@ -331,10 +331,15 @@ impl FloodTracker {
     }
 }
 
-/// A hashed CD key, as it arrives in `SID_AUTH_CHECK`.
+/// A stable fingerprint of one physical CD key.
 ///
-/// We store the 20-byte hash the client sends, never a raw key. There is no reason for
-/// a server to hold a usable CD key, and every reason not to.
+/// **Not** the wire's per-key `Hash` field from `SID_AUTH_CHECK` — that one is mixed with
+/// the client and server tokens specifically so it changes every session (replay
+/// protection), which would make identical uniqueness tracking see a different key on
+/// every reconnect. The caller must derive this from the session-independent parts of
+/// the key data instead (its product and public values), e.g. by hashing those two
+/// fields together. Either way, we store a hash, never a raw key: there is no reason for
+/// a server to hold a usable one, and every reason not to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KeyId(pub [u8; 20]);
 

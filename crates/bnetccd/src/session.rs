@@ -11,12 +11,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bnetcc_core::limits::ClientClass;
+use bnetcc_core::limits::{ClientClass, KeyId};
 use bnetcc_core::session::SessionState;
-use bnetcc_crypto::{logon_proof, proofs_match};
+use bnetcc_crypto::{logon_proof, proofs_match, xsha1_bytes};
 use bnetcc_proto::bncs::{
-    advertise_status, decode_frame, encode_frame, logon_status, sid, Frame, ProtocolSelector,
-    DEFAULT_MAX_FRAME,
+    advertise_status, auth_check_status, decode_frame, encode_frame, logon_status, sid, Frame,
+    ProtocolSelector, DEFAULT_MAX_FRAME,
 };
 use bnetcc_proto::buf::{RecvBuf, Writer};
 use bnetcc_proto::chat::{
@@ -31,7 +31,26 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::node::{Account, Node, Outbound, Wire};
+use crate::node::{Account, KeyClaim, Node, Outbound, Wire};
+
+/// Current time in milliseconds since the Unix epoch, for [`bnetcc_core::limits::KeyRegistry`]'s
+/// cooldown window. Best-effort like [`next_server_token`]: if the clock is broken, keys
+/// simply never cool down, which is safe (fails toward stricter, not laxer).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Derive a stable per-key fingerprint from the session-independent parts of a CD key
+/// (its product and public values), never from the wire's `Hash` field — see
+/// [`KeyId`]'s doc comment for why that field cannot be used for uniqueness tracking.
+fn key_fingerprint(product_value: u32, public_value: u32) -> KeyId {
+    let mut buf = [0u8; 8];
+    buf[..4].copy_from_slice(&product_value.to_le_bytes());
+    buf[4..].copy_from_slice(&public_value.to_le_bytes());
+    KeyId(xsha1_bytes(&buf))
+}
 
 /// Per-connection tunables, resolved from config once at startup.
 #[derive(Debug, Clone, Copy)]
@@ -162,6 +181,19 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr, node: Arc<Node>, limits
     }
 }
 
+/// Read a username field, truncating rather than disconnecting if it is over-length.
+///
+/// Real Battle.net truncates usernames past 15 characters instead of rejecting them
+/// (docs/PROTOCOL-NOTES.md). Reading with headroom and truncating after the fact matches
+/// that; reading straight into `USERNAME_MAX` would instead fail the whole frame — and
+/// the caller previously treated that as a reason to close the connection — the moment a
+/// nonstandard client sent one byte too many.
+fn read_username(r: &mut bnetcc_proto::buf::Reader<'_>) -> Result<Vec<u8>, bnetcc_proto::ProtoError> {
+    const READ_LIMIT: usize = 64;
+    let raw = r.cstr(READ_LIMIT)?;
+    Ok(raw[..raw.len().min(USERNAME_MAX)].to_vec())
+}
+
 /// Spawn the writer half and return a handle plus its join handle.
 fn spawn_writer(
     mut wr: tokio::net::tcp::OwnedWriteHalf,
@@ -197,6 +229,12 @@ struct Bncs {
     state: SessionState,
     server_token: u32,
     product: Option<FourCc>,
+    /// The version byte from `SID_AUTH_INFO`, for logging. Not currently checked against
+    /// anything — see `auth_check`.
+    version_byte: Option<u32>,
+    /// CD keys claimed by `auth_check`, released on disconnect regardless of whether
+    /// this session ever logged in.
+    claimed_keys: Vec<KeyId>,
     account: Option<Account>,
     channel: Option<Vec<u8>>,
     flags: u32,
@@ -220,6 +258,8 @@ async fn bncs_session(
         state: SessionState::Connected,
         server_token: next_server_token(),
         product: None,
+        version_byte: None,
+        claimed_keys: Vec::new(),
         account: None,
         channel: None,
         flags: 0,
@@ -278,7 +318,7 @@ async fn bncs_session(
                 s.state = SessionState::Closing;
                 break;
             }
-            match s.handle(&frame) {
+            match s.handle(&frame).await {
                 Step::Continue => {}
                 Step::Close => {
                     s.state = SessionState::Closing;
@@ -301,6 +341,10 @@ async fn bncs_session(
 
 impl Bncs {
     fn cleanup(&mut self) {
+        let now = now_ms();
+        for key in self.claimed_keys.drain(..) {
+            self.node.release_key(key, now);
+        }
         if let (Some(key), Some(account)) = (self.channel.take(), self.account.as_ref()) {
             let name = account.name.clone();
             let new_op = self.node.leave_channel(&key, account.id);
@@ -314,12 +358,12 @@ impl Bncs {
         }
     }
 
-    fn handle(&mut self, frame: &Frame) -> Step {
+    async fn handle(&mut self, frame: &Frame) -> Step {
         let step = match frame.id {
             sid::AUTH_INFO => self.auth_info(frame),
             sid::AUTH_CHECK => self.auth_check(frame),
-            sid::LOGONRESPONSE2 => self.logon(frame),
-            sid::CREATEACCOUNT2 => self.create_account(frame),
+            sid::LOGONRESPONSE2 => self.logon(frame).await,
+            sid::CREATEACCOUNT2 => self.create_account(frame).await,
             sid::ENTERCHAT => self.enter_chat(frame),
             sid::JOINCHANNEL => self.join_channel(frame),
             sid::CHATCOMMAND => self.chat_command(frame),
@@ -369,13 +413,22 @@ impl Bncs {
             let _protocol = r.u32()?;
             let _platform = r.fourcc()?;
             let product = r.fourcc()?;
-            let _version_byte = r.u32()?;
-            Ok::<_, bnetcc_proto::ProtoError>(product)
+            let version_byte = r.u32()?;
+            Ok::<_, bnetcc_proto::ProtoError>((product, version_byte))
         })();
-        let Ok(product) = parsed else {
+        let Ok((product, version_byte)) = parsed else {
             return Step::Close;
         };
         self.product = Some(product);
+        self.version_byte = Some(version_byte);
+        // Not checked against anything yet — see `auth_check`'s doc comment. Logged so an
+        // operator can see what real client builds are actually connecting.
+        info!(
+            peer = %self.peer,
+            product = %product,
+            version_byte = %format!("{version_byte:#010x}"),
+            "SID_AUTH_INFO"
+        );
 
         // Now that the product is known, move this connection onto that product's
         // limits. On refusal we close: there is no BNCS status meaning "too many
@@ -420,22 +473,101 @@ impl Bncs {
         self.send(&Frame::new(sid::AUTH_INFO, w.finish()))
     }
 
-    fn auth_check(&mut self, _frame: &Frame) -> Step {
-        // A private server accepts any client build by default. Version and CD-key
-        // enforcement belongs in a policy table an operator fills in, not hard-coded
-        // hashes shipped in the repo.
+    /// Version is still unchecked by design — see `auth_info`'s comment and
+    /// `docs/PROTOCOL-NOTES.md`. CD-key uniqueness *is* enforced here: one live session
+    /// per key, which is the actual gate on a bot fleet (addresses are cheap, keys are
+    /// not — see `docs/WARNET.md`).
+    ///
+    /// The wire layout parsed below (client token, exe version, exe hash, key count,
+    /// spawn flag, exe info, then per-key length/product/public/hash, then owner name)
+    /// is this project's best-confidence read of `SID_AUTH_CHECK`'s request side and has
+    /// **not** been confirmed against a real client capture. Refusing every logon over a
+    /// wire format we are not sure of would be worse than not enforcing key uniqueness
+    /// at all, so a parse failure here fails *open* — log it and accept — rather than
+    /// closing the connection the way a confirmed frame layout's parse failure would.
+    fn auth_check(&mut self, frame: &Frame) -> Step {
+        let mut r = frame.reader();
+        let parsed = (|| {
+            let _client_token = r.u32()?;
+            let _exe_version = r.u32()?;
+            let _exe_hash = r.u32()?;
+            let key_count = r.u32()?;
+            let _spawn = r.u32()?;
+            let _exe_info = r.cstr(256)?;
+            let mut keys = Vec::with_capacity(key_count.min(2) as usize);
+            for _ in 0..key_count.min(2) {
+                let _key_length = r.u32()?;
+                let product_value = r.u32()?;
+                let public_value = r.u32()?;
+                let _reserved = r.u32()?;
+                let _hash: [u8; 20] = r.array()?;
+                keys.push(key_fingerprint(product_value, public_value));
+            }
+            let _owner = r.cstr(64)?;
+            Ok::<_, bnetcc_proto::ProtoError>(keys)
+        })();
+
+        let keys = match parsed {
+            Ok(keys) => keys,
+            Err(e) => {
+                warn!(
+                    peer = %self.peer,
+                    error = %e,
+                    "could not parse SID_AUTH_CHECK against our unverified guess at its \
+                     layout; accepting without a CD-key uniqueness check"
+                );
+                return self.auth_check_ok();
+            }
+        };
+
+        let now = now_ms();
+        for (i, &key) in keys.iter().enumerate() {
+            let second = i == 1; // Warcraft III sends a base key and an expansion key.
+            match self.node.claim_key(key, now) {
+                KeyClaim::Ok => {}
+                KeyClaim::InUse { holder } => {
+                    for &done in &keys[..i] {
+                        self.node.release_key(done, now);
+                    }
+                    let mut status = auth_check_status::KEY_IN_USE;
+                    if second {
+                        status |= auth_check_status::SECOND_KEY;
+                    }
+                    let mut w = Writer::with_capacity(32);
+                    w.u32(status).cstr(holder.as_bytes());
+                    return self.send(&Frame::new(sid::AUTH_CHECK, w.finish()));
+                }
+                KeyClaim::Banned => {
+                    for &done in &keys[..i] {
+                        self.node.release_key(done, now);
+                    }
+                    let mut status = auth_check_status::KEY_BANNED;
+                    if second {
+                        status |= auth_check_status::SECOND_KEY;
+                    }
+                    let mut w = Writer::with_capacity(8);
+                    w.u32(status).cstr(b"");
+                    return self.send(&Frame::new(sid::AUTH_CHECK, w.finish()));
+                }
+            }
+        }
+        self.claimed_keys = keys;
+        self.auth_check_ok()
+    }
+
+    fn auth_check_ok(&mut self) -> Step {
         let mut w = Writer::with_capacity(8);
-        w.u32(0x0000).cstr(b"");
+        w.u32(auth_check_status::PASSED).cstr(b"");
         self.send(&Frame::new(sid::AUTH_CHECK, w.finish()))
     }
 
-    fn logon(&mut self, frame: &Frame) -> Step {
+    async fn logon(&mut self, frame: &Frame) -> Step {
         let mut r = frame.reader();
         let parsed = (|| {
             let client_token = r.u32()?;
             let _server_token = r.u32()?;
             let proof: [u8; 20] = r.array()?;
-            let username = r.cstr(USERNAME_MAX)?.to_vec();
+            let username = read_username(&mut r)?;
             Ok::<_, bnetcc_proto::ProtoError>((client_token, proof, username))
         })();
         let Ok((client_token, proof, username)) = parsed else {
@@ -443,13 +575,16 @@ impl Bncs {
         };
         let name = String::from_utf8_lossy(&username).to_string();
 
-        let status = match self.node.account(&name) {
+        let status = match self.node.account(&name).await {
             None => logon_status::NO_SUCH_ACCOUNT,
             Some(account) => {
                 // Always use *our* server token, never the one the client echoed back.
                 let expected = logon_proof(client_token, self.server_token, &account.password_hash);
                 if proofs_match(&proof, &expected) {
                     info!(peer = %self.peer, account = %account.name, "logon accepted");
+                    for &key in &self.claimed_keys {
+                        self.node.record_key_holder_name(key, account.name.clone());
+                    }
                     self.account = Some(account);
                     logon_status::SUCCESS
                 } else {
@@ -466,11 +601,11 @@ impl Bncs {
         self.send(&Frame::new(sid::LOGONRESPONSE2, w.finish()))
     }
 
-    fn create_account(&mut self, frame: &Frame) -> Step {
+    async fn create_account(&mut self, frame: &Frame) -> Step {
         let mut r = frame.reader();
         let parsed = (|| {
             let hash: [u8; 20] = r.array()?;
-            let username = r.cstr(USERNAME_MAX)?.to_vec();
+            let username = read_username(&mut r)?;
             Ok::<_, bnetcc_proto::ProtoError>((hash, username))
         })();
         let Ok((hash, username)) = parsed else {
@@ -480,16 +615,24 @@ impl Bncs {
 
         // Note: `SID_CREATEACCOUNT2` carries the password hashed **once**, unlike the
         // logon proof which is a double hash. Storing what arrives is therefore correct.
-        let status: u32 = if name.is_empty() {
-            0x07 // too short
-        } else {
-            match self.node.create_account(&name, hash) {
-                Ok(account) => {
-                    // Creation does not log you in; the client sends a logon next.
-                    info!(peer = %self.peer, account = %account.name, "account created");
-                    0x00
-                }
-                Err(()) => 0x04, // name already exists
+        //
+        // Status codes beyond 0x00/0x04 are unverified against a real client capture —
+        // BNETDocs documents 0x02 "name contains invalid characters" but this project has
+        // not confirmed it. See docs/PROTOCOL-NOTES.md's unverified list.
+        let status: u32 = match self.node.create_account(&name, hash).await {
+            Ok(account) => {
+                // Creation does not log you in; the client sends a logon next.
+                info!(peer = %self.peer, account = %account.name, "account created");
+                0x00
+            }
+            Err(crate::storage::CreateAccountError::NameTaken) => 0x04,
+            Err(crate::storage::CreateAccountError::Invalid(why)) => {
+                debug!(peer = %self.peer, name = %name, reason = %why, "account creation refused");
+                0x02
+            }
+            Err(crate::storage::CreateAccountError::Backend(why)) => {
+                warn!(peer = %self.peer, reason = %why, "account creation failed in storage");
+                return Step::Close;
             }
         };
 
@@ -839,4 +982,136 @@ async fn gateway_session(
     drop(tx);
     let _ = writer.await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn auth_info_frame() -> Frame {
+        let mut w = Writer::with_capacity(32);
+        w.u32(0)
+            .fourcc(bnetcc_proto::FourCc::from_ascii(b"IX86"))
+            .fourcc(product::SEXP)
+            .u32(0xCD);
+        Frame::new(sid::AUTH_INFO, w.finish())
+    }
+
+    /// A minimal `SID_AUTH_CHECK` carrying one CD key. `product_value`/`public_value` are
+    /// the two fields our uniqueness check actually keys on — see `key_fingerprint`.
+    fn auth_check_frame(product_value: u32, public_value: u32) -> Frame {
+        let mut w = Writer::with_capacity(96);
+        w.u32(0) // client token
+            .u32(0) // exe version
+            .u32(0) // exe hash
+            .u32(1) // key count
+            .u32(0) // spawn
+            .cstr(b"test.exe 00/00/00 000000")
+            .u32(16) // key length
+            .u32(product_value)
+            .u32(public_value)
+            .u32(0) // reserved
+            .bytes(&[0u8; 20]) // wire hash; unused by our uniqueness check, see KeyId
+            .cstr(b"tester");
+        Frame::new(sid::AUTH_CHECK, w.finish())
+    }
+
+    async fn send_frame(stream: &mut TcpStream, frame: &Frame) {
+        let mut out = Vec::new();
+        encode_frame(frame, &mut out).expect("encodable");
+        stream.write_all(&out).await.expect("write");
+    }
+
+    async fn recv_frame(stream: &mut TcpStream) -> Frame {
+        let mut buf = RecvBuf::with_capacity(256);
+        loop {
+            if let Ok(Some(f)) = decode_frame(&mut buf, DEFAULT_MAX_FRAME) {
+                return f;
+            }
+            let tail = buf.writable_tail(256);
+            let n = stream.read(tail).await.expect("read");
+            assert_ne!(n, 0, "peer closed before sending a frame");
+            buf.commit(n, 256);
+        }
+    }
+
+    async fn auth_check_status_of(stream: &mut TcpStream, product_value: u32, public_value: u32) -> u32 {
+        send_frame(stream, &auth_info_frame()).await;
+        let _ = recv_frame(stream).await; // SID_AUTH_INFO reply
+        send_frame(stream, &auth_check_frame(product_value, public_value)).await;
+        let reply = recv_frame(stream).await;
+        assert_eq!(reply.id, sid::AUTH_CHECK);
+        reply.reader().u32().expect("status")
+    }
+
+    async fn connect(addr: std::net::SocketAddr) -> TcpStream {
+        let mut s = TcpStream::connect(addr).await.expect("connect");
+        s.write_all(&[0x01]).await.expect("protocol selector"); // "game client"
+        s
+    }
+
+    #[tokio::test]
+    async fn the_same_cd_key_cannot_open_two_live_sessions() {
+        let node = Arc::new(crate::node::test_node());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let limits = SessionLimits::default();
+        tokio::spawn({
+            let node = Arc::clone(&node);
+            async move {
+                loop {
+                    let (stream, peer) = listener.accept().await.expect("accept");
+                    tokio::spawn(handle(stream, peer, Arc::clone(&node), limits));
+                }
+            }
+        });
+
+        let mut a = connect(addr).await;
+        assert_eq!(
+            auth_check_status_of(&mut a, 1, 42).await,
+            auth_check_status::PASSED,
+            "first session should claim the key cleanly"
+        );
+
+        let mut b = connect(addr).await;
+        let status = auth_check_status_of(&mut b, 1, 42).await;
+        assert_eq!(
+            status & !auth_check_status::SECOND_KEY,
+            auth_check_status::KEY_IN_USE,
+            "a second live session must not be able to claim the same key"
+        );
+
+        // Releasing the first session's connection, and waiting out the registry's
+        // cooldown, must free the key back up.
+        drop(a);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let mut c = connect(addr).await;
+        assert_eq!(
+            auth_check_status_of(&mut c, 1, 42).await,
+            auth_check_status::PASSED,
+            "the key must become claimable again once the holder disconnects"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_cd_keys_do_not_conflict() {
+        let node = Arc::new(crate::node::test_node());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let limits = SessionLimits::default();
+        tokio::spawn({
+            let node = Arc::clone(&node);
+            async move {
+                loop {
+                    let (stream, peer) = listener.accept().await.expect("accept");
+                    tokio::spawn(handle(stream, peer, Arc::clone(&node), limits));
+                }
+            }
+        });
+
+        let mut a = connect(addr).await;
+        let mut b = connect(addr).await;
+        assert_eq!(auth_check_status_of(&mut a, 1, 1).await, auth_check_status::PASSED);
+        assert_eq!(auth_check_status_of(&mut b, 1, 2).await, auth_check_status::PASSED);
+    }
 }

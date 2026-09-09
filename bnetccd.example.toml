@@ -116,3 +116,9 @@ identity_key = "node.key"
 # are quarantined until the hub reconciles, so ladder integrity is never traded for
 # availability.
 offline_login = false
+
+[storage]
+# Path to the SQLite database file. Leave empty and accounts live in memory only —
+# fine for a quick local test, but every registration is lost on restart. Set this
+# for anything that isn't a throwaway.
+path = "bnetccd.db"

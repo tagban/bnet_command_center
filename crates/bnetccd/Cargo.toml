@@ -10,6 +10,8 @@ description = "Command Center node daemon"
 bnetcc-core = { path = "../bnetcc-core" }
 bnetcc-crypto = { path = "../bnetcc-crypto" }
 bnetcc-proto = { path = "../bnetcc-proto" }
+bnetcc-storage = { path = "../bnetcc-storage" }
+bnetcc-storage-sqlite = { path = "../bnetcc-storage-sqlite" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

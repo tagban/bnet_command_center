@@ -19,9 +19,10 @@ Referred to as **Command Center** in prose, `bnetcc` in code and on the command 
 
 ## Status
 
-**Phase 0 complete.** The protocol core, cryptography, domain rules and a concurrency
-harness are written, tested and measured. `bnetccd` is written but not yet compiled — see
-[Building](#building).
+**Phase 0 complete, phase 1 underway.** The protocol core, cryptography, domain rules and
+a concurrency harness are written, tested and measured. `bnetccd` builds and runs; account
+storage and CD-key uniqueness are wired end-to-end. See [`docs/HANDOFF.md`](docs/HANDOFF.md)
+for exact state and what's next.
 
 | Crate | State | Tests |
 |---|---|---|
@@ -29,14 +30,15 @@ harness are written, tested and measured. `bnetccd` is written but not yet compi
 | `bnetcc-proto` | BNCS, MCP and chat-gateway framing, wire codecs, BNI icons, BNFTP, statstrings | 89 |
 | `bnetcc-core` | Policy, channels, admission, flood, key registry, ads, bridged identities, session FSM | 98 |
 | `bnetcc-storage` | `Storage` trait, attribute ACLs, write-behind, conformance suite | 33 |
-| `bnetcc-smoke` | Real handshake at 4,000 concurrent connections | — |
-| `bnetccd` | Written; needs a dependency-resolving build | — |
-| `bnetcc-storage-sqlite` | Written; needs `rusqlite` | — |
+| `bnetcc-storage-sqlite` | SQLite backend with migrations | 6 |
+| `bnetcc-smoke` | Real handshake, thread-per-connection, sized to the host | — |
+| `bnetccd` | Node daemon — accounts persist, CD-key uniqueness enforced, storage actor | 26 |
 
-227 tests, `cargo clippy -D warnings` clean, **zero third-party dependencies** in the four
-library crates — which is deliberate: the crates that parse attacker-controlled bytes and
-hold the domain rules are the ones you want cheap to fuzz and cheap to audit. Database
-drivers and the async runtime live only in the crates that cannot avoid them.
+259 tests, `cargo clippy -D warnings` clean, **zero third-party dependencies** in the four
+core library crates (`crypto`/`proto`/`core`/`storage`) — deliberate: the crates that parse
+attacker-controlled bytes and hold the domain rules are the ones you want cheap to fuzz and
+cheap to audit. The database driver and async runtime live only in the two crates that
+cannot avoid them.
 
 Measured on 2 vCPU / 8 GB: **4,000/4,000 concurrent connections**, every one through a
 real handshake with a verified X-SHA-1 logon proof, 30 KiB RSS per connection (an upper
@@ -91,40 +93,24 @@ The full evidence table is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §2
 ## Building
 
 ```sh
-cargo test                                  # the four library crates + harness
+cargo build --workspace
+cargo test --workspace
+```
+
+**`bash scripts/verify.sh`** is the one-command version: build, test, clippy, and a load
+test sized to whatever your host's thread ceiling can sustain (macOS's is typically much
+lower than Linux's — the script checks `kern.num_taskthreads` and scales down rather than
+finding out the hard way), writing the full compiler output to `verify.log`. It finds
+`cargo` via `~/.cargo/env` if it is not on `PATH`, and raises the open-file limit before
+the load test (macOS defaults to 256).
+
+To run the load test by hand instead:
+
+```sh
 cargo build --release -p bnetcc-smoke
 ulimit -n 20000
 ./target/release/bnetcc-smoke 2500 40        # 2500 concurrent real handshakes
 ```
-
-**`crates/bnetccd` and `crates/bnetcc-storage-sqlite` are excluded from the workspace.** They
-need `tokio` and `rusqlite`, and the environment this scaffold was authored in had no access
-to `crates.io`. To build them:
-
-```diff
-  members = [
-      "crates/bnetcc-crypto",
-      "crates/bnetcc-proto",
-      "crates/bnetcc-core",
-      "crates/bnetcc-storage",
-      "crates/smoke",
-+     "crates/bnetccd",
-+     "crates/bnetcc-storage-sqlite",
-  ]
-- exclude = ["crates/bnetccd", "crates/bnetcc-storage-sqlite"]
-```
-
-**`bash scripts/verify.sh` does all of that for you.** It enables both crates, runs
-build, test, clippy and the 2,500-connection load test, and writes `verify.log`. If the
-build fails it restores the reduced workspace so the library crates still build.
-
-`verify.log` is the file to send back — it carries the actual compiler output rather than
-a summary of it. The script needs only `awk` and `cargo`, finds `cargo` via
-`~/.cargo/env` if it is not on `PATH`, and raises the open-file limit before the load
-test (macOS defaults to 256, far below what 2,500 connections need).
-
-Both are real code, not stubs, but neither has been through a compiler — expect to fix
-what `rustc` finds. The four library crates they depend on are fully tested.
 (`bnetcc-storage-sqlite` is a separate crate rather than a feature flag because an
 *optional* dependency still forces registry resolution.)
 
