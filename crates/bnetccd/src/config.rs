@@ -4,13 +4,14 @@
 //! across `bnetd.conf` plus fifteen side files. Every field has a default, so a minimal
 //! config is a handful of lines and an operator only writes what they want to change.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 #[cfg(test)]
 use bnetcc_core::limits::ClientClass;
 use bnetcc_core::policy::{ClientLimits, ConnLimitsPatch, Policy, ServerMode};
+use bnetcc_proto::chat::{normalize_channel_name, user_flags};
 use bnetcc_proto::FourCc;
 use serde::Deserialize;
 
@@ -43,20 +44,148 @@ pub struct Config {
 #[serde(deny_unknown_fields, default)]
 pub struct ChannelsConfig {
     /// Whether the first arrival to a private (user-created) channel is granted operator.
-    /// Op/Clan channels always auto-op and `Public *` channels never do, regardless of
-    /// this; it only governs the private case. Off by default.
+    /// Op/Clan channels op only their named account and `Public *` channels never auto-op,
+    /// regardless of this; it only governs the private case. Off by default.
     pub auto_op_private: bool,
-    /// Channels a telnet/chat-gateway user may enter *in addition to* public channels.
-    /// Gateway users are otherwise confined to `Public *` channels — they must not reach
-    /// arbitrary private or Op/Clan channels. Defaults to a tech-support channel.
-    pub telnet_channels: Vec<String>,
+    /// Global default for telnet/chat-gateway channel access: `"public"` (gateway users
+    /// may enter public channels only — the default), `"none"` (no channels), or `"all"`.
+    /// A per-channel `telnet` setting in `[[channels.defined]]` overrides this.
+    pub telnet_access: String,
+    /// Pre-defined channels with fixed properties, applied when the channel is created.
+    /// Names not listed here fall back to the name-convention behaviour.
+    pub defined: Vec<ChannelDef>,
 }
 
 impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
             auto_op_private: false,
-            telnet_channels: vec!["Open Tech Support".to_string()],
+            telnet_access: "public".to_string(),
+            defined: Vec::new(),
+        }
+    }
+}
+
+/// A pre-defined channel and its fixed properties. Unset optional fields fall back to the
+/// name-convention default for that channel.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ChannelDef {
+    /// Display name (matched case-insensitively, normalised like any channel name).
+    pub name: String,
+    /// Whether it appears in `SID_GETCHANNELLIST`. Defaults to true.
+    pub listed: Option<bool>,
+    /// Public semantics: a public channel never auto-ops. Defaults from the name
+    /// convention (`Public *` → true).
+    pub public: Option<bool>,
+    /// Whether the channel survives becoming empty (does not vanish). Default false.
+    pub persist: Option<bool>,
+    /// Maximum users; falls back to the server default.
+    pub max_users: Option<usize>,
+    /// Message shown to a user on entry (a per-channel topic/greeting).
+    pub topic: Option<String>,
+    /// Telnet/chat-gateway access override: `"allow"`, `"deny"`, or unset (inherit the
+    /// global `telnet_access`). This is how "Open Tech Support" is opened to telnet while
+    /// other non-public channels stay closed.
+    pub telnet: Option<String>,
+    /// Only game clients may enter (not the telnet/chat gateway). Default false.
+    pub game_only: Option<bool>,
+    /// Restrict entry to users carrying a chat flag: `"admin"`, `"speaker"`, or unset
+    /// (anyone). Ties into flag-limited channels.
+    pub min_flag: Option<String>,
+}
+
+/// Global default for telnet/chat-gateway channel access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TelnetAccess {
+    /// Gateway users may not enter any channel by default.
+    None,
+    /// Gateway users may enter public channels only (the default).
+    #[default]
+    Public,
+    /// Gateway users may enter any channel by default.
+    All,
+}
+
+/// A pre-defined channel with every property resolved to a concrete value.
+#[derive(Debug, Clone)]
+pub struct ResolvedChannel {
+    /// Display name as configured.
+    pub display: String,
+    /// Appears in the channel list.
+    pub listed: bool,
+    /// Public semantics (never auto-ops).
+    pub public: bool,
+    /// Survives becoming empty.
+    pub persist: bool,
+    /// Max users, or `None` for the server default.
+    pub max_users: Option<usize>,
+    /// Per-entry topic/greeting.
+    pub topic: Option<String>,
+    /// Telnet override: `Some(true)` allow, `Some(false)` deny, `None` inherit global.
+    /// Read by [`ChannelRules::telnet_may_join`]; not yet consulted on a live path because
+    /// the chat gateway cannot join channels yet (docs/ROADMAP.md).
+    #[allow(dead_code)]
+    pub telnet: Option<bool>,
+    /// Only game clients may enter. Enforced once the gateway's channel-join command
+    /// exists — until then no telnet client can reach any channel, so nothing to reject.
+    #[allow(dead_code)]
+    pub game_only: bool,
+    /// Required chat-flag bitmask for entry; 0 = open to anyone.
+    pub min_flag: u32,
+}
+
+/// Resolved, validated channel rules: the global telnet default plus the defined channels
+/// keyed by normalised name.
+#[derive(Debug, Clone, Default)]
+pub struct ChannelRules {
+    /// Global telnet access default when a channel has no explicit `telnet` setting. Read
+    /// by [`ChannelRules::telnet_may_join`]; see the note there about the enforcement gap.
+    #[allow(dead_code)]
+    pub telnet_access: TelnetAccess,
+    by_key: HashMap<Vec<u8>, ResolvedChannel>,
+}
+
+impl ChannelRules {
+    /// The rule for a channel by its normalised key, if one is defined.
+    #[must_use]
+    pub fn get(&self, key: &[u8]) -> Option<&ResolvedChannel> {
+        self.by_key.get(key)
+    }
+
+    /// Every defined channel that should appear in the channel list.
+    pub fn listed(&self) -> impl Iterator<Item = &ResolvedChannel> {
+        self.by_key.values().filter(|c| c.listed)
+    }
+
+    /// Whether a telnet/chat-gateway user may enter this channel, given its display name.
+    /// Uses the per-channel override if defined, else the global default (public-only).
+    ///
+    /// Not yet called on a live path: the chat gateway is a stub that cannot join channels.
+    /// It becomes the enforcement point the moment the gateway parses `/join`
+    /// (docs/ROADMAP.md); tested in `channel_rules` unit tests meanwhile.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn telnet_may_join(&self, display: &str) -> bool {
+        let key = normalize_channel_name(display.as_bytes());
+        if let Some(rule) = self.by_key.get(&key) {
+            if let Some(explicit) = rule.telnet {
+                return explicit;
+            }
+            // No per-channel override: fall through to the global default using the
+            // resolved public flag.
+            return match self.telnet_access {
+                TelnetAccess::None => false,
+                TelnetAccess::Public => rule.public,
+                TelnetAccess::All => true,
+            };
+        }
+        match self.telnet_access {
+            TelnetAccess::None => false,
+            TelnetAccess::Public => {
+                bnetcc_core::channel::classify_name(display) == bnetcc_core::channel::NameKind::Public
+            }
+            TelnetAccess::All => true,
         }
     }
 }
@@ -246,6 +375,12 @@ pub struct LimitsConfig {
     /// an operator can waive the address cost for their own host, not the key cost.
     pub gateway_allowlist: Vec<IpAddr>,
 
+    /// Enforce one live session per CD key (`SID_AUTH_CHECK` result `0x201` "key in use").
+    /// This is the economic gate on bot fleets (see `docs/WARNET.md`), so it defaults on.
+    /// Turn it off to let several clients share a key — useful when testing with a fleet
+    /// of your own bots on one key.
+    pub cd_key_uniqueness: bool,
+
     /// Connection limits, per client type.
     pub clients: ClientLimitsConfig,
 }
@@ -336,6 +471,7 @@ impl Default for LimitsConfig {
             handshake_timeout_secs: 30,
             idle_timeout_secs: 1200,
             gateway_allowlist: Vec::new(),
+            cd_key_uniqueness: true,
             clients: ClientLimitsConfig::default(),
         }
     }
@@ -487,6 +623,77 @@ impl Config {
             allowed,
         })
     }
+
+    /// Resolve and validate the channel rules.
+    ///
+    /// # Errors
+    ///
+    /// A bad `telnet_access` value, a bad per-channel `telnet` / `min_flag` value, a blank
+    /// channel name, or two definitions that normalise to the same channel.
+    pub fn channel_rules(&self) -> Result<ChannelRules, String> {
+        let telnet_access = match self.channels.telnet_access.to_ascii_lowercase().as_str() {
+            "none" => TelnetAccess::None,
+            "public" | "" => TelnetAccess::Public,
+            "all" => TelnetAccess::All,
+            other => {
+                return Err(format!(
+                    "channels.telnet_access must be \"public\", \"none\" or \"all\", not {other:?}"
+                ))
+            }
+        };
+
+        let mut by_key = HashMap::new();
+        for def in &self.channels.defined {
+            let display = def.name.trim();
+            if display.is_empty() {
+                return Err("a channels.defined entry has an empty name".into());
+            }
+            let key = normalize_channel_name(display.as_bytes());
+            if key.is_empty() {
+                return Err(format!("channel name {display:?} normalises to nothing"));
+            }
+            let public = def.public.unwrap_or_else(|| {
+                bnetcc_core::channel::classify_name(display) == bnetcc_core::channel::NameKind::Public
+            });
+            let telnet = match def.telnet.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                None | Some("") => None,
+                Some("allow") => Some(true),
+                Some("deny") => Some(false),
+                Some(other) => {
+                    return Err(format!(
+                        "channel {display:?}: telnet must be \"allow\" or \"deny\", not {other:?}"
+                    ))
+                }
+            };
+            let min_flag = match def.min_flag.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                None | Some("") | Some("none") => 0,
+                Some("admin") => user_flags::ADMIN,
+                Some("speaker") => user_flags::SPEAKER,
+                Some("operator") => user_flags::OPERATOR,
+                Some(other) => {
+                    return Err(format!(
+                        "channel {display:?}: min_flag must be \"admin\", \"speaker\" or \
+                         \"operator\", not {other:?}"
+                    ))
+                }
+            };
+            let resolved = ResolvedChannel {
+                display: display.to_string(),
+                listed: def.listed.unwrap_or(true),
+                public,
+                persist: def.persist.unwrap_or(false),
+                max_users: def.max_users,
+                topic: def.topic.clone().filter(|t| !t.is_empty()),
+                telnet,
+                game_only: def.game_only.unwrap_or(false),
+                min_flag,
+            };
+            if by_key.insert(key, resolved).is_some() {
+                return Err(format!("two channels.defined entries resolve to {display:?}"));
+            }
+        }
+        Ok(ChannelRules { telnet_access, by_key })
+    }
 }
 
 #[cfg(test)]
@@ -499,6 +706,65 @@ mod tests {
         assert_eq!(cfg.server.mode, "gaming");
         assert_eq!(cfg.listen.bncs.port(), 6112);
         assert!(!cfg.federation.enabled);
+    }
+
+    #[test]
+    fn defined_channels_resolve_and_apply_rules() {
+        let cfg = Config::from_toml(
+            r#"
+            [channels]
+            telnet_access = "public"
+
+            [[channels.defined]]
+            name = "Open Tech Support"
+            telnet = "allow"
+            persist = true
+            topic = "Ask here"
+
+            [[channels.defined]]
+            name = "Staff"
+            listed = false
+            min_flag = "admin"
+
+            [[channels.defined]]
+            name = "War2 Ladder"
+            game_only = true
+            "#,
+        )
+        .unwrap();
+        let rules = cfg.channel_rules().unwrap();
+
+        // Per-channel telnet override lets telnet into a non-public channel...
+        assert!(rules.telnet_may_join("Open Tech Support"));
+        // ...while a normal private channel stays closed to telnet under the default.
+        assert!(!rules.telnet_may_join("Someones Room"));
+        // Public channels are reachable by the global default.
+        assert!(rules.telnet_may_join("Public Chat"));
+
+        let tech = rules
+            .get(&normalize_channel_name(b"Open Tech Support"))
+            .expect("defined");
+        assert!(tech.persist);
+        assert_eq!(tech.topic.as_deref(), Some("Ask here"));
+
+        let staff = rules.get(&normalize_channel_name(b"Staff")).expect("defined");
+        assert!(!staff.listed);
+        assert_eq!(staff.min_flag, user_flags::ADMIN);
+
+        let ladder = rules.get(&normalize_channel_name(b"War2 Ladder")).expect("defined");
+        assert!(ladder.game_only);
+
+        // Only "Open Tech Support" and "War2 Ladder" are listed (Staff is hidden).
+        assert_eq!(rules.listed().count(), 2);
+    }
+
+    #[test]
+    fn a_bad_channel_setting_is_rejected() {
+        let cfg = Config::from_toml(
+            "[[channels.defined]]\nname = \"X\"\ntelnet = \"maybe\"",
+        )
+        .unwrap();
+        assert!(cfg.channel_rules().is_err());
     }
 
     #[test]

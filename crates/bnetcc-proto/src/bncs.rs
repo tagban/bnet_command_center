@@ -155,6 +155,11 @@ impl ProtocolSelector {
 /// Only those Command Center handles or deliberately ignores are named. The full index is at
 /// <https://bnetdocs.org/packet/index>.
 pub mod sid {
+    /// Keepalive. Clients send `SID_NULL` periodically (roughly every couple of minutes)
+    /// to hold the connection open; it carries no payload and expects no reply. It arrives
+    /// unprompted in any state, so accept it everywhere and never treat it as a violation —
+    /// rejecting it disconnects an idle client mid-session.
+    pub const NULL: u8 = 0x00;
     /// Client stops advertising a game. Zero payload.
     ///
     /// Every `Battle.snp` client sends this on logoff even when not in a game, and
@@ -178,6 +183,10 @@ pub mod sid {
     pub const SYSTEMINFO: u8 = 0x2B;
     /// Legacy logon: CD-key check for the old flow.
     pub const CDKEY: u8 = 0x30;
+    /// Legacy logon: CD-key check, hashed form (War2 BNE and later old clients use this
+    /// instead of `CDKEY` so the key is not sent in the clear). Reply is `(UINT32) Result`
+    /// (0x01 = Ok) then `(STRING) Key owner`.
+    pub const CDKEY2: u8 = 0x36;
     /// Client requests the game list.
     pub const GETADVLISTEX: u8 = 0x09;
     /// Client enters chat.
@@ -201,6 +210,13 @@ pub mod sid {
     pub const CHATCOMMAND: u8 = 0x0E;
     /// Server emits a chat event.
     pub const CHATEVENT: u8 = 0x0F;
+    /// Client reads account profile keys. Clients request this at the login screen and in
+    /// chat. **CVE-2004-2705's vector** — a naive server returns any key of any account,
+    /// including the password digest — so the handler must return only ACL-filtered values
+    /// (currently: empty for everything, until per-key ACLs are wired to this path).
+    pub const READUSERDATA: u8 = 0x26;
+    /// Client writes account profile keys.
+    pub const WRITEUSERDATA: u8 = 0x27;
     /// Server warns of flood detection before disconnecting.
     pub const FLOODDETECTED: u8 = 0x13;
     /// Client's UDP-detection response, sent unprompted right after the version check
@@ -248,6 +264,9 @@ pub mod sid {
     pub const WARCRAFTGENERAL: u8 = 0x44;
     /// WarCraft III announces its game hosting port.
     pub const NETGAMEPORT: u8 = 0x45;
+    /// Client requests server news / MOTD (Diablo, War2 BNE and others send this after
+    /// joining). Server may reply with news entries; accepting it is what matters.
+    pub const NEWS_INFO: u8 = 0x46;
     /// WarCraft III asks for an advertisement's click URL. WAR3/W3XP only.
     pub const QUERYADURL: u8 = 0x41;
     /// Server prompts the client to set an account email (client shows a dialog). Also

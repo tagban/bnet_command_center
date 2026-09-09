@@ -6,6 +6,7 @@ mod config;
 mod node;
 mod session;
 mod storage;
+mod udp;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -143,6 +144,25 @@ async fn run(cfg: Config) -> Result<(), String> {
         info!(dir = %dir.display(), "serving operator-supplied files over BNFTP");
     }
 
+    // UDP :6112 for the login-time UDP check that lets classic clients host/join games.
+    // Best-effort — a bind failure only means clients keep the No-UDP flag (games stay
+    // greyed), which is no worse than not having it.
+    let udp_socket = match tokio::net::UdpSocket::bind(cfg.listen.bncs).await {
+        Ok(s) => {
+            info!(addr = %cfg.listen.bncs, "listening for the game UDP check");
+            let socket = Arc::new(s);
+            // The receive loop answers clients that probe first; the socket is also handed
+            // to the node so sessions can send the login-time PKT_SERVERPING that un-greys
+            // Create/Join on clients that wait for the server to ping them.
+            tokio::spawn(udp::run(Arc::clone(&socket)));
+            Some(socket)
+        }
+        Err(e) => {
+            warn!(error = %e, "could not bind UDP; classic clients will show No-UDP (games greyed)");
+            None
+        }
+    };
+
     let node = Arc::new(Node::new(
         node::NodeConfig {
             policy: policy.clone(),
@@ -153,6 +173,9 @@ async fn run(cfg: Config) -> Result<(), String> {
             files_dir,
             admins: cfg.admins.clone(),
             auto_op_private: cfg.channels.auto_op_private,
+            channel_rules: cfg.channel_rules()?,
+            cd_key_uniqueness: cfg.limits.cd_key_uniqueness,
+            udp_socket,
         },
         storage,
     ));

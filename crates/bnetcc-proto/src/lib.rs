@@ -94,12 +94,16 @@ pub mod product {
 
     /// Whether the server should never answer UDP for this product.
     ///
-    /// Real Battle.net does not respond to UDP at all for `W2BN`, `DRTL` and `DSHR`, so
-    /// those clients always show the No-UDP flag. Matching that avoids a cosmetic
-    /// difference users notice immediately.
+    /// `DRTL`/`DSHR` (Diablo, Diablo Shareware) are kept here provisionally — we have no
+    /// live client to test them and Diablo's game model differs.
+    ///
+    /// `W2BN` is deliberately **not** listed: a real Warcraft II BNE client (captured
+    /// 2026-09-09) binds UDP `:6112`, shows a UDP warning, and greys Create/Join until the
+    /// server's `PKT_SERVERPING` completes the round trip. The earlier "W2BN always
+    /// No-UDP" note was a misreading; enabling games for it is a stated product goal.
     #[must_use]
     pub fn always_no_udp(p: FourCc) -> bool {
-        matches!(p, W2BN | DRTL | DSHR)
+        matches!(p, DRTL | DSHR)
     }
 
     #[cfg(test)]
@@ -118,7 +122,9 @@ pub mod product {
 
         #[test]
         fn no_udp_products() {
-            assert!(always_no_udp(W2BN));
+            // W2BN must NOT be here: it runs the UDP check and needs PKT_SERVERPING to
+            // enable game hosting (confirmed against a real client, 2026-09-09).
+            assert!(!always_no_udp(W2BN));
             assert!(always_no_udp(DRTL));
             assert!(always_no_udp(DSHR));
             assert!(!always_no_udp(STAR));

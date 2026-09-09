@@ -386,8 +386,12 @@ From BNETDocs' *Known Server Issues*. These are not bugs to fix; clients expect 
   cooldown or clients will see spurious "key in use".
 - **150–230 ms delay after channel joins, self-whispers, and friend-list queries.** Some bots
   are written against this timing.
-- **Servers do not respond to UDP at all for W2BN/DRTL/DSHR**, so those clients always get the
-  No-UDP flag (`0x10`). Set it unconditionally for those products.
+- **Diablo (`DRTL`/`DSHR`) get the No-UDP flag (`0x10`) unconditionally** (provisional — no
+  live client tested). **`W2BN` does NOT:** a real Warcraft II BNE client (captured
+  2026-09-09) binds UDP `:6112`, shows a UDP warning, and greys Create/Join until the server
+  sends it `PKT_SERVERPING` and the round trip completes. It does *not* probe first — it waits
+  for the server to ping its `:6112`, then replies over TCP with `SID_UDPPINGRESPONSE` (0x14).
+  The earlier "servers never answer UDP for W2BN" note was a misreading and is corrected here.
 - **`SEXP` 1.16.1 may send `SID_STOPADV` before login completes.** Don't treat pre-auth
   `0x02` as a violation.
 - **Diablo: Hellfire (`HRTL`) never receives `SID_STARTVERSIONING`** and hangs during

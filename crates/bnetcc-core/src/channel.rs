@@ -65,6 +65,9 @@ pub enum JoinDenial {
     Full,
     /// Account is banned from this channel — `EID_CHANNELRESTRICTED`.
     Banned,
+    /// Entry is restricted (e.g. a flag-gated channel the user lacks the flag for) —
+    /// `EID_CHANNELRESTRICTED`.
+    Restricted,
     /// Already present.
     AlreadyPresent,
 }
@@ -113,10 +116,13 @@ pub struct Channel {
     heirs: Vec<AccountId>,
     bans: BTreeSet<AccountId>,
     seq: u64,
-    /// Whether the first arrival to an empty channel is granted operator. Defaults from
-    /// the class, but the node overrides it per channel-name convention (Op/Clan always,
-    /// "Public *" never, private per config) — see [`Channel::set_auto_op`].
-    auto_op: bool,
+    /// How operator is auto-granted on join. Defaults from the class, but the node
+    /// overrides it per channel-name convention at creation — see [`Channel::set_op_grant`]
+    /// and [`op_grant_for_name`].
+    op_grant: OpGrant,
+    /// Whether this channel survives becoming empty, beyond what its class dictates. Set
+    /// for operator-defined persistent channels — see [`Channel::set_persist`].
+    persist: bool,
 }
 
 impl Channel {
@@ -128,7 +134,11 @@ impl Channel {
             ChannelClass::Official => channel_flags::PUBLIC | channel_flags::SYSTEM,
             _ => channel_flags::PUBLIC,
         };
-        let auto_op = class.grants_first_operator();
+        let op_grant = if class.grants_first_operator() {
+            OpGrant::FirstArrival
+        } else {
+            OpGrant::None
+        };
         Self {
             name,
             display,
@@ -140,15 +150,20 @@ impl Channel {
             heirs: Vec::new(),
             bans: BTreeSet::new(),
             seq: 0,
-            auto_op,
+            op_grant,
+            persist: false,
         }
     }
 
-    /// Override whether the first arrival is granted operator. The node calls this at
-    /// creation based on the channel-name convention and config; see
-    /// [`operator_grant_for_name`].
-    pub fn set_auto_op(&mut self, auto_op: bool) {
-        self.auto_op = auto_op;
+    /// Set how operator is auto-granted. The node calls this at creation based on the
+    /// channel-name convention and config; see [`op_grant_for_name`].
+    pub fn set_op_grant(&mut self, op_grant: OpGrant) {
+        self.op_grant = op_grant;
+    }
+
+    /// Set whether the channel survives becoming empty (a defined persistent channel).
+    pub fn set_persist(&mut self, persist: bool) {
+        self.persist = persist;
     }
 
     /// Normalised lookup name.
@@ -250,8 +265,14 @@ impl Channel {
             return Err(JoinDenial::Full);
         }
 
-        let granted_operator =
-            self.members.is_empty() && self.operator.is_none() && self.auto_op;
+        let granted_operator = self.operator.is_none()
+            && match &self.op_grant {
+                OpGrant::None => false,
+                OpGrant::FirstArrival => self.members.is_empty(),
+                // "Op <name>" / "Clan <name>": only the named account is auto-opped, and
+                // whenever they arrive — not merely whoever shows up first.
+                OpGrant::NameMatch(op_name) => name.eq_ignore_ascii_case(op_name),
+            };
         let flags = if granted_operator {
             base_flags | user_flags::OPERATOR
         } else {
@@ -289,7 +310,9 @@ impl Channel {
 
         let mut out = LeaveOutcome {
             now_empty: self.members.is_empty(),
-            should_destroy: self.members.is_empty() && !self.class.persists_when_empty(),
+            should_destroy: self.members.is_empty()
+                && !self.class.persists_when_empty()
+                && !self.persist,
             ..LeaveOutcome::default()
         };
 
@@ -414,18 +437,57 @@ pub fn classify_name(display: &str) -> NameKind {
     }
 }
 
-/// Whether the first arrival to an empty channel of this name should be granted operator.
+/// How a channel auto-grants operator on join.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpGrant {
+    /// No auto-grant; operator is only ever assigned explicitly.
+    None,
+    /// The first arrival to the empty channel is granted operator.
+    FirstArrival,
+    /// Only the account whose name matches (case-insensitively) is granted operator, and
+    /// whenever they join. Used by `Op <name>` / `Clan <name>` channels.
+    NameMatch(String),
+}
+
+/// The operator-grant policy for a channel of this name.
 ///
-/// - Op/Clan channels: always (`true`).
-/// - `Public *` channels: never (`false`).
-/// - Private channels: `auto_op_private`, a per-node config choice.
+/// - `Op <name>` / `Clan <name>`: [`OpGrant::NameMatch`] on `<name>` — only that account
+///   is auto-opped (e.g. "Op Fish" ops only "Fish"). An `Op`/`Clan` with no name grants
+///   to nobody.
+/// - `Public *`: [`OpGrant::None`].
+/// - Private: first arrival if `auto_op_private`, else nobody.
 #[must_use]
-pub fn operator_grant_for_name(display: &str, auto_op_private: bool) -> bool {
+pub fn op_grant_for_name(display: &str, auto_op_private: bool) -> OpGrant {
     match classify_name(display) {
-        NameKind::OpOrClan => true,
-        NameKind::Public => false,
-        NameKind::Private => auto_op_private,
+        NameKind::OpOrClan => match designated_op_name(display) {
+            Some(name) => OpGrant::NameMatch(name),
+            None => OpGrant::None,
+        },
+        NameKind::Public => OpGrant::None,
+        NameKind::Private => {
+            if auto_op_private {
+                OpGrant::FirstArrival
+            } else {
+                OpGrant::None
+            }
+        }
     }
+}
+
+/// The `<name>` in `Op <name>` / `Clan <name>`, preserving its original case. `None` if
+/// there is no name after the prefix.
+#[must_use]
+pub fn designated_op_name(display: &str) -> Option<String> {
+    let trimmed = display.trim();
+    for prefix in ["op ", "clan "] {
+        if trimmed.len() > prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            let name = trimmed[prefix.len()..].trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Whether a telnet / chat-gateway user may enter a channel by this name.
@@ -467,14 +529,28 @@ mod tests {
 
     #[test]
     fn operator_grant_follows_the_name_rules() {
-        // Op/Clan always auto-op, regardless of the private toggle.
-        assert!(operator_grant_for_name("Op Warlord", false));
-        assert!(operator_grant_for_name("Clan xYz", false));
+        // Op/Clan grant to the *named* account only, regardless of the private toggle.
+        assert_eq!(op_grant_for_name("Op Warlord", false), OpGrant::NameMatch("Warlord".into()));
+        assert_eq!(op_grant_for_name("Clan xYz", false), OpGrant::NameMatch("xYz".into()));
+        // An Op/Clan channel with no name grants to nobody.
+        assert_eq!(op_grant_for_name("Op", false), OpGrant::None);
         // Public never auto-ops, even with the toggle on.
-        assert!(!operator_grant_for_name("Public Chat", true));
+        assert_eq!(op_grant_for_name("Public Chat", true), OpGrant::None);
         // Private follows the toggle.
-        assert!(!operator_grant_for_name("my hangout", false));
-        assert!(operator_grant_for_name("my hangout", true));
+        assert_eq!(op_grant_for_name("my hangout", false), OpGrant::None);
+        assert_eq!(op_grant_for_name("my hangout", true), OpGrant::FirstArrival);
+    }
+
+    #[test]
+    fn op_channel_ops_only_the_matching_name() {
+        // "Op Fish": whoever arrives first is NOT opped unless they are Fish.
+        let mut c = Channel::new(b"op fish".to_vec(), "Op Fish".into(), ChannelClass::Local, 40);
+        c.set_op_grant(op_grant_for_name("Op Fish", false));
+        let intruder = c.join(1, "Grunt".into(), 0, Vec::new()).unwrap();
+        assert!(!intruder.granted_operator, "a non-matching user must not be opped");
+        let fish = c.join(2, "fish".into(), 0, Vec::new()).unwrap();
+        assert!(fish.granted_operator, "the named account is opped whenever it joins");
+        assert!(c.is_operator(2));
     }
 
     #[test]
@@ -490,7 +566,7 @@ mod tests {
     #[test]
     fn a_channel_with_auto_op_off_never_grants_operator() {
         let mut c = Channel::new(b"public chat".to_vec(), "Public Chat".into(), ChannelClass::Local, 40);
-        c.set_auto_op(false);
+        c.set_op_grant(OpGrant::None);
         let out = join(&mut c, 1).unwrap();
         assert!(!out.granted_operator, "public channels must not auto-op");
         assert_eq!(out.flags & user_flags::OPERATOR, 0);

@@ -48,6 +48,17 @@ impl SessionState {
         matches!(self, Self::LoggedIn | Self::Chatting | Self::InChannel)
     }
 
+    /// Whether the session is still in the **automated** pre-login handshake (`Connected`
+    /// or `Versioning`), where the client should respond in milliseconds. Once the version
+    /// check passes (`Authenticating`), a human is typically at the login screen reading
+    /// the TOS and typing credentials, so the caller applies the longer idle timeout there
+    /// rather than the short handshake deadline — otherwise a real user is disconnected
+    /// mid-login. The short deadline still guards the automated phase against slowloris.
+    #[must_use]
+    pub const fn in_automated_handshake(self) -> bool {
+        matches!(self, Self::Connected | Self::Versioning)
+    }
+
     /// Whether a packet id is acceptable in this state.
     ///
     /// Two deliberate quirks, both from real Battle.net behaviour that clients depend on:
@@ -71,7 +82,8 @@ impl SessionState {
         //              timer regardless of where they are in the handshake
         if matches!(
             id,
-            sid::PING
+            sid::NULL
+                | sid::PING
                 | sid::STOPADV
                 | sid::CHECKAD
                 | sid::CLICKAD
@@ -96,7 +108,9 @@ impl SessionState {
             Self::Connected => matches!(id, sid::AUTH_INFO | sid::STARTVERSIONING),
             // AUTH_CHECK completes the modern version check; REPORTVERSION the legacy one,
             // with CDKEY sometimes sent alongside it.
-            Self::Versioning => matches!(id, sid::AUTH_CHECK | sid::REPORTVERSION | sid::CDKEY),
+            Self::Versioning => {
+                matches!(id, sid::AUTH_CHECK | sid::REPORTVERSION | sid::CDKEY | sid::CDKEY2)
+            }
             Self::Authenticating => matches!(
                 id,
                 sid::LOGONRESPONSE
@@ -108,10 +122,12 @@ impl SessionState {
                     | sid::AUTH_ACCOUNTLOGONPROOF
                     // Legacy flow may send its CD-key check just before the logon.
                     | sid::CDKEY
-                    // Real clients request icon data between the version check passing and
-                    // sending their logon, not only afterwards.
+                    | sid::CDKEY2
+                    // Real clients request icon data and read profile keys between the
+                    // version check passing and sending their logon, not only afterwards.
                     | sid::GETICONDATA
                     | sid::GETFILETIME
+                    | sid::READUSERDATA
             ),
             Self::LoggedIn => matches!(
                 id,
@@ -122,6 +138,9 @@ impl SessionState {
                     | sid::CHECKDATAFILE2
                     | sid::GETCHANNELLIST
                     | sid::FRIENDSLIST
+                    | sid::READUSERDATA
+                    | sid::WRITEUSERDATA
+                    | sid::NEWS_INFO
                     | sid::QUERYREALMS2
                     | sid::LOGONREALMEX
                     | sid::NETGAMEPORT
@@ -138,6 +157,9 @@ impl SessionState {
                     | sid::CHATCOMMAND
                     | sid::GETCHANNELLIST
                     | sid::FRIENDSLIST
+                    | sid::READUSERDATA
+                    | sid::WRITEUSERDATA
+                    | sid::NEWS_INFO
                     | sid::GETADVLISTEX
                     | sid::STARTADVEX3
                     | sid::NOTIFYJOIN
@@ -292,7 +314,15 @@ mod tests {
     fn no_unauthenticated_state_accepts_a_data_bearing_packet() {
         // The structural guard against CVE-2004-2705's class: sweep every packet id and
         // assert that a pre-auth session accepts only the handshake set.
+        //
+        // Note SID_READUSERDATA is *deliberately absent* from this allowlist even though
+        // real clients send it at the login screen: its whole danger is returning another
+        // account's keys pre-auth, so the second, stricter guard below asserts it is never
+        // accepted before the version check, and the handler itself returns only
+        // ACL-filtered (currently empty) values. SID_WRITEUSERDATA is likewise absent —
+        // writes require a completed login.
         let handshake = [
+            sid::NULL,
             sid::AUTH_INFO,
             sid::AUTH_CHECK,
             sid::LOGONRESPONSE,
@@ -309,11 +339,14 @@ mod tests {
             sid::DISPLAYAD,
             sid::QUERYADURL,
             // Stateless UDP-detection reply, plus icon/file metadata requests real
-            // clients send during the handshake. None reads user data, so none reopens
-            // CVE-2004-2705's class the way SID_READUSERDATA pre-auth would.
+            // clients send during the handshake. None reads user data.
             sid::UDPPINGRESPONSE,
             sid::GETICONDATA,
             sid::GETFILETIME,
+            // The login screen reads profile keys; accepted only from Authenticating (not
+            // the fully-automated Connected/Versioning phases), and the handler returns
+            // no data until per-key ACLs are wired. Verified by the stricter guard below.
+            sid::READUSERDATA,
             // Legacy-logon handshake packets (Diablo I, War2 BNE, old Mac clients). Same
             // reasoning: identity/version/key negotiation, no user-data read.
             sid::CLIENTID,
@@ -323,6 +356,7 @@ mod tests {
             sid::STARTVERSIONING,
             sid::REPORTVERSION,
             sid::CDKEY,
+            sid::CDKEY2,
         ];
         for state in [
             SessionState::Connected,
@@ -338,6 +372,22 @@ mod tests {
                     );
                 }
             }
+        }
+
+        // Stricter guard: the fully-automated pre-version phases must not accept the
+        // data-read/write packets at all, and no unauthenticated state may accept a
+        // profile *write*. Only the interactive Authenticating phase accepts a
+        // (data-less) READUSERDATA.
+        for state in [SessionState::Connected, SessionState::Versioning] {
+            assert!(!state.accepts(sid::READUSERDATA), "{} accepted READUSERDATA", state.name());
+        }
+        for state in [
+            SessionState::Connected,
+            SessionState::Versioning,
+            SessionState::Authenticating,
+        ] {
+            assert!(!state.accepts(sid::WRITEUSERDATA), "{} accepted WRITEUSERDATA", state.name());
+            assert!(!state.accepts(sid::CHATCOMMAND), "{} accepted chat", state.name());
         }
     }
 

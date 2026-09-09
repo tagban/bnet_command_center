@@ -213,6 +213,18 @@ fn version_mpq_name(platform: Option<FourCc>) -> String {
     format!("{plat}ver1.mpq")
 }
 
+/// The BNI icon file to advertise for a client's product. StarCraft/Brood War and
+/// WarCraft III have their own icon packs; everything else (Diablo, Warcraft II BNE, the
+/// old Mac clients) uses the shared `icons.bni`. An operator supplies these in the BNFTP
+/// files directory.
+fn icon_file_name(product: Option<FourCc>) -> &'static [u8] {
+    match product {
+        Some(p) if p == product::STAR || p == product::SEXP => b"icons_STAR.bni",
+        Some(p) if p == product::WAR3 || p == product::W3XP => b"icons-WAR3.bni",
+        _ => b"icons.bni",
+    }
+}
+
 /// Convert a Unix time to a Windows FILETIME (100-nanosecond ticks since 1601-01-01).
 fn unix_to_filetime(t: SystemTime) -> u64 {
     const EPOCH_DIFF_SECS: u64 = 11_644_473_600; // 1601→1970 in seconds.
@@ -438,10 +450,12 @@ async fn bncs_session(
 
     let mut buf = RecvBuf::with_capacity(READ_CHUNK);
     loop {
-        let deadline = if s.state.authenticated() {
-            limits.idle_timeout
-        } else {
+        // The short handshake deadline guards only the automated pre-login phase; once the
+        // version check passes, a human may be at the login screen, so use the idle timeout.
+        let deadline = if s.state.in_automated_handshake() {
             limits.handshake_timeout
+        } else {
+            limits.idle_timeout
         };
 
         let tail = buf.writable_tail(READ_CHUNK);
@@ -480,9 +494,24 @@ async fn bncs_session(
                 }
             };
             if !s.state.accepts(frame.id) {
+                if s.state.authenticated() {
+                    // Post-login, an unrecognised packet is tolerated: real clients emit a
+                    // long tail of optional packets (news, profile, realm, WC3 extras) and
+                    // dropping the connection over one is hostile. Ignore it and continue.
+                    // Pre-login the strict close below stands — that is the CVE-class guard.
+                    debug!(
+                        peer = %s.peer,
+                        id = %format!("{:#04x}", frame.id),
+                        state = s.state.name(),
+                        len = frame.body.len(),
+                        body = %hex_preview(&frame.body),
+                        "ignoring unrecognised packet (authenticated)"
+                    );
+                    continue;
+                }
                 debug!(
                     peer = %s.peer,
-                    id = frame.id,
+                    id = %format!("{:#04x}", frame.id),
                     state = s.state.name(),
                     "packet not accepted in this state; closing"
                 );
@@ -563,13 +592,29 @@ impl Bncs {
             // withdrawing a game the host does not have is a no-op).
             sid::STOPADV | sid::LEAVEGAME => self.stop_advertising(),
             sid::NETGAMEPORT => self.net_game_port(frame),
+            // Legacy CD-key checks (old-logon flow). We accept the key — CD-key uniqueness
+            // is enforced on the modern AUTH_CHECK path via KeyRegistry, not here.
+            sid::CDKEY => self.cd_key_reply(sid::CDKEY),
+            sid::CDKEY2 => self.cd_key_reply(sid::CDKEY2),
+            // The client asks for a file's modification time (TOS, bnserver.ini, icons)
+            // to decide whether to re-download it over BNFTP. It waits for this reply, so
+            // never leave it unanswered.
+            sid::GETFILETIME => self.get_filetime(frame),
+            // Icon file negotiation: tell the client which BNI icon file to fetch (per
+            // product) and its filetime; the client BNFTP-downloads it and renders user
+            // icons from it. War2 and others show blank icons without this.
+            sid::GETICONDATA => self.get_icon_data(),
+            // Profile reads. Returns empty for every key for now — see the handler; this
+            // keeps CVE-2004-2705 shut (no account's keys are ever returned) while letting
+            // the client's login-screen and profile reads complete instead of hanging.
+            sid::READUSERDATA => self.read_user_data(frame),
             // Keepalive, the UDP detection reply, legacy-logon informational packets, and
-            // advertisement telemetry — all accepted but not acted on. GETICONDATA and
-            // FRIENDSLIST are accepted here too; serving real icon and friends data is
-            // future work (see docs/ROADMAP.md), and clients proceed without a reply.
-            sid::PING
+            // advertisement telemetry — all accepted but not acted on. FRIENDSLIST is
+            // accepted here too; serving real friends data is future work (docs/ROADMAP.md).
+            sid::NULL
+            | sid::PING
             | sid::UDPPINGRESPONSE
-            | sid::GETICONDATA
+            | sid::NEWS_INFO
             | sid::FRIENDSLIST
             | sid::NOTIFYJOIN
             | sid::CLICKAD
@@ -577,7 +622,6 @@ impl Bncs {
             | sid::CLIENTID2
             | sid::LOCALEINFO
             | sid::SYSTEMINFO
-            | sid::CDKEY
             | sid::DISPLAYAD => Step::Continue,
             other => {
                 debug!(peer = %self.peer, id = other, "unhandled packet");
@@ -604,6 +648,22 @@ impl Bncs {
             // Queue full: the peer is not reading. Never buffer without bound.
             debug!(peer = %self.peer, "outbound queue full; closing");
             Step::Close
+        }
+    }
+
+    /// Kick off the login-time UDP ping to this client (see [`crate::udp::ping_client`]).
+    /// Classic clients bind UDP `:6112` and wait for the server to ping them before they
+    /// un-grey Create/Join. Called once per client from whichever login flow it uses:
+    /// `auth_info` (modern) or `start_versioning` (legacy). Fire-and-forget; skips products
+    /// that never run the check and hosts sharing ours (handled inside `ping_client`).
+    fn spawn_udp_ping(&self) {
+        if matches!(self.product, Some(p) if product::always_no_udp(p)) {
+            return;
+        }
+        if let Some(sock) = &self.node.udp_socket {
+            let sock = Arc::clone(sock);
+            let ip = self.peer.ip();
+            tokio::spawn(crate::udp::ping_client(sock, ip));
         }
     }
 
@@ -665,7 +725,10 @@ impl Bncs {
         let mut w = Writer::with_capacity(64);
         w.u32(logon_type)
             .u32(self.server_token)
-            .u32(0) // UDP value
+            // Non-zero UDP value so the client runs its UDP connectivity test (which the
+            // UDP listener answers). A zero here tells the client not to bother, leaving
+            // game hosting disabled. See crate::udp.
+            .u32(self.server_token)
             .u64(0) // CheckRevision MPQ filetime
             .cstr(mpq.as_bytes())
             .cstr(b"A=1 B=1 C=1 4 A=A^S B=B^C C=C^A A=A^B");
@@ -675,7 +738,11 @@ impl Bncs {
             // client. See docs/LEGAL.md §3 — this is a designed-in block, not a gap.
             w.bytes(&[0u8; 128]);
         }
-        self.send(&Frame::new(sid::AUTH_INFO, w.finish()))
+        let step = self.send(&Frame::new(sid::AUTH_INFO, w.finish()));
+        // Modern-flow clients also wait for the server's UDP ping to un-grey Create/Join.
+        // Guarded against same-host self-loops inside `spawn_udp_ping`/`ping_client`.
+        self.spawn_udp_ping();
+        step
     }
 
     /// Two checks live here. **Version restriction** is opt-in (`versions.restrict`):
@@ -740,6 +807,11 @@ impl Bncs {
             Ok::<_, bnetcc_proto::ProtoError>(keys)
         })();
 
+        // Operator opted out of one-session-per-key (e.g. a test fleet on one key).
+        if !self.node.cd_key_uniqueness {
+            return self.auth_check_ok();
+        }
+
         let keys = match parsed {
             Ok(keys) => keys,
             Err(e) => {
@@ -803,21 +875,32 @@ impl Bncs {
         let mut r = frame.reader();
         let parsed = (|| {
             let client_token = r.u32()?;
-            let _server_token = r.u32()?;
+            let client_server_token = r.u32()?;
             let proof: [u8; 20] = r.array()?;
             let username = read_username(&mut r)?;
-            Ok::<_, bnetcc_proto::ProtoError>((client_token, proof, username))
+            Ok::<_, bnetcc_proto::ProtoError>((client_token, client_server_token, proof, username))
         })();
-        let Ok((client_token, proof, username)) = parsed else {
+        let Ok((client_token, client_server_token, proof, username)) = parsed else {
             return Step::Close;
         };
         let name = String::from_utf8_lossy(&username).to_string();
 
+        // Which server token the proof was computed with:
+        // - Modern LOGONRESPONSE2 (0x3A): the token WE issued in SID_AUTH_INFO. Never trust
+        //   the client's echo here — pinning it to our value is the replay protection.
+        // - Legacy LOGONRESPONSE (0x29): the old flow issues no server token, so the client
+        //   uses whatever it put in the packet (real old clients send 0). Verify with that,
+        //   or the proof can never match and every legacy logon fails as "wrong password".
+        let server_token = if reply_id == sid::LOGONRESPONSE {
+            client_server_token
+        } else {
+            self.server_token
+        };
+
         let ok = match self.node.account(&name).await {
             None => false,
             Some(account) => {
-                // Always use *our* server token, never the one the client echoed back.
-                let expected = logon_proof(client_token, self.server_token, &account.password_hash);
+                let expected = logon_proof(client_token, server_token, &account.password_hash);
                 if proofs_match(&proof, &expected) {
                     info!(peer = %self.peer, account = %account.name, "logon accepted");
                     for &key in &self.claimed_keys {
@@ -879,7 +962,12 @@ impl Bncs {
         w.u64(0) // MPQ filetime
             .cstr(mpq.as_bytes())
             .cstr(b"A=1 B=1 C=1 4 A=A^S B=B^C C=C^A A=A^B");
-        self.send(&Frame::new(sid::STARTVERSIONING, w.finish()))
+        let step = self.send(&Frame::new(sid::STARTVERSIONING, w.finish()));
+        // Legacy-flow clients (StarCraft, Warcraft II BNE, Diablo) bind UDP :6112 and wait
+        // for the server to ping them; without it Create/Join stay greyed. Confirmed against
+        // a real W2BN client, 2026-09-09. Guarded against same-host self-loops.
+        self.spawn_udp_ping();
+        step
     }
 
     /// `SID_REPORTVERSION` (0x07), the legacy version/CD-key check. Enforces version
@@ -896,14 +984,97 @@ impl Bncs {
                     platform = %platform,
                     "rejected by version restriction (legacy)"
                 );
-                let mut w = Writer::with_capacity(8);
-                w.u32(0x0000).cstr(b""); // 0 = failed version check
-                return self.send(&Frame::new(sid::REPORTVERSION, w.finish()));
+                return self.report_version_reply(0x0000); // 0 = failed version check
             }
         }
+        self.report_version_reply(0x0002) // 2 = success
+    }
+
+    /// Build a `SID_REPORTVERSION` reply. The response is `(UINT32) Result`, `(STRING)`
+    /// patch path, then a trailing `(UINT8)` — the last byte is documented on BNETDocs and
+    /// omitting it makes some old clients under-read the packet and report the version as
+    /// unsupported even on a success result. Patch path is empty (no patch to apply).
+    fn report_version_reply(&mut self, result: u32) -> Step {
         let mut w = Writer::with_capacity(8);
-        w.u32(0x0002).cstr(b""); // 2 = success
+        w.u32(result).cstr(b"").u8(0);
         self.send(&Frame::new(sid::REPORTVERSION, w.finish()))
+    }
+
+    /// `SID_GETFILETIME` (0x33): the client asks for a file's modification time so it can
+    /// decide whether its cached copy is current or must be re-downloaded over BNFTP. The
+    /// reply echoes the request id and filename with the file's FILETIME (0 if we do not
+    /// have the file). The client blocks on this during the TOS/config step of login.
+    fn get_filetime(&mut self, frame: &Frame) -> Step {
+        let mut r = frame.reader();
+        let parsed = (|| {
+            let request_id = r.u32()?;
+            let unknown = r.u32()?;
+            let filename = r.cstr(bnftp::MAX_FILENAME)?.to_vec();
+            Ok::<_, bnetcc_proto::ProtoError>((request_id, unknown, filename))
+        })();
+        let Ok((request_id, unknown, filename)) = parsed else {
+            return Step::Close;
+        };
+        let filetime = self.node.file_mtime(&filename).map_or(0, unix_to_filetime);
+        let mut w = Writer::with_capacity(32);
+        w.u32(request_id).u32(unknown).u64(filetime).cstr(&filename);
+        self.send(&Frame::new(sid::GETFILETIME, w.finish()))
+    }
+
+    /// `SID_READUSERDATA` (0x26): the client requests profile keys for one or more
+    /// accounts. Request is `(DWORD)` account count, `(DWORD)` key count, `(DWORD)` request
+    /// id, then the account names and key names. The reply echoes the counts and id, then
+    /// `accounts * keys` value strings.
+    ///
+    /// **Security:** this is CVE-2004-2705's exact vector — a server that returns any key
+    /// of any account leaks password digests. Until per-key ACLs
+    /// (`bnetcc_storage::attr::AttrSchema::filter_readable`) are wired to this path, we
+    /// return an **empty** value for every requested cell. No account data is ever
+    /// disclosed; the client simply sees blank profile fields.
+    fn read_user_data(&mut self, frame: &Frame) -> Step {
+        let mut r = frame.reader();
+        let parsed = (|| {
+            let accounts = r.u32()?;
+            let keys = r.u32()?;
+            let request_id = r.u32()?;
+            Ok::<_, bnetcc_proto::ProtoError>((accounts, keys, request_id))
+        })();
+        let Ok((accounts, keys, request_id)) = parsed else {
+            return Step::Close;
+        };
+        // Bound the response so a malformed request cannot make us emit a huge frame.
+        let cells = (accounts as u64).saturating_mul(keys as u64).min(256) as usize;
+        let mut w = Writer::with_capacity(16 + cells);
+        w.u32(accounts).u32(keys).u32(request_id);
+        for _ in 0..cells {
+            w.cstr(b""); // ACL-filtered value; empty until real filtering is wired.
+        }
+        self.send(&Frame::new(sid::READUSERDATA, w.finish()))
+    }
+
+    /// `SID_GETICONDATA` (0x2D): tell the client which BNI icon file to use for this
+    /// product and its filetime. The client then BNFTP-downloads the file (if its cached
+    /// copy is stale) and renders each user's icon from it based on flags/statstring.
+    /// Reply is `(FILETIME)` then `(STRING)` filename.
+    fn get_icon_data(&mut self) -> Step {
+        let name = icon_file_name(self.product);
+        let filetime = self.node.file_mtime(name).map_or(0, unix_to_filetime);
+        let mut w = Writer::with_capacity(32);
+        w.u64(filetime).cstr(name);
+        self.send(&Frame::new(sid::GETICONDATA, w.finish()))
+    }
+
+    /// Reply to a legacy `SID_CDKEY` / `SID_CDKEY2` CD-key check. Response is `(UINT32)`
+    /// Result (0x01 = Ok) then `(STRING)` Key owner. We accept the key here — legacy CD-key
+    /// *uniqueness* is not yet enforced on this path (the modern `SID_AUTH_CHECK` path
+    /// does that via `KeyRegistry`); wiring it here is future work (see docs/ROADMAP.md).
+    /// `reply_id` echoes whichever of the two packets the client sent.
+    fn cd_key_reply(&mut self, reply_id: u8) -> Step {
+        const RESULT_OK: u32 = 0x01;
+        let owner = self.account.as_ref().map_or(String::new(), |a| a.name.clone());
+        let mut w = Writer::with_capacity(16);
+        w.u32(RESULT_OK).cstr(owner.as_bytes());
+        self.send(&Frame::new(reply_id, w.finish()))
     }
 
     /// Parse a create-account request (20-byte password hash then username — the shared
@@ -1010,21 +1181,25 @@ impl Bncs {
         let Ok((_join_flags, requested)) = parsed else {
             return Step::Close;
         };
+        self.do_join(&requested, &account)
+    }
 
+    /// Join a channel by name, from either `SID_JOINCHANNEL` or a `/join` command.
+    fn do_join(&mut self, requested: &[u8], account: &Account) -> Step {
         // Leave the current channel first; joining your current channel returns you to
         // the previous one on real Battle.net, but leaving unconditionally is the
         // behaviour clients cope with and is far easier to reason about.
         if let Some(prev) = self.channel.take() {
-            if prev == normalize_channel_name(&requested) {
+            if prev == normalize_channel_name(requested) {
                 // Re-joining the same channel: nothing to do.
                 self.channel = Some(prev);
                 return Step::Continue;
             }
-            self.leave_current(&prev, &account);
+            self.leave_current(&prev, account);
         }
 
         match self.node.join_channel(
-            &requested,
+            requested,
             account.id,
             &account.name,
             self.flags,
@@ -1034,10 +1209,12 @@ impl Bncs {
             Err(denial) => {
                 let event = match denial {
                     bnetcc_core::JoinDenial::Full => EventId::ChannelFull,
-                    bnetcc_core::JoinDenial::Banned => EventId::ChannelRestricted,
+                    bnetcc_core::JoinDenial::Banned | bnetcc_core::JoinDenial::Restricted => {
+                        EventId::ChannelRestricted
+                    }
                     bnetcc_core::JoinDenial::AlreadyPresent => return Step::Continue,
                 };
-                self.send(&chat_event(event, 0, 0, b"", &requested))
+                self.send(&chat_event(event, 0, 0, b"", requested))
             }
             Ok((joined, existing)) => {
                 self.flags = joined.outcome.flags;
@@ -1099,6 +1276,10 @@ impl Bncs {
                 );
                 if let Some(wire) = encode(&ev) {
                     let _ = self.node.broadcast(&joined.key, &wire, Some(account.id));
+                }
+                // 4. A per-channel topic/greeting, if this channel defines one.
+                if let Some(topic) = &joined.topic {
+                    return self.send(&chat_event(EventId::Info, 0, 0, b"", topic.as_bytes()));
                 }
                 Step::Continue
             }
@@ -1162,6 +1343,20 @@ impl Bncs {
         let _arg = parts.next().unwrap_or("").trim();
 
         match cmd.as_str() {
+            "join" | "j" => {
+                let target = _arg;
+                if target.is_empty() {
+                    return self.send(&chat_event(
+                        EventId::Error,
+                        0,
+                        0,
+                        b"",
+                        b"Usage: /join <channel>",
+                    ));
+                }
+                let account = account.clone();
+                self.do_join(target.as_bytes(), &account)
+            }
             "me" | "emote" => {
                 let body = sanitize_chat_text(_arg.as_bytes());
                 let ev = chat_event(EventId::Emote, self.flags, 0, account.name.as_bytes(), &body);
@@ -1489,13 +1684,14 @@ mod tests {
         stream.write_all(&out).await.expect("write");
     }
 
-    /// Read the next frame, skipping `SID_PING` — the server sends one on connect and may
-    /// send more unprompted, and the tests care about the handshake frames around them.
+    /// Read the next frame, skipping server-initiated notifications the request/reply
+    /// tests do not care about: `SID_PING` (sent on connect and unprompted) and
+    /// `SID_CHATEVENT` (MOTD, joins, and other async chat events).
     async fn recv_frame(stream: &mut TcpStream) -> Frame {
         let mut buf = RecvBuf::with_capacity(256);
         loop {
             match decode_frame(&mut buf, DEFAULT_MAX_FRAME) {
-                Ok(Some(f)) if f.id == sid::PING => continue,
+                Ok(Some(f)) if f.id == sid::PING || f.id == sid::CHATEVENT => continue,
                 Ok(Some(f)) => return f,
                 _ => {}
             }

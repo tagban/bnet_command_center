@@ -150,6 +150,13 @@ pub struct Node {
     /// Whether the first arrival to a private channel is auto-opped (Op/Clan always are,
     /// `Public *` never are; this governs only the private case).
     pub auto_op_private: bool,
+    /// Pre-defined channel rules (listed/public/persist/telnet/game-only/flag-gated).
+    pub channel_rules: crate::config::ChannelRules,
+    /// Whether to enforce one live session per CD key.
+    pub cd_key_uniqueness: bool,
+    /// Shared UDP socket bound to `:6112`, used to send the login-time `PKT_SERVERPING`
+    /// that un-greys Create/Join on classic clients; `None` if the UDP bind failed.
+    pub udp_socket: Option<Arc<tokio::net::UdpSocket>>,
     /// Server name shown to clients.
     pub name: String,
     /// Message of the day.
@@ -201,6 +208,13 @@ pub struct NodeConfig {
     pub admins: crate::config::AdminsConfig,
     /// Whether private channels auto-op their first arrival.
     pub auto_op_private: bool,
+    /// Pre-defined channel rules (listed/public/persist/telnet/game-only/flag-gated).
+    pub channel_rules: crate::config::ChannelRules,
+    /// Whether to enforce one live session per CD key. Off lets a fleet share a key.
+    pub cd_key_uniqueness: bool,
+    /// Shared UDP socket bound to `:6112` for sending the login-time UDP ping; `None` if the
+    /// bind failed (classic clients then keep the No-UDP flag and games stay greyed).
+    pub udp_socket: Option<Arc<tokio::net::UdpSocket>>,
 }
 
 impl Node {
@@ -214,6 +228,9 @@ impl Node {
             version_policy: cfg.version_policy,
             admins: cfg.admins,
             auto_op_private: cfg.auto_op_private,
+            channel_rules: cfg.channel_rules,
+            cd_key_uniqueness: cfg.cd_key_uniqueness,
+            udp_socket: cfg.udp_socket,
             name: cfg.name,
             motd: cfg.motd,
             channel_max_users: 40,
@@ -351,13 +368,25 @@ impl Node {
     /// Names of all live channels, for `SID_GETCHANNELLIST`.
     #[must_use]
     pub fn channel_names(&self) -> Vec<String> {
-        self.inner
-            .lock()
-            .expect("node lock")
-            .channels
-            .values()
-            .map(|c| c.display().to_string())
-            .collect()
+        use std::collections::BTreeSet;
+        // Listed pre-defined channels always appear, even when empty; live channels are
+        // added on top. Dedupe by normalised name so a live instance of a defined channel
+        // is not listed twice.
+        let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let mut names = Vec::new();
+        for rule in self.channel_rules.listed() {
+            let key = normalize_channel_name(rule.display.as_bytes());
+            if seen.insert(key) {
+                names.push(rule.display.clone());
+            }
+        }
+        let inner = self.inner.lock().expect("node lock");
+        for c in inner.channels.values() {
+            if seen.insert(c.name().to_vec()) {
+                names.push(c.display().to_string());
+            }
+        }
+        names
     }
 
     /// Join a channel, creating it if it does not exist.
@@ -383,14 +412,32 @@ impl Node {
         }
         let display = String::from_utf8_lossy(raw_name).trim().to_string();
 
+        // A defined channel may gate entry on a required flag (e.g. a staff channel).
+        let rule = self.channel_rules.get(&key).cloned();
+        if let Some(rule) = &rule {
+            if rule.min_flag != 0 && base_flags & rule.min_flag == 0 {
+                return Err(JoinDenial::Restricted);
+            }
+        }
+        let topic = rule.as_ref().and_then(|r| r.topic.clone());
+
         let mut inner = self.inner.lock().expect("node lock");
-        let max_users = self.channel_max_users;
+        let default_max = self.channel_max_users;
         let auto_op_private = self.auto_op_private;
         let channel = inner.channels.entry(key.clone()).or_insert_with(|| {
+            let max_users = rule.as_ref().and_then(|r| r.max_users).unwrap_or(default_max);
             let mut c = Channel::new(key.clone(), display.clone(), ChannelClass::Local, max_users);
-            // Apply the name convention: Op/Clan always auto-op, "Public *" never, private
-            // per config. See bnetcc_core::channel::operator_grant_for_name.
-            c.set_auto_op(bnetcc_core::channel::operator_grant_for_name(&display, auto_op_private));
+            // A defined channel that is marked public never auto-ops; otherwise apply the
+            // name convention ("Op <name>"/"Clan <name>" op only <name>, private per config).
+            let op_grant = if rule.as_ref().is_some_and(|r| r.public) {
+                bnetcc_core::channel::OpGrant::None
+            } else {
+                bnetcc_core::channel::op_grant_for_name(&display, auto_op_private)
+            };
+            c.set_op_grant(op_grant);
+            if let Some(r) = &rule {
+                c.set_persist(r.persist);
+            }
             c
         });
 
@@ -410,6 +457,7 @@ impl Node {
             display: channel.display().to_string(),
             flags: channel.flags(),
             outcome,
+            topic,
         };
         inner
             .subscribers
@@ -462,6 +510,16 @@ impl Node {
         self.inner.lock().expect("node lock").games.values().cloned().collect()
     }
 
+    /// Modification time of a served file, for `SID_GETFILETIME`. Returns `None` if there
+    /// is no files directory, the name fails the traversal guard, or the file is absent.
+    /// A brief blocking `metadata` call, acceptable for an infrequent handshake packet.
+    #[must_use]
+    pub fn file_mtime(&self, filename: &[u8]) -> Option<std::time::SystemTime> {
+        let dir = self.files_dir.as_ref()?;
+        let name = bnetcc_proto::bnftp::sanitize_filename(filename)?;
+        std::fs::metadata(dir.join(name)).ok()?.modified().ok()
+    }
+
     /// Send pre-encoded bytes to every subscriber of a channel, optionally excluding one.
     ///
     /// Encoding happens once in the caller; this clones an `Arc` per recipient. A
@@ -507,6 +565,8 @@ pub struct JoinedChannel {
     pub flags: u32,
     /// Join outcome, including whether operator was granted.
     pub outcome: bnetcc_core::channel::JoinOutcome,
+    /// Per-channel topic/greeting to show the joiner, if the channel defines one.
+    pub topic: Option<String>,
 }
 
 /// A user already present in a channel when someone joins, for `EID_SHOWUSER`.
@@ -534,7 +594,12 @@ pub(crate) fn test_node() -> Node {
             version_policy: crate::config::VersionPolicy::default(),
             files_dir: None,
             admins: crate::config::AdminsConfig::default(),
-            auto_op_private: false,
+            // Tests exercise the classic "first joiner of a normal channel is opped"
+            // behaviour, which in production is the opt-in private-channel case.
+            auto_op_private: true,
+            channel_rules: crate::config::ChannelRules::default(),
+            cd_key_uniqueness: true,
+            udp_socket: None,
         },
         storage,
     )
@@ -567,13 +632,15 @@ mod tests {
     fn first_joiner_of_a_channel_gets_operator() {
         let n = node();
         let (out, _rx) = outbound(4);
+        // A private channel (test_node enables auto_op_private), so the first arrival is
+        // opped. Op/Clan channels op only their named account — covered in bnetcc-core.
         let (joined, existing) = n
-            .join_channel(b"Op Clan XYZ", 1, "Zealot", 0, Vec::new(), out)
+            .join_channel(b"Zealot's Hangout", 1, "Zealot", 0, Vec::new(), out)
             .unwrap();
         assert!(joined.outcome.granted_operator);
         assert_eq!(joined.outcome.flags & user_flags::OPERATOR, user_flags::OPERATOR);
         assert!(existing.is_empty());
-        assert_eq!(joined.key, b"op clan xyz");
+        assert_eq!(joined.key, b"zealot's hangout");
     }
 
     #[test]
