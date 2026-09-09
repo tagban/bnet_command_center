@@ -100,6 +100,23 @@ impl<'a> Statstring<'a> {
     }
 }
 
+/// Build a minimal statstring for a user who has no stored stats yet.
+///
+/// The product tag appears first, reversed (a `u32` rendered as text — `SEXP` reads as
+/// `PXES`), which is how the client identifies the user's product and icon. The zeroed
+/// fields stand in for stats we do not track yet. This mirrors the shape a real server
+/// sends for a fresh account and is enough for a client to render the user in its list.
+#[must_use]
+pub fn build_default(product: FourCc) -> Vec<u8> {
+    let a = product.as_ascii();
+    let reversed = [a[3], a[2], a[1], a[0]];
+    let mut s = Vec::with_capacity(29);
+    s.extend_from_slice(&reversed);
+    s.extend_from_slice(b" 0 0 0 0 0 0 0 0 ");
+    s.extend_from_slice(&reversed);
+    s
+}
+
 /// A WarCraft III race tier, the middle character of an icon code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {

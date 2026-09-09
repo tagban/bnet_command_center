@@ -7,6 +7,7 @@ mod node;
 mod session;
 mod storage;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,11 +124,36 @@ async fn run(cfg: Config) -> Result<(), String> {
     };
     let storage = storage::spawn(storage_backend);
 
+    let version_policy = cfg.version_policy()?;
+    if cfg.versions.restrict {
+        let combos: usize = cfg.versions.allowed.values().map(BTreeMap::len).sum();
+        info!(
+            product_platform_combinations = combos,
+            "client version restriction is ON; only listed product/platform/version-byte \
+             combinations will be admitted"
+        );
+    }
+
+    let files_dir = if cfg.files.dir.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(&cfg.files.dir))
+    };
+    if let Some(dir) = &files_dir {
+        info!(dir = %dir.display(), "serving operator-supplied files over BNFTP");
+    }
+
     let node = Arc::new(Node::new(
-        policy.clone(),
-        cfg.server.name.clone(),
-        cfg.server.motd.clone(),
-        cfg.limits.gateway_allowlist.clone(),
+        node::NodeConfig {
+            policy: policy.clone(),
+            name: cfg.server.name.clone(),
+            motd: cfg.server.motd.clone(),
+            gateway_allowlist: cfg.limits.gateway_allowlist.clone(),
+            version_policy,
+            files_dir,
+            admins: cfg.admins.clone(),
+            auto_op_private: cfg.channels.auto_op_private,
+        },
         storage,
     ));
 

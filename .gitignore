@@ -8,3 +8,4 @@ node.key
 *.db-shm
 /verify.log
 /.claude/
+/files/

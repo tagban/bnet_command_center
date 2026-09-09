@@ -52,6 +52,10 @@ pub struct Member {
     pub name: String,
     /// Chat flags (operator, squelched, no-UDP, …).
     pub flags: u32,
+    /// The user's statstring, echoed in `EID_SHOWUSER`/`EID_JOIN` so other clients can
+    /// render their product and icon. Opaque to the server — see
+    /// [`bnetcc_proto::statstring`].
+    pub statstring: Vec<u8>,
 }
 
 /// Why a join was refused.
@@ -109,6 +113,10 @@ pub struct Channel {
     heirs: Vec<AccountId>,
     bans: BTreeSet<AccountId>,
     seq: u64,
+    /// Whether the first arrival to an empty channel is granted operator. Defaults from
+    /// the class, but the node overrides it per channel-name convention (Op/Clan always,
+    /// "Public *" never, private per config) — see [`Channel::set_auto_op`].
+    auto_op: bool,
 }
 
 impl Channel {
@@ -120,6 +128,7 @@ impl Channel {
             ChannelClass::Official => channel_flags::PUBLIC | channel_flags::SYSTEM,
             _ => channel_flags::PUBLIC,
         };
+        let auto_op = class.grants_first_operator();
         Self {
             name,
             display,
@@ -131,7 +140,15 @@ impl Channel {
             heirs: Vec::new(),
             bans: BTreeSet::new(),
             seq: 0,
+            auto_op,
         }
+    }
+
+    /// Override whether the first arrival is granted operator. The node calls this at
+    /// creation based on the channel-name convention and config; see
+    /// [`operator_grant_for_name`].
+    pub fn set_auto_op(&mut self, auto_op: bool) {
+        self.auto_op = auto_op;
     }
 
     /// Normalised lookup name.
@@ -216,7 +233,13 @@ impl Channel {
     ///
     /// [`JoinDenial`] when the channel is full, the account is banned, or it is already
     /// present.
-    pub fn join(&mut self, account: AccountId, name: String, base_flags: u32) -> Result<JoinOutcome, JoinDenial> {
+    pub fn join(
+        &mut self,
+        account: AccountId,
+        name: String,
+        base_flags: u32,
+        statstring: Vec<u8>,
+    ) -> Result<JoinOutcome, JoinDenial> {
         if self.bans.contains(&account) {
             return Err(JoinDenial::Banned);
         }
@@ -228,7 +251,7 @@ impl Channel {
         }
 
         let granted_operator =
-            self.members.is_empty() && self.operator.is_none() && self.class.grants_first_operator();
+            self.members.is_empty() && self.operator.is_none() && self.auto_op;
         let flags = if granted_operator {
             base_flags | user_flags::OPERATOR
         } else {
@@ -241,6 +264,7 @@ impl Channel {
             account,
             name,
             flags,
+            statstring,
         });
         self.bump();
         Ok(JoinOutcome {
@@ -363,6 +387,62 @@ impl Channel {
     }
 }
 
+/// How a channel name is classified for operator-grant and access rules. Battle.net
+/// channel names follow conventions the server reads to decide behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameKind {
+    /// An operator or clan channel (`Op <name>`, `Clan <tag>`). Members who belong are
+    /// auto-opped; these are staff/clan spaces.
+    OpOrClan,
+    /// A `Public *` channel — a shared public space where operator is never auto-granted.
+    Public,
+    /// A private, user-created named channel — auto-op is a per-node config choice.
+    Private,
+}
+
+/// Classify a channel by its display name (case-insensitive). ASCII-only prefixes, since
+/// the conventions (`Op `, `Clan `, `Public `) are ASCII.
+#[must_use]
+pub fn classify_name(display: &str) -> NameKind {
+    let lower = display.trim().to_ascii_lowercase();
+    if lower.starts_with("op ") || lower.starts_with("clan ") {
+        NameKind::OpOrClan
+    } else if lower.starts_with("public") {
+        NameKind::Public
+    } else {
+        NameKind::Private
+    }
+}
+
+/// Whether the first arrival to an empty channel of this name should be granted operator.
+///
+/// - Op/Clan channels: always (`true`).
+/// - `Public *` channels: never (`false`).
+/// - Private channels: `auto_op_private`, a per-node config choice.
+#[must_use]
+pub fn operator_grant_for_name(display: &str, auto_op_private: bool) -> bool {
+    match classify_name(display) {
+        NameKind::OpOrClan => true,
+        NameKind::Public => false,
+        NameKind::Private => auto_op_private,
+    }
+}
+
+/// Whether a telnet / chat-gateway user may enter a channel by this name.
+///
+/// Gateway users are confined to `Public *` channels plus an operator-configured
+/// allowlist (e.g. "Open Tech Support"); they must never reach arbitrary private or
+/// Op/Clan channels. `extra` is that allowlist, matched case-insensitively. Enforce this
+/// at the gateway's channel-join command once that is implemented.
+#[must_use]
+pub fn gateway_may_join(display: &str, extra: &[String]) -> bool {
+    if classify_name(display) == NameKind::Public {
+        return true;
+    }
+    let lower = display.trim().to_ascii_lowercase();
+    extra.iter().any(|c| c.trim().to_ascii_lowercase() == lower)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,7 +452,48 @@ mod tests {
     }
 
     fn join(c: &mut Channel, id: AccountId) -> Result<JoinOutcome, JoinDenial> {
-        c.join(id, format!("user{id}"), 0)
+        c.join(id, format!("user{id}"), 0, Vec::new())
+    }
+
+    #[test]
+    fn channel_names_classify_by_convention() {
+        assert_eq!(classify_name("Op Warlord"), NameKind::OpOrClan);
+        assert_eq!(classify_name("Clan xYz"), NameKind::OpOrClan);
+        assert_eq!(classify_name("Public Chat"), NameKind::Public);
+        assert_eq!(classify_name("Public"), NameKind::Public);
+        assert_eq!(classify_name("Brood War USA-1"), NameKind::Private);
+        assert_eq!(classify_name("my hangout"), NameKind::Private);
+    }
+
+    #[test]
+    fn operator_grant_follows_the_name_rules() {
+        // Op/Clan always auto-op, regardless of the private toggle.
+        assert!(operator_grant_for_name("Op Warlord", false));
+        assert!(operator_grant_for_name("Clan xYz", false));
+        // Public never auto-ops, even with the toggle on.
+        assert!(!operator_grant_for_name("Public Chat", true));
+        // Private follows the toggle.
+        assert!(!operator_grant_for_name("my hangout", false));
+        assert!(operator_grant_for_name("my hangout", true));
+    }
+
+    #[test]
+    fn telnet_users_are_confined_to_public_and_the_allowlist() {
+        let extra = vec!["Open Tech Support".to_string()];
+        assert!(gateway_may_join("Public Chat", &extra), "public is allowed");
+        assert!(gateway_may_join("open tech support", &extra), "allowlist, case-insensitive");
+        assert!(!gateway_may_join("Op Warlord", &extra), "op channels are off-limits");
+        assert!(!gateway_may_join("Clan xYz", &extra), "clan channels are off-limits");
+        assert!(!gateway_may_join("someones private room", &extra), "private is off-limits");
+    }
+
+    #[test]
+    fn a_channel_with_auto_op_off_never_grants_operator() {
+        let mut c = Channel::new(b"public chat".to_vec(), "Public Chat".into(), ChannelClass::Local, 40);
+        c.set_auto_op(false);
+        let out = join(&mut c, 1).unwrap();
+        assert!(!out.granted_operator, "public channels must not auto-op");
+        assert_eq!(out.flags & user_flags::OPERATOR, 0);
     }
 
     #[test]
@@ -593,7 +714,7 @@ mod tests {
             for &(op, a, b) in ops {
                 match op {
                     0 => {
-                        let _ = c.join(a, format!("u{a}"), 0);
+                        let _ = c.join(a, format!("u{a}"), 0, Vec::new());
                     }
                     1 => {
                         c.leave(a);

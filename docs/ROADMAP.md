@@ -40,19 +40,42 @@ The milestone is a screenshot of Brood War sitting in a channel. Nothing else co
 
 - [x] **Resolve dependencies and build `bnetccd` and `bnetcc-storage-sqlite`.** Done
       2026-09-08 — both compiled clean on the first real attempt.
-- [ ] **Test against a real client.** Expect surprises; `docs/PROTOCOL-NOTES.md` marks each
-      with ⚠️ or 🛑. The likeliest: the zero-game `SID_GETADVLISTEX` shape, four-character
-      code byte order, the BNI code-list-when-flags-are-set question, and the ad extension
-      tag's wire bytes.
+- [~] **Test against a real client.** In progress (2026-09-09). A real StarCraft/Brood War
+      client (via a BNLS-assisted bot) logs in, creates an account, chats and switches
+      channels end-to-end against `bnetccd`. Fixing the modern flow this way corrected the
+      real `SID_AUTH_CHECK` layout, added `SID_PING`-on-connect, `SID_UDPPINGRESPONSE`/
+      `GETICONDATA`/`LEAVECHAT` acceptance, legacy `SID_CREATEACCOUNT`, the channel-name
+      field in `EID_CHANNEL`, and user-list statstrings. **Legacy (old-logon) flow** for
+      War2 BNE / Diablo / old Mac clients is implemented and reaches CheckRevision + BNFTP
+      MPQ serving; the one open item is the `SID_REPORTVERSION` reply a real War2 client
+      accepts (it does CheckRevision, then rejects our version-OK reply — needs the exact
+      on-screen error to pin down). WC3 remains blocked by the RSA signature (LEGAL §3).
+      Remaining ⚠️/🛑 to confirm: the `SID_GETADVLISTEX` game-entry layout, four-character
+      code byte order, the BNI code-list-when-flags-are-set question, ad extension tags.
 - [x] **Wire account storage into `bnetccd`** — done 2026-09-08. A dedicated thread
       (`bnetccd::storage`) owns the `Storage` backend and is reached over a channel;
       `SID_CREATEACCOUNT2`/`SID_LOGONRESPONSE2` go through it, so accounts persist and get
       real name validation for the first time. **Still open:** everything about attribute
       storage — `WriteBehind` isn't wired to anything client-facing yet, so there is no
       `AttrSchema::filter_readable` read path to guard. That's the rest of this item.
-- [ ] **BNFTP serving** (protocol byte `0x02`). The codec exists; it needs the file server
-      behind it, serving **only operator-supplied files** from a configured directory —
-      placeholders in the repo, never Blizzard assets (`docs/LEGAL.md` §2).
+- [x] **BNFTP serving** (protocol byte `0x02`) — done 2026-09-09. Serves operator-supplied
+      files from `[files] dir` (the platform version-check MPQ, icons, etc.), with
+      `sanitize_filename` as the traversal guard. The server advertises the platform-matched
+      MPQ name (`IX86ver1.mpq`/`PMACver1.mpq`/`XMACver1.mpq`). Never ships Blizzard assets.
+- [x] **Game directory** — done 2026-09-09. `SID_STARTADVEX3` advertises, `SID_GETADVLISTEX`
+      lists, `SID_STOPADV`/`SID_LEAVEGAME`/disconnect withdraw. Verified with a game test
+      client (`session.rs` tests: create → list → visible to another client → end → gone,
+      plus auto-withdraw on host disconnect). ⚠️ The `SID_GETADVLISTEX` game-entry wire
+      layout is unverified against a real client — confirm with a WinBot create/list cycle.
+- [x] **Admin/sysop accounts** — done 2026-09-09. `[admins] accounts` grants the Battle.net
+      Administrator flag + Blizzard-rep tag on login (both modern and legacy logon paths).
+- [x] **Username rules** — done 2026-09-09. 2-char minimum, any letters/digits/symbols that
+      are wire-safe (no whitespace/control), ≥1 alphanumeric, bridge namespace reserved.
+- [x] **Auto-op by channel-name convention** — done 2026-09-09. Op/Clan channels always
+      auto-op, `Public *` never, private per `[channels] auto_op_private`.
+- [~] **Telnet/gateway channel restriction** — policy helper + config done 2026-09-09
+      (`gateway_may_join`: public channels + `[channels] telnet_channels` allowlist, tested).
+      **Enforcement pending** the gateway's channel-join command, which is still a stub.
 - [ ] **Icon serving**: answer `SID_GETICONDATA` per product before `SID_ENTERCHAT` (a
       client that does not get this **terminates the connection**), plus `SID_GETFILETIME`
       for revalidation. Ship a `bnetcc icons` subcommand wrapping the existing
@@ -83,6 +106,23 @@ The milestone is a screenshot of Brood War sitting in a channel. Nothing else co
 - [ ] **`cargo fuzz`** targets for `decode_frame`, `decode_line`, `bni::parse` and
       `bnftp::decode_request`. The in-tree pseudo-random tests are a stand-in.
 - [ ] **Packaging**: systemd unit, launchd plist, Windows service wrapper.
+
+### Requested by tagban — designed, not yet built
+
+These are captured so they are not lost; each needs real design work, not just a handler.
+
+- [ ] **Universal clans.** Clan membership/ranks/triggers for **every** product, server-side,
+      independent of WarCraft III's built-in `SID_CLAN*` system — so any game can be "in a
+      clan" even though old clients won't render it. Model clans in `bnetcc-core` (tag,
+      members, ranks), drive them via chat triggers, and reserve the `Clan <tag>` channel
+      space (already classified as Op/Clan for auto-op).
+- [ ] **Game-only channels** (only game clients may enter, not the chat/telnet gateway).
+- [ ] **Flag-limited channels** (entry gated on a user carrying certain flags, e.g. admin).
+- [ ] **Enforce the telnet channel restriction** at the gateway's channel-join command —
+      the `gateway_may_join` policy and `[channels] telnet_channels` config are already in
+      place and tested; they plug in once the gateway parses `/join` (it currently echoes).
+- [ ] **Finish the legacy version-check reply** for real War2 BNE (the `SID_REPORTVERSION`
+      response value/format a real client accepts) — see the phase-1 "real client" note.
 
 ## Phase 2 — Federation, and Diablo II Open
 

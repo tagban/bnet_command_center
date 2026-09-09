@@ -77,20 +77,41 @@ impl SessionState {
                 | sid::CLICKAD
                 | sid::DISPLAYAD
                 | sid::QUERYADURL
+                // The client's UDP-detection reply, sent unprompted right after the
+                // version check passes — it carries no state, so accept it anywhere
+                // rather than disconnecting a client mid-handshake over it.
+                | sid::UDPPINGRESPONSE
+                // Legacy-logon informational packets (Diablo I, War2 BNE, old Mac
+                // clients). They carry client identity/locale/system info, request no
+                // data, and change no state, so accept them anywhere in the handshake.
+                | sid::CLIENTID
+                | sid::CLIENTID2
+                | sid::LOCALEINFO
+                | sid::SYSTEMINFO
         ) {
             return true;
         }
         match self {
-            Self::Connected => matches!(id, sid::AUTH_INFO),
-            Self::Versioning => matches!(id, sid::AUTH_CHECK),
+            // AUTH_INFO opens the modern flow; STARTVERSIONING opens the legacy one.
+            Self::Connected => matches!(id, sid::AUTH_INFO | sid::STARTVERSIONING),
+            // AUTH_CHECK completes the modern version check; REPORTVERSION the legacy one,
+            // with CDKEY sometimes sent alongside it.
+            Self::Versioning => matches!(id, sid::AUTH_CHECK | sid::REPORTVERSION | sid::CDKEY),
             Self::Authenticating => matches!(
                 id,
                 sid::LOGONRESPONSE
                     | sid::LOGONRESPONSE2
+                    | sid::CREATEACCOUNT
                     | sid::CREATEACCOUNT2
                     | sid::AUTH_ACCOUNTCREATE
                     | sid::AUTH_ACCOUNTLOGON
                     | sid::AUTH_ACCOUNTLOGONPROOF
+                    // Legacy flow may send its CD-key check just before the logon.
+                    | sid::CDKEY
+                    // Real clients request icon data between the version check passing and
+                    // sending their logon, not only afterwards.
+                    | sid::GETICONDATA
+                    | sid::GETFILETIME
             ),
             Self::LoggedIn => matches!(
                 id,
@@ -100,6 +121,7 @@ impl SessionState {
                     | sid::GETFILETIME
                     | sid::CHECKDATAFILE2
                     | sid::GETCHANNELLIST
+                    | sid::FRIENDSLIST
                     | sid::QUERYREALMS2
                     | sid::LOGONREALMEX
                     | sid::NETGAMEPORT
@@ -112,8 +134,10 @@ impl SessionState {
                     | sid::GETFILETIME
                     | sid::CHECKDATAFILE2
                     | sid::JOINCHANNEL
+                    | sid::LEAVECHAT
                     | sid::CHATCOMMAND
                     | sid::GETCHANNELLIST
+                    | sid::FRIENDSLIST
                     | sid::GETADVLISTEX
                     | sid::STARTADVEX3
                     | sid::NOTIFYJOIN
@@ -133,8 +157,8 @@ impl SessionState {
     #[must_use]
     pub const fn next_on_success(self, id: u8) -> Option<Self> {
         match (self, id) {
-            (Self::Connected, sid::AUTH_INFO) => Some(Self::Versioning),
-            (Self::Versioning, sid::AUTH_CHECK) => Some(Self::Authenticating),
+            (Self::Connected, sid::AUTH_INFO | sid::STARTVERSIONING) => Some(Self::Versioning),
+            (Self::Versioning, sid::AUTH_CHECK | sid::REPORTVERSION) => Some(Self::Authenticating),
             // Note that account creation does *not* log you in. Real Battle.net requires
             // a separate logon afterwards, and clients are written to expect that.
             (
@@ -273,6 +297,7 @@ mod tests {
             sid::AUTH_CHECK,
             sid::LOGONRESPONSE,
             sid::LOGONRESPONSE2,
+            sid::CREATEACCOUNT,
             sid::CREATEACCOUNT2,
             sid::AUTH_ACCOUNTCREATE,
             sid::AUTH_ACCOUNTLOGON,
@@ -283,6 +308,21 @@ mod tests {
             sid::CLICKAD,
             sid::DISPLAYAD,
             sid::QUERYADURL,
+            // Stateless UDP-detection reply, plus icon/file metadata requests real
+            // clients send during the handshake. None reads user data, so none reopens
+            // CVE-2004-2705's class the way SID_READUSERDATA pre-auth would.
+            sid::UDPPINGRESPONSE,
+            sid::GETICONDATA,
+            sid::GETFILETIME,
+            // Legacy-logon handshake packets (Diablo I, War2 BNE, old Mac clients). Same
+            // reasoning: identity/version/key negotiation, no user-data read.
+            sid::CLIENTID,
+            sid::CLIENTID2,
+            sid::LOCALEINFO,
+            sid::SYSTEMINFO,
+            sid::STARTVERSIONING,
+            sid::REPORTVERSION,
+            sid::CDKEY,
         ];
         for state in [
             SessionState::Connected,

@@ -23,9 +23,11 @@ use bnetcc_proto::chat::{
     chat_event, normalize_channel_name, sanitize_chat_text, user_flags, EventId,
     CHANNEL_NAME_MAX, CHAT_TEXT_MAX, USERNAME_MAX,
 };
+use bnetcc_proto::bnftp;
 use bnetcc_proto::error::FourCc;
 use bnetcc_proto::line::{decode_line, encode_line, gateway_message};
 use bnetcc_proto::product;
+use bnetcc_proto::statstring;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -113,6 +115,7 @@ fn next_server_token() -> u32 {
 pub async fn handle(stream: TcpStream, peer: SocketAddr, node: Arc<Node>, limits: SessionLimits) {
     let _ = stream.set_nodelay(true);
     let ip = peer.ip();
+    debug!(%peer, "accepted TCP connection");
 
     // The protocol selector is the first byte and must arrive promptly. A peer that
     // connects and says nothing is a slowloris; it gets the handshake deadline and
@@ -170,15 +173,148 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr, node: Arc<Node>, limits
             }
         }
         Some(ProtocolSelector::Bnftp) => {
-            // Clients fetch icons.bni, tos.txt and patch MPQs over this. Until it is
-            // implemented we close cleanly rather than hang the client.
-            debug!(%peer, "BNFTP requested but not implemented");
+            if let Err(reason) = node.admit(ClientClass::Bnftp, ip) {
+                debug!(%peer, ?reason, "BNFTP connection refused by admission control");
+                return;
+            }
+            let result = bnftp_session(stream, peer, Arc::clone(&node), limits).await;
+            node.release(ClientClass::Bnftp, ip);
+            if let Err(e) = result {
+                debug!(%peer, error = %e, "BNFTP session ended");
+            }
         }
         None => {
             // Unknown selector: close without responding, exactly as real Battle.net does.
             debug!(%peer, selector, "unknown protocol selector");
         }
     }
+}
+
+/// The version-check MPQ filename to advertise for a client's platform.
+///
+/// The file is platform-specific: a PowerPC Mac client (`PMAC`/`XMAC`) cannot run
+/// CheckRevision against the Windows (`IX86`) MPQ. The client fetches exactly the name we
+/// send here over BNFTP, so an operator supplies one per platform they want to admit.
+///
+/// We use PvPGN's `<PLATFORM>ver1.mpq` naming (`IX86ver1.mpq`, `PMACver1.mpq`,
+/// `XMACver1.mpq`) — the scheme under which a stock PvPGN `files/` directory ships all
+/// three platforms. An unrecognised or absent platform falls back to `IX86`.
+fn version_mpq_name(platform: Option<FourCc>) -> String {
+    let plat = platform
+        .map(|p| {
+            let a = p.as_ascii();
+            if a.iter().all(u8::is_ascii_graphic) {
+                String::from_utf8_lossy(&a).into_owned()
+            } else {
+                "IX86".to_string()
+            }
+        })
+        .unwrap_or_else(|| "IX86".to_string());
+    format!("{plat}ver1.mpq")
+}
+
+/// Convert a Unix time to a Windows FILETIME (100-nanosecond ticks since 1601-01-01).
+fn unix_to_filetime(t: SystemTime) -> u64 {
+    const EPOCH_DIFF_SECS: u64 = 11_644_473_600; // 1601→1970 in seconds.
+    let secs = t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    (secs + EPOCH_DIFF_SECS).saturating_mul(10_000_000)
+}
+
+/// Serve one BNFTP file request: the client asks for a filename, we send a header and the
+/// file bytes from the operator's configured directory. This is how a real classic client
+/// fetches the version-check MPQ it needs to pass CheckRevision, plus `icons.bni`, `tos.txt`
+/// and ad images. One file per connection, then the client closes.
+///
+/// Only files in the configured directory are served, and only names that pass
+/// [`bnftp::sanitize_filename`] — the security boundary against path traversal from an
+/// unauthenticated peer.
+async fn bnftp_session(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    node: Arc<Node>,
+    limits: SessionLimits,
+) -> std::io::Result<()> {
+    // Accumulate until the whole fixed-plus-filename request has arrived.
+    let mut buf = Vec::with_capacity(64);
+    let mut chunk = [0u8; 512];
+    let request = loop {
+        match bnftp::decode_request(&buf) {
+            Ok(Some(req)) => break req,
+            Ok(None) => {}
+            Err(e) => {
+                debug!(%peer, error = %e, "malformed BNFTP request");
+                return Ok(());
+            }
+        }
+        if buf.len() > bnftp::MAX_REQUEST {
+            debug!(%peer, "BNFTP request exceeded the size cap");
+            return Ok(());
+        }
+        let n = tokio::time::timeout(limits.handshake_timeout, stream.read(&mut chunk))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "bnftp request"))??;
+        if n == 0 {
+            return Ok(()); // client closed before completing the request
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+
+    let Some(dir) = node.files_dir.clone() else {
+        debug!(%peer, "BNFTP request but no files directory is configured; refusing");
+        return Ok(());
+    };
+    let Some(name) = bnftp::sanitize_filename(&request.filename) else {
+        debug!(
+            peer = %peer,
+            filename = %String::from_utf8_lossy(&request.filename),
+            "BNFTP filename rejected by the traversal guard"
+        );
+        return Ok(());
+    };
+
+    let path = dir.join(name);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) => {
+            debug!(%peer, file = %name, error = %e, "BNFTP file not found or unreadable");
+            return Ok(());
+        }
+    };
+    let filetime = tokio::fs::metadata(&path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map_or(0, unix_to_filetime);
+
+    let file_size = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    let header = bnftp::ResponseHeader {
+        kind: 0,
+        file_size,
+        ad_id: request.ad_id,
+        ad_extension: request.ad_extension,
+        filetime,
+        filename: request.filename.clone(),
+    };
+    info!(%peer, file = %name, bytes = bytes.len(), "serving BNFTP file");
+    stream.write_all(&bnftp::encode_response_header(&header)).await?;
+    stream.write_all(&bytes).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// A short hex preview of a frame body, for debug logging while reverse-engineering a
+/// client's wire format. Capped so a large frame does not flood the log.
+fn hex_preview(body: &[u8]) -> String {
+    const MAX: usize = 64;
+    let shown = &body[..body.len().min(MAX)];
+    let mut s = String::with_capacity(shown.len() * 2 + 3);
+    for b in shown {
+        s.push_str(&format!("{b:02x}"));
+    }
+    if body.len() > MAX {
+        s.push_str("...");
+    }
+    s
 }
 
 /// Read a username field, truncating rather than disconnecting if it is over-length.
@@ -219,6 +355,14 @@ enum Step {
     Close,
 }
 
+/// Protocol-independent result of a create-account attempt, mapped by each of
+/// `SID_CREATEACCOUNT` / `SID_CREATEACCOUNT2` into the reply its own wire format expects.
+enum CreateOutcome {
+    Created,
+    NameTaken,
+    Invalid,
+}
+
 struct Bncs {
     node: Arc<Node>,
     out: Outbound,
@@ -229,15 +373,25 @@ struct Bncs {
     state: SessionState,
     server_token: u32,
     product: Option<FourCc>,
-    /// The version byte from `SID_AUTH_INFO`, for logging. Not currently checked against
-    /// anything — see `auth_check`.
+    /// The platform FourCC from `SID_AUTH_INFO` (`IX86`, `PMAC`, `XMAC`). Used, with the
+    /// product and version byte, for optional version restriction — see `auth_check`.
+    platform: Option<FourCc>,
+    /// The version byte from `SID_AUTH_INFO`. Logged always; enforced only when
+    /// `versions.restrict` is on — see `auth_check`.
     version_byte: Option<u32>,
+    /// This user's statstring, built from the product at `SID_AUTH_INFO`, echoed in the
+    /// `EID_SHOWUSER`/`EID_JOIN` events other clients use to render them.
+    statstring: Vec<u8>,
     /// CD keys claimed by `auth_check`, released on disconnect regardless of whether
     /// this session ever logged in.
     claimed_keys: Vec<KeyId>,
     account: Option<Account>,
     channel: Option<Vec<u8>>,
     flags: u32,
+    /// The game-hosting port the client announced via `SID_NETGAMEPORT`; defaults to the
+    /// Battle.net game port until then. Used in the game directory so joiners can reach
+    /// the host peer-to-peer.
+    game_port: u16,
 }
 
 async fn bncs_session(
@@ -258,12 +412,29 @@ async fn bncs_session(
         state: SessionState::Connected,
         server_token: next_server_token(),
         product: None,
+        platform: None,
         version_byte: None,
+        statstring: Vec::new(),
         claimed_keys: Vec::new(),
         account: None,
         channel: None,
         flags: 0,
+        game_port: 6112,
     };
+
+    // Real Battle.net (and Atlas) send SID_PING (0x25) as soon as a game client connects,
+    // carrying a cookie the client echoes back; the client uses it for latency display and
+    // some clients/bots wait for it before continuing the handshake. Send it up front so
+    // we match that behaviour rather than leaving such a client waiting.
+    {
+        let mut w = Writer::with_capacity(4);
+        w.u32(s.server_token);
+        if let Step::Close = s.send(&Frame::new(sid::PING, w.finish())) {
+            drop(tx);
+            let _ = writer.await;
+            return (Ok(()), s.class);
+        }
+    }
 
     let mut buf = RecvBuf::with_capacity(READ_CHUNK);
     loop {
@@ -345,6 +516,10 @@ impl Bncs {
         for key in self.claimed_keys.drain(..) {
             self.node.release_key(key, now);
         }
+        // A game must never outlive the connection hosting it.
+        if let Some(account) = &self.account {
+            self.node.withdraw_game(account.id);
+        }
         if let (Some(key), Some(account)) = (self.channel.take(), self.account.as_ref()) {
             let name = account.name.clone();
             let new_op = self.node.leave_channel(&key, account.id);
@@ -359,25 +534,50 @@ impl Bncs {
     }
 
     async fn handle(&mut self, frame: &Frame) -> Step {
+        debug!(
+            peer = %self.peer,
+            id = %format!("{:#04x}", frame.id),
+            len = frame.body.len(),
+            state = self.state.name(),
+            body = %hex_preview(&frame.body),
+            "recv BNCS frame"
+        );
         let step = match frame.id {
             sid::AUTH_INFO => self.auth_info(frame),
             sid::AUTH_CHECK => self.auth_check(frame),
-            sid::LOGONRESPONSE2 => self.logon(frame).await,
-            sid::CREATEACCOUNT2 => self.create_account(frame).await,
+            sid::STARTVERSIONING => self.start_versioning(frame),
+            sid::REPORTVERSION => self.report_version(frame),
+            sid::LOGONRESPONSE => self.logon(frame, sid::LOGONRESPONSE).await,
+            sid::LOGONRESPONSE2 => self.logon(frame, sid::LOGONRESPONSE2).await,
+            sid::CREATEACCOUNT => self.create_account_legacy(frame).await,
+            sid::CREATEACCOUNT2 => self.create_account2(frame).await,
             sid::ENTERCHAT => self.enter_chat(frame),
             sid::JOINCHANNEL => self.join_channel(frame),
+            sid::LEAVECHAT => self.leave_chat(),
             sid::CHATCOMMAND => self.chat_command(frame),
             sid::GETCHANNELLIST => self.channel_list(),
             sid::GETADVLISTEX => self.game_list(),
             sid::CHECKAD => self.check_ad(frame),
-            sid::STARTADVEX3 => self.advertise(),
-            // Keepalive, the "sent on logoff even when not in a game" quirk, and the
-            // advertisement telemetry we accept but do not act on.
+            sid::STARTADVEX3 => self.advertise(frame),
+            // A game ended (STOPADV is also sent spuriously on logoff, which is harmless —
+            // withdrawing a game the host does not have is a no-op).
+            sid::STOPADV | sid::LEAVEGAME => self.stop_advertising(),
+            sid::NETGAMEPORT => self.net_game_port(frame),
+            // Keepalive, the UDP detection reply, legacy-logon informational packets, and
+            // advertisement telemetry — all accepted but not acted on. GETICONDATA and
+            // FRIENDSLIST are accepted here too; serving real icon and friends data is
+            // future work (see docs/ROADMAP.md), and clients proceed without a reply.
             sid::PING
-            | sid::STOPADV
-            | sid::LEAVEGAME
+            | sid::UDPPINGRESPONSE
+            | sid::GETICONDATA
+            | sid::FRIENDSLIST
             | sid::NOTIFYJOIN
             | sid::CLICKAD
+            | sid::CLIENTID
+            | sid::CLIENTID2
+            | sid::LOCALEINFO
+            | sid::SYSTEMINFO
+            | sid::CDKEY
             | sid::DISPLAYAD => Step::Continue,
             other => {
                 debug!(peer = %self.peer, id = other, "unhandled packet");
@@ -411,21 +611,25 @@ impl Bncs {
         let mut r = frame.reader();
         let parsed = (|| {
             let _protocol = r.u32()?;
-            let _platform = r.fourcc()?;
+            let platform = r.fourcc()?;
             let product = r.fourcc()?;
             let version_byte = r.u32()?;
-            Ok::<_, bnetcc_proto::ProtoError>((product, version_byte))
+            Ok::<_, bnetcc_proto::ProtoError>((platform, product, version_byte))
         })();
-        let Ok((product, version_byte)) = parsed else {
+        let Ok((platform, product, version_byte)) = parsed else {
             return Step::Close;
         };
         self.product = Some(product);
+        self.platform = Some(platform);
         self.version_byte = Some(version_byte);
-        // Not checked against anything yet — see `auth_check`'s doc comment. Logged so an
-        // operator can see what real client builds are actually connecting.
+        self.statstring = statstring::build_default(product);
+        // Whether this is *enforced* depends on config (versions.restrict); either way it
+        // is logged, so an operator can see what real client builds are connecting before
+        // deciding what to allow. Enforcement itself happens in `auth_check`.
         info!(
             peer = %self.peer,
             product = %product,
+            platform = %platform,
             version_byte = %format!("{version_byte:#010x}"),
             "SID_AUTH_INFO"
         );
@@ -457,12 +661,13 @@ impl Bncs {
         );
         let logon_type: u32 = if srp { 0x02 } else { 0x00 };
 
+        let mpq = version_mpq_name(self.platform);
         let mut w = Writer::with_capacity(64);
         w.u32(logon_type)
             .u32(self.server_token)
             .u32(0) // UDP value
             .u64(0) // CheckRevision MPQ filetime
-            .cstr(b"ver-IX86-1.mpq")
+            .cstr(mpq.as_bytes())
             .cstr(b"A=1 B=1 C=1 4 A=A^S B=B^C C=C^A A=A^B");
         if srp {
             // WarCraft III expects a 128-byte RSA signature here and verifies it against
@@ -473,19 +678,42 @@ impl Bncs {
         self.send(&Frame::new(sid::AUTH_INFO, w.finish()))
     }
 
-    /// Version is still unchecked by design — see `auth_info`'s comment and
-    /// `docs/PROTOCOL-NOTES.md`. CD-key uniqueness *is* enforced here: one live session
-    /// per key, which is the actual gate on a bot fleet (addresses are cheap, keys are
-    /// not — see `docs/WARNET.md`).
+    /// Two checks live here. **Version restriction** is opt-in (`versions.restrict`):
+    /// off by default so nobody is locked out, and when on it rejects a client whose
+    /// product/platform/version-byte (captured in `auth_info`) is not on the allowlist,
+    /// with `0x100` "old version". **CD-key uniqueness** is always on: one live session
+    /// per key, the real gate on a bot fleet (addresses are cheap, keys are not — see
+    /// `docs/WARNET.md`).
     ///
-    /// The wire layout parsed below (client token, exe version, exe hash, key count,
-    /// spawn flag, exe info, then per-key length/product/public/hash, then owner name)
-    /// is this project's best-confidence read of `SID_AUTH_CHECK`'s request side and has
-    /// **not** been confirmed against a real client capture. Refusing every logon over a
-    /// wire format we are not sure of would be worse than not enforcing key uniqueness
-    /// at all, so a parse failure here fails *open* — log it and accept — rather than
-    /// closing the connection the way a confirmed frame layout's parse failure would.
+    /// The request wire layout parsed below was confirmed against a real BNLS-assisted
+    /// client connecting to Atlas on 2026-09-09 (see `docs/PROTOCOL-NOTES.md` §3), for the
+    /// single-key StarCraft/Brood War case. The two-key WarCraft III case is extrapolated,
+    /// not yet captured. A parse failure still fails *open* — log and accept, skipping only
+    /// the key check — because refusing every logon over a misparsed frame is worse than
+    /// not enforcing uniqueness; version restriction, when on, is applied before the parse
+    /// and so is unaffected.
     fn auth_check(&mut self, frame: &Frame) -> Step {
+        // Version restriction comes first: it depends only on what auth_info already
+        // captured, not on parsing this frame, so it holds even if the body is malformed.
+        if let (Some(product), Some(platform), Some(version_byte)) =
+            (self.product, self.platform, self.version_byte)
+        {
+            if !self.node.version_policy.allows(product, platform, version_byte) {
+                info!(
+                    peer = %self.peer,
+                    product = %product,
+                    platform = %platform,
+                    version_byte = %format!("{version_byte:#010x}"),
+                    "rejected by version restriction"
+                );
+                let mut w = Writer::with_capacity(16);
+                // 0x100 "old version" carries a patch-MPQ filename; we have none, so send
+                // an empty string. The client shows an upgrade-required message.
+                w.u32(auth_check_status::OLD_VERSION).cstr(b"");
+                return self.send(&Frame::new(sid::AUTH_CHECK, w.finish()));
+            }
+        }
+
         let mut r = frame.reader();
         let parsed = (|| {
             let _client_token = r.u32()?;
@@ -493,7 +721,11 @@ impl Bncs {
             let _exe_hash = r.u32()?;
             let key_count = r.u32()?;
             let _spawn = r.u32()?;
-            let _exe_info = r.cstr(256)?;
+            // The per-key block comes BEFORE the EXE info string, not after it. Confirmed
+            // against a real client (BNLS-assisted bot) connecting to Atlas, 2026-09-09:
+            //   client_token, exe_version, exe_hash, key_count, spawn,
+            //   [key_length, product_value, public_value, reserved, hash:20]*,
+            //   exe_info:cstr, owner:cstr
             let mut keys = Vec::with_capacity(key_count.min(2) as usize);
             for _ in 0..key_count.min(2) {
                 let _key_length = r.u32()?;
@@ -503,6 +735,7 @@ impl Bncs {
                 let _hash: [u8; 20] = r.array()?;
                 keys.push(key_fingerprint(product_value, public_value));
             }
+            let _exe_info = r.cstr(256)?;
             let _owner = r.cstr(64)?;
             Ok::<_, bnetcc_proto::ProtoError>(keys)
         })();
@@ -513,8 +746,8 @@ impl Bncs {
                 warn!(
                     peer = %self.peer,
                     error = %e,
-                    "could not parse SID_AUTH_CHECK against our unverified guess at its \
-                     layout; accepting without a CD-key uniqueness check"
+                    "could not parse SID_AUTH_CHECK; accepting without a CD-key uniqueness \
+                     check (see this function's fail-open note)"
                 );
                 return self.auth_check_ok();
             }
@@ -561,7 +794,12 @@ impl Bncs {
         self.send(&Frame::new(sid::AUTH_CHECK, w.finish()))
     }
 
-    async fn logon(&mut self, frame: &Frame) -> Step {
+    /// Handle a logon proof. `reply_id` distinguishes the two forms, which share the same
+    /// request layout (client token, server token, 20-byte double-hash proof, username)
+    /// and verification but differ in their reply's result codes:
+    /// - `SID_LOGONRESPONSE2` (0x3A): 0x00 success · 0x01 no account · 0x02 wrong password.
+    /// - `SID_LOGONRESPONSE` (0x29, legacy): 0x00 **failure** · 0x01 **success**.
+    async fn logon(&mut self, frame: &Frame, reply_id: u8) -> Step {
         let mut r = frame.reader();
         let parsed = (|| {
             let client_token = r.u32()?;
@@ -575,8 +813,8 @@ impl Bncs {
         };
         let name = String::from_utf8_lossy(&username).to_string();
 
-        let status = match self.node.account(&name).await {
-            None => logon_status::NO_SUCH_ACCOUNT,
+        let ok = match self.node.account(&name).await {
+            None => false,
             Some(account) => {
                 // Always use *our* server token, never the one the client echoed back.
                 let expected = logon_proof(client_token, self.server_token, &account.password_hash);
@@ -585,23 +823,96 @@ impl Bncs {
                     for &key in &self.claimed_keys {
                         self.node.record_key_holder_name(key, account.name.clone());
                     }
+                    // Sysops carry the Battle.net Administrator flag and the Blizzard-rep
+                    // tag (the staff icon) in every channel they enter.
+                    if self.node.admins.is_admin(&account.name) {
+                        self.flags |= user_flags::ADMIN | user_flags::BLIZZARD_REP;
+                        info!(peer = %self.peer, account = %account.name, "administrator logged on");
+                    }
                     self.account = Some(account);
-                    logon_status::SUCCESS
+                    true
                 } else {
-                    logon_status::WRONG_PASSWORD
+                    false
                 }
             }
         };
 
         let mut w = Writer::with_capacity(8);
-        w.u32(status);
-        if status == logon_status::ACCOUNT_CLOSED {
-            w.cstr(b"");
+        if reply_id == sid::LOGONRESPONSE {
+            // Legacy: 1 = success, 0 = failure (no distinct no-account/wrong-password).
+            w.u32(u32::from(ok));
+        } else {
+            w.u32(if ok {
+                logon_status::SUCCESS
+            } else {
+                logon_status::NO_SUCH_ACCOUNT
+            });
         }
-        self.send(&Frame::new(sid::LOGONRESPONSE2, w.finish()))
+        self.send(&Frame::new(reply_id, w.finish()))
     }
 
-    async fn create_account(&mut self, frame: &Frame) -> Step {
+    /// `SID_STARTVERSIONING` (0x06), the legacy flow's opener. Payload is platform,
+    /// product and version byte; the reply is the MPQ filetime, filename and
+    /// check-revision formula, mirroring what `SID_AUTH_INFO` returns in the modern flow.
+    fn start_versioning(&mut self, frame: &Frame) -> Step {
+        let mut r = frame.reader();
+        if let Ok((platform, product, version_byte)) = (|| {
+            let platform = r.fourcc()?;
+            let product = r.fourcc()?;
+            let version_byte = r.u32()?;
+            Ok::<_, bnetcc_proto::ProtoError>((platform, product, version_byte))
+        })() {
+            self.platform = Some(platform);
+            self.product = Some(product);
+            self.version_byte = Some(version_byte);
+            self.statstring = statstring::build_default(product);
+            info!(
+                peer = %self.peer,
+                product = %product,
+                platform = %platform,
+                version_byte = %format!("{version_byte:#010x}"),
+                "SID_STARTVERSIONING (legacy)"
+            );
+        }
+        let mpq = version_mpq_name(self.platform);
+        let mut w = Writer::with_capacity(64);
+        w.u64(0) // MPQ filetime
+            .cstr(mpq.as_bytes())
+            .cstr(b"A=1 B=1 C=1 4 A=A^S B=B^C C=C^A A=A^B");
+        self.send(&Frame::new(sid::STARTVERSIONING, w.finish()))
+    }
+
+    /// `SID_REPORTVERSION` (0x07), the legacy version/CD-key check. Enforces version
+    /// restriction if configured (like `auth_check`), otherwise accepts. Result: 0x02 is
+    /// success; the trailing string is a patch path, empty when none is needed.
+    fn report_version(&mut self, _frame: &Frame) -> Step {
+        if let (Some(product), Some(platform), Some(version_byte)) =
+            (self.product, self.platform, self.version_byte)
+        {
+            if !self.node.version_policy.allows(product, platform, version_byte) {
+                info!(
+                    peer = %self.peer,
+                    product = %product,
+                    platform = %platform,
+                    "rejected by version restriction (legacy)"
+                );
+                let mut w = Writer::with_capacity(8);
+                w.u32(0x0000).cstr(b""); // 0 = failed version check
+                return self.send(&Frame::new(sid::REPORTVERSION, w.finish()));
+            }
+        }
+        let mut w = Writer::with_capacity(8);
+        w.u32(0x0002).cstr(b""); // 2 = success
+        self.send(&Frame::new(sid::REPORTVERSION, w.finish()))
+    }
+
+    /// Parse a create-account request (20-byte password hash then username — the shared
+    /// shape of both `SID_CREATEACCOUNT` and `SID_CREATEACCOUNT2`) and attempt the create.
+    ///
+    /// Returns `Ok(outcome)` with a protocol-independent result the caller formats into
+    /// the reply its packet expects, or `Err(Step::Close)` when the frame is malformed or
+    /// storage failed hard.
+    async fn do_create_account(&mut self, frame: &Frame) -> Result<CreateOutcome, Step> {
         let mut r = frame.reader();
         let parsed = (|| {
             let hash: [u8; 20] = r.array()?;
@@ -609,36 +920,65 @@ impl Bncs {
             Ok::<_, bnetcc_proto::ProtoError>((hash, username))
         })();
         let Ok((hash, username)) = parsed else {
-            return Step::Close;
+            return Err(Step::Close);
         };
         let name = String::from_utf8_lossy(&username).to_string();
 
-        // Note: `SID_CREATEACCOUNT2` carries the password hashed **once**, unlike the
-        // logon proof which is a double hash. Storing what arrives is therefore correct.
-        //
-        // Status codes beyond 0x00/0x04 are unverified against a real client capture —
-        // BNETDocs documents 0x02 "name contains invalid characters" but this project has
-        // not confirmed it. See docs/PROTOCOL-NOTES.md's unverified list.
-        let status: u32 = match self.node.create_account(&name, hash).await {
+        // Both packets carry the password hashed **once** (unlike the logon proof, which
+        // is a double hash), so storing what arrives is correct.
+        match self.node.create_account(&name, hash).await {
             Ok(account) => {
                 // Creation does not log you in; the client sends a logon next.
                 info!(peer = %self.peer, account = %account.name, "account created");
-                0x00
+                Ok(CreateOutcome::Created)
             }
-            Err(crate::storage::CreateAccountError::NameTaken) => 0x04,
+            Err(crate::storage::CreateAccountError::NameTaken) => Ok(CreateOutcome::NameTaken),
             Err(crate::storage::CreateAccountError::Invalid(why)) => {
                 debug!(peer = %self.peer, name = %name, reason = %why, "account creation refused");
-                0x02
+                Ok(CreateOutcome::Invalid)
             }
             Err(crate::storage::CreateAccountError::Backend(why)) => {
                 warn!(peer = %self.peer, reason = %why, "account creation failed in storage");
-                return Step::Close;
+                Err(Step::Close)
             }
-        };
+        }
+    }
 
+    /// `SID_CREATEACCOUNT2` (0x3D): reply carries a status code and an (empty) reason
+    /// string. Codes beyond 0x00/0x04 are unverified against a real client — see
+    /// `docs/PROTOCOL-NOTES.md`.
+    async fn create_account2(&mut self, frame: &Frame) -> Step {
+        let outcome = match self.do_create_account(frame).await {
+            Ok(o) => o,
+            Err(step) => return step,
+        };
+        let status: u32 = match outcome {
+            CreateOutcome::Created => 0x00,
+            CreateOutcome::NameTaken => 0x04,
+            CreateOutcome::Invalid => 0x02,
+        };
         let mut w = Writer::with_capacity(8);
         w.u32(status).cstr(b"");
         self.send(&Frame::new(sid::CREATEACCOUNT2, w.finish()))
+    }
+
+    /// `SID_CREATEACCOUNT` (0x2A): the older form, reply is a bare result DWORD. The
+    /// success/failure values are unverified against a real old client (the one client
+    /// tested against this path ignores the value and simply reconnects); we use the same
+    /// 0x00-is-success convention as the rest of the protocol family. See
+    /// `docs/PROTOCOL-NOTES.md`.
+    async fn create_account_legacy(&mut self, frame: &Frame) -> Step {
+        let outcome = match self.do_create_account(frame).await {
+            Ok(o) => o,
+            Err(step) => return step,
+        };
+        let result: u32 = match outcome {
+            CreateOutcome::Created => 0x00,
+            CreateOutcome::NameTaken | CreateOutcome::Invalid => 0x01,
+        };
+        let mut w = Writer::with_capacity(4);
+        w.u32(result);
+        self.send(&Frame::new(sid::CREATEACCOUNT, w.finish()))
     }
 
     fn enter_chat(&mut self, _frame: &Frame) -> Step {
@@ -647,9 +987,14 @@ impl Bncs {
         };
         let mut w = Writer::with_capacity(64);
         w.cstr(account.name.as_bytes())
-            .cstr(b"")
+            .cstr(self.statstring.as_slice())
             .cstr(account.name.as_bytes());
-        self.send(&Frame::new(sid::ENTERCHAT, w.finish()))
+        if matches!(self.send(&Frame::new(sid::ENTERCHAT, w.finish())), Step::Close) {
+            return Step::Close;
+        }
+        // Server MOTD, once, at chat entry — not on every channel join. A per-channel MOTD
+        // is a separate future feature (see docs/ROADMAP.md).
+        self.send(&chat_event(EventId::Info, 0, 0, b"", self.node.motd.as_bytes()))
     }
 
     fn join_channel(&mut self, frame: &Frame) -> Step {
@@ -683,6 +1028,7 @@ impl Bncs {
             account.id,
             &account.name,
             self.flags,
+            self.statstring.clone(),
             self.out.clone(),
         ) {
             Err(denial) => {
@@ -697,47 +1043,64 @@ impl Bncs {
                 self.flags = joined.outcome.flags;
                 self.channel = Some(joined.key.clone());
 
-                // 1. "You are in channel X".
+                // 1. "You are in channel X". For EID_CHANNEL the channel name goes in the
+                // *text* field, not the username field — confirmed against a real client
+                // (a client reads the channel name from text and shows blank otherwise).
                 if matches!(
                     self.send(&chat_event(
                         EventId::Channel,
                         joined.flags,
                         0,
-                        joined.display.as_bytes(),
                         b"",
+                        joined.display.as_bytes(),
                     )),
                     Step::Close
                 ) {
                     return Step::Close;
                 }
-                // 2. One EID_SHOWUSER per occupant already present.
-                for (name, flags) in existing {
+                // 2. One EID_SHOWUSER per occupant already present, then one for us — a
+                // client builds its user list from these, and needs to see itself too.
+                // Each carries the user's statstring so the client can render product and
+                // icon; without it the entry shows blank.
+                for occ in existing {
                     if matches!(
                         self.send(&chat_event(
                             EventId::ShowUser,
-                            flags,
+                            occ.flags,
                             0,
-                            name.as_bytes(),
-                            b"",
+                            occ.name.as_bytes(),
+                            &occ.statstring,
                         )),
                         Step::Close
                     ) {
                         return Step::Close;
                     }
                 }
-                // 3. Tell everyone else we arrived.
-                let ev = chat_event(EventId::Join, self.flags, 0, account.name.as_bytes(), b"");
+                if matches!(
+                    self.send(&chat_event(
+                        EventId::ShowUser,
+                        self.flags,
+                        0,
+                        account.name.as_bytes(),
+                        &self.statstring,
+                    )),
+                    Step::Close
+                ) {
+                    return Step::Close;
+                }
+                // 3. Tell everyone else we arrived, with our statstring so their lists
+                // render us.
+                let ev = chat_event(
+                    EventId::Join,
+                    self.flags,
+                    0,
+                    account.name.as_bytes(),
+                    &self.statstring,
+                );
                 if let Some(wire) = encode(&ev) {
                     let _ = self.node.broadcast(&joined.key, &wire, Some(account.id));
                 }
-                // 4. MOTD, as real Battle.net does on a first join.
-                self.send(&chat_event(
-                    EventId::Info,
-                    0,
-                    0,
-                    b"",
-                    self.node.motd.as_bytes(),
-                ))
+                Step::Continue
             }
         }
     }
@@ -748,6 +1111,16 @@ impl Bncs {
         if let Some(wire) = encode(&ev) {
             let _ = self.node.broadcast(key, &wire, Some(account.id));
         }
+    }
+
+    /// `SID_LEAVECHAT` (0x10): the client is leaving the chat environment (often to switch
+    /// channels or enter a game). Leave the current channel but keep the connection —
+    /// there is no reply, and the client typically joins another channel next.
+    fn leave_chat(&mut self) -> Step {
+        if let (Some(key), Some(account)) = (self.channel.take(), self.account.clone()) {
+            self.leave_current(&key, &account);
+        }
+        Step::Continue
     }
 
     fn chat_command(&mut self, frame: &Frame) -> Step {
@@ -869,33 +1242,125 @@ impl Bncs {
         self.send(&Frame::new(sid::GETCHANNELLIST, w.finish()))
     }
 
+    /// `SID_GETADVLISTEX` (0x09): return the games this node currently knows about.
+    ///
+    /// ⚠️ **Wire format unverified against a real client.** Each game entry embeds a
+    /// `sockaddr_in` (address family, big-endian port, host IP) so a joiner can reach the
+    /// host peer-to-peer, followed by status, elapsed seconds, and the name/password/
+    /// statstring strings. The zero-game case sends count 0 then a status DWORD, per
+    /// BNETDocs' ambiguous note. The game test client mirrors this layout; confirm it
+    /// against a real client (e.g. a WinBot create/list cycle) before relying on it.
     fn game_list(&mut self) -> Step {
-        let mut w = Writer::with_capacity(8);
-        if self.node.policy.game_listing.allowed() {
-            // No game advertisements yet; an empty list is the honest answer.
-            w.u32(0).u32(1);
+        // Warnet mode never lists games; otherwise show what hosts have advertised.
+        let games = if self.node.policy.game_listing.allowed() {
+            self.node.games()
         } else {
-            // Warnet mode: no games, ever. Status 1 = "game doesn't exist".
-            w.u32(0).u32(1);
+            Vec::new()
+        };
+
+        let mut w = Writer::with_capacity(64);
+        w.u32(games.len() as u32);
+        if games.is_empty() {
+            // Zero-game case: a status DWORD stands in for the (absent) entries.
+            w.u32(0x01); // "game does not exist" / empty
+            return self.send(&Frame::new(sid::GETADVLISTEX, w.finish()));
         }
-        // NOTE: BNETDocs describes the zero-game case ambiguously — "(UINT32) Number of
-        // games [if 0 → a single (UINT32) Status follows instead]". We send count then
-        // status. Verify against a real client capture before release; getting this
-        // wrong makes the client hang rather than show an error.
+        for g in &games {
+            let elapsed = u32::try_from(g.created.elapsed().as_secs()).unwrap_or(u32::MAX);
+            w.u16(g.game_type)
+                .u16(g.parameter)
+                .u32(0) // language id
+                .u16(2) // AF_INET
+                .u16(g.port.to_be()) // port, network byte order
+                .bytes(&g.host_ip.octets()) // host IP, network order
+                .u32(0) // sin_zero
+                .u32(0) // sin_zero
+                .u32(g.state) // game status
+                .u32(elapsed)
+                .cstr(&g.name)
+                .cstr(&g.password)
+                .cstr(&g.statstring);
+        }
         self.send(&Frame::new(sid::GETADVLISTEX, w.finish()))
     }
 
-    fn advertise(&mut self) -> Step {
-        let status = if self.node.policy.game_hosting.allowed() {
+    /// `SID_STARTADVEX3` (0x1C): a client advertises a game it is hosting. We register it
+    /// in the node's directory so `SID_GETADVLISTEX` can hand it to other clients.
+    ///
+    /// ⚠️ Request layout unverified against a real client — see `game_list`.
+    fn advertise(&mut self, frame: &Frame) -> Step {
+        if !self.node.policy.game_hosting.allowed() {
+            // Warnet mode: hosting is off. Reply with the game's own documented code so the
+            // client shows a real message rather than hanging on a dropped packet.
+            let mut w = Writer::with_capacity(4);
+            w.u32(advertise_status::TYPE_UNAVAILABLE);
+            return self.send(&Frame::new(sid::STARTADVEX3, w.finish()));
+        }
+        let Some(account) = self.account.clone() else {
+            return Step::Close;
+        };
+
+        let mut r = frame.reader();
+        let parsed = (|| {
+            let state = r.u32()?;
+            let _uptime = r.u32()?;
+            let game_type = r.u16()?;
+            let parameter = r.u16()?;
+            let _unknown = r.u32()?;
+            let _ladder = r.u32()?;
+            let name = r.cstr(CHANNEL_NAME_MAX)?.to_vec();
+            let password = r.cstr(CHANNEL_NAME_MAX)?.to_vec();
+            let statstring = r.cstr(512)?.to_vec();
+            Ok::<_, bnetcc_proto::ProtoError>((state, game_type, parameter, name, password, statstring))
+        })();
+        let Ok((state, game_type, parameter, name, password, statstring)) = parsed else {
+            return Step::Close;
+        };
+
+        let host_ip = match self.peer.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            std::net::IpAddr::V6(_) => std::net::Ipv4Addr::UNSPECIFIED,
+        };
+        let ad = crate::node::GameAd {
+            name,
+            password,
+            statstring,
+            game_type,
+            parameter,
+            state,
+            port: self.game_port,
+            host_ip,
+            host: account.id,
+            created: std::time::Instant::now(),
+        };
+        let ok = self.node.advertise_game(ad);
+        if ok {
+            info!(peer = %self.peer, account = %account.name, "game advertised");
+        }
+        let mut w = Writer::with_capacity(4);
+        w.u32(if ok {
             advertise_status::OK
         } else {
-            // The game's own documented code, so the client shows a real message.
-            // Dropping the packet instead would hang the client.
-            advertise_status::TYPE_UNAVAILABLE
-        };
-        let mut w = Writer::with_capacity(4);
-        w.u32(status);
+            advertise_status::NAME_TAKEN
+        });
         self.send(&Frame::new(sid::STARTADVEX3, w.finish()))
+    }
+
+    /// `SID_STOPADV` (0x02) / `SID_LEAVEGAME` (0x1F): the host's game is over. Remove it
+    /// from the directory so it stops appearing in the game list.
+    fn stop_advertising(&mut self) -> Step {
+        if let Some(account) = &self.account {
+            self.node.withdraw_game(account.id);
+        }
+        Step::Continue
+    }
+
+    /// `SID_NETGAMEPORT` (0x45): the client announces the port it will host games on.
+    fn net_game_port(&mut self, frame: &Frame) -> Step {
+        if let Ok(port) = frame.reader().u16() {
+            self.game_port = port;
+        }
+        Step::Continue
     }
 }
 
@@ -1000,18 +1465,20 @@ mod tests {
     /// A minimal `SID_AUTH_CHECK` carrying one CD key. `product_value`/`public_value` are
     /// the two fields our uniqueness check actually keys on — see `key_fingerprint`.
     fn auth_check_frame(product_value: u32, public_value: u32) -> Frame {
+        // Field order matches the parser (verified against a real client): the key block
+        // comes before the EXE info string, not after it.
         let mut w = Writer::with_capacity(96);
         w.u32(0) // client token
             .u32(0) // exe version
             .u32(0) // exe hash
             .u32(1) // key count
             .u32(0) // spawn
-            .cstr(b"test.exe 00/00/00 000000")
             .u32(16) // key length
             .u32(product_value)
             .u32(public_value)
             .u32(0) // reserved
             .bytes(&[0u8; 20]) // wire hash; unused by our uniqueness check, see KeyId
+            .cstr(b"test.exe 00/00/00 000000")
             .cstr(b"tester");
         Frame::new(sid::AUTH_CHECK, w.finish())
     }
@@ -1022,11 +1489,15 @@ mod tests {
         stream.write_all(&out).await.expect("write");
     }
 
+    /// Read the next frame, skipping `SID_PING` — the server sends one on connect and may
+    /// send more unprompted, and the tests care about the handshake frames around them.
     async fn recv_frame(stream: &mut TcpStream) -> Frame {
         let mut buf = RecvBuf::with_capacity(256);
         loop {
-            if let Ok(Some(f)) = decode_frame(&mut buf, DEFAULT_MAX_FRAME) {
-                return f;
+            match decode_frame(&mut buf, DEFAULT_MAX_FRAME) {
+                Ok(Some(f)) if f.id == sid::PING => continue,
+                Ok(Some(f)) => return f,
+                _ => {}
             }
             let tail = buf.writable_tail(256);
             let n = stream.read(tail).await.expect("read");
@@ -1113,5 +1584,151 @@ mod tests {
         let mut b = connect(addr).await;
         assert_eq!(auth_check_status_of(&mut a, 1, 1).await, auth_check_status::PASSED);
         assert_eq!(auth_check_status_of(&mut b, 1, 2).await, auth_check_status::PASSED);
+    }
+
+    /// Spawn a server on an ephemeral port and return its address.
+    async fn spawn_server() -> std::net::SocketAddr {
+        let node = Arc::new(crate::node::test_node());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let limits = SessionLimits::default();
+        tokio::spawn(async move {
+            loop {
+                let (stream, peer) = listener.accept().await.expect("accept");
+                tokio::spawn(handle(stream, peer, Arc::clone(&node), limits));
+            }
+        });
+        addr
+    }
+
+    /// Drive a full modern-flow login as a game test client: handshake, create the
+    /// account, log in, enter chat. Leaves the stream logged in and ready for game or
+    /// channel packets. Returns the connected stream.
+    async fn login(addr: std::net::SocketAddr, user: &str, password: &str, key: u32) -> TcpStream {
+        const CLIENT_TOKEN: u32 = 0xCAFE_BABE;
+        let mut s = connect(addr).await;
+
+        // Version handshake. Each caller passes a distinct `key` so concurrent logins in
+        // one test do not collide on the one-session-per-CD-key rule.
+        send_frame(&mut s, &auth_info_frame()).await;
+        let info = recv_frame(&mut s).await;
+        assert_eq!(info.id, sid::AUTH_INFO);
+        let mut ir = info.reader();
+        let _logon_type = ir.u32().unwrap();
+        let server_token = ir.u32().unwrap();
+        send_frame(&mut s, &auth_check_frame(1, key)).await;
+        let check = recv_frame(&mut s).await;
+        assert_eq!(check.reader().u32().unwrap(), auth_check_status::PASSED);
+
+        // Create the account (single-hash), then log in with the double-hash proof.
+        let h1 = bnetcc_crypto::password_hash(password);
+        let mut cw = Writer::with_capacity(32);
+        cw.bytes(&h1).cstr(user.as_bytes());
+        send_frame(&mut s, &Frame::new(sid::CREATEACCOUNT2, cw.finish())).await;
+        let created = recv_frame(&mut s).await;
+        assert_eq!(created.reader().u32().unwrap(), 0x00, "account creation");
+
+        let proof = bnetcc_crypto::logon_proof(CLIENT_TOKEN, server_token, &h1);
+        let mut lw = Writer::with_capacity(32);
+        lw.u32(CLIENT_TOKEN).u32(server_token).bytes(&proof).cstr(user.as_bytes());
+        send_frame(&mut s, &Frame::new(sid::LOGONRESPONSE2, lw.finish())).await;
+        let logon = recv_frame(&mut s).await;
+        assert_eq!(logon.reader().u32().unwrap(), logon_status::SUCCESS, "logon");
+
+        send_frame(&mut s, &Frame::new(sid::ENTERCHAT, Writer::new().finish())).await;
+        let _enter = recv_frame(&mut s).await; // ENTERCHAT reply (+ MOTD)
+        s
+    }
+
+    /// Build a `SID_STARTADVEX3` request for a game called `name`.
+    fn start_adv_frame(name: &str) -> Frame {
+        let mut w = Writer::with_capacity(64);
+        w.u32(0) // state
+            .u32(0) // uptime
+            .u16(0x02) // game type
+            .u16(0) // parameter
+            .u32(1) // unknown
+            .u32(0) // ladder
+            .cstr(name.as_bytes())
+            .cstr(b"") // password
+            .cstr(b"0x01 0x02 map.scm"); // statstring
+        Frame::new(sid::STARTADVEX3, w.finish())
+    }
+
+    /// Ask for the game list and return each game's name.
+    async fn list_game_names(s: &mut TcpStream) -> Vec<String> {
+        send_frame(s, &Frame::new(sid::GETADVLISTEX, Writer::new().finish())).await;
+        let reply = recv_frame(s).await;
+        assert_eq!(reply.id, sid::GETADVLISTEX);
+        let mut r = reply.reader();
+        let count = r.u32().expect("count");
+        let mut names = Vec::new();
+        for _ in 0..count {
+            let _game_type = r.u16().unwrap();
+            let _parameter = r.u16().unwrap();
+            let _lang = r.u32().unwrap();
+            let _af = r.u16().unwrap();
+            let _port = r.u16().unwrap();
+            let _ip: [u8; 4] = r.array().unwrap();
+            let _z0 = r.u32().unwrap();
+            let _z1 = r.u32().unwrap();
+            let _status = r.u32().unwrap();
+            let _elapsed = r.u32().unwrap();
+            let name = r.cstr(256).unwrap().to_vec();
+            let _password = r.cstr(256).unwrap();
+            let _statstring = r.cstr(512).unwrap();
+            names.push(String::from_utf8_lossy(&name).into_owned());
+        }
+        names
+    }
+
+    #[tokio::test]
+    async fn a_hosted_game_appears_in_the_list_then_disappears_when_ended() {
+        let addr = spawn_server().await;
+        let mut host = login(addr, "HostBot", "pw", 1).await;
+
+        // No games yet.
+        assert!(list_game_names(&mut host).await.is_empty());
+
+        // Advertise a game; it should appear in the list.
+        send_frame(&mut host, &start_adv_frame("My Melee Game")).await;
+        let adv = recv_frame(&mut host).await;
+        assert_eq!(adv.id, sid::STARTADVEX3);
+        assert_eq!(adv.reader().u32().unwrap(), advertise_status::OK);
+
+        let names = list_game_names(&mut host).await;
+        assert_eq!(names, vec!["My Melee Game".to_string()], "hosted game should be listed");
+
+        // A second client sees it too.
+        let mut viewer = login(addr, "Viewer", "pw", 2).await;
+        assert_eq!(list_game_names(&mut viewer).await, vec!["My Melee Game".to_string()]);
+
+        // Ending it (SID_STOPADV) removes it from the directory.
+        send_frame(&mut host, &Frame::new(sid::STOPADV, Writer::new().finish())).await;
+        // STOPADV has no reply; give the server a moment, then re-list.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            list_game_names(&mut viewer).await.is_empty(),
+            "an ended game must not remain in the list"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hosts_game_is_withdrawn_when_the_host_disconnects() {
+        let addr = spawn_server().await;
+        let mut host = login(addr, "Ghost", "pw", 1).await;
+        send_frame(&mut host, &start_adv_frame("Abandoned")).await;
+        let _ = recv_frame(&mut host).await;
+
+        let mut viewer = login(addr, "Watcher", "pw", 2).await;
+        assert_eq!(list_game_names(&mut viewer).await, vec!["Abandoned".to_string()]);
+
+        // Host vanishes without sending STOPADV — the game must still be cleaned up.
+        drop(host);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            list_game_names(&mut viewer).await.is_empty(),
+            "a game must not outlive the connection hosting it"
+        );
     }
 }

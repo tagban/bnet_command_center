@@ -104,12 +104,52 @@ struct Inner {
     channels: HashMap<Vec<u8>, Channel>,
     /// Subscribers per channel, keyed by normalised channel name.
     subscribers: HashMap<Vec<u8>, Vec<(AccountId, Outbound)>>,
+    /// Advertised games, keyed by lowercased game name. A node is a directory of the
+    /// games its clients host; the games themselves are peer-to-peer (`SID_STARTADVEX3`
+    /// to advertise, `SID_GETADVLISTEX` to discover). See [`GameAd`].
+    games: HashMap<Vec<u8>, GameAd>,
+}
+
+/// A game advertised by a hosting client, tracked so other clients can discover it via
+/// `SID_GETADVLISTEX`.
+///
+/// The wire fields (type, parameter, host address, statstring) are carried through mostly
+/// opaquely — the server is a directory, not a referee — and echoed back in the game list.
+#[derive(Debug, Clone)]
+pub struct GameAd {
+    /// Display name as advertised.
+    pub name: Vec<u8>,
+    /// Join password; empty for a public game.
+    pub password: Vec<u8>,
+    /// Map/game info blob the client renders. Opaque to the server.
+    pub statstring: Vec<u8>,
+    /// Game type (melee, ffa, ladder, …) — echoed, not interpreted.
+    pub game_type: u16,
+    /// Product-specific sub-type / parameter.
+    pub parameter: u16,
+    /// Host-supplied state/flags.
+    pub state: u32,
+    /// Host's advertised game port.
+    pub port: u16,
+    /// Host's address, as seen by the node.
+    pub host_ip: std::net::Ipv4Addr,
+    /// The hosting account.
+    pub host: AccountId,
+    /// When the ad was created, for the elapsed-time field.
+    pub created: std::time::Instant,
 }
 
 /// Everything one node shares between connections.
 pub struct Node {
     /// Effective policy, already narrowed by the hub if federated.
     pub policy: Policy,
+    /// Client version restriction. Off by default — see `crate::config::VersionsConfig`.
+    pub version_policy: crate::config::VersionPolicy,
+    /// Accounts granted the Battle.net Administrator (sysop) role.
+    pub admins: crate::config::AdminsConfig,
+    /// Whether the first arrival to a private channel is auto-opped (Op/Clan always are,
+    /// `Public *` never are; this governs only the private case).
+    pub auto_op_private: bool,
     /// Server name shown to clients.
     pub name: String,
     /// Message of the day.
@@ -119,6 +159,9 @@ pub struct Node {
     /// Configured advertisement banners. Empty means we never answer `SID_CHECKAD`,
     /// which leaves the client showing whatever it already has.
     pub ads: AdRotation,
+    /// Directory of operator-supplied files served over BNFTP (version-check MPQ,
+    /// `icons.bni`, `tos.txt`, ad images). `None` refuses every BNFTP request.
+    pub files_dir: Option<std::path::PathBuf>,
     inner: Mutex<Inner>,
     /// One table for every client class. Counts are keyed by `(class, address)`, so a
     /// Brood War client and a chat-gateway bot from the same address are accounted
@@ -138,24 +181,44 @@ pub struct Node {
     key_holder_names: Mutex<HashMap<KeyId, String>>,
 }
 
+/// The config-derived settings a [`Node`] is built from, bundled so the constructor takes
+/// a handful of arguments rather than a dozen positional ones. Resolved from
+/// [`crate::config::Config`] in `main`, or built with defaults in tests.
+pub struct NodeConfig {
+    /// Effective policy, already narrowed by the hub if federated.
+    pub policy: Policy,
+    /// Server name shown to clients.
+    pub name: String,
+    /// Message of the day.
+    pub motd: String,
+    /// Addresses exempt from the one-gateway-connection-per-IP rule.
+    pub gateway_allowlist: Vec<IpAddr>,
+    /// Client version restriction.
+    pub version_policy: crate::config::VersionPolicy,
+    /// Directory of files served over BNFTP; `None` refuses every request.
+    pub files_dir: Option<std::path::PathBuf>,
+    /// Administrator accounts.
+    pub admins: crate::config::AdminsConfig,
+    /// Whether private channels auto-op their first arrival.
+    pub auto_op_private: bool,
+}
+
 impl Node {
-    /// Build a node.
+    /// Build a node from its resolved configuration and a storage handle.
     #[must_use]
-    pub fn new(
-        policy: Policy,
-        name: String,
-        motd: String,
-        gateway_allowlist: Vec<IpAddr>,
-        storage: crate::storage::StorageHandle,
-    ) -> Self {
+    pub fn new(cfg: NodeConfig, storage: crate::storage::StorageHandle) -> Self {
         let mut admission = AdmissionTable::new();
-        admission.set_allowlist(gateway_allowlist);
+        admission.set_allowlist(cfg.gateway_allowlist);
         Self {
-            policy,
-            name,
-            motd,
+            policy: cfg.policy,
+            version_policy: cfg.version_policy,
+            admins: cfg.admins,
+            auto_op_private: cfg.auto_op_private,
+            name: cfg.name,
+            motd: cfg.motd,
             channel_max_users: 40,
             ads: AdRotation::default(),
+            files_dir: cfg.files_dir,
             inner: Mutex::new(Inner::default()),
             admission: Mutex::new(admission),
             connections: AtomicU64::new(0),
@@ -311,8 +374,9 @@ impl Node {
         account: AccountId,
         display_name: &str,
         base_flags: u32,
+        statstring: Vec<u8>,
         out: Outbound,
-    ) -> Result<(JoinedChannel, Vec<(String, u32)>), JoinDenial> {
+    ) -> Result<(JoinedChannel, Vec<ChannelOccupant>), JoinDenial> {
         let key = normalize_channel_name(raw_name);
         if key.is_empty() {
             return Err(JoinDenial::Full);
@@ -321,18 +385,26 @@ impl Node {
 
         let mut inner = self.inner.lock().expect("node lock");
         let max_users = self.channel_max_users;
-        let channel = inner
-            .channels
-            .entry(key.clone())
-            .or_insert_with(|| Channel::new(key.clone(), display, ChannelClass::Local, max_users));
+        let auto_op_private = self.auto_op_private;
+        let channel = inner.channels.entry(key.clone()).or_insert_with(|| {
+            let mut c = Channel::new(key.clone(), display.clone(), ChannelClass::Local, max_users);
+            // Apply the name convention: Op/Clan always auto-op, "Public *" never, private
+            // per config. See bnetcc_core::channel::operator_grant_for_name.
+            c.set_auto_op(bnetcc_core::channel::operator_grant_for_name(&display, auto_op_private));
+            c
+        });
 
-        let existing: Vec<(String, u32)> = channel
+        let existing: Vec<ChannelOccupant> = channel
             .members()
             .iter()
-            .map(|m| (m.name.clone(), m.flags))
+            .map(|m| ChannelOccupant {
+                name: m.name.clone(),
+                flags: m.flags,
+                statstring: m.statstring.clone(),
+            })
             .collect();
 
-        let outcome = channel.join(account, display_name.to_string(), base_flags)?;
+        let outcome = channel.join(account, display_name.to_string(), base_flags, statstring)?;
         let joined = JoinedChannel {
             key: key.clone(),
             display: channel.display().to_string(),
@@ -360,6 +432,34 @@ impl Node {
             inner.subscribers.remove(key);
         }
         outcome.new_operator
+    }
+
+    /// Advertise (or re-advertise) a game. Keyed by lowercased name, so a host updating
+    /// its own game replaces the prior entry. Returns whether the name was free — a
+    /// different host trying to reuse a live name is refused (`false`).
+    pub fn advertise_game(&self, ad: GameAd) -> bool {
+        let key = ad.name.to_ascii_lowercase();
+        let mut inner = self.inner.lock().expect("node lock");
+        if let Some(existing) = inner.games.get(&key) {
+            if existing.host != ad.host {
+                return false; // name taken by another host's live game
+            }
+        }
+        inner.games.insert(key, ad);
+        true
+    }
+
+    /// Remove a game advertised by `account`, if any. Called on `SID_STOPADV`,
+    /// `SID_LEAVEGAME` and disconnect, so a game never outlives its host.
+    pub fn withdraw_game(&self, account: AccountId) {
+        let mut inner = self.inner.lock().expect("node lock");
+        inner.games.retain(|_, g| g.host != account);
+    }
+
+    /// Snapshot of the currently advertised games, for `SID_GETADVLISTEX`.
+    #[must_use]
+    pub fn games(&self) -> Vec<GameAd> {
+        self.inner.lock().expect("node lock").games.values().cloned().collect()
     }
 
     /// Send pre-encoded bytes to every subscriber of a channel, optionally excluding one.
@@ -409,16 +509,33 @@ pub struct JoinedChannel {
     pub outcome: bnetcc_core::channel::JoinOutcome,
 }
 
+/// A user already present in a channel when someone joins, for `EID_SHOWUSER`.
+#[derive(Debug, Clone)]
+pub struct ChannelOccupant {
+    /// Display name.
+    pub name: String,
+    /// Chat flags.
+    pub flags: u32,
+    /// Statstring, echoed so the joining client can render this user.
+    pub statstring: Vec<u8>,
+}
+
 /// An in-memory-backed node for tests. Exposed beyond this module so `session`'s own
 /// tests can drive a real `Node` without a database.
 #[cfg(test)]
 pub(crate) fn test_node() -> Node {
     let storage = crate::storage::spawn(Box::new(bnetcc_storage::memory::MemoryStorage::new()));
     Node::new(
-        Policy::for_mode(bnetcc_core::policy::ServerMode::Gaming),
-        "Test".into(),
-        "motd".into(),
-        Vec::new(),
+        NodeConfig {
+            policy: Policy::for_mode(bnetcc_core::policy::ServerMode::Gaming),
+            name: "Test".into(),
+            motd: "motd".into(),
+            gateway_allowlist: Vec::new(),
+            version_policy: crate::config::VersionPolicy::default(),
+            files_dir: None,
+            admins: crate::config::AdminsConfig::default(),
+            auto_op_private: false,
+        },
         storage,
     )
 }
@@ -451,7 +568,7 @@ mod tests {
         let n = node();
         let (out, _rx) = outbound(4);
         let (joined, existing) = n
-            .join_channel(b"Op Clan XYZ", 1, "Zealot", 0, out)
+            .join_channel(b"Op Clan XYZ", 1, "Zealot", 0, Vec::new(), out)
             .unwrap();
         assert!(joined.outcome.granted_operator);
         assert_eq!(joined.outcome.flags & user_flags::OPERATOR, user_flags::OPERATOR);
@@ -464,8 +581,8 @@ mod tests {
         let n = node();
         let (o1, _r1) = outbound(4);
         let (o2, _r2) = outbound(4);
-        n.join_channel(b"Blizzard Tech", 1, "a", 0, o1).unwrap();
-        let (_, existing) = n.join_channel(b"  blizzard   TECH ", 2, "b", 0, o2).unwrap();
+        n.join_channel(b"Blizzard Tech", 1, "a", 0, Vec::new(), o1).unwrap();
+        let (_, existing) = n.join_channel(b"  blizzard   TECH ", 2, "b", 0, Vec::new(), o2).unwrap();
         assert_eq!(existing.len(), 1, "second user must land in the same channel");
     }
 
@@ -474,8 +591,8 @@ mod tests {
         let n = node();
         let (o1, mut r1) = outbound(4);
         let (o2, mut r2) = outbound(4);
-        n.join_channel(b"chat", 1, "a", 0, o1).unwrap();
-        n.join_channel(b"chat", 2, "b", 0, o2).unwrap();
+        n.join_channel(b"chat", 1, "a", 0, Vec::new(), o1).unwrap();
+        n.join_channel(b"chat", 2, "b", 0, Vec::new(), o2).unwrap();
 
         let wire = Arc::new(vec![0xFFu8, 0x0F, 4, 0]);
         let stalled = n.broadcast(b"chat", &wire, Some(1));
@@ -489,8 +606,8 @@ mod tests {
         let n = node();
         let (slow, _slow_rx) = outbound(1); // fills immediately
         let (fast, mut fast_rx) = outbound(64);
-        n.join_channel(b"chat", 1, "slow", 0, slow).unwrap();
-        n.join_channel(b"chat", 2, "fast", 0, fast).unwrap();
+        n.join_channel(b"chat", 1, "slow", 0, Vec::new(), slow).unwrap();
+        n.join_channel(b"chat", 2, "fast", 0, Vec::new(), fast).unwrap();
 
         let wire = Arc::new(vec![0xFFu8, 0x0F, 4, 0]);
         let mut stalled = Vec::new();
@@ -510,7 +627,7 @@ mod tests {
     fn an_empty_channel_is_destroyed_on_the_last_departure() {
         let n = node();
         let (out, _rx) = outbound(4);
-        n.join_channel(b"temp", 1, "a", 0, out).unwrap();
+        n.join_channel(b"temp", 1, "a", 0, Vec::new(), out).unwrap();
         assert_eq!(n.channel_names().len(), 1);
         n.leave_channel(b"temp", 1);
         assert!(n.channel_names().is_empty());

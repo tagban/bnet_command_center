@@ -161,6 +161,23 @@ pub mod sid {
     /// StarCraft 1.16.1 may send it *before* login completes. Treat as a no-op, never
     /// as a protocol violation.
     pub const STOPADV: u8 = 0x02;
+    /// Legacy logon: client identification (older clients send `CLIENTID2`).
+    pub const CLIENTID: u8 = 0x05;
+    /// Legacy logon: client asks the server to begin version checking. The server replies
+    /// with the same id carrying the MPQ filetime, filename and check-revision formula.
+    /// This is the pre-`SID_AUTH_INFO` path used by Diablo I, Warcraft II BNE and the old
+    /// Mac clients.
+    pub const STARTVERSIONING: u8 = 0x06;
+    /// Legacy logon: client reports its version/checksum; server replies with a result.
+    pub const REPORTVERSION: u8 = 0x07;
+    /// Legacy logon: client locale and timezone. Informational; no reply.
+    pub const LOCALEINFO: u8 = 0x12;
+    /// Legacy logon: client identification, second generation. Informational; no reply.
+    pub const CLIENTID2: u8 = 0x1E;
+    /// Legacy logon: client system information. Informational; no reply.
+    pub const SYSTEMINFO: u8 = 0x2B;
+    /// Legacy logon: CD-key check for the old flow.
+    pub const CDKEY: u8 = 0x30;
     /// Client requests the game list.
     pub const GETADVLISTEX: u8 = 0x09;
     /// Client enters chat.
@@ -177,12 +194,19 @@ pub mod sid {
     pub const GETCHANNELLIST: u8 = 0x0B;
     /// Client joins a channel.
     pub const JOINCHANNEL: u8 = 0x0C;
+    /// Client leaves the chat environment (e.g. to enter a game) — no reply. The client
+    /// stays connected; it may join another channel afterwards.
+    pub const LEAVECHAT: u8 = 0x10;
     /// Client sends chat text or a slash command.
     pub const CHATCOMMAND: u8 = 0x0E;
     /// Server emits a chat event.
     pub const CHATEVENT: u8 = 0x0F;
     /// Server warns of flood detection before disconnecting.
     pub const FLOODDETECTED: u8 = 0x13;
+    /// Client's UDP-detection response, sent unprompted right after the version check
+    /// passes. Carries a four-byte tag (`bnet`/`tenb`); the server only needs to accept
+    /// it, not act on it.
+    pub const UDPPINGRESPONSE: u8 = 0x14;
     /// Client advertises a game.
     pub const STARTADVEX3: u8 = 0x1C;
     /// Client left a game.
@@ -208,6 +232,10 @@ pub mod sid {
     pub const CHECKDATAFILE2: u8 = 0x3C;
     /// Legacy logon (Diablo I, Warcraft II BNE, shareware StarCraft).
     pub const LOGONRESPONSE: u8 = 0x29;
+    /// Account creation, first generation. Payload is a 20-byte password hash then the
+    /// username — the same shape as [`CREATEACCOUNT2`] but with a bare result DWORD in
+    /// reply. Older/custom clients (and some bots) use this instead of `CREATEACCOUNT2`.
+    pub const CREATEACCOUNT: u8 = 0x2A;
     /// Account creation, second generation.
     pub const CREATEACCOUNT2: u8 = 0x3D;
     /// Modern-status logon used by StarCraft, Brood War and Diablo II.
@@ -222,6 +250,11 @@ pub mod sid {
     pub const NETGAMEPORT: u8 = 0x45;
     /// WarCraft III asks for an advertisement's click URL. WAR3/W3XP only.
     pub const QUERYADURL: u8 = 0x41;
+    /// Server prompts the client to set an account email (client shows a dialog). Also
+    /// sent by the client to set one.
+    pub const SETEMAIL: u8 = 0x59;
+    /// Client requests its friends list. Sent during login, before joining a channel.
+    pub const FRIENDSLIST: u8 = 0x65;
     /// Version and platform negotiation.
     pub const AUTH_INFO: u8 = 0x50;
     /// Version check and CD-key verdict.

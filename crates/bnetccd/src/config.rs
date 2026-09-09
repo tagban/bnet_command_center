@@ -28,6 +28,74 @@ pub struct Config {
     pub federation: FederationConfig,
     /// Account persistence.
     pub storage: StorageConfig,
+    /// Client version restriction.
+    pub versions: VersionsConfig,
+    /// BNFTP file serving.
+    pub files: FilesConfig,
+    /// Server administrators.
+    pub admins: AdminsConfig,
+    /// Channel behaviour.
+    pub channels: ChannelsConfig,
+}
+
+/// Channel behaviour.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ChannelsConfig {
+    /// Whether the first arrival to a private (user-created) channel is granted operator.
+    /// Op/Clan channels always auto-op and `Public *` channels never do, regardless of
+    /// this; it only governs the private case. Off by default.
+    pub auto_op_private: bool,
+    /// Channels a telnet/chat-gateway user may enter *in addition to* public channels.
+    /// Gateway users are otherwise confined to `Public *` channels — they must not reach
+    /// arbitrary private or Op/Clan channels. Defaults to a tech-support channel.
+    pub telnet_channels: Vec<String>,
+}
+
+impl Default for ChannelsConfig {
+    fn default() -> Self {
+        Self {
+            auto_op_private: false,
+            telnet_channels: vec!["Open Tech Support".to_string()],
+        }
+    }
+}
+
+/// Server administrators — accounts granted the Battle.net Administrator (sysop) role.
+///
+/// A listed account carries the sysop flags in chat: the Battle.net Administrator flag
+/// and the Blizzard-representative tag (the icon that marks staff). Matching is
+/// case-insensitive. Kept in config, never hardcoded, so who is staff is an operator
+/// decision.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AdminsConfig {
+    /// Account names to treat as sysops.
+    pub accounts: Vec<String>,
+}
+
+impl AdminsConfig {
+    /// Whether `name` is a configured administrator (case-insensitive).
+    #[must_use]
+    pub fn is_admin(&self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        self.accounts.iter().any(|a| a.to_ascii_lowercase() == lower)
+    }
+}
+
+/// BNFTP file serving.
+///
+/// Classic clients fetch the version-check MPQ, `icons.bni`, `tos.txt` and ad images over
+/// BNFTP. Real (non-BNLS) clients — Diablo I, War2 BNE, old Mac clients — *require* the
+/// version-check MPQ here, or they hang at "Checking versions". Only operator-supplied
+/// files from this directory are served; Command Center ships no Blizzard assets.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FilesConfig {
+    /// Directory of files to serve over BNFTP. Empty disables serving (every request is
+    /// refused), which is why a real classic client cannot pass version checking until an
+    /// operator points this at a directory holding the version-check MPQ.
+    pub dir: String,
 }
 
 /// Account persistence.
@@ -38,6 +106,58 @@ pub struct StorageConfig {
     /// a restart. Fine for a quick local test, never for a real node — see
     /// `bnetccd::node::Account`'s doc comment.
     pub path: String,
+}
+
+/// Client version restriction.
+///
+/// Off by default: a fresh node accepts any version byte, so nobody is locked out while an
+/// operator is still learning what their community's clients report (the version byte and
+/// platform of every connection are logged at `SID_AUTH_INFO` regardless). Turning
+/// `restrict` on makes `allowed` an allowlist: a `(product, platform)` combination is
+/// accepted only if it has an entry and the client's version byte is in it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct VersionsConfig {
+    /// When false (default) any version byte is accepted.
+    pub restrict: bool,
+    /// Product FourCC → platform FourCC → allowed version bytes. Consulted only when
+    /// `restrict` is true. Products are codes like `SEXP`, `STAR`, `WAR3`; platforms are
+    /// `IX86`, `PMAC`, `XMAC`. Version bytes are small integers (Brood War is `211`).
+    pub allowed: BTreeMap<String, BTreeMap<String, Vec<u32>>>,
+}
+
+/// A resolved, validated form of [`VersionsConfig`] for fast per-connection lookup.
+#[derive(Debug, Clone, Default)]
+pub struct VersionPolicy {
+    restrict: bool,
+    allowed: BTreeMap<(FourCc, FourCc), Vec<u32>>,
+}
+
+impl VersionPolicy {
+    /// Whether a client of `product` on `platform` reporting `version_byte` is allowed.
+    ///
+    /// Always true when restriction is off. When on, the `(product, platform)` pair must
+    /// have an entry and the version byte must be listed in it.
+    #[must_use]
+    pub fn allows(&self, product: FourCc, platform: FourCc, version_byte: u32) -> bool {
+        if !self.restrict {
+            return true;
+        }
+        self.allowed
+            .get(&(product, platform))
+            .is_some_and(|bytes| bytes.contains(&version_byte))
+    }
+}
+
+fn parse_fourcc(kind: &str, code: &str) -> Result<FourCc, String> {
+    let bytes = code.as_bytes();
+    if bytes.len() != 4 || !code.is_ascii() {
+        return Err(format!(
+            "versions.allowed: {kind} code {code:?} must be exactly four ASCII characters, \
+             such as SEXP, IX86 or PMAC"
+        ));
+    }
+    Ok(FourCc::from_ascii(&[bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 /// Server identity and behaviour.
@@ -335,6 +455,37 @@ impl Config {
             return self.limits.max_connections;
         }
         u32::try_from(fd_limit.saturating_sub(RESERVED_FDS)).unwrap_or(u32::MAX)
+    }
+
+    /// Resolve and validate the version restriction policy.
+    ///
+    /// # Errors
+    ///
+    /// A product or platform key that is not exactly four ASCII characters — a typo would
+    /// otherwise create a rule nothing ever matches, silently locking out the client the
+    /// operator meant to allow. Also rejects `restrict = true` with no entries at all,
+    /// which would refuse every client and is never what an operator intends.
+    pub fn version_policy(&self) -> Result<VersionPolicy, String> {
+        let mut allowed = BTreeMap::new();
+        for (product, platforms) in &self.versions.allowed {
+            let product_cc = parse_fourcc("product", product)?;
+            for (platform, bytes) in platforms {
+                let platform_cc = parse_fourcc("platform", platform)?;
+                allowed.insert((product_cc, platform_cc), bytes.clone());
+            }
+        }
+        if self.versions.restrict && allowed.is_empty() {
+            return Err(
+                "versions.restrict is true but versions.allowed is empty; this would \
+                 refuse every client. List the products and platforms to allow, or set \
+                 restrict = false."
+                    .into(),
+            );
+        }
+        Ok(VersionPolicy {
+            restrict: self.versions.restrict,
+            allowed,
+        })
     }
 }
 

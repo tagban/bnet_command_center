@@ -122,3 +122,37 @@ offline_login = false
 # fine for a quick local test, but every registration is lost on restart. Set this
 # for anything that isn't a throwaway.
 path = "bnetccd.db"
+
+[files]
+# Directory of operator-supplied files served over BNFTP: the version-check MPQs that
+# real classic clients (Diablo I, War2 BNE, old PowerPC Mac clients) need to pass
+# CheckRevision, plus icons.bni, tos.txt and ad images. The server advertises the
+# platform-matched name — IX86ver1.mpq / PMACver1.mpq / XMACver1.mpq — so supply the
+# platforms you want to admit. A stock PvPGN files/ directory has all of them. Empty
+# disables BNFTP serving (real classic clients then hang at "Checking versions").
+dir = ""
+
+[admins]
+# Accounts treated as Battle.net Administrators (sysops). They carry the admin flag and
+# the Blizzard-representative tag (the staff icon) in every channel. Case-insensitive.
+accounts = []
+
+[channels]
+# Grant operator to the first arrival of a *private* (user-created) channel. Op/Clan
+# channels always auto-op and "Public *" channels never do — this governs only private
+# channels. Off by default.
+auto_op_private = false
+# Non-public channels a telnet/chat-gateway user may enter. Gateway users are otherwise
+# confined to "Public *" channels; they never reach arbitrary private or Op/Clan channels.
+telnet_channels = ["Open Tech Support"]
+
+# [versions]
+# Restrict which client version bytes may connect. Off by default (any version is
+# allowed) so nobody is locked out while you learn what your community runs — every
+# connection's product, platform and version byte are logged regardless. Turn it on and
+# list the allowed version bytes per product and platform:
+# restrict = true
+# [versions.allowed.SEXP]
+# IX86 = [211]        # Brood War 1.16.1 reports version byte 211 (0xD3)
+# [versions.allowed.W2BN]
+# IX86 = [79]         # War2 BNE reports 79 (0x4F)

@@ -259,7 +259,7 @@ fn serve(mut sock: TcpStream, shared: Arc<Shared>) {
                             .iter()
                             .map(|m| (m.name.clone(), m.flags))
                             .collect();
-                        match ch.join(id, name.clone(), flags) {
+                        match ch.join(id, name.clone(), flags, Vec::new()) {
                             Ok(o) => (existing, o.flags),
                             Err(_) => break 'outer,
                         }

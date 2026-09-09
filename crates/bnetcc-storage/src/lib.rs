@@ -191,26 +191,29 @@ pub trait Storage: Send + 'static {
 ///
 /// [`StorageError::InvalidName`] with a message suitable for showing the user.
 pub fn validate_account_name(name: &str) -> Result<()> {
+    const MIN: usize = 2; // Shortest name allowed — a product decision, see docs.
     const MAX: usize = 15; // Battle.net truncates beyond this.
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err(StorageError::InvalidName("name is empty".into()));
+    if name.len() < MIN {
+        return Err(StorageError::InvalidName(format!(
+            "shorter than {MIN} characters"
+        )));
     }
-    if trimmed.len() > MAX {
+    if name.len() > MAX {
         return Err(StorageError::InvalidName(format!(
             "longer than {MAX} characters"
         )));
     }
-    if trimmed != name {
-        return Err(StorageError::InvalidName(
-            "leading or trailing whitespace".into(),
-        ));
-    }
     if !name.is_ascii() {
         return Err(StorageError::InvalidName("non-ASCII characters".into()));
     }
-    if name.bytes().any(|b| b < 0x20 || b == 0x7F) {
-        return Err(StorageError::InvalidName("control characters".into()));
+    // Any letter, digit or symbol is allowed — but nothing that breaks the wire. Chat,
+    // statstrings and the gateway are space-delimited and line-oriented, so a space, tab,
+    // CR/LF or other control byte in a name would corrupt those; reject the whole
+    // whitespace/control class rather than a hand-picked symbol denylist.
+    if name.bytes().any(|b| b <= 0x20 || b == 0x7F) {
+        return Err(StorageError::InvalidName(
+            "whitespace or control characters".into(),
+        ));
     }
     let alnum = name.bytes().filter(u8::is_ascii_alphanumeric).count();
     if alnum == 0 {
@@ -235,9 +238,16 @@ mod tests {
 
     #[test]
     fn ordinary_names_are_accepted() {
-        for n in ["Zealot", "a", "user_1", "[CLAN]Bob", "x-y", "12345"] {
+        for n in ["Zealot", "gg", "user_1", "[CLAN]Bob", "x-y", "12345"] {
             assert!(validate_account_name(n).is_ok(), "{n} was rejected");
         }
+    }
+
+    #[test]
+    fn names_must_be_at_least_two_characters() {
+        assert!(validate_account_name("a").is_err(), "one char should be too short");
+        assert!(validate_account_name("ab").is_ok(), "two chars is the minimum");
+        assert!(validate_account_name("x1").is_ok());
     }
 
     #[test]
