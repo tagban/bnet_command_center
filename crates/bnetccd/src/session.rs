@@ -592,6 +592,10 @@ impl Bncs {
             // withdrawing a game the host does not have is a no-op).
             sid::STOPADV | sid::LEAVEGAME => self.stop_advertising(),
             sid::NETGAMEPORT => self.net_game_port(frame),
+            // Map authentication: a host sends the map's size, SHA-1 and filename to be
+            // "authenticated" before the game can start. We approve every map — see the
+            // handler; refusing leaves the host stuck on "Unable to authenticate map".
+            sid::CHECKDATAFILE2 => self.check_data_file2(frame),
             // Legacy CD-key checks (old-logon flow). We accept the key — CD-key uniqueness
             // is enforced on the modern AUTH_CHECK path via KeyRegistry, not here.
             sid::CDKEY => self.cd_key_reply(sid::CDKEY),
@@ -1556,6 +1560,26 @@ impl Bncs {
             self.game_port = port;
         }
         Step::Continue
+    }
+
+    /// `SID_CHECKDATAFILE2` (0x3C): when hosting a game the client asks the server to
+    /// authenticate the map file. Request: `(UINT32)` size, `(20 bytes)` SHA-1, `(STRING)`
+    /// filename. We approve every map — there is no Blizzard map-hash database to check
+    /// against, gating custom maps is not wanted, and leaving this unanswered strands the
+    /// host on "Unable to authenticate map" (confirmed against a real W2BN host, 2026-09-09).
+    /// Reply is a single `(UINT32)` result; `1` = approved, matching PvPGN.
+    fn check_data_file2(&mut self, frame: &Frame) -> Step {
+        let mut r = frame.reader();
+        let name = (|| -> Result<String, bnetcc_proto::ProtoError> {
+            let _size = r.u32()?;
+            let _hash: [u8; 20] = r.array()?;
+            Ok(String::from_utf8_lossy(r.cstr(260)?).into_owned())
+        })()
+        .unwrap_or_default();
+        debug!(peer = %self.peer, map = %name, "SID_CHECKDATAFILE2: approving map");
+        let mut w = Writer::with_capacity(4);
+        w.u32(1); // 1 = approved
+        self.send(&Frame::new(sid::CHECKDATAFILE2, w.finish()))
     }
 }
 
