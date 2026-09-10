@@ -18,6 +18,12 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rcgen.workspace = true
+argon2.workspace = true
+rand.workspace = true
 clap.workspace = true
 
 [lints.rust]

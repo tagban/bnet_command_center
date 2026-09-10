@@ -3,6 +3,7 @@
 *.pdb
 bnetccd.toml
 node.key
+/bnetccd-admin/
 *.db
 *.db-wal
 *.db-shm

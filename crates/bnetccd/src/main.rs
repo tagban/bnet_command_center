@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod admin;
 mod config;
 mod node;
 mod session;
@@ -186,17 +187,31 @@ async fn run(cfg: Config) -> Result<(), String> {
         storage,
     ));
 
-    // Optional read-only status UI. Off unless configured; a bad address or bind failure is
-    // logged and never blocks the node from serving clients.
+    // Optional HTTPS admin panel. Off unless configured; a bad address, admin-secret error,
+    // or bind failure is logged and never blocks the node from serving clients. The admin
+    // credentials + self-signed cert live in `bnetccd-admin/` next to the account database.
     if !cfg.status.listen.is_empty() {
         match cfg.status.listen.parse::<std::net::SocketAddr>() {
             Ok(addr) => {
-                tokio::spawn(status::run(addr, Arc::clone(&node)));
+                let admin_dir = std::path::Path::new(&cfg.storage.path)
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map_or_else(|| PathBuf::from("bnetccd-admin"), |p| p.join("bnetccd-admin"));
+                match admin::Admin::load_or_init(&admin_dir) {
+                    Ok(a) => {
+                        tokio::spawn(status::run(addr, Arc::clone(&node), Arc::new(a)));
+                    }
+                    Err(e) => warn!(
+                        dir = %admin_dir.display(),
+                        error = %e,
+                        "could not initialise admin panel credentials; panel disabled"
+                    ),
+                }
             }
             Err(e) => warn!(
                 listen = %cfg.status.listen,
                 error = %e,
-                "invalid status.listen; status UI disabled"
+                "invalid status.listen; admin panel disabled"
             ),
         }
     }
