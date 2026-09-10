@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bnetcc_core::limits::{ClientClass, KeyId};
+use bnetcc_core::limits::{ClientClass, FloodTracker, FloodVerdict, KeyId};
+use bnetcc_core::policy::FloodPenalty;
 use bnetcc_core::session::SessionState;
 use bnetcc_crypto::{logon_proof, proofs_match, xsha1_bytes};
 use bnetcc_proto::bncs::{
@@ -409,6 +410,12 @@ struct Bncs {
     /// Battle.net game port until then. Used in the game directory so joiners can reach
     /// the host peer-to-peer.
     game_port: u16,
+    /// Per-connection chat flood budget (token bucket). Every inbound chat line spends a
+    /// token; over-budget lines are penalised per policy before they can fan out, so one
+    /// flooder cannot multiply into channel-wide load. See `bnetcc_core::FloodTracker`.
+    flood: FloodTracker,
+    /// Epoch-millis until which this session is muted for flooding (`0` = not muted).
+    muted_until_ms: u64,
 }
 
 async fn bncs_session(
@@ -421,6 +428,7 @@ async fn bncs_session(
     let (tx, rx) = mpsc::channel::<Wire>(limits.outbound_queue);
     let writer = spawn_writer(wr, rx);
 
+    let flood = FloodTracker::new(node.policy.game_flood, now_ms());
     let mut s = Bncs {
         node,
         out: Outbound::new(tx.clone()),
@@ -438,6 +446,8 @@ async fn bncs_session(
         channel: None,
         flags: 0,
         game_port: 6112,
+        flood,
+        muted_until_ms: 0,
     };
 
     // Real Battle.net (and Atlas) send SID_PING (0x25) as soon as a game client connects,
@@ -1254,52 +1264,49 @@ impl Bncs {
                 self.flags = joined.outcome.flags;
                 self.channel = Some(joined.key.clone());
 
-                // 1. "You are in channel X". For EID_CHANNEL the channel name goes in the
-                // *text* field, not the username field — confirmed against a real client
-                // (a client reads the channel name from text and shows blank otherwise).
-                if matches!(
-                    self.send(&chat_event(
-                        EventId::Channel,
-                        joined.flags,
-                        0,
-                        b"",
-                        joined.display.as_bytes(),
-                    )),
-                    Step::Close
-                ) {
-                    return Step::Close;
-                }
-                // 2. One EID_SHOWUSER per occupant already present, then one for us — a
-                // client builds its user list from these, and needs to see itself too.
-                // Each carries the user's statstring so the client can render product and
-                // icon; without it the entry shows blank.
-                for occ in existing {
-                    if matches!(
-                        self.send(&chat_event(
+                // The join snapshot — "you are in channel X" (EID_CHANNEL) then one
+                // EID_SHOWUSER per occupant already present plus one for us — is coalesced
+                // into a SINGLE queued write. Sent as separate frames it would put one item
+                // per occupant into the bounded outbound queue, so a channel near the queue
+                // depth (~64) overflowed the *joiner's* queue mid-list and capped channel
+                // size. One buffer is one queue item regardless of occupant count, and the
+                // client still parses the individual frames within it.
+                //
+                // For EID_CHANNEL the channel name goes in the *text* field, not the
+                // username field — confirmed against a real client (it reads the name from
+                // text and shows blank otherwise). Each EID_SHOWUSER carries the user's
+                // statstring so the client can render product and icon.
+                let mut snapshot = Vec::with_capacity(64 + existing.len() * 48);
+                let _ = encode_frame(
+                    &chat_event(EventId::Channel, joined.flags, 0, b"", joined.display.as_bytes()),
+                    &mut snapshot,
+                );
+                for occ in &existing {
+                    let _ = encode_frame(
+                        &chat_event(
                             EventId::ShowUser,
                             occ.flags,
                             0,
                             occ.name.as_bytes(),
                             &occ.statstring,
-                        )),
-                        Step::Close
-                    ) {
-                        return Step::Close;
-                    }
+                        ),
+                        &mut snapshot,
+                    );
                 }
-                if matches!(
-                    self.send(&chat_event(
+                let _ = encode_frame(
+                    &chat_event(
                         EventId::ShowUser,
                         self.flags,
                         0,
                         self.display_name.as_bytes(),
                         &self.statstring,
-                    )),
-                    Step::Close
-                ) {
+                    ),
+                    &mut snapshot,
+                );
+                if !self.out.send(&Arc::new(snapshot)) {
                     return Step::Close;
                 }
-                // 3. Tell everyone else we arrived, with our statstring so their lists
+                // Tell everyone else we arrived, with our statstring so their lists
                 // render us.
                 let ev = chat_event(
                     EventId::Join,
@@ -1355,6 +1362,16 @@ impl Bncs {
         if text.is_empty() {
             return Step::Continue;
         }
+        // Flood control. Every chat line (talk, emote, or slash command) spends a token;
+        // over-budget lines are penalised here, before they can fan out to the channel, so
+        // one flooder cannot amplify into channel-wide load.
+        let now = now_ms();
+        if now < self.muted_until_ms {
+            return Step::Continue; // muted: drop silently until the window passes
+        }
+        if let FloodVerdict::Exceeded(penalty) = self.flood.check(now) {
+            return self.apply_flood_penalty(penalty, now);
+        }
         if text.first() == Some(&b'/') {
             return self.slash_command(&text, &account, &key);
         }
@@ -1368,6 +1385,35 @@ impl Bncs {
             }
         }
         Step::Continue
+    }
+
+    /// Apply the flood penalty for an over-budget chat line and return the step to take.
+    /// `DropMessage` and `Mute` warn the sender (real Battle.net drops silently, which is
+    /// maddening to debug); `Disconnect` sends `SID_FLOODDETECTED` and closes.
+    fn apply_flood_penalty(&mut self, penalty: FloodPenalty, now: u64) -> Step {
+        match penalty {
+            FloodPenalty::DropMessage => self.send(&chat_event(
+                EventId::Error,
+                0,
+                0,
+                b"",
+                b"You are talking too fast; slow down.",
+            )),
+            FloodPenalty::Mute { seconds } => {
+                self.muted_until_ms = now.saturating_add(u64::from(seconds) * 1000);
+                self.send(&chat_event(
+                    EventId::Error,
+                    0,
+                    0,
+                    b"",
+                    b"You have been temporarily muted for flooding.",
+                ))
+            }
+            FloodPenalty::Disconnect => {
+                let _ = self.send(&Frame::empty(sid::FLOODDETECTED));
+                Step::Close
+            }
+        }
     }
 
     fn slash_command(&mut self, text: &[u8], account: &Account, key: &[u8]) -> Step {
