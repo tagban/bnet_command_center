@@ -265,6 +265,8 @@ pub struct GameAd {
 /// A logged-in session, registered so staff moderation can reach it across channels — to
 /// resolve its address for an IP ban, or to force it off for a tag ban.
 struct SessionEntry {
+    /// Display name as shown to others (original case), for the online-users list.
+    name: String,
     /// The peer address this session connected from.
     ip: IpAddr,
     /// Its write side, so a removal notice can be queued before it is cut.
@@ -1028,10 +1030,37 @@ impl Node {
     /// Register a logged-in session so staff moderation can reach it later. Pair with
     /// [`Self::unregister_session`] on disconnect.
     pub fn register_session(&self, display_name: &str, ip: IpAddr, out: Outbound, kill: Arc<Notify>) {
-        self.sessions
+        self.sessions.lock().expect("sessions lock").insert(
+            display_name.to_ascii_lowercase(),
+            SessionEntry { name: display_name.to_string(), ip, out, kill },
+        );
+    }
+
+    /// Seconds since the node started, for the status pages.
+    #[must_use]
+    pub fn uptime_secs(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+
+    /// How many sessions are logged in (past the CD-key/logon handshake).
+    #[must_use]
+    pub fn online_count(&self) -> usize {
+        self.sessions.lock().expect("sessions lock").len()
+    }
+
+    /// The display names of all logged-in sessions, sorted case-insensitively. For the
+    /// public status page's optional who's-online list.
+    #[must_use]
+    pub fn online_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .sessions
             .lock()
             .expect("sessions lock")
-            .insert(display_name.to_ascii_lowercase(), SessionEntry { ip, out, kill });
+            .values()
+            .map(|e| e.name.clone())
+            .collect();
+        names.sort_by_key(|n| n.to_ascii_lowercase());
+        names
     }
 
     /// Drop a session from the moderation registry.

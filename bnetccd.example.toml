@@ -30,8 +30,20 @@ motd = "Welcome to Command Center."
 # BNCS and the chat gateway share this port; they are told apart by the first byte a
 # client sends (0x01 game, 0x02 BNFTP, 0x03/0x43/0x63 chat gateway).
 bncs = "0.0.0.0:6112"
-# Admin, health and Prometheus metrics. Keep this on loopback or behind a firewall.
-admin = "127.0.0.1:6115"
+# Number of accept loops sharing the port (SO_REUSEPORT, Unix only; forced to 1 elsewhere).
+accept_shards = 1
+
+[status]
+# Password-gated HTTPS admin panel (dashboard, settings, user management, restart). Empty
+# disables it. Loopback-only unless you enable remote access from its Settings page — it can
+# change the server, so keep it off the open internet.
+listen = "127.0.0.1:6114"
+# Read-only public status page + JSON feed (plain HTTP, no auth). Empty disables it. Safe to
+# expose: shows aggregate stats only. Hook a site into <addr>/status.json (CORS is open).
+public_listen = ""
+# Whether the public feed lists online usernames. Off shows counts/uptime/channels/games
+# only; who is online is opt-in.
+public_show_users = false
 
 [limits]
 # 0 means "derive from RLIMIT_NOFILE", reserving 64 descriptors for listeners, logs and

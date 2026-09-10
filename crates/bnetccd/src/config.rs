@@ -41,14 +41,21 @@ pub struct Config {
     pub status: StatusConfig,
 }
 
-/// Optional read-only status dashboard (see `crate::status`).
+/// The admin panel (`crate::status`) and the public status endpoint (`crate::public_status`).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct StatusConfig {
-    /// Address to serve the status UI on, e.g. `"127.0.0.1:6114"`. Empty (the default)
-    /// disables it. **Keep it on `127.0.0.1`** — it exposes operational detail (who is
-    /// online, games, channels) and has no authentication.
+    /// Address for the password-gated HTTPS admin panel, e.g. `"127.0.0.1:6114"`. Empty (the
+    /// default) disables it. Loopback-only unless remote access is enabled from its Settings
+    /// page — it can change the server, so keep it off the open internet.
     pub listen: String,
+    /// Address for the read-only public status page + JSON feed, e.g. `"0.0.0.0:6116"`. Empty
+    /// (the default) disables it. Plain HTTP, unauthenticated, safe to expose publicly — it
+    /// shows only aggregate stats (and usernames only if `public_show_users` is on).
+    pub public_listen: String,
+    /// Whether the public status feed lists the online usernames. Off by default: counts,
+    /// uptime and channel/game totals are always shown, but who is online is opt-in.
+    pub public_show_users: bool,
 }
 
 /// Channel behaviour.

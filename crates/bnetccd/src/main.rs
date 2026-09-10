@@ -6,6 +6,7 @@ mod admin;
 mod config;
 mod moderation;
 mod node;
+mod public_status;
 mod session;
 mod status;
 mod storage;
@@ -241,6 +242,25 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
                 listen = %cfg.status.listen,
                 error = %e,
                 "invalid status.listen; admin panel disabled"
+            ),
+        }
+    }
+
+    // Optional public, read-only status page + JSON feed (plain HTTP, unauthenticated, safe
+    // to expose). Separate from the admin panel above so public traffic never touches it.
+    if !cfg.status.public_listen.is_empty() {
+        match cfg.status.public_listen.parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                tokio::spawn(public_status::run(
+                    addr,
+                    Arc::clone(&node),
+                    cfg.status.public_show_users,
+                ));
+            }
+            Err(e) => warn!(
+                listen = %cfg.status.public_listen,
+                error = %e,
+                "invalid status.public_listen; public status page disabled"
             ),
         }
     }
