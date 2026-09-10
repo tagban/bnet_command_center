@@ -958,6 +958,7 @@ fn settings_page(admin: &Admin, config_path: &Path, flash: Option<(bool, &str)>)
     let gw_per_ip = cfg_int(&doc, &["limits", "clients", "gateway", "per_ip"], 1);
     let bnftp_per_ip = cfg_int(&doc, &["limits", "clients", "bnftp", "per_ip"], 4);
     let products = html_escape(&cfg_products_text(&doc));
+    let channels_defined = html_escape(&cfg_channels_text(&doc));
     let admins = html_escape(&cfg_admin_list(&doc));
     // Public status
     let public_listen = html_escape(&cfg_string(&doc, &["status", "public_listen"], ""));
@@ -1018,6 +1019,11 @@ fn settings_page(admin: &Admin, config_path: &Path, flash: Option<(bool, &str)>)
 <textarea id="po" name="product_overrides" rows="3" style="width:100%;box-sizing:border-box" placeholder="DRTL=1&#10;W2BN=8">{products}</textarea>
 <label for="ad">Staff accounts (comma or newline separated) — get /tagban, /ipban, /mute</label>
 <textarea id="ad" name="admins" rows="2" style="width:100%;box-sizing:border-box">{admins}</textarea>
+
+<div class="hdr">Defined channels</div>
+<label for="ch">One per line: <code>name | max | products | public | persist</code></label>
+<textarea id="ch" name="channels_defined" rows="4" style="width:100%;box-sizing:border-box" placeholder="War2 BNE | 100 | W2BN | yes | no&#10;Staff | 0 |  | no | yes">{channels_defined}</textarea>
+<p class="muted">Blank fields keep the default. <code>products</code> is a comma list of client FourCCs (empty = any). <code>public</code>/<code>persist</code> take yes/no. Other per-channel options (topic, min_flag, telnet) stay in the config file and are preserved on save.</p>
 
 <div class="hdr">Public status endpoint</div>
 <label for="pl">Public status address (empty = disabled)</label>
@@ -1191,6 +1197,68 @@ fn do_settings_config(req: &Request, admin: &Admin, config_path: &Path) -> Respo
         set_cfg(&mut doc, &["limits", "clients", "products"], toml_edit::Item::Table(table));
     }
 
+    // Defined channels: rebuild `[[channels.defined]]` from the textarea. Each existing
+    // channel is looked up by name and its table reused, so options the editor doesn't show
+    // (topic, min_flag, telnet, game_only) survive; a channel dropped from the box is removed.
+    if let Some(v) = req.form.get("channels_defined") {
+        let mut existing: HashMap<String, toml_edit::Table> = HashMap::new();
+        if let Some(aot) = cfg_get(&doc, &["channels", "defined"]).and_then(toml_edit::Item::as_array_of_tables) {
+            for t in aot.iter() {
+                if let Some(name) = t.get("name").and_then(toml_edit::Item::as_str) {
+                    existing.insert(name.to_ascii_lowercase(), t.clone());
+                }
+            }
+        }
+        let mut aot = toml_edit::ArrayOfTables::new();
+        for line in v.split(['\n', '\r']).map(str::trim).filter(|s| !s.is_empty()) {
+            let mut parts = line.split('|').map(str::trim);
+            let name = parts.next().unwrap_or("");
+            if name.is_empty() {
+                return html_page(settings_page(
+                    admin,
+                    config_path,
+                    Some((false, &format!("Channel line '{line}' needs a name before the first '|'."))),
+                ));
+            }
+            let mut t = existing.get(&name.to_ascii_lowercase()).cloned().unwrap_or_default();
+            t["name"] = toml_edit::value(name);
+            // max_users
+            match parts.next().unwrap_or("") {
+                "" => { t.remove("max_users"); }
+                m => match m.parse::<i64>() {
+                    Ok(n) if n >= 0 => t["max_users"] = toml_edit::value(n),
+                    _ => {
+                        return html_page(settings_page(
+                            admin,
+                            config_path,
+                            Some((false, &format!("Channel '{name}': max must be a whole number ≥ 0."))),
+                        ))
+                    }
+                },
+            }
+            // products (comma list)
+            let prods = parts.next().unwrap_or("");
+            if prods.is_empty() {
+                t.remove("products");
+            } else {
+                let mut arr = toml_edit::Array::new();
+                for p in prods.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    arr.push(p.to_ascii_uppercase());
+                }
+                t["products"] = toml_edit::value(arr);
+            }
+            // public / persist (yes/no; blank leaves default)
+            for (field, raw) in [("public", parts.next()), ("persist", parts.next())] {
+                match raw.and_then(parse_yesno) {
+                    Some(b) => t[field] = toml_edit::value(b),
+                    None => { t.remove(field); }
+                }
+            }
+            aot.push(t);
+        }
+        set_cfg(&mut doc, &["channels", "defined"], toml_edit::Item::ArrayOfTables(aot));
+    }
+
     // Validate the whole document still deserialises as a Config (catches out-of-range values,
     // bad combinations, and any structural mistake) before writing anything.
     let serialized = doc.to_string();
@@ -1273,6 +1341,42 @@ fn cfg_products_text(doc: &toml_edit::DocumentMut) -> String {
 /// `on`/absent checkbox helper: an HTML checkbox is present in the form only when ticked.
 fn checkbox(form: &HashMap<String, String>, field: &str) -> bool {
     form.get(field).map(String::as_str) == Some("on")
+}
+
+/// Render `[[channels.defined]]` as one `name | max | products | public | persist` line per
+/// channel, for the settings textarea.
+fn cfg_channels_text(doc: &toml_edit::DocumentMut) -> String {
+    let Some(aot) = cfg_get(doc, &["channels", "defined"]).and_then(toml_edit::Item::as_array_of_tables) else {
+        return String::new();
+    };
+    aot.iter()
+        .map(|t| {
+            let name = t.get("name").and_then(toml_edit::Item::as_str).unwrap_or("");
+            let max = t.get("max_users").and_then(toml_edit::Item::as_integer).map(|n| n.to_string()).unwrap_or_default();
+            let products = t
+                .get("products")
+                .and_then(toml_edit::Item::as_array)
+                .map(|a| a.iter().filter_map(toml_edit::Value::as_str).collect::<Vec<_>>().join(","))
+                .unwrap_or_default();
+            let yn = |k: &str| match t.get(k).and_then(toml_edit::Item::as_bool) {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "",
+            };
+            format!("{name} | {max} | {products} | {} | {}", yn("public"), yn("persist"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parse a yes/no field: `yes`/`y`/`true` → Some(true), `no`/`n`/`false` → Some(false),
+/// blank/other → None (leave the setting at its default).
+fn parse_yesno(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "yes" | "y" | "true" => Some(true),
+        "no" | "n" | "false" => Some(false),
+        _ => None,
+    }
 }
 
 fn cfg_admin_list(doc: &toml_edit::DocumentMut) -> String {
