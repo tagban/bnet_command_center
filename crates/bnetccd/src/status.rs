@@ -890,6 +890,8 @@ button {{ margin-top:20px; width:100%; padding:11px; border:none; border-radius:
 .ok {{ background:rgba(90,196,125,.12); border:1px solid var(--ok); color:var(--ok); padding:9px 12px; border-radius:8px; font-size:13px; margin-bottom:8px; }}
 a {{ color:var(--accent); }} .row {{ display:flex; align-items:center; gap:10px; margin:14px 0; }} .row input {{ width:auto; }}
 .row3 {{ display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }}
+.hdr {{ margin:24px 0 4px; padding-top:14px; border-top:1px solid var(--line); font-weight:600; font-size:14px; }}
+label.cb {{ margin:0; text-transform:none; letter-spacing:0; color:var(--fg); }}
 code {{ background:#0f1115; border:1px solid var(--line); border-radius:4px; padding:1px 5px; font-size:12px; }}
 .muted {{ color:var(--muted); font-size:12px; }}
 </style></head><body><div class="card">{inner}</div></body></html>"##
@@ -954,7 +956,29 @@ fn settings_page(admin: &Admin, config_path: &Path, flash: Option<(bool, &str)>)
     let max_conn = cfg_int(&doc, &["limits", "max_connections"], 0);
     let game_per_ip = cfg_int(&doc, &["limits", "clients", "game_default", "per_ip"], 8);
     let gw_per_ip = cfg_int(&doc, &["limits", "clients", "gateway", "per_ip"], 1);
+    let bnftp_per_ip = cfg_int(&doc, &["limits", "clients", "bnftp", "per_ip"], 4);
+    let products = html_escape(&cfg_products_text(&doc));
     let admins = html_escape(&cfg_admin_list(&doc));
+    // Public status
+    let public_listen = html_escape(&cfg_string(&doc, &["status", "public_listen"], ""));
+    let public_users_ck = if cfg_bool(&doc, &["status", "public_show_users"], false) { "checked" } else { "" };
+    // Discord
+    let d_url = html_escape(&cfg_string(&doc, &["discord", "webhook_url"], ""));
+    let d_interval = cfg_int(&doc, &["discord", "status_interval_mins"], 30);
+    let d_window = cfg_int(&doc, &["discord", "games_window_hours"], 6);
+    let d_status_ck = if cfg_bool(&doc, &["discord", "post_status"], true) { "checked" } else { "" };
+    let d_events_ck = if cfg_bool(&doc, &["discord", "post_events"], true) { "checked" } else { "" };
+    let d_miles_ck = if cfg_bool(&doc, &["discord", "post_milestones"], true) { "checked" } else { "" };
+    // Stats push
+    let s_url = html_escape(&cfg_string(&doc, &["stats_push", "url"], ""));
+    let s_interval = cfg_int(&doc, &["stats_push", "interval_secs"], 60);
+    let s_token = html_escape(&cfg_string(&doc, &["stats_push", "token"], ""));
+    let s_users_ck = if cfg_bool(&doc, &["stats_push", "include_users"], false) { "checked" } else { "" };
+    // Federation role
+    let is_node = cfg_bool(&doc, &["federation", "enabled"], false);
+    let master_sel = if is_node { "" } else { "selected" };
+    let node_sel = if is_node { "selected" } else { "" };
+    let hub = html_escape(&cfg_string(&doc, &["federation", "hub"], ""));
 
     let flash_html = match flash {
         Some((true, m)) => format!(r#"<p class="ok">{}</p>"#, html_escape(m)),
@@ -984,13 +1008,53 @@ fn settings_page(admin: &Admin, config_path: &Path, flash: Option<(bool, &str)>)
 </div>
 <label for="mc">Max connections (0 = derive from file-descriptor limit)</label>
 <input id="mc" name="max_connections" type="number" min="0" value="{max_conn}">
-<label for="gp">Per-IP limit — game clients / gateway bots</label>
+<label>Per-IP limits — game / gateway (telnet) / BNFTP</label>
 <div class="row3">
-<input id="gp" name="game_per_ip" type="number" min="0" value="{game_per_ip}">
+<input name="game_per_ip" type="number" min="0" value="{game_per_ip}">
 <input name="gateway_per_ip" type="number" min="0" value="{gw_per_ip}">
+<input name="bnftp_per_ip" type="number" min="0" value="{bnftp_per_ip}">
 </div>
+<label for="po">Per-product overrides — one <code>PRODUCT=limit</code> per line (e.g. <code>DRTL=1</code>)</label>
+<textarea id="po" name="product_overrides" rows="3" style="width:100%;box-sizing:border-box" placeholder="DRTL=1&#10;W2BN=8">{products}</textarea>
 <label for="ad">Staff accounts (comma or newline separated) — get /tagban, /ipban, /mute</label>
-<textarea id="ad" name="admins" rows="3" style="width:100%;box-sizing:border-box">{admins}</textarea>
+<textarea id="ad" name="admins" rows="2" style="width:100%;box-sizing:border-box">{admins}</textarea>
+
+<div class="hdr">Public status endpoint</div>
+<label for="pl">Public status address (empty = disabled)</label>
+<input id="pl" name="public_listen" type="text" value="{public_listen}" placeholder="0.0.0.0:6116">
+<div class="row"><input id="pu" name="public_show_users" type="checkbox" {public_users_ck}><label for="pu" class="cb">List online usernames publicly</label></div>
+
+<div class="hdr">Discord updates</div>
+<label for="dw">Webhook URL (empty = disabled)</label>
+<input id="dw" name="discord_webhook" type="text" value="{d_url}" placeholder="https://discord.com/api/webhooks/…">
+<label>Status interval (mins) / games window (hrs)</label>
+<div class="row3">
+<input name="discord_interval" type="number" min="1" value="{d_interval}">
+<input name="discord_window" type="number" min="1" value="{d_window}">
+</div>
+<div class="row"><input id="ds" name="discord_status" type="checkbox" {d_status_ck}><label for="ds" class="cb">Post periodic status</label></div>
+<div class="row"><input id="de" name="discord_events" type="checkbox" {d_events_ck}><label for="de" class="cb">Post start / stop / restart events</label></div>
+<div class="row"><input id="dm" name="discord_milestones" type="checkbox" {d_miles_ck}><label for="dm" class="cb">Post milestones (new peak)</label></div>
+
+<div class="hdr">Push stats to your site</div>
+<label for="su">Endpoint URL (empty = disabled)</label>
+<input id="su" name="stats_url" type="text" value="{s_url}" placeholder="https://mysite.com/ingest">
+<label for="si">Interval (seconds)</label>
+<input id="si" name="stats_interval" type="number" min="5" value="{s_interval}">
+<label for="st">Bearer token (optional)</label>
+<input id="st" name="stats_token" type="text" value="{s_token}">
+<div class="row"><input id="siu" name="stats_users" type="checkbox" {s_users_ck}><label for="siu" class="cb">Include online usernames in the push</label></div>
+
+<div class="hdr">Server role</div>
+<label for="role">This server is a…</label>
+<select id="role" name="role" style="width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:#0f1115;color:var(--fg)">
+<option value="master" {master_sel}>Master (standalone)</option>
+<option value="node" {node_sel}>Node (federated to a master)</option>
+</select>
+<label for="hub">Master address (for Node mode)</label>
+<input id="hub" name="hub" type="text" value="{hub}" placeholder="hub.example.net:7112">
+<p class="muted">Federation is not active yet (Phase 2) — this only records the intended role/master; a Node will run standalone until federation ships.</p>
+
 <button type="submit" style="margin-top:14px">Save configuration</button></form>
 <p class="muted">Changes take effect after a restart. A backup of the previous config is kept as <code>{bak}</code>, and an invalid value is rejected before anything is written.</p>
 
@@ -1021,15 +1085,32 @@ fn do_settings_config(req: &Request, admin: &Admin, config_path: &Path) -> Respo
         set_cfg(&mut doc, &["server", "motd"], toml_edit::value(v.trim()));
     }
 
+    // String fields.
+    for (field, path) in [
+        ("public_listen", &["status", "public_listen"][..]),
+        ("discord_webhook", &["discord", "webhook_url"][..]),
+        ("stats_url", &["stats_push", "url"][..]),
+        ("stats_token", &["stats_push", "token"][..]),
+        ("hub", &["federation", "hub"][..]),
+    ] {
+        if let Some(v) = req.form.get(field) {
+            set_cfg(&mut doc, path, toml_edit::value(v.trim()));
+        }
+    }
+
     // Integer fields: reject a non-numeric entry with a readable message before touching the
     // document, rather than leaning on the deserialiser's terser error.
-    let ints: [(&str, &[&str]); 6] = [
+    let ints: [(&str, &[&str]); 10] = [
         ("private_max", &["channels", "private_max"]),
         ("public_max", &["channels", "public_max"]),
         ("clan_max", &["channels", "clan_max"]),
         ("max_connections", &["limits", "max_connections"]),
         ("game_per_ip", &["limits", "clients", "game_default", "per_ip"]),
         ("gateway_per_ip", &["limits", "clients", "gateway", "per_ip"]),
+        ("bnftp_per_ip", &["limits", "clients", "bnftp", "per_ip"]),
+        ("discord_interval", &["discord", "status_interval_mins"]),
+        ("discord_window", &["discord", "games_window_hours"]),
+        ("stats_interval", &["stats_push", "interval_secs"]),
     ];
     for (field, path) in ints {
         if let Some(raw) = req.form.get(field) {
@@ -1047,12 +1128,67 @@ fn do_settings_config(req: &Request, admin: &Admin, config_path: &Path) -> Respo
         }
     }
 
+    // Boolean (checkbox) fields — present in the form only when ticked.
+    for (field, path) in [
+        ("public_show_users", &["status", "public_show_users"][..]),
+        ("discord_status", &["discord", "post_status"][..]),
+        ("discord_events", &["discord", "post_events"][..]),
+        ("discord_milestones", &["discord", "post_milestones"][..]),
+        ("stats_users", &["stats_push", "include_users"][..]),
+    ] {
+        set_cfg(&mut doc, path, toml_edit::value(checkbox(&req.form, field)));
+    }
+
+    // Server role: Master = federation off, Node = federation on (needs a hub, enforced by
+    // the Config validation below with a friendlier pre-check).
+    let is_node = req.form.get("role").map(String::as_str) == Some("node");
+    set_cfg(&mut doc, &["federation", "enabled"], toml_edit::value(is_node));
+    if is_node && req.form.get("hub").map_or(true, |h| h.trim().is_empty()) {
+        return html_page(settings_page(
+            admin,
+            config_path,
+            Some((false, "Node mode needs a master (hub) address.")),
+        ));
+    }
+
+    // Staff accounts (comma/newline separated).
     if let Some(v) = req.form.get("admins") {
         let mut arr = toml_edit::Array::new();
         for name in v.split([',', '\n', '\r']).map(str::trim).filter(|s| !s.is_empty()) {
             arr.push(name);
         }
         set_cfg(&mut doc, &["admins", "accounts"], toml_edit::value(arr));
+    }
+
+    // Per-product per-IP overrides: rebuild the whole products table from the textarea, so a
+    // removed line clears its override. Each line is `PRODUCT=limit`.
+    if let Some(v) = req.form.get("product_overrides") {
+        let mut table = toml_edit::Table::new();
+        for line in v.split(['\n', '\r']).map(str::trim).filter(|s| !s.is_empty()) {
+            let Some((product, num)) = line.split_once('=') else {
+                return html_page(settings_page(
+                    admin,
+                    config_path,
+                    Some((false, &format!("Product override '{line}' must be PRODUCT=number."))),
+                ));
+            };
+            let (product, num) = (product.trim(), num.trim());
+            match num.parse::<i64>() {
+                Ok(n) if n >= 0 && !product.is_empty() => {
+                    let mut entry = toml_edit::Table::new();
+                    entry["per_ip"] = toml_edit::value(n);
+                    table.insert(product, toml_edit::Item::Table(entry));
+                }
+                _ => {
+                    return html_page(settings_page(
+                        admin,
+                        config_path,
+                        Some((false, &format!("Product override '{line}' must be PRODUCT=number (≥0)."))),
+                    ))
+                }
+            }
+        }
+        set_cfg(&mut doc, &["limits", "clients", "products"], toml_edit::Item::Table(table));
     }
 
     // Validate the whole document still deserialises as a Config (catches out-of-range values,
@@ -1110,6 +1246,33 @@ fn cfg_string(doc: &toml_edit::DocumentMut, path: &[&str], default: &str) -> Str
 
 fn cfg_int(doc: &toml_edit::DocumentMut, path: &[&str], default: i64) -> i64 {
     cfg_get(doc, path).and_then(|i| i.as_integer()).unwrap_or(default)
+}
+
+fn cfg_bool(doc: &toml_edit::DocumentMut, path: &[&str], default: bool) -> bool {
+    cfg_get(doc, path).and_then(|i| i.as_bool()).unwrap_or(default)
+}
+
+/// Render `[limits.clients.products]` as `PRODUCT=per_ip` lines for the settings textarea.
+fn cfg_products_text(doc: &toml_edit::DocumentMut) -> String {
+    cfg_get(doc, &["limits", "clients", "products"])
+        .and_then(|i| i.as_table())
+        .map(|t| {
+            t.iter()
+                .filter_map(|(k, v)| {
+                    v.as_table_like()
+                        .and_then(|pt| pt.get("per_ip"))
+                        .and_then(toml_edit::Item::as_integer)
+                        .map(|n| format!("{k}={n}"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// `on`/absent checkbox helper: an HTML checkbox is present in the form only when ticked.
+fn checkbox(form: &HashMap<String, String>, field: &str) -> bool {
+    form.get(field).map(String::as_str) == Some("on")
 }
 
 fn cfg_admin_list(doc: &toml_edit::DocumentMut) -> String {
