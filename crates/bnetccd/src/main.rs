@@ -12,6 +12,7 @@ mod public_status;
 mod session;
 mod stats_push;
 mod status;
+mod tracker;
 mod storage;
 mod udp;
 
@@ -224,6 +225,23 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
     // Optional stats push to an external website (outbound-only, no forwarded port needed).
     if !cfg.stats_push.url.trim().is_empty() {
         tokio::spawn(stats_push::run(Arc::clone(&node), cfg.stats_push.clone()));
+    }
+
+    // Optional PvPGN-compatible tracking: advertise this server to public trackers, and/or
+    // host our own tracker (UDP beacon receiver) + public server-list page.
+    if !cfg.tracker.advertise_to.is_empty() {
+        tokio::spawn(tracker::advertise(
+            Arc::clone(&node),
+            cfg.listen.bncs.port(),
+            cfg.tracker.clone(),
+        ));
+    }
+    if !cfg.tracker.host_listen.trim().is_empty() || !cfg.tracker.list_listen.trim().is_empty() {
+        tokio::spawn(tracker::host(
+            cfg.tracker.host_listen.clone(),
+            cfg.tracker.list_listen.clone(),
+            cfg.tracker.prune_after_secs,
+        ));
     }
 
     // Optional HTTPS admin panel. Off unless configured; a bad address, admin-secret error,

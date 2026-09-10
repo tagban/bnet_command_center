@@ -330,6 +330,16 @@ ul { margin:6px 0; padding-left:20px; }
 </table>
 <p class="muted">The body is identical to <code>/status.json</code>. Best-effort, on its own task — a slow or failing endpoint never affects the server.</p>
 
+<h2>Server tracking (PvPGN lists)</h2>
+<p>Optional, config-file only. <b>Advertise</b> this server to public PvPGN trackers so it appears on their lists (a UDP beacon on port 6114), and/or <b>host your own list</b>: receive other servers' beacons and publish them.</p>
+<table>
+<tr><th>Config key</th><th>Effect</th></tr>
+<tr><td><code>[tracker] advertise_to</code></td><td>Trackers to beacon to (e.g. <code>["tracker.pvpgn.org"]</code>). Empty = off.</td></tr>
+<tr><td><code>description / url / contact_*</code></td><td>What our beacon reports (description defaults to the server name).</td></tr>
+<tr><td><code>host_listen</code></td><td>UDP address to receive other servers' beacons, e.g. <code>0.0.0.0:6114</code>. Empty = off.</td></tr>
+<tr><td><code>list_listen</code></td><td>HTTP address for the public list page + <code>/servers.json</code>, e.g. <code>0.0.0.0:8080</code> (port 80 needs root; forward 80→8080).</td></tr>
+</table>
+
 <h2>Configuration (<code>bnetccd.toml</code>)</h2>
 <p class="muted">Edit on the <a href="/settings">Settings</a> page (which writes the file and keeps a <code>.bak</code>) or by hand. Most changes apply on the next restart; the Restart button is on Settings.</p>
 <table>

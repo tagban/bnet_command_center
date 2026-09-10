@@ -43,6 +43,47 @@ pub struct Config {
     pub discord: DiscordConfig,
     /// Optional stats push to an external website.
     pub stats_push: StatsPushConfig,
+    /// Optional PvPGN-compatible server tracking (advertise us / host a list).
+    pub tracker: TrackerConfig,
+}
+
+/// PvPGN-compatible server tracking (see `crate::tracker`). Both halves optional.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TrackerConfig {
+    /// Trackers to beacon this server to, `host` or `host:port` (default port 6114). Empty =
+    /// don't advertise. e.g. `["tracker.pvpgn.org", "track.muleslow.net"]`.
+    pub advertise_to: Vec<String>,
+    /// Description/URL/contact sent in our beacon (description defaults to the server name).
+    pub description: String,
+    pub url: String,
+    pub contact_name: String,
+    pub contact_email: String,
+    /// Seconds between beacons (minimum 30; default 300).
+    pub advertise_interval_secs: u64,
+    /// UDP address to receive other servers' beacons on, e.g. `"0.0.0.0:6114"`. Empty = off.
+    pub host_listen: String,
+    /// HTTP address to serve the public server-list page/JSON on, e.g. `"0.0.0.0:8080"`.
+    /// Empty = off. (Port 80 needs root; bind a high port and forward at the router.)
+    pub list_listen: String,
+    /// Drop a listed server after this many seconds without a beacon (default 600).
+    pub prune_after_secs: u64,
+}
+
+impl Default for TrackerConfig {
+    fn default() -> Self {
+        Self {
+            advertise_to: Vec::new(),
+            description: String::new(),
+            url: String::new(),
+            contact_name: String::new(),
+            contact_email: String::new(),
+            advertise_interval_secs: 300,
+            host_listen: String::new(),
+            list_listen: String::new(),
+            prune_after_secs: 600,
+        }
+    }
 }
 
 /// Push the public status JSON to an external URL on an interval (see `crate::stats_push`).

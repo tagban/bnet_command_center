@@ -65,6 +65,23 @@ interval_secs = 60
 token = ""                  # optional; sent as "Authorization: Bearer <token>" — a secret
 include_users = false       # include the online-usernames list in the pushed JSON
 
+[tracker]
+# PvPGN-compatible server tracking. Two independent halves, both optional.
+# Advertise this server to public trackers (UDP beacon, default port 6114) so it appears on
+# their lists. Empty = don't advertise.
+advertise_to = []           # e.g. ["tracker.pvpgn.org", "track.muleslow.net"]
+description = ""             # shown on lists; defaults to the server name
+url = ""
+contact_name = ""
+contact_email = ""
+advertise_interval_secs = 300
+# Host our own tracker: receive other servers' beacons on this UDP address, and serve a
+# public server-list page + /servers.json on the HTTP address. Both empty = off.
+# Port 80 needs root; bind a high port (e.g. 8080) and forward 80->8080 at your router.
+host_listen = ""            # e.g. "0.0.0.0:6114"
+list_listen = ""            # e.g. "0.0.0.0:8080"
+prune_after_secs = 600      # drop a server that stops beaconing
+
 [limits]
 # 0 means "derive from RLIMIT_NOFILE", reserving 64 descriptors for listeners, logs and
 # storage handles. The effective ceiling is logged at INFO on startup — you should never

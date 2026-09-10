@@ -178,6 +178,20 @@ Your endpoint receives a JSON body like:
  "connections":42,"users_online":30,"peak_connections":51,"channels":4,"games":2}
 ```
 
+### Server tracking (PvPGN-compatible)
+
+Optional. `[tracker]` can **advertise** this server to public PvPGN trackers (a UDP beacon on port 6114, per the [PvPGN tracking protocol](https://bnetdocs.org/document/35/pvpgn-tracking-protocol)) so it appears on their lists, and/or **host your own list** — receive other servers' beacons and publish a page + `/servers.json`.
+
+```toml
+[tracker]
+advertise_to = ["tracker.pvpgn.org"]   # beacon us to these trackers (empty = off)
+description = "My Server"               # defaults to the server name
+host_listen = "0.0.0.0:6114"            # receive other servers' beacons (empty = off)
+list_listen = "0.0.0.0:8080"            # public list page + /servers.json (empty = off)
+```
+
+The wire codec is implemented from the published protocol spec (not PvPGN's GPL sources — see `docs/LEGAL.md`). Port 80 for the list page needs root, so bind a high port and forward `80 → 8080` at your router.
+
 ---
 
 ## Building
