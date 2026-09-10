@@ -256,6 +256,7 @@ async fn route(req: &Request, peer_ip: IpAddr, panel: &Panel) -> Response {
         ("POST", "/settings") => do_settings(req, admin),
         ("POST", "/settings/config") => do_settings_config(req, admin, config_path),
         ("POST", "/restart") => do_restart(restart),
+        ("GET", "/help") => html_page(HELP.to_string()),
         ("GET", "/users") => users_page(node, req, None).await,
         ("POST", "/users/flags") => do_user_flags(req, node).await,
         ("POST", "/users/reset") => do_user_reset(req, node).await,
@@ -273,6 +274,91 @@ fn do_restart(restart: &Arc<Notify>) -> Response {
     restart.notify_one();
     html_page(shell("Restarting — Command Center", RESTARTING_PAGE))
 }
+
+/// The Help & Reference page: interfaces/ports, configuration options, and the planned
+/// Discord integration. Static reference content, so it is a self-contained constant.
+const HELP: &str = r##"<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Help — Command Center</title>
+<style>
+:root { color-scheme: light dark; --bg:#0f1115; --card:#1a1d24; --fg:#e6e8ec; --muted:#9aa0aa; --accent:#5aa9e6; --line:#2a2e37; --ok:#5ac47d; --warn:#e6a15a; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif; }
+header { padding:16px 20px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:12px; }
+header h1 { font-size:16px; margin:0; }
+header nav { margin-left:auto; } header nav a { color:var(--accent); text-decoration:none; font-size:13px; }
+main { max-width:820px; margin:0 auto; padding:24px 20px 48px; }
+h2 { font-size:15px; margin:28px 0 8px; border-bottom:1px solid var(--line); padding-bottom:6px; }
+h2:first-of-type { margin-top:8px; }
+table { width:100%; border-collapse:collapse; margin:8px 0; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+td,th { text-align:left; padding:8px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+th { color:var(--muted); font-weight:500; font-size:12px; }
+tr:last-child td { border-bottom:none; }
+code { background:#0f1115; border:1px solid var(--line); border-radius:4px; padding:1px 5px; font-size:12px; }
+.muted { color:var(--muted); }
+.pill { display:inline-block; font-size:11px; padding:1px 7px; border-radius:10px; border:1px solid var(--warn); color:var(--warn); margin-left:8px; }
+.note { background:rgba(90,169,230,.08); border:1px solid var(--line); border-radius:8px; padding:10px 14px; margin:10px 0; }
+ul { margin:6px 0; padding-left:20px; }
+</style></head><body>
+<header><h1>Help &amp; Reference</h1><nav><a href="/">Dashboard</a> · <a href="/users">Users</a> · <a href="/settings">Settings</a></nav></header>
+<main>
+
+<h2>Interfaces &amp; ports</h2>
+<p class="muted">Ports are configurable in <code>bnetccd.toml</code>; the values below are the defaults this server ships with.</p>
+<table>
+<tr><th>Interface</th><th>Address</th><th>What it is</th></tr>
+<tr><td><b>Game &amp; chat (BNCS)</b></td><td>TCP + UDP <code>0.0.0.0:6112</code></td><td>Where Battle.net clients and chat-gateway bots connect. The UDP side is the login-time game check. This is the port players point their client at.</td></tr>
+<tr><td><b>Admin panel</b></td><td>HTTPS <code>127.0.0.1:6114</code></td><td>This site. Password-gated; it can change the server (settings, users, restart). Loopback-only unless you enable remote access on the Settings page, because it is privileged — forward it only behind that toggle.</td></tr>
+<tr><td><b>Public status</b></td><td>HTTP <code>0.0.0.0:6116</code></td><td>Read-only, no login, safe to expose. Forward this port to publish server stats. See below.</td></tr>
+</table>
+
+<h2>Public status endpoint</h2>
+<p>Two routes on the public port, for anyone (no login):</p>
+<ul>
+<li><code>/status.json</code> — a JSON feed (server name, MOTD, uptime, connections, users online, peak, channel/game counts). It sends <code>Access-Control-Allow-Origin: *</code>, so a site like bnet.cc can <code>fetch()</code> it directly and render your own widget.</li>
+<li><code>/</code> — a ready-made status page that renders the feed and refreshes every few seconds.</li>
+</ul>
+<p class="muted">Set <code>[status] public_show_users = true</code> to also list who is online; it is off by default (counts only).</p>
+
+<h2>Configuration (<code>bnetccd.toml</code>)</h2>
+<p class="muted">Edit on the <a href="/settings">Settings</a> page (which writes the file and keeps a <code>.bak</code>) or by hand. Most changes apply on the next restart; the Restart button is on Settings.</p>
+<table>
+<tr><th>Section / key</th><th>Meaning</th></tr>
+<tr><td><code>[server] name / motd</code></td><td>Server display name and message of the day.</td></tr>
+<tr><td><code>[server] mode</code></td><td><code>gaming</code>, <code>warnet</code> (chat/bots only), or <code>both</code>.</td></tr>
+<tr><td><code>[listen] bncs</code></td><td>The game/chat bind address (port 6112).</td></tr>
+<tr><td><code>[listen] accept_shards</code></td><td>Parallel accept loops for very high connection rates (Unix only).</td></tr>
+<tr><td><code>[status] listen</code></td><td>Admin panel address (empty = disabled).</td></tr>
+<tr><td><code>[status] public_listen</code></td><td>Public status address (empty = disabled).</td></tr>
+<tr><td><code>[status] public_show_users</code></td><td>Whether the public feed lists online usernames.</td></tr>
+<tr><td><code>[channels] private_max / public_max / clan_max</code></td><td>Per-category user caps (<code>0</code> = unlimited).</td></tr>
+<tr><td><code>[channels] auto_op_private</code></td><td>Whether the first arrival to a private channel becomes operator.</td></tr>
+<tr><td><code>[admins] accounts</code></td><td>Staff accounts — they get the Blizzard-rep icon and the <code>/tagban</code>, <code>/ipban</code>, <code>/mute</code>, <code>/kick</code>, <code>/ban</code> commands. Can also be granted per-account on the <a href="/users">Users</a> page.</td></tr>
+<tr><td><code>[limits] max_connections</code></td><td>Global connection ceiling (<code>0</code> = derive from the file-descriptor limit).</td></tr>
+<tr><td><code>[limits.clients.gateway] per_ip</code></td><td>Telnet/chat-gateway connections per IP (keyless path — default 1).</td></tr>
+<tr><td><code>[limits.clients.game_default] per_ip</code></td><td>Default game connections per IP (default 8); override one product with <code>[limits.clients.products.DRTL] per_ip = 1</code>.</td></tr>
+<tr><td><code>[storage] path</code></td><td>SQLite database file (empty = in-memory, lost on restart).</td></tr>
+</table>
+
+<h2>Chat commands</h2>
+<ul>
+<li><b>Anyone:</b> <code>/help</code>, <code>/join</code>, <code>/me</code>, <code>/who</code>, <code>/whoami</code>, <code>/squelch</code> &amp; <code>/unsquelch</code> (personal ignore).</li>
+<li><b>Channel operator:</b> <code>/kick</code>, <code>/ban</code>, <code>/unban</code>, <code>/designate</code>.</li>
+<li><b>Staff:</b> <code>/tagban &lt;text&gt;</code>, <code>/ipban &lt;user&gt; [hrs]</code>, <code>/mute &lt;user&gt; [hrs]</code>, and their inverses, plus <code>/bans</code>.</li>
+</ul>
+
+<h2>Discord updates <span class="pill">planned</span></h2>
+<div class="note">Not available in this release yet — this describes how it will work once enabled.</div>
+<p>You create a Discord channel webhook and put its URL in the config; the server posts to that channel. You never share the secret with anyone but your own config file. Planned <code>[discord]</code> options control <b>when</b> data is dropped into Discord:</p>
+<table>
+<tr><th>Option</th><th>When it posts</th></tr>
+<tr><td><b>Periodic status</b></td><td>A recurring summary (configurable interval) — users online, channels, games, uptime.</td></tr>
+<tr><td><b>Up / down events</b></td><td>When the server starts, and on a clean shutdown — so you notice restarts.</td></tr>
+<tr><td><b>Milestones</b></td><td>Notable moments, e.g. a new peak-connections record.</td></tr>
+<tr><td><b>Games played, last N hours</b></td><td>A rolling count of games hosted in the last N hours, broken down per client/product (e.g. STAR / SEXP / W2BN).</td></tr>
+</table>
+<p class="muted">Each is individually switchable, so you can post just the periodic summary, only events, or everything.</p>
+
+</main></body></html>"##;
 
 /// How many accounts one page of the user list shows.
 const USERS_PAGE_SIZE: u32 = 50;
@@ -455,7 +541,7 @@ button.danger {{ background:var(--danger); color:#fff; }}
 .pager {{ margin-top:16px; display:flex; gap:16px; align-items:center; }}
 .pager a {{ color:var(--accent); text-decoration:none; }} .pager .disabled {{ color:var(--muted); }}
 </style></head><body>
-<header><h1>Users</h1><nav><a href="/">Dashboard</a> · <a href="/settings">Settings</a></nav></header>
+<header><h1>Users</h1><nav><a href="/">Dashboard</a> · <a href="/settings">Settings</a> · <a href="/help">Help</a></nav></header>
 <main>
 {flash_html}
 <table>
@@ -900,7 +986,7 @@ fn settings_page(admin: &Admin, config_path: &Path, flash: Option<(bool, &str)>)
 <form method="post" action="/restart" onsubmit="return confirm('Restart the server now? Connected clients will be dropped for a moment.')">
 <p class="muted">Restarts the daemon to apply configuration changes. Only comes back automatically when started via the launcher; a standalone server will stop until you start it again.</p>
 <button type="submit" style="background:#7a2323;border:1px solid #a33">Restart server</button></form>
-<p style="margin-top:18px"><a href="/">Dashboard</a> &middot; <a href="/change-password">Change password</a></p>
+<p style="margin-top:18px"><a href="/">Dashboard</a> &middot; <a href="/help">Help</a> &middot; <a href="/change-password">Change password</a></p>
 <form method="post" action="/logout"><button type="submit" style="background:transparent;border:1px solid var(--line);color:var(--muted)">Sign out</button></form>"#,
         bak = html_escape(&format!("{}.bak", config_path.display())),
     );
@@ -1096,7 +1182,7 @@ const DASHBOARD: &str = r##"<!doctype html>
 <header>
   <h1>BNET Command Center · <span class="name" id="server">…</span></h1>
   <span class="meta" id="meta"></span>
-  <nav><a href="/users">Users</a> · <a href="/settings">Settings</a> · <a href="/change-password">Password</a></nav>
+  <nav><a href="/users">Users</a> · <a href="/settings">Settings</a> · <a href="/help">Help</a> · <a href="/change-password">Password</a></nav>
 </header>
 <main>
   <div class="tiles">

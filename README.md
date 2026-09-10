@@ -124,6 +124,36 @@ tests; Windows SmartScreen may warn on first launch of an unsigned binary.
 
 ---
 
+## Ports & interfaces
+
+Three network surfaces, all configurable in `bnetccd.toml` (defaults shown):
+
+| Interface | Address | Purpose |
+|---|---|---|
+| **Game & chat (BNCS)** | TCP + UDP `0.0.0.0:6112` | Where clients and chat-gateway bots connect; the UDP side is the login-time game check. Point clients here. |
+| **Admin panel** | HTTPS `127.0.0.1:6114` | Password-gated dashboard: live status, settings editor, user management, restart. It can change the server, so it is **loopback-only** unless you enable remote access from its Settings page. |
+| **Public status** | HTTP `0.0.0.0:6116` | Read-only, unauthenticated, safe to expose. Forward this port to publish stats. |
+
+The admin panel's one-time password is printed to the log on first run (and stored hashed under `bnetccd-admin/`); the launcher prints where to sign in.
+
+### Public status endpoint
+
+Two routes on the public port, for anyone:
+
+- **`/status.json`** — server name, MOTD, uptime, connections, users online, peak, and channel/game counts. It sends `Access-Control-Allow-Origin: *`, so a site (e.g. bnet.cc) can `fetch()` it cross-origin and render its own widget. Set `[status] public_show_users = true` to also include the online-usernames list (off by default).
+- **`/`** — a ready-made status page that renders the feed and refreshes.
+
+### Discord updates *(planned — not in this release yet)*
+
+Point the server at a Discord channel **webhook** (you create it in Discord and put the URL in `bnetccd.toml`; the secret never leaves your config). Planned `[discord]` options control **when** data is posted, each switchable independently:
+
+- **Periodic status** — a recurring summary (configurable interval): users online, channels, games, uptime.
+- **Up / down events** — a message on startup and clean shutdown.
+- **Milestones** — e.g. a new peak-connections record.
+- **Games played, last *N* hours** — a rolling count of games hosted in the window, broken down per client/product.
+
+---
+
 ## Building
 
 ```sh
