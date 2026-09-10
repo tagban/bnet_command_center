@@ -188,7 +188,7 @@ fn load_or_generate_cert(dir: &Path) -> std::io::Result<(String, String)> {
         return Ok((cert, key));
     }
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     let cert_pem = certified.cert.pem();
     let key_pem = certified.key_pair.serialize_pem();
     fs::write(&cert_path, &cert_pem)?;

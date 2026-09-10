@@ -1094,6 +1094,9 @@ impl Bncs {
     /// check. Requested keys the account does not have also come back empty.
     async fn read_user_data(&mut self, frame: &Frame) -> Step {
         let mut r = frame.reader();
+        // The tuple is a one-off parse result threaded straight into the handler below;
+        // naming a struct for it would not earn its keep.
+        #[allow(clippy::type_complexity)]
         let parsed = (|| -> Result<(usize, usize, u32, Vec<String>, Vec<String>), bnetcc_proto::ProtoError> {
             let accounts = (r.u32()? as usize).min(64);
             let keys = (r.u32()? as usize).min(64);
