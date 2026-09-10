@@ -24,6 +24,10 @@ use crate::config::Config;
 use crate::node::Node;
 use crate::session::SessionLimits;
 
+/// Exit code the daemon uses to ask its supervisor (the launcher) to relaunch it, as opposed
+/// to a normal shutdown (0). Must match `RESTART_EXIT_CODE` in `bnetcc-launcher`.
+const RESTART_EXIT_CODE: i32 = 75;
+
 #[derive(Parser, Debug)]
 #[command(name = "bnetccd", version, about = "Command Center node daemon")]
 struct Args {
@@ -202,6 +206,10 @@ async fn run(cfg: Config) -> Result<(), String> {
         storage,
     ));
 
+    // Signalled by the admin panel's "Restart server" button; the main task selects on it
+    // below and exits with RESTART_EXIT_CODE so the launcher-supervisor relaunches us.
+    let restart = Arc::new(tokio::sync::Notify::new());
+
     // Optional HTTPS admin panel. Off unless configured; a bad address, admin-secret error,
     // or bind failure is logged and never blocks the node from serving clients. The admin
     // credentials + self-signed cert live in `bnetccd-admin/` next to the account database.
@@ -214,7 +222,12 @@ async fn run(cfg: Config) -> Result<(), String> {
                     .map_or_else(|| PathBuf::from("bnetccd-admin"), |p| p.join("bnetccd-admin"));
                 match admin::Admin::load_or_init(&admin_dir) {
                     Ok(a) => {
-                        tokio::spawn(status::run(addr, Arc::clone(&node), Arc::new(a)));
+                        tokio::spawn(status::run(
+                            addr,
+                            Arc::clone(&node),
+                            Arc::new(a),
+                            Arc::clone(&restart),
+                        ));
                     }
                     Err(e) => warn!(
                         dir = %admin_dir.display(),
@@ -275,11 +288,19 @@ async fn run(cfg: Config) -> Result<(), String> {
         tokio::spawn(accept_loop(listener, Arc::clone(&node), limits, max_connections));
     }
 
-    let _ = tokio::signal::ctrl_c().await;
-    info!("shutdown signal received");
-
-    info!(connections = node.connection_count(), "stopping");
-    Ok(())
+    // Wait for either a shutdown (Ctrl-C) or a panel-requested restart.
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!(connections = node.connection_count(), "shutdown signal received; stopping");
+            Ok(())
+        }
+        () = restart.notified() => {
+            // Exit with the agreed code so the launcher-supervisor relaunches us with the
+            // (possibly just-edited) config. A standalone daemon simply exits.
+            info!(connections = node.connection_count(), "restart requested via admin panel; exiting for relaunch");
+            std::process::exit(RESTART_EXIT_CODE);
+        }
+    }
 }
 
 /// Build a listening socket with `SO_REUSEADDR` (plus `SO_REUSEPORT` on Unix) so several

@@ -58,6 +58,10 @@ accounts = []
 /// Executable suffix for the current platform (`.exe` on Windows, empty elsewhere).
 const EXE_SUFFIX: &str = std::env::consts::EXE_SUFFIX;
 
+/// Exit code the daemon uses to request a relaunch (as opposed to a clean shutdown). Must
+/// match `RESTART_EXIT_CODE` in the `bnetccd` binary.
+const RESTART_EXIT_CODE: i32 = 75;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "bnetcc-launcher",
@@ -126,24 +130,26 @@ fn run(args: &Args) -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Run the server with the data directory as its working directory, so its database and
-    // admin/ban files land there, and with stdio inherited so its log (including the one-time
-    // admin password on first run) shows up right here. Ctrl-C reaches the child too and it
-    // shuts down cleanly; we simply wait for it.
-    let status = Command::new(&server)
-        .arg("--config")
-        .arg(&config_path)
-        .current_dir(&data_dir)
-        .status()
-        .map_err(|e| format!("failed to start server {}: {e}", server.display()))?;
+    // Supervise the server: run it with the data directory as its working directory (so its
+    // database and admin/ban files land there) and stdio inherited (so its log — including the
+    // one-time admin password on first run — shows up right here). When the admin panel's
+    // "Restart" is used, the server exits with RESTART_EXIT_CODE and we relaunch it; any other
+    // exit (including a clean Ctrl-C, which also reaches the child) ends the launcher too.
+    loop {
+        let status = Command::new(&server)
+            .arg("--config")
+            .arg(&config_path)
+            .current_dir(&data_dir)
+            .status()
+            .map_err(|e| format!("failed to start server {}: {e}", server.display()))?;
 
-    if status.success() {
-        Ok(ExitCode::SUCCESS)
-    } else {
-        // Surface the server's own exit code where the platform provides one.
         match status.code() {
-            Some(code) => Ok(ExitCode::from(u8::try_from(code).unwrap_or(1))),
-            None => Ok(ExitCode::FAILURE),
+            Some(RESTART_EXIT_CODE) => {
+                println!("\n[launcher] restart requested — relaunching the server…\n");
+                continue;
+            }
+            Some(0) | None => return Ok(ExitCode::SUCCESS),
+            Some(code) => return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1))),
         }
     }
 }

@@ -26,6 +26,7 @@ use rustls::ServerConfig;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
@@ -93,7 +94,7 @@ pub struct GameInfo {
 /// Serve the admin panel over HTTPS until the process ends. Binding or TLS-setup failures
 /// are logged and non-fatal — the panel is a convenience, never a reason to take the node
 /// down.
-pub async fn run(listen: SocketAddr, node: Arc<Node>, admin: Arc<Admin>) {
+pub async fn run(listen: SocketAddr, node: Arc<Node>, admin: Arc<Admin>, restart: Arc<Notify>) {
     // rustls 0.23 needs a process crypto provider; install one if the app hasn't.
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -121,19 +122,20 @@ pub async fn run(listen: SocketAddr, node: Arc<Node>, admin: Arc<Admin>) {
             Ok(pair) => pair,
             Err(_) => continue,
         };
-        let (tls, node, admin, sessions, rate) = (
+        let (tls, node, admin, sessions, rate, restart) = (
             tls.clone(),
             Arc::clone(&node),
             Arc::clone(&admin),
             Arc::clone(&sessions),
             Arc::clone(&rate),
+            Arc::clone(&restart),
         );
         tokio::spawn(async move {
             let peer_ip = peer.ip();
             // A failed TLS handshake (e.g. someone speaking plain HTTP to the port) just
             // drops — no plaintext is ever served.
             if let Ok(stream) = tls.accept(sock).await {
-                handle_conn(stream, peer_ip, &node, &admin, &sessions, &rate).await;
+                handle_conn(stream, peer_ip, &node, &admin, &sessions, &rate, &restart).await;
             }
         });
     }
@@ -178,6 +180,7 @@ async fn handle_conn<S>(
     admin: &Admin,
     sessions: &Sessions,
     rate: &RateLimiter,
+    restart: &Arc<Notify>,
 ) where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -192,7 +195,7 @@ async fn handle_conn<S>(
         let _ = write_response(&mut stream, &resp).await;
         return;
     }
-    let resp = route(&req, peer_ip, node, admin, sessions, rate);
+    let resp = route(&req, peer_ip, node, admin, sessions, rate, restart);
     let _ = write_response(&mut stream, &resp).await;
 }
 
@@ -205,6 +208,7 @@ fn route(
     admin: &Admin,
     sessions: &Sessions,
     rate: &RateLimiter,
+    restart: &Arc<Notify>,
 ) -> Response {
     // Public routes (no session required).
     match (req.method.as_str(), req.path.as_str()) {
@@ -232,8 +236,19 @@ fn route(
         ("POST", "/change-password") => do_change_pw(req, admin),
         ("GET", "/settings") => html_page(settings_page(admin)),
         ("POST", "/settings") => do_settings(req, admin),
+        ("POST", "/restart") => do_restart(restart),
         _ => text("404 Not Found", "Not found."),
     }
+}
+
+/// `POST /restart` — signal the daemon to exit with the restart code. Whether it actually
+/// comes back depends on being run under the launcher-supervisor; a standalone daemon just
+/// stops. The reply is a self-refreshing page that polls until the panel answers again.
+fn do_restart(restart: &Arc<Notify>) -> Response {
+    // The main task is selecting on this; it exits the process with RESTART_EXIT_CODE, and
+    // the launcher (if supervising) relaunches. notify_one is enough — one waiter.
+    restart.notify_one();
+    html_page(shell("Restarting — Command Center", RESTARTING_PAGE))
 }
 
 fn do_login(
@@ -612,11 +627,31 @@ fn settings_page(admin: &Admin) -> String {
 <div class="row"><input id="rm" name="remote" type="checkbox" {checked}><label for="rm" style="margin:0;text-transform:none;letter-spacing:0;color:var(--fg)">Enable remote access (non-localhost)</label></div>
 <p class="muted">When off, only localhost can reach this panel — even with the port forwarded. Turn it on only after you have forwarded 6114 and want remote control.</p>
 <button type="submit">Save settings</button></form>
+<h1 style="margin-top:28px">Server control</h1>
+<form method="post" action="/restart" onsubmit="return confirm('Restart the server now? Connected clients will be dropped for a moment.')">
+<p class="muted">Restarts the daemon to apply configuration changes. Only comes back automatically when started via the launcher; a standalone server will stop until you start it again.</p>
+<button type="submit" style="background:#7a2323;border:1px solid #a33">Restart server</button></form>
 <p style="margin-top:18px"><a href="/">Dashboard</a> &middot; <a href="/change-password">Change password</a></p>
 <form method="post" action="/logout"><button type="submit" style="background:transparent;border:1px solid var(--line);color:var(--muted)">Sign out</button></form>"#
     );
     shell("Settings — Command Center", &inner)
 }
+
+/// Shown after a restart is requested: it polls the panel and reloads once it answers again
+/// (which it will only do if the launcher-supervisor relaunched the daemon).
+const RESTARTING_PAGE: &str = r#"<h1>Restarting…</h1>
+<p class="sub">The server is restarting to apply changes.</p>
+<p class="muted" id="msg">Waiting for it to come back…</p>
+<script>
+async function poll() {
+  try {
+    const r = await fetch('/status.json', {cache:'no-store'});
+    if (r.ok) { location.href = '/'; return; }
+  } catch (e) {}
+  setTimeout(poll, 1500);
+}
+setTimeout(poll, 2500);
+</script>"#;
 
 /// The dashboard page. Self-contained (no external assets): it polls `/status.json` every
 /// two seconds and re-renders. Served same-origin, so the fetch has no CORS concerns.
