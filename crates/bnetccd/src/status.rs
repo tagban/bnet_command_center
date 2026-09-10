@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
 use crate::admin::Admin;
+use crate::config::Config;
 use crate::node::Node;
 
 /// Session lifetime before re-login is required.
@@ -45,6 +47,18 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 type Sessions = Arc<Mutex<HashMap<String, Instant>>>;
 /// Per-IP failed-login tracker: ip → (fail count, window start).
 type RateLimiter = Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>;
+
+/// The panel's shared, per-process state, bundled so request handling passes one handle
+/// rather than a growing list of arguments. Every field is cheap to clone (an `Arc`).
+#[derive(Clone)]
+struct Panel {
+    node: Arc<Node>,
+    admin: Arc<Admin>,
+    sessions: Sessions,
+    rate: RateLimiter,
+    restart: Arc<Notify>,
+    config_path: Arc<PathBuf>,
+}
 
 /// A point-in-time view of the node, serialised to `/status.json`.
 #[derive(Debug, Serialize)]
@@ -94,7 +108,14 @@ pub struct GameInfo {
 /// Serve the admin panel over HTTPS until the process ends. Binding or TLS-setup failures
 /// are logged and non-fatal — the panel is a convenience, never a reason to take the node
 /// down.
-pub async fn run(listen: SocketAddr, node: Arc<Node>, admin: Arc<Admin>, restart: Arc<Notify>) {
+pub async fn run(
+    listen: SocketAddr,
+    node: Arc<Node>,
+    admin: Arc<Admin>,
+    restart: Arc<Notify>,
+    config_path: PathBuf,
+) {
+    let config_path = Arc::new(config_path);
     // rustls 0.23 needs a process crypto provider; install one if the app hasn't.
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -115,27 +136,26 @@ pub async fn run(listen: SocketAddr, node: Arc<Node>, admin: Arc<Admin>, restart
     };
     let remote = if listen.ip().is_loopback() { "localhost-only" } else { "bind is non-loopback; remote gated by the toggle" };
     info!(addr = %listen, %remote, "admin panel listening over HTTPS");
-    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
-    let rate: RateLimiter = Arc::new(Mutex::new(HashMap::new()));
+    let panel = Panel {
+        node,
+        admin,
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        rate: Arc::new(Mutex::new(HashMap::new())),
+        restart,
+        config_path,
+    };
     loop {
         let (sock, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(_) => continue,
         };
-        let (tls, node, admin, sessions, rate, restart) = (
-            tls.clone(),
-            Arc::clone(&node),
-            Arc::clone(&admin),
-            Arc::clone(&sessions),
-            Arc::clone(&rate),
-            Arc::clone(&restart),
-        );
+        let (tls, panel) = (tls.clone(), panel.clone());
         tokio::spawn(async move {
             let peer_ip = peer.ip();
             // A failed TLS handshake (e.g. someone speaking plain HTTP to the port) just
             // drops — no plaintext is ever served.
             if let Ok(stream) = tls.accept(sock).await {
-                handle_conn(stream, peer_ip, &node, &admin, &sessions, &rate, &restart).await;
+                handle_conn(stream, peer_ip, &panel).await;
             }
         });
     }
@@ -173,15 +193,8 @@ struct Response {
     location: Option<String>,
 }
 
-async fn handle_conn<S>(
-    mut stream: S,
-    peer_ip: IpAddr,
-    node: &Node,
-    admin: &Admin,
-    sessions: &Sessions,
-    rate: &RateLimiter,
-    restart: &Arc<Notify>,
-) where
+async fn handle_conn<S>(mut stream: S, peer_ip: IpAddr, panel: &Panel)
+where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     let Some(req) = read_request(&mut stream).await else {
@@ -190,26 +203,26 @@ async fn handle_conn<S>(
     // Remote gate: a non-loopback peer is refused entirely until an admin enables remote
     // access from localhost. This sits in front of auth, so a remote attacker can't even
     // reach the login form while remote is off.
-    if !peer_ip.is_loopback() && !admin.remote_enabled() {
+    if !peer_ip.is_loopback() && !panel.admin.remote_enabled() {
         let resp = text("403 Forbidden", "Remote access is disabled on this server.");
         let _ = write_response(&mut stream, &resp).await;
         return;
     }
-    let resp = route(&req, peer_ip, node, admin, sessions, rate, restart);
+    let resp = route(&req, peer_ip, panel);
     let _ = write_response(&mut stream, &resp).await;
 }
 
 /// Route a request to a response. Sync: session/rate stores are plain mutexes and the
 /// snapshot is sync, so nothing here awaits.
-fn route(
-    req: &Request,
-    peer_ip: IpAddr,
-    node: &Node,
-    admin: &Admin,
-    sessions: &Sessions,
-    rate: &RateLimiter,
-    restart: &Arc<Notify>,
-) -> Response {
+fn route(req: &Request, peer_ip: IpAddr, panel: &Panel) -> Response {
+    // Rebind the panel's fields as the borrows the handlers already expect. Deref coercion
+    // turns `&Arc<T>` into `&T`, so the handler signatures below are unchanged.
+    let node: &Node = &panel.node;
+    let admin: &Admin = &panel.admin;
+    let sessions: &Sessions = &panel.sessions;
+    let rate: &RateLimiter = &panel.rate;
+    let restart: &Arc<Notify> = &panel.restart;
+    let config_path: &Path = &panel.config_path;
     // Public routes (no session required).
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/login") => return html_page(login_page_with("")),
@@ -234,8 +247,9 @@ fn route(
         ("GET", "/status.json") => json_response(node),
         ("GET", "/change-password") => html_page(change_pw_page(false)),
         ("POST", "/change-password") => do_change_pw(req, admin),
-        ("GET", "/settings") => html_page(settings_page(admin)),
+        ("GET", "/settings") => html_page(settings_page(admin, config_path, None)),
         ("POST", "/settings") => do_settings(req, admin),
+        ("POST", "/settings/config") => do_settings_config(req, admin, config_path),
         ("POST", "/restart") => do_restart(restart),
         _ => text("404 Not Found", "Not found."),
     }
@@ -559,17 +573,20 @@ fn shell(title: &str, inner: &str) -> String {
         r##"<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>{title}</title>
 <style>
-:root {{ color-scheme: light dark; --bg:#0f1115; --card:#1a1d24; --fg:#e6e8ec; --muted:#9aa0aa; --accent:#5aa9e6; --line:#2a2e37; --err:#e06a6a; }}
+:root {{ color-scheme: light dark; --bg:#0f1115; --card:#1a1d24; --fg:#e6e8ec; --muted:#9aa0aa; --accent:#5aa9e6; --line:#2a2e37; --err:#e06a6a; --ok:#5ac47d; }}
 * {{ box-sizing:border-box; }}
-body {{ margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif; }}
-.card {{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:28px; width:min(92vw,380px); }}
+body {{ margin:0; min-height:100vh; display:flex; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif; }}
+.card {{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:28px; width:min(92vw,440px); margin:auto; }}
 h1 {{ font-size:16px; margin:0 0 4px; }}
 p.sub {{ color:var(--muted); margin:0 0 18px; font-size:13px; }}
 label {{ display:block; font-size:12px; color:var(--muted); margin:14px 0 6px; text-transform:uppercase; letter-spacing:.04em; }}
-input[type=password] {{ width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--line); background:#0f1115; color:var(--fg); font-size:14px; }}
+input[type=password], input[type=text], input[type=number], textarea {{ width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--line); background:#0f1115; color:var(--fg); font-size:14px; font-family:inherit; }}
 button {{ margin-top:20px; width:100%; padding:11px; border:none; border-radius:8px; background:var(--accent); color:#04121f; font-weight:600; font-size:14px; cursor:pointer; }}
 .err {{ background:rgba(224,106,106,.12); border:1px solid var(--err); color:var(--err); padding:9px 12px; border-radius:8px; font-size:13px; margin-bottom:8px; }}
+.ok {{ background:rgba(90,196,125,.12); border:1px solid var(--ok); color:var(--ok); padding:9px 12px; border-radius:8px; font-size:13px; margin-bottom:8px; }}
 a {{ color:var(--accent); }} .row {{ display:flex; align-items:center; gap:10px; margin:14px 0; }} .row input {{ width:auto; }}
+.row3 {{ display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }}
+code {{ background:#0f1115; border:1px solid var(--line); border-radius:4px; padding:1px 5px; font-size:12px; }}
 .muted {{ color:var(--muted); font-size:12px; }}
 </style></head><body><div class="card">{inner}</div></body></html>"##
     )
@@ -619,22 +636,201 @@ fn change_pw_page_with(must_change: bool, err: &str) -> String {
     shell("Change password — Command Center", &inner)
 }
 
-fn settings_page(admin: &Admin) -> String {
+/// The settings page. `flash` is `(ok, message)` shown after a config save.
+fn settings_page(admin: &Admin, config_path: &Path, flash: Option<(bool, &str)>) -> String {
     let checked = if admin.remote_enabled() { "checked" } else { "" };
+    let doc = load_config_doc(config_path);
+    // Current config values (from the file), each falling back to the config default so the
+    // form is never blank on a fresh install.
+    let name = html_escape(&cfg_string(&doc, &["server", "name"], "Command Center"));
+    let motd = html_escape(&cfg_string(&doc, &["server", "motd"], "Welcome to Command Center."));
+    let private_max = cfg_int(&doc, &["channels", "private_max"], 0);
+    let public_max = cfg_int(&doc, &["channels", "public_max"], 0);
+    let clan_max = cfg_int(&doc, &["channels", "clan_max"], 0);
+    let max_conn = cfg_int(&doc, &["limits", "max_connections"], 0);
+    let game_per_ip = cfg_int(&doc, &["limits", "clients", "game_default", "per_ip"], 8);
+    let gw_per_ip = cfg_int(&doc, &["limits", "clients", "gateway", "per_ip"], 1);
+    let admins = html_escape(&cfg_admin_list(&doc));
+
+    let flash_html = match flash {
+        Some((true, m)) => format!(r#"<p class="ok">{}</p>"#, html_escape(m)),
+        Some((false, m)) => err_banner(m),
+        None => String::new(),
+    };
+
     let inner = format!(
         r#"<h1>Settings</h1><p class="sub">Admin panel</p>
 <form method="post" action="/settings">
 <div class="row"><input id="rm" name="remote" type="checkbox" {checked}><label for="rm" style="margin:0;text-transform:none;letter-spacing:0;color:var(--fg)">Enable remote access (non-localhost)</label></div>
 <p class="muted">When off, only localhost can reach this panel — even with the port forwarded. Turn it on only after you have forwarded 6114 and want remote control.</p>
-<button type="submit">Save settings</button></form>
+<button type="submit">Save remote setting</button></form>
+
+<h1 style="margin-top:28px">Server configuration</h1>
+<p class="sub">Written to the config file; applied after a restart.</p>{flash_html}
+<form method="post" action="/settings/config">
+<label for="sn">Server name</label>
+<input id="sn" name="server_name" type="text" value="{name}" maxlength="64">
+<label for="mo">Message of the day</label>
+<input id="mo" name="server_motd" type="text" value="{motd}" maxlength="200">
+<label for="pm">Channel caps — Private / Public / Clan (0 = unlimited)</label>
+<div class="row3">
+<input id="pm" name="private_max" type="number" min="0" value="{private_max}">
+<input name="public_max" type="number" min="0" value="{public_max}">
+<input name="clan_max" type="number" min="0" value="{clan_max}">
+</div>
+<label for="mc">Max connections (0 = derive from file-descriptor limit)</label>
+<input id="mc" name="max_connections" type="number" min="0" value="{max_conn}">
+<label for="gp">Per-IP limit — game clients / gateway bots</label>
+<div class="row3">
+<input id="gp" name="game_per_ip" type="number" min="0" value="{game_per_ip}">
+<input name="gateway_per_ip" type="number" min="0" value="{gw_per_ip}">
+</div>
+<label for="ad">Staff accounts (comma or newline separated) — get /tagban, /ipban, /mute</label>
+<textarea id="ad" name="admins" rows="3" style="width:100%;box-sizing:border-box">{admins}</textarea>
+<button type="submit" style="margin-top:14px">Save configuration</button></form>
+<p class="muted">Changes take effect after a restart. A backup of the previous config is kept as <code>{bak}</code>, and an invalid value is rejected before anything is written.</p>
+
 <h1 style="margin-top:28px">Server control</h1>
 <form method="post" action="/restart" onsubmit="return confirm('Restart the server now? Connected clients will be dropped for a moment.')">
 <p class="muted">Restarts the daemon to apply configuration changes. Only comes back automatically when started via the launcher; a standalone server will stop until you start it again.</p>
 <button type="submit" style="background:#7a2323;border:1px solid #a33">Restart server</button></form>
 <p style="margin-top:18px"><a href="/">Dashboard</a> &middot; <a href="/change-password">Change password</a></p>
-<form method="post" action="/logout"><button type="submit" style="background:transparent;border:1px solid var(--line);color:var(--muted)">Sign out</button></form>"#
+<form method="post" action="/logout"><button type="submit" style="background:transparent;border:1px solid var(--line);color:var(--muted)">Sign out</button></form>"#,
+        bak = html_escape(&format!("{}.bak", config_path.display())),
     );
     shell("Settings — Command Center", &inner)
+}
+
+/// `POST /settings/config` — apply the edited server settings to the config file.
+///
+/// Every change is staged in a comment-preserving document, the whole result is validated by
+/// deserialising it as a [`Config`], the previous file is copied to `<path>.bak`, and only
+/// then is the new file written. A malformed value therefore never reaches disk, so it can
+/// never brick the next restart.
+fn do_settings_config(req: &Request, admin: &Admin, config_path: &Path) -> Response {
+    let mut doc = load_config_doc(config_path);
+
+    if let Some(v) = req.form.get("server_name") {
+        set_cfg(&mut doc, &["server", "name"], toml_edit::value(v.trim()));
+    }
+    if let Some(v) = req.form.get("server_motd") {
+        set_cfg(&mut doc, &["server", "motd"], toml_edit::value(v.trim()));
+    }
+
+    // Integer fields: reject a non-numeric entry with a readable message before touching the
+    // document, rather than leaning on the deserialiser's terser error.
+    let ints: [(&str, &[&str]); 6] = [
+        ("private_max", &["channels", "private_max"]),
+        ("public_max", &["channels", "public_max"]),
+        ("clan_max", &["channels", "clan_max"]),
+        ("max_connections", &["limits", "max_connections"]),
+        ("game_per_ip", &["limits", "clients", "game_default", "per_ip"]),
+        ("gateway_per_ip", &["limits", "clients", "gateway", "per_ip"]),
+    ];
+    for (field, path) in ints {
+        if let Some(raw) = req.form.get(field) {
+            let raw = raw.trim();
+            match raw.parse::<i64>() {
+                Ok(n) if n >= 0 => set_cfg(&mut doc, path, toml_edit::value(n)),
+                _ => {
+                    return html_page(settings_page(
+                        admin,
+                        config_path,
+                        Some((false, &format!("'{field}' must be a whole number ≥ 0 (got '{raw}')."))),
+                    ))
+                }
+            }
+        }
+    }
+
+    if let Some(v) = req.form.get("admins") {
+        let mut arr = toml_edit::Array::new();
+        for name in v.split([',', '\n', '\r']).map(str::trim).filter(|s| !s.is_empty()) {
+            arr.push(name);
+        }
+        set_cfg(&mut doc, &["admins", "accounts"], toml_edit::value(arr));
+    }
+
+    // Validate the whole document still deserialises as a Config (catches out-of-range values,
+    // bad combinations, and any structural mistake) before writing anything.
+    let serialized = doc.to_string();
+    if let Err(e) = toml::from_str::<Config>(&serialized) {
+        return html_page(settings_page(
+            admin,
+            config_path,
+            Some((false, &format!("Rejected — the result is not a valid config: {e}"))),
+        ));
+    }
+
+    // Back up the current file (best-effort — absent on a first-ever save), then write.
+    let _ = std::fs::copy(config_path, config_path.with_extension("toml.bak"));
+    if let Err(e) = std::fs::write(config_path, serialized.as_bytes()) {
+        return html_page(settings_page(
+            admin,
+            config_path,
+            Some((false, &format!("Could not write the config file: {e}"))),
+        ));
+    }
+
+    html_page(settings_page(
+        admin,
+        config_path,
+        Some((true, "Saved. Restart the server (below) to apply these changes.")),
+    ))
+}
+
+/// Read the config file into an editable, comment-preserving document, or an empty one if it
+/// does not exist or fails to parse (a fresh save then writes a minimal valid file).
+fn load_config_doc(path: &Path) -> toml_edit::DocumentMut {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
+        .unwrap_or_default()
+}
+
+/// Follow a dotted path of table keys to an item, if present.
+fn cfg_get<'a>(doc: &'a toml_edit::DocumentMut, path: &[&str]) -> Option<&'a toml_edit::Item> {
+    let (last, tables) = path.split_last()?;
+    let mut tbl = doc.as_table();
+    for seg in tables {
+        tbl = tbl.get(seg)?.as_table()?;
+    }
+    tbl.get(last)
+}
+
+fn cfg_string(doc: &toml_edit::DocumentMut, path: &[&str], default: &str) -> String {
+    cfg_get(doc, path)
+        .and_then(|i| i.as_str())
+        .map_or_else(|| default.to_string(), str::to_string)
+}
+
+fn cfg_int(doc: &toml_edit::DocumentMut, path: &[&str], default: i64) -> i64 {
+    cfg_get(doc, path).and_then(|i| i.as_integer()).unwrap_or(default)
+}
+
+fn cfg_admin_list(doc: &toml_edit::DocumentMut) -> String {
+    cfg_get(doc, &["admins", "accounts"])
+        .and_then(|i| i.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+        .unwrap_or_default()
+}
+
+/// Set `path` (dotted table keys ending in the key to set) to `value`, creating any missing
+/// intermediate tables. An intermediate that is somehow not a table is replaced with one, so
+/// this never panics on a hand-edited file.
+fn set_cfg(doc: &mut toml_edit::DocumentMut, path: &[&str], value: toml_edit::Item) {
+    let (last, tables) = path.split_last().expect("config path is non-empty");
+    let mut tbl = doc.as_table_mut();
+    for seg in tables {
+        let entry = tbl
+            .entry(seg)
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+        if !entry.is_table() {
+            *entry = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        tbl = entry.as_table_mut().expect("just ensured a table");
+    }
+    tbl[last] = value;
 }
 
 /// Shown after a restart is requested: it polls the panel and reloads once it answers again

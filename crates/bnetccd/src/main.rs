@@ -79,7 +79,7 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    match runtime.block_on(run(cfg)) {
+    match runtime.block_on(run(cfg, args.config)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             error!("{e}");
@@ -88,7 +88,7 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-async fn run(cfg: Config) -> Result<(), String> {
+async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
     let mode = cfg.server.parsed_mode()?;
     let policy = cfg.policy()?;
 
@@ -227,6 +227,7 @@ async fn run(cfg: Config) -> Result<(), String> {
                             Arc::clone(&node),
                             Arc::new(a),
                             Arc::clone(&restart),
+                            config_path.clone(),
                         ));
                     }
                     Err(e) => warn!(

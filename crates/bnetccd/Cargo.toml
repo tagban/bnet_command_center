@@ -19,6 +19,9 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+# Comment-preserving TOML editing for the admin panel's settings editor, so writing a
+# setting back does not strip the operator's hand-written config comments.
+toml_edit = "0.22"
 tokio-rustls.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
