@@ -20,6 +20,30 @@ use tokio::sync::oneshot;
 
 use crate::node::Account;
 
+/// Attribute holding an account's admin-assigned user flags (a decimal `u32`).
+const FLAGS_ATTR: &str = r"System\Flags";
+/// Attribute holding the epoch-seconds of an account's last successful logon.
+const LAST_LOGIN_ATTR: &str = r"System\LastLogin";
+
+/// One account's row in the admin user list.
+#[derive(Debug, Clone)]
+pub struct UserSummary {
+    /// Stable id.
+    pub id: AccountId,
+    /// Display name.
+    pub name: String,
+    /// Registration time, epoch seconds.
+    pub created_at: u64,
+    /// Last successful logon, epoch seconds; `None` if never (or before tracking began).
+    pub last_login: Option<u64>,
+    /// Wins summed across every product's `Record\` counters.
+    pub wins: u64,
+    /// Losses summed across every product's `Record\` counters.
+    pub losses: u64,
+    /// Admin-assigned flags currently stored on the account.
+    pub flags: u32,
+}
+
 /// The outcome of a finished game, as folded into an account's `Record\` counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameOutcome {
@@ -92,6 +116,60 @@ enum Command {
         keys: Vec<AttrKey>,
         resp: oneshot::Sender<AttrMap>,
     },
+    /// A page of accounts for the admin user list, each with its records and stored flags.
+    ListUsers {
+        offset: u64,
+        limit: u32,
+        resp: oneshot::Sender<Vec<UserSummary>>,
+    },
+    /// Read an account's stored admin-assigned flags (applied at logon).
+    UserFlags {
+        account_id: AccountId,
+        resp: oneshot::Sender<u32>,
+    },
+    /// Replace an account's stored admin-assigned flags.
+    SetUserFlags {
+        account_id: AccountId,
+        flags: u32,
+        resp: oneshot::Sender<Result<(), String>>,
+    },
+    /// Reset an account's password to a new X-SHA-1 digest (write-through).
+    ResetPassword {
+        account_id: AccountId,
+        digest: [u8; 20],
+        resp: oneshot::Sender<Result<(), String>>,
+    },
+    /// Permanently delete an account and its data (write-through).
+    DeleteUser {
+        account_id: AccountId,
+        resp: oneshot::Sender<Result<(), String>>,
+    },
+    /// Record a successful logon time. Fire-and-forget: no reply, so a login is never
+    /// slowed by the write, and a failure is a missing timestamp, nothing worse.
+    RecordLogin {
+        account_id: AccountId,
+        when: u64,
+    },
+}
+
+/// Sum wins/losses across every product's `Record\<product>\0\{wins,losses}` counters, and
+/// pull the stored flags and last-login timestamp, from one account's full attribute set.
+fn summarize_attrs(attrs: &AttrMap) -> (u64, u64, Option<u64>, u32) {
+    let (mut wins, mut losses) = (0u64, 0u64);
+    let (mut last_login, mut flags) = (None, 0u32);
+    for (k, v) in attrs {
+        let key = k.as_str().to_ascii_lowercase();
+        if key.ends_with(r"\0\wins") {
+            wins = wins.saturating_add(v.parse().unwrap_or(0));
+        } else if key.ends_with(r"\0\losses") {
+            losses = losses.saturating_add(v.parse().unwrap_or(0));
+        } else if key == FLAGS_ATTR.to_ascii_lowercase() {
+            flags = v.parse().unwrap_or(0);
+        } else if key == LAST_LOGIN_ATTR.to_ascii_lowercase() {
+            last_login = v.parse().ok();
+        }
+    }
+    (wins, losses, last_login, flags)
 }
 
 /// Handle held by every session task. Cheap to clone — it is just a channel sender.
@@ -175,6 +253,56 @@ impl StorageHandle {
         }
         rx.await.unwrap_or_default()
     }
+
+    /// A page of accounts for the admin user list.
+    pub async fn list_users(&self, offset: u64, limit: u32) -> Vec<UserSummary> {
+        let (resp, rx) = oneshot::channel();
+        if self.0.send(Command::ListUsers { offset, limit, resp }).is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// An account's stored admin-assigned flags (`0` if none or on failure).
+    pub async fn user_flags(&self, account_id: AccountId) -> u32 {
+        let (resp, rx) = oneshot::channel();
+        if self.0.send(Command::UserFlags { account_id, resp }).is_err() {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+
+    /// Replace an account's stored admin-assigned flags.
+    pub async fn set_user_flags(&self, account_id: AccountId, flags: u32) -> Result<(), String> {
+        let (resp, rx) = oneshot::channel();
+        if self.0.send(Command::SetUserFlags { account_id, flags, resp }).is_err() {
+            return Err("storage actor is gone".into());
+        }
+        rx.await.unwrap_or_else(|_| Err("storage actor is gone".into()))
+    }
+
+    /// Reset an account's password to a new X-SHA-1 digest.
+    pub async fn reset_password(&self, account_id: AccountId, digest: [u8; 20]) -> Result<(), String> {
+        let (resp, rx) = oneshot::channel();
+        if self.0.send(Command::ResetPassword { account_id, digest, resp }).is_err() {
+            return Err("storage actor is gone".into());
+        }
+        rx.await.unwrap_or_else(|_| Err("storage actor is gone".into()))
+    }
+
+    /// Permanently delete an account.
+    pub async fn delete_user(&self, account_id: AccountId) -> Result<(), String> {
+        let (resp, rx) = oneshot::channel();
+        if self.0.send(Command::DeleteUser { account_id, resp }).is_err() {
+            return Err("storage actor is gone".into());
+        }
+        rx.await.unwrap_or_else(|_| Err("storage actor is gone".into()))
+    }
+
+    /// Record a successful logon time, fire-and-forget (never blocks the login).
+    pub fn record_login(&self, account_id: AccountId, when: u64) {
+        let _ = self.0.send(Command::RecordLogin { account_id, when });
+    }
 }
 
 /// Start the storage actor on a dedicated thread, which owns `backend` for the life of
@@ -238,6 +366,61 @@ pub fn spawn(mut backend: Box<dyn Storage + Send>) -> StorageHandle {
                         .map_err(|e: StorageError| e.to_string());
                         let _ = resp.send(result);
                     }
+                    Command::ListUsers { offset, limit, resp } => {
+                        let users = backend
+                            .list_accounts(offset, limit)
+                            .map(|accounts| {
+                                accounts
+                                    .into_iter()
+                                    .map(|a| {
+                                        let attrs = backend.attrs_all(a.id).unwrap_or_default();
+                                        let (wins, losses, last_login, flags) =
+                                            summarize_attrs(&attrs);
+                                        UserSummary {
+                                            id: a.id,
+                                            name: a.name,
+                                            created_at: a.created_at,
+                                            last_login,
+                                            wins,
+                                            losses,
+                                            flags,
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let _ = resp.send(users);
+                    }
+                    Command::UserFlags { account_id, resp } => {
+                        let key = AttrKey::new(FLAGS_ATTR);
+                        let flags = backend
+                            .attrs_get(account_id, std::slice::from_ref(&key))
+                            .ok()
+                            .and_then(|m| m.get(&key).and_then(|v| v.parse::<u32>().ok()))
+                            .unwrap_or(0);
+                        let _ = resp.send(flags);
+                    }
+                    Command::SetUserFlags { account_id, flags, resp } => {
+                        let mut one = AttrMap::new();
+                        one.insert(AttrKey::new(FLAGS_ATTR), flags.to_string());
+                        let result = backend.attrs_put(account_id, one).map_err(|e| e.to_string());
+                        let _ = resp.send(result);
+                    }
+                    Command::ResetPassword { account_id, digest, resp } => {
+                        let result = backend
+                            .set_credential(account_id, Credential::Xsha1 { digest })
+                            .map_err(|e| e.to_string());
+                        let _ = resp.send(result);
+                    }
+                    Command::DeleteUser { account_id, resp } => {
+                        let result = backend.delete_account(account_id).map_err(|e| e.to_string());
+                        let _ = resp.send(result);
+                    }
+                    Command::RecordLogin { account_id, when } => {
+                        let mut one = AttrMap::new();
+                        one.insert(AttrKey::new(LAST_LOGIN_ATTR), when.to_string());
+                        let _ = backend.attrs_put(account_id, one);
+                    }
                     Command::ReadReadableAttrs { account_name, keys, resp } => {
                         // Look up the owner, read the requested keys, and hand back only what
                         // an *other* party may see. Actor::Other is the safe floor: it never
@@ -282,4 +465,44 @@ fn to_account(a: bnetcc_storage::model::Account) -> Option<Account> {
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bnetcc_proto::chat::user_flags;
+    use bnetcc_storage::memory::MemoryStorage;
+
+    #[tokio::test]
+    async fn user_management_round_trip_through_the_actor() {
+        let h = spawn(Box::new(MemoryStorage::new()));
+        let acct = h.create_account("Zealot", [1u8; 20]).await.expect("create");
+
+        // Flags start empty, round-trip through set/get.
+        assert_eq!(h.user_flags(acct.id).await, 0);
+        let flags = user_flags::ADMIN | user_flags::BLIZZARD_REP | user_flags::SPEAKER;
+        h.set_user_flags(acct.id, flags).await.expect("set flags");
+        assert_eq!(h.user_flags(acct.id).await, flags);
+
+        // A recorded login and a couple of game results show up in the summary. record_login
+        // is fire-and-forget, but the actor processes its channel in order, so the awaited
+        // record_game calls that follow guarantee it has been applied before the list read.
+        h.record_login(acct.id, 1_700_000_500);
+        h.record_game(acct.id, "SEXP", GameOutcome::Win).await.unwrap();
+        h.record_game(acct.id, "SEXP", GameOutcome::Loss).await.unwrap();
+
+        let users = h.list_users(0, 10).await;
+        let u = users.iter().find(|u| u.id == acct.id).expect("account is listed");
+        assert_eq!(u.name, "Zealot");
+        assert_eq!(u.flags, flags);
+        assert_eq!(u.wins, 1);
+        assert_eq!(u.losses, 1);
+        assert_eq!(u.last_login, Some(1_700_000_500));
+
+        // Reset and delete both succeed; the account is gone afterwards.
+        h.reset_password(acct.id, [9u8; 20]).await.expect("reset");
+        h.delete_user(acct.id).await.expect("delete");
+        assert!(h.account_by_name("Zealot").await.is_none());
+        assert!(h.list_users(0, 10).await.iter().all(|u| u.id != acct.id));
+    }
 }

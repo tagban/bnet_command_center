@@ -31,6 +31,16 @@ use crate::moderation::BanStore;
 /// Bytes ready for the wire, shared by every recipient of a broadcast.
 pub type Wire = Arc<Vec<u8>>;
 
+/// The user flags an administrator may assign to an account from the panel, and the only
+/// bits honoured when applying an account's stored flags at logon. Restricting to this set
+/// means a hand-edited or corrupted `System\Flags` attribute can never grant a bit with
+/// protocol side effects (e.g. `NO_UDP`, `SQUELCHED`). "Staff" is the administrator pair
+/// (`ADMIN | BLIZZARD_REP`); the rest are cosmetic/role flags.
+pub const ASSIGNABLE_FLAGS: u32 = bnetcc_proto::chat::user_flags::ADMIN
+    | bnetcc_proto::chat::user_flags::BLIZZARD_REP
+    | bnetcc_proto::chat::user_flags::SPEAKER
+    | bnetcc_proto::chat::user_flags::SPECIAL_GUEST;
+
 /// A per-session personal ignore ("squelch") list: the base account names whose channel
 /// chat this session does not want to see. Lives on [`Outbound`] so channel fan-out can
 /// consult the *recipient's* list cheaply. The `any` flag keeps the common case (nobody
@@ -485,6 +495,37 @@ impl Node {
     /// Look up an account by name, case-insensitively.
     pub async fn account(&self, name: &str) -> Option<Account> {
         self.storage.account_by_name(name).await
+    }
+
+    /// A page of accounts for the admin user-management list.
+    pub async fn list_users(&self, offset: u64, limit: u32) -> Vec<crate::storage::UserSummary> {
+        self.storage.list_users(offset, limit).await
+    }
+
+    /// An account's stored admin-assigned flags, masked to the assignable set.
+    pub async fn user_flags(&self, account_id: AccountId) -> u32 {
+        self.storage.user_flags(account_id).await & ASSIGNABLE_FLAGS
+    }
+
+    /// Replace an account's stored flags (masked to the assignable set, so a panel can never
+    /// persist a bit with protocol side effects). Takes effect at the account's next logon.
+    pub async fn set_user_flags(&self, account_id: AccountId, flags: u32) -> Result<(), String> {
+        self.storage.set_user_flags(account_id, flags & ASSIGNABLE_FLAGS).await
+    }
+
+    /// Reset an account's password to a new X-SHA-1 digest.
+    pub async fn reset_password(&self, account_id: AccountId, digest: [u8; 20]) -> Result<(), String> {
+        self.storage.reset_password(account_id, digest).await
+    }
+
+    /// Permanently delete an account and its data.
+    pub async fn delete_user(&self, account_id: AccountId) -> Result<(), String> {
+        self.storage.delete_user(account_id).await
+    }
+
+    /// Record a successful logon time (fire-and-forget).
+    pub fn record_login(&self, account_id: AccountId, when_secs: u64) {
+        self.storage.record_login(account_id, when_secs);
     }
 
     /// Claim a server-wide-unique display name for a new session: `base` if it is free,

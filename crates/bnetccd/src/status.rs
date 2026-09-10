@@ -31,9 +31,12 @@ use tokio::sync::Notify;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
+use bnetcc_proto::chat::user_flags;
+
 use crate::admin::Admin;
 use crate::config::Config;
 use crate::node::Node;
+use crate::storage::UserSummary;
 
 /// Session lifetime before re-login is required.
 const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
@@ -180,6 +183,8 @@ fn build_tls(admin: &Admin) -> Result<ServerConfig, String> {
 struct Request {
     method: String,
     path: String,
+    /// Query-string parameters (e.g. `?offset=100`), decoded.
+    query: HashMap<String, String>,
     cookies: HashMap<String, String>,
     form: HashMap<String, String>,
 }
@@ -208,13 +213,13 @@ where
         let _ = write_response(&mut stream, &resp).await;
         return;
     }
-    let resp = route(&req, peer_ip, panel);
+    let resp = route(&req, peer_ip, panel).await;
     let _ = write_response(&mut stream, &resp).await;
 }
 
 /// Route a request to a response. Sync: session/rate stores are plain mutexes and the
 /// snapshot is sync, so nothing here awaits.
-fn route(req: &Request, peer_ip: IpAddr, panel: &Panel) -> Response {
+async fn route(req: &Request, peer_ip: IpAddr, panel: &Panel) -> Response {
     // Rebind the panel's fields as the borrows the handlers already expect. Deref coercion
     // turns `&Arc<T>` into `&T`, so the handler signatures below are unchanged.
     let node: &Node = &panel.node;
@@ -251,6 +256,10 @@ fn route(req: &Request, peer_ip: IpAddr, panel: &Panel) -> Response {
         ("POST", "/settings") => do_settings(req, admin),
         ("POST", "/settings/config") => do_settings_config(req, admin, config_path),
         ("POST", "/restart") => do_restart(restart),
+        ("GET", "/users") => users_page(node, req, None).await,
+        ("POST", "/users/flags") => do_user_flags(req, node).await,
+        ("POST", "/users/reset") => do_user_reset(req, node).await,
+        ("POST", "/users/delete") => do_user_delete(req, node).await,
         _ => text("404 Not Found", "Not found."),
     }
 }
@@ -263,6 +272,200 @@ fn do_restart(restart: &Arc<Notify>) -> Response {
     // the launcher (if supervising) relaunches. notify_one is enough — one waiter.
     restart.notify_one();
     html_page(shell("Restarting — Command Center", RESTARTING_PAGE))
+}
+
+/// How many accounts one page of the user list shows.
+const USERS_PAGE_SIZE: u32 = 50;
+
+/// `GET /users` — the user-management list, one page at a time.
+async fn users_page(node: &Node, req: &Request, flash: Option<(bool, &str)>) -> Response {
+    let offset: u64 = req.query.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Fetch one extra to learn whether a further page exists, without a second count query.
+    let mut users = node.list_users(offset, USERS_PAGE_SIZE + 1).await;
+    let has_next = users.len() as u32 > USERS_PAGE_SIZE;
+    users.truncate(USERS_PAGE_SIZE as usize);
+    html_page(render_users(&users, offset, has_next, flash))
+}
+
+/// `POST /users/flags` — set an account's assignable flags from the row's checkboxes.
+async fn do_user_flags(req: &Request, node: &Node) -> Response {
+    let Some(id) = req.form.get("id").and_then(|s| s.parse::<u64>().ok()) else {
+        return users_page(node, req, Some((false, "Missing account id."))).await;
+    };
+    let mut flags = 0u32;
+    if req.form.get("staff").map(String::as_str) == Some("on") {
+        flags |= user_flags::ADMIN | user_flags::BLIZZARD_REP;
+    }
+    if req.form.get("speaker").map(String::as_str) == Some("on") {
+        flags |= user_flags::SPEAKER;
+    }
+    if req.form.get("guest").map(String::as_str) == Some("on") {
+        flags |= user_flags::SPECIAL_GUEST;
+    }
+    let flash = match node.set_user_flags(id, flags).await {
+        Ok(()) => (true, "Flags saved — they take effect at the user's next login.".to_string()),
+        Err(e) => (false, format!("Could not save flags: {e}")),
+    };
+    users_page(node, req, Some((flash.0, &flash.1))).await
+}
+
+/// `POST /users/reset` — reset an account's password to an admin-supplied plaintext, which
+/// is hashed to the X-SHA-1 digest a client would send at logon (never stored in the clear).
+async fn do_user_reset(req: &Request, node: &Node) -> Response {
+    let Some(id) = req.form.get("id").and_then(|s| s.parse::<u64>().ok()) else {
+        return users_page(node, req, Some((false, "Missing account id."))).await;
+    };
+    let new = req.form.get("new_password").map(String::as_str).unwrap_or("");
+    if new.is_empty() {
+        return users_page(node, req, Some((false, "The new password cannot be empty."))).await;
+    }
+    let digest = bnetcc_crypto::password_hash(new);
+    let flash = match node.reset_password(id, digest).await {
+        Ok(()) => (true, "Password reset. Give the user the new password.".to_string()),
+        Err(e) => (false, format!("Could not reset password: {e}")),
+    };
+    users_page(node, req, Some((flash.0, &flash.1))).await
+}
+
+/// `POST /users/delete` — permanently delete an account.
+async fn do_user_delete(req: &Request, node: &Node) -> Response {
+    let Some(id) = req.form.get("id").and_then(|s| s.parse::<u64>().ok()) else {
+        return users_page(node, req, Some((false, "Missing account id."))).await;
+    };
+    let flash = match node.delete_user(id).await {
+        Ok(()) => (true, "Account deleted.".to_string()),
+        Err(e) => (false, format!("Could not delete account: {e}")),
+    };
+    users_page(node, req, Some((flash.0, &flash.1))).await
+}
+
+/// Render "N{unit} ago" for a timestamp `secs` epoch-seconds in the past, avoiding a date
+/// dependency. `0` (unset) renders as "never".
+fn ago(secs: u64) -> String {
+    if secs == 0 {
+        return "never".to_string();
+    }
+    let now = crate::now_ms() / 1000;
+    let d = now.saturating_sub(secs);
+    if d < 90 {
+        "just now".to_string()
+    } else if d < 3600 {
+        format!("{}m ago", d / 60)
+    } else if d < 86_400 {
+        format!("{}h ago", d / 3600)
+    } else {
+        format!("{}d ago", d / 86_400)
+    }
+}
+
+/// Build the user-management page for one loaded slice of accounts.
+fn render_users(users: &[UserSummary], offset: u64, has_next: bool, flash: Option<(bool, &str)>) -> String {
+    let flash_html = match flash {
+        Some((true, m)) => format!(r#"<p class="ok">{}</p>"#, html_escape(m)),
+        Some((false, m)) => err_banner(m),
+        None => String::new(),
+    };
+    let mut rows = String::new();
+    if users.is_empty() {
+        rows.push_str(r#"<tr><td colspan="5" class="empty">No accounts on this page.</td></tr>"#);
+    }
+    for u in users {
+        let staff = u.flags & user_flags::ADMIN != 0;
+        let speaker = u.flags & user_flags::SPEAKER != 0;
+        let guest = u.flags & user_flags::SPECIAL_GUEST != 0;
+        let ck = |on: bool| if on { "checked" } else { "" };
+        let name = html_escape(&u.name);
+        rows.push_str(&format!(
+            r#"<tr>
+<td><b>{name}</b>{badge}<div class="sub2">created {created}</div></td>
+<td>{last}</td>
+<td class="num">{wins}/{losses}</td>
+<td>
+  <form method="post" action="/users/flags" class="inline">
+    <input type="hidden" name="id" value="{id}">
+    <label><input type="checkbox" name="staff" {cs}> Staff</label>
+    <label><input type="checkbox" name="speaker" {csp}> Speaker</label>
+    <label><input type="checkbox" name="guest" {cg}> Guest</label>
+    <button type="submit">Save</button>
+  </form>
+</td>
+<td>
+  <form method="post" action="/users/reset" class="inline" onsubmit="return confirm('Reset the password for {name}?')">
+    <input type="hidden" name="id" value="{id}">
+    <input type="password" name="new_password" placeholder="new password" autocomplete="new-password">
+    <button type="submit">Reset</button>
+  </form>
+  <form method="post" action="/users/delete" class="inline" onsubmit="return confirm('Permanently delete {name}? This cannot be undone.')">
+    <input type="hidden" name="id" value="{id}">
+    <button type="submit" class="danger">Delete</button>
+  </form>
+</td>
+</tr>"#,
+            badge = if staff { r#" <span class="tag">staff</span>"# } else { "" },
+            created = ago(u.created_at),
+            last = ago(u.last_login.unwrap_or(0)),
+            wins = u.wins,
+            losses = u.losses,
+            id = u.id,
+            cs = ck(staff),
+            csp = ck(speaker),
+            cg = ck(guest),
+        ));
+    }
+
+    let prev = offset.saturating_sub(u64::from(USERS_PAGE_SIZE));
+    let prev_link = if offset > 0 {
+        format!(r#"<a href="/users?offset={prev}">‹ Prev</a>"#)
+    } else {
+        r#"<span class="disabled">‹ Prev</span>"#.to_string()
+    };
+    let next_off = offset + u64::from(USERS_PAGE_SIZE);
+    let next_link = if has_next {
+        format!(r#"<a href="/users?offset={next_off}">Next ›</a>"#)
+    } else {
+        r#"<span class="disabled">Next ›</span>"#.to_string()
+    };
+
+    format!(
+        r##"<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Users — Command Center</title>
+<style>
+:root {{ color-scheme: light dark; --bg:#0f1115; --card:#1a1d24; --fg:#e6e8ec; --muted:#9aa0aa; --accent:#5aa9e6; --line:#2a2e37; --err:#e06a6a; --ok:#5ac47d; --danger:#a33; }}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif; }}
+header {{ padding:16px 20px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:12px; }}
+header h1 {{ font-size:16px; margin:0; }}
+header nav {{ margin-left:auto; }} header nav a {{ color:var(--accent); text-decoration:none; font-size:13px; }}
+main {{ padding:20px; }}
+table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; }}
+td,th {{ text-align:left; padding:10px 14px; border-bottom:1px solid var(--line); vertical-align:middle; }}
+th {{ color:var(--muted); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }}
+tr:last-child td {{ border-bottom:none; }}
+.sub2 {{ color:var(--muted); font-size:12px; }}
+.num {{ font-variant-numeric:tabular-nums; }}
+.empty {{ color:var(--muted); padding:16px; }}
+.tag {{ background:rgba(90,169,230,.15); color:var(--accent); border:1px solid var(--accent); border-radius:4px; font-size:11px; padding:1px 5px; margin-left:6px; }}
+form.inline {{ display:inline-flex; align-items:center; gap:6px; margin:0 8px 0 0; }}
+form.inline label {{ color:var(--fg); font-size:12px; display:inline-flex; align-items:center; gap:3px; margin:0; text-transform:none; letter-spacing:0; }}
+input[type=password] {{ padding:5px 8px; border-radius:6px; border:1px solid var(--line); background:#0f1115; color:var(--fg); width:130px; }}
+button {{ padding:5px 10px; border:none; border-radius:6px; background:var(--accent); color:#04121f; font-weight:600; font-size:12px; cursor:pointer; }}
+button.danger {{ background:var(--danger); color:#fff; }}
+.err {{ background:rgba(224,106,106,.12); border:1px solid var(--err); color:var(--err); padding:9px 12px; border-radius:8px; margin-bottom:12px; }}
+.ok {{ background:rgba(90,196,125,.12); border:1px solid var(--ok); color:var(--ok); padding:9px 12px; border-radius:8px; margin-bottom:12px; }}
+.pager {{ margin-top:16px; display:flex; gap:16px; align-items:center; }}
+.pager a {{ color:var(--accent); text-decoration:none; }} .pager .disabled {{ color:var(--muted); }}
+</style></head><body>
+<header><h1>Users</h1><nav><a href="/">Dashboard</a> · <a href="/settings">Settings</a></nav></header>
+<main>
+{flash_html}
+<table>
+<tr><th>Account</th><th>Last login</th><th>W/L</th><th>Flags (apply at next login)</th><th>Password / Delete</th></tr>
+{rows}
+</table>
+<div class="pager">{prev_link}{next_link}<span class="sub2">showing from #{start}</span></div>
+</main></body></html>"##,
+        start = offset + 1,
+    )
 }
 
 fn do_login(
@@ -465,7 +668,10 @@ where
     let mut rl = lines.next()?.split_whitespace();
     let method = rl.next()?.to_string();
     let raw_path = rl.next()?.to_string();
-    let path = raw_path.split('?').next().unwrap_or("/").to_string();
+    let (path, query) = match raw_path.split_once('?') {
+        Some((p, q)) => (p.to_string(), parse_form(q)),
+        None => (raw_path.clone(), HashMap::new()),
+    };
 
     let mut content_length = 0usize;
     let mut cookies = HashMap::new();
@@ -502,7 +708,7 @@ where
     } else {
         HashMap::new()
     };
-    Some(Request { method, path, cookies, form })
+    Some(Request { method, path, query, cookies, form })
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -890,7 +1096,7 @@ const DASHBOARD: &str = r##"<!doctype html>
 <header>
   <h1>BNET Command Center · <span class="name" id="server">…</span></h1>
   <span class="meta" id="meta"></span>
-  <nav><a href="/settings">Settings</a> · <a href="/change-password">Password</a></nav>
+  <nav><a href="/users">Users</a> · <a href="/settings">Settings</a> · <a href="/change-password">Password</a></nav>
 </header>
 <main>
   <div class="tiles">

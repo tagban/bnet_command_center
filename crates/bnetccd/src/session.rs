@@ -964,6 +964,12 @@ impl Bncs {
                         self.flags |= user_flags::ADMIN | user_flags::BLIZZARD_REP;
                         info!(peer = %self.peer, account = %account.name, "administrator logged on");
                     }
+                    // Apply any admin-assigned flags stored on the account (staff, speaker,
+                    // special guest), masked to the assignable set. This is how the panel's
+                    // per-account flag/staff changes take effect — at the next logon.
+                    self.flags |= self.node.user_flags(account.id).await;
+                    // Note the logon time for the admin user list (fire-and-forget).
+                    self.node.record_login(account.id, now_ms() / 1000);
                     // Claim a server-wide-unique display name (Name, or Name#2/#3… if this
                     // account is already online elsewhere) for the life of this session.
                     self.display_name = self.node.claim_name(&account.name);
@@ -1528,7 +1534,7 @@ impl Bncs {
             "ipunban" => self.staff_ipunban(_arg, account),
             "mute" => self.staff_mute(_arg, account),
             "unmute" => self.staff_unmute(_arg, account),
-            "bans" => self.staff_bans(account),
+            "bans" => self.staff_bans(),
             "whoami" => {
                 let op = if self.node.is_operator(key, account.id) {
                     " (operator)"
@@ -1755,9 +1761,11 @@ impl Bncs {
 
     // -- staff moderation (Blizzard-rep / sysop only) ---------------------------
 
-    /// Whether the acting account is a configured server administrator.
-    fn require_staff(&self, account: &Account) -> bool {
-        self.node.admins.is_admin(&account.name)
+    /// Whether this session holds staff privilege. True for the effective Administrator flag,
+    /// which covers both the configured `[admins]` list and any panel-granted staff flag
+    /// stored on the account — both are OR-ed into `self.flags` at logon.
+    fn require_staff(&self) -> bool {
+        self.flags & user_flags::ADMIN != 0
     }
 
     /// The refusal shown to a non-staff account that tries a staff command.
@@ -1773,7 +1781,7 @@ impl Bncs {
     /// `/tagban <text>` — refuse any account whose name contains `text` (e.g. a clan prefix
     /// like `BNU-`), and disconnect everyone online who already matches. Persists.
     fn staff_tagban(&self, arg: &str, account: &Account) -> Step {
-        if !self.require_staff(account) {
+        if !self.require_staff() {
             return self.staff_denied();
         }
         let sub = arg.trim();
@@ -1795,7 +1803,7 @@ impl Bncs {
 
     /// `/tagunban <text>` — lift a tag ban.
     fn staff_tagunban(&self, arg: &str, account: &Account) -> Step {
-        if !self.require_staff(account) {
+        if !self.require_staff() {
             return self.staff_denied();
         }
         let sub = arg.trim();
@@ -1813,7 +1821,7 @@ impl Bncs {
     /// `/ipban <user> [hours]` — ban an online user's address for `hours` (default 24; `0`
     /// or `perm` = permanent) and disconnect every session on it. Persists.
     fn staff_ipban(&self, arg: &str, account: &Account) -> Step {
-        if !self.require_staff(account) {
+        if !self.require_staff() {
             return self.staff_denied();
         }
         let mut it = arg.split_whitespace();
@@ -1846,7 +1854,7 @@ impl Bncs {
 
     /// `/ipunban <ip>` — lift an IP ban.
     fn staff_ipunban(&self, arg: &str, account: &Account) -> Step {
-        if !self.require_staff(account) {
+        if !self.require_staff() {
             return self.staff_denied();
         }
         let Ok(ip) = arg.trim().parse::<std::net::IpAddr>() else {
@@ -1863,7 +1871,7 @@ impl Bncs {
     /// `/mute <user> [hours]` — silence an account's chat across the whole server (default
     /// indefinite; a number sets hours). The user stays connected; their lines are dropped.
     fn staff_mute(&self, arg: &str, account: &Account) -> Step {
-        if !self.require_staff(account) {
+        if !self.require_staff() {
             return self.staff_denied();
         }
         let mut it = arg.split_whitespace();
@@ -1889,7 +1897,7 @@ impl Bncs {
 
     /// `/unmute <user>` — lift a server mute.
     fn staff_unmute(&self, arg: &str, account: &Account) -> Step {
-        if !self.require_staff(account) {
+        if !self.require_staff() {
             return self.staff_denied();
         }
         let base = base_name(arg.trim());
@@ -1905,8 +1913,8 @@ impl Bncs {
     }
 
     /// `/bans` — list the active tag bans, IP bans, and mutes.
-    fn staff_bans(&self, account: &Account) -> Step {
-        if !self.require_staff(account) {
+    fn staff_bans(&self) -> Step {
+        if !self.require_staff() {
             return self.staff_denied();
         }
         let now = now_ms();
