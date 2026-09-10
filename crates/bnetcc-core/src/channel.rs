@@ -454,6 +454,65 @@ impl Channel {
     pub fn is_banned(&self, account: AccountId) -> bool {
         self.bans.contains(&account)
     }
+
+    /// Kick the specific session shown as `target_name` (operator action). Unlike [`kick`],
+    /// which targets an account, this removes exactly the named session — the identity used
+    /// in chat, so `Fish#2` is distinguishable from `Fish`.
+    ///
+    /// # Errors
+    /// [`OpError`] if the actor is not the operator, the target is absent, or is the actor.
+    pub fn kick_by_name(&mut self, by: AccountId, target_name: &str) -> Result<LeaveOutcome, OpError> {
+        if !self.is_operator(by) {
+            return Err(OpError::NotOperator);
+        }
+        let idx = self.position_by_name(target_name).ok_or(OpError::NotPresent)?;
+        if self.members[idx].account == by {
+            return Err(OpError::CannotTargetSelf);
+        }
+        Ok(self.remove_at(idx))
+    }
+
+    /// Ban the account behind the session shown as `target_name`, removing that session.
+    /// Returns the banned account id (for reporting) and the removal outcome.
+    ///
+    /// # Errors
+    /// [`OpError`] if the actor is not the operator, the target is absent, or is the actor.
+    pub fn ban_by_name(
+        &mut self,
+        by: AccountId,
+        target_name: &str,
+    ) -> Result<(AccountId, LeaveOutcome), OpError> {
+        if !self.is_operator(by) {
+            return Err(OpError::NotOperator);
+        }
+        let idx = self.position_by_name(target_name).ok_or(OpError::NotPresent)?;
+        let account = self.members[idx].account;
+        if account == by {
+            return Err(OpError::CannotTargetSelf);
+        }
+        self.bans.insert(account);
+        Ok((account, self.remove_at(idx)))
+    }
+
+    /// Nominate the session shown as `target_name` as an heir. Returns the heir's account.
+    ///
+    /// # Errors
+    /// [`OpError`] if the actor is not the operator, the target is absent, or is the actor.
+    pub fn designate_by_name(&mut self, by: AccountId, target_name: &str) -> Result<AccountId, OpError> {
+        if !self.is_operator(by) {
+            return Err(OpError::NotOperator);
+        }
+        let idx = self.position_by_name(target_name).ok_or(OpError::NotPresent)?;
+        let heir = self.members[idx].account;
+        if heir == by {
+            return Err(OpError::CannotTargetSelf);
+        }
+        if !self.heirs.contains(&heir) {
+            self.heirs.push(heir);
+            self.bump();
+        }
+        Ok(heir)
+    }
 }
 
 /// How a channel name is classified for operator-grant and access rules. Battle.net
@@ -775,6 +834,39 @@ mod tests {
         c.kick(1, 2).unwrap();
         assert!(!c.is_banned(2));
         assert!(join(&mut c, 2).is_ok());
+    }
+
+    #[test]
+    fn operator_kicks_and_bans_by_name() {
+        let mut c = chan(ChannelClass::Local);
+        join(&mut c, 1).unwrap(); // user1 = operator (first arrival)
+        join(&mut c, 2).unwrap();
+        // A non-operator cannot kick; the operator cannot kick themselves.
+        assert_eq!(c.kick_by_name(2, "user1"), Err(OpError::NotOperator));
+        assert_eq!(c.kick_by_name(1, "user1"), Err(OpError::CannotTargetSelf));
+        assert_eq!(c.kick_by_name(1, "ghost"), Err(OpError::NotPresent));
+        // Kick removes that session but does not ban it.
+        assert!(c.kick_by_name(1, "user2").is_ok());
+        assert_eq!(c.len(), 1);
+        assert!(!c.is_banned(2));
+        join(&mut c, 2).unwrap();
+        // Ban removes and blocks rejoin; the banned account id is returned.
+        let (account, _) = c.ban_by_name(1, "user2").unwrap();
+        assert_eq!(account, 2);
+        assert!(c.is_banned(2));
+        assert_eq!(join(&mut c, 2), Err(JoinDenial::Banned));
+    }
+
+    #[test]
+    fn operator_designates_an_heir_by_name() {
+        let mut c = chan(ChannelClass::Local);
+        join(&mut c, 1).unwrap(); // operator
+        join(&mut c, 2).unwrap();
+        assert_eq!(c.designate_by_name(2, "user1"), Err(OpError::NotOperator));
+        assert_eq!(c.designate_by_name(1, "user1"), Err(OpError::CannotTargetSelf));
+        assert_eq!(c.designate_by_name(1, "user2"), Ok(2));
+        // When the operator leaves, the named heir inherits.
+        assert_eq!(c.leave("user1").new_operator, Some(2));
     }
 
     #[test]

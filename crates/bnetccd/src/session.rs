@@ -603,7 +603,7 @@ impl Bncs {
             sid::ENTERCHAT => self.enter_chat(frame),
             sid::JOINCHANNEL => self.join_channel(frame),
             sid::LEAVECHAT => self.leave_chat(),
-            sid::CHATCOMMAND => self.chat_command(frame),
+            sid::CHATCOMMAND => self.chat_command(frame).await,
             sid::GETCHANNELLIST => self.channel_list(),
             sid::GETADVLISTEX => self.game_list(),
             sid::CHECKAD => self.check_ad(frame),
@@ -1345,7 +1345,7 @@ impl Bncs {
         Step::Continue
     }
 
-    fn chat_command(&mut self, frame: &Frame) -> Step {
+    async fn chat_command(&mut self, frame: &Frame) -> Step {
         let Some(account) = self.account.clone() else {
             return Step::Close;
         };
@@ -1373,9 +1373,14 @@ impl Bncs {
             return self.apply_flood_penalty(penalty, now);
         }
         if text.first() == Some(&b'/') {
-            return self.slash_command(&text, &account, &key);
+            return self.slash_command(&text, &account, &key).await;
         }
 
+        // Re-check membership before fanning out: an operator may have kicked us since we
+        // joined, and a removed session must not keep talking to the channel.
+        if !self.ensure_member(&key) {
+            return Step::Continue;
+        }
         let ev = chat_event(EventId::Talk, self.flags, 0, self.display_name.as_bytes(), &text);
         if let Some(wire) = encode(&ev) {
             // Real Battle.net does not echo your own channel talk back to you.
@@ -1385,6 +1390,23 @@ impl Bncs {
             }
         }
         Step::Continue
+    }
+
+    /// Confirm we are still a member of `key`; if not (e.g. we were kicked), clear our local
+    /// channel state, tell the user, and return `false` so the caller drops the action.
+    fn ensure_member(&mut self, key: &[u8]) -> bool {
+        if self.node.is_member(key, &self.display_name) {
+            return true;
+        }
+        self.channel = None;
+        let _ = self.send(&chat_event(
+            EventId::Error,
+            0,
+            0,
+            b"",
+            b"You are no longer in a channel.",
+        ));
+        false
     }
 
     /// Apply the flood penalty for an over-budget chat line and return the step to take.
@@ -1416,7 +1438,7 @@ impl Bncs {
         }
     }
 
-    fn slash_command(&mut self, text: &[u8], account: &Account, key: &[u8]) -> Step {
+    async fn slash_command(&mut self, text: &[u8], account: &Account, key: &[u8]) -> Step {
         let s = String::from_utf8_lossy(text);
         let mut parts = s[1..].splitn(2, ' ');
         let cmd = parts.next().unwrap_or("").to_ascii_lowercase();
@@ -1438,6 +1460,9 @@ impl Bncs {
                 self.do_join(target.as_bytes(), &account)
             }
             "me" | "emote" => {
+                if !self.ensure_member(key) {
+                    return Step::Continue;
+                }
                 let body = sanitize_chat_text(_arg.as_bytes());
                 let ev = chat_event(EventId::Emote, self.flags, 0, self.display_name.as_bytes(), &body);
                 if let Some(wire) = encode(&ev) {
@@ -1445,6 +1470,10 @@ impl Bncs {
                 }
                 Step::Continue
             }
+            "kick" => self.op_kick(_arg, account, key),
+            "ban" => self.op_ban(_arg, account, key),
+            "unban" => self.op_unban(_arg, account, key).await,
+            "designate" | "heir" => self.op_designate(_arg, account, key),
             "whoami" => {
                 let op = if self.node.is_operator(key, account.id) {
                     " (operator)"
@@ -1483,12 +1512,11 @@ impl Bncs {
                 self.send(&chat_event(EventId::Info, 0, 0, b"", header.as_bytes()))
             }
             "help" | "?" => {
-                // Keep this list in sync with the arms above. Operator/moderation and
-                // whisper/friends commands are not yet implemented (they need cross-session
-                // routing and per-channel op/ban state) — see docs/ROADMAP.md.
+                // Keep this list in sync with the arms above. Whisper/friends/ignore commands
+                // are still pending (they need cross-session routing) — see docs/ROADMAP.md.
                 for line in [
-                    "Commands: /help, /join <channel>, /me <action>, /who [channel],",
-                    "  /whoami, /ver",
+                    "Commands: /help, /join <channel>, /me <action>, /who [channel], /whoami, /ver",
+                    "Operator: /kick <user>, /ban <user>, /unban <user>, /designate <user>",
                 ] {
                     if matches!(
                         self.send(&chat_event(EventId::Info, 0, 0, b"", line.as_bytes())),
@@ -1506,6 +1534,120 @@ impl Bncs {
                 b"",
                 b"That is not a valid command. Type /help for the list.",
             )),
+        }
+    }
+
+    /// `/kick <user>` — operator removes a user from the current channel.
+    fn op_kick(&self, target: &str, actor: &Account, key: &[u8]) -> Step {
+        if target.is_empty() {
+            return self.send(&chat_event(EventId::Error, 0, 0, b"", b"Usage: /kick <user>"));
+        }
+        match self.node.channel_kick(key, actor.id, target) {
+            crate::node::ModResult::NotOperator => self.op_error("You are not the channel operator."),
+            crate::node::ModResult::NotFound => self.op_error("No such user in this channel."),
+            crate::node::ModResult::CannotTargetSelf => self.op_error("You cannot kick yourself."),
+            crate::node::ModResult::Ok { target_out, new_operator } => {
+                self.after_removal(key, target, target_out, new_operator, "kicked");
+                self.send(&chat_event(
+                    EventId::Info,
+                    0,
+                    0,
+                    b"",
+                    format!("You kicked {target}.").as_bytes(),
+                ))
+            }
+        }
+    }
+
+    /// `/ban <user>` — operator removes a user and blocks their account from rejoining.
+    fn op_ban(&self, target: &str, actor: &Account, key: &[u8]) -> Step {
+        if target.is_empty() {
+            return self.send(&chat_event(EventId::Error, 0, 0, b"", b"Usage: /ban <user>"));
+        }
+        match self.node.channel_ban(key, actor.id, target) {
+            crate::node::ModResult::NotOperator => self.op_error("You are not the channel operator."),
+            crate::node::ModResult::NotFound => self.op_error("No such user in this channel."),
+            crate::node::ModResult::CannotTargetSelf => self.op_error("You cannot ban yourself."),
+            crate::node::ModResult::Ok { target_out, new_operator } => {
+                self.after_removal(key, target, target_out, new_operator, "banned");
+                self.send(&chat_event(
+                    EventId::Info,
+                    0,
+                    0,
+                    b"",
+                    format!("You banned {target}.").as_bytes(),
+                ))
+            }
+        }
+    }
+
+    /// `/unban <user>` — operator lifts a channel ban. The target is not present, so its
+    /// account is resolved from storage by name.
+    async fn op_unban(&self, target: &str, actor: &Account, key: &[u8]) -> Step {
+        if target.is_empty() {
+            return self.send(&chat_event(EventId::Error, 0, 0, b"", b"Usage: /unban <user>"));
+        }
+        let Some(acct) = self.node.account(target).await else {
+            return self.op_error("No such account.");
+        };
+        match self.node.channel_unban(key, actor.id, acct.id) {
+            crate::node::ModResult::NotOperator => self.op_error("You are not the channel operator."),
+            crate::node::ModResult::NotFound => self.op_error("No such channel."),
+            _ => self.send(&chat_event(
+                EventId::Info,
+                0,
+                0,
+                b"",
+                format!("Unbanned {target}.").as_bytes(),
+            )),
+        }
+    }
+
+    /// `/designate <user>` — operator nominates a present user as heir to operator.
+    fn op_designate(&self, target: &str, actor: &Account, key: &[u8]) -> Step {
+        if target.is_empty() {
+            return self.send(&chat_event(EventId::Error, 0, 0, b"", b"Usage: /designate <user>"));
+        }
+        match self.node.channel_designate(key, actor.id, target) {
+            crate::node::ModResult::NotOperator => self.op_error("You are not the channel operator."),
+            crate::node::ModResult::NotFound => self.op_error("No such user in this channel."),
+            crate::node::ModResult::CannotTargetSelf => self.op_error("You cannot designate yourself."),
+            _ => self.send(&chat_event(
+                EventId::Info,
+                0,
+                0,
+                b"",
+                format!("{target} will inherit operator when you leave.").as_bytes(),
+            )),
+        }
+    }
+
+    /// Send an operator-command error line to the actor.
+    fn op_error(&self, msg: &str) -> Step {
+        self.send(&chat_event(EventId::Error, 0, 0, b"", msg.as_bytes()))
+    }
+
+    /// Shared tail of a kick/ban: notify the removed user via their own connection, announce
+    /// the departure to the channel so rosters drop them, and note any operator succession.
+    fn after_removal(
+        &self,
+        key: &[u8],
+        target: &str,
+        target_out: Option<crate::node::Outbound>,
+        new_operator: Option<bnetcc_core::channel::AccountId>,
+        verb: &str,
+    ) {
+        if let Some(out) = target_out {
+            let msg = format!("You were {verb} from the channel by {}.", self.display_name);
+            if let Some(wire) = encode(&chat_event(EventId::Error, 0, 0, b"", msg.as_bytes())) {
+                let _ = out.send(&wire);
+            }
+        }
+        if let Some(wire) = encode(&chat_event(EventId::Leave, 0, 0, target.as_bytes(), b"")) {
+            let _ = self.node.broadcast(key, &wire, None);
+        }
+        if let Some(op) = new_operator {
+            debug!(new_operator = op, "operator inherited after a removal");
         }
     }
 

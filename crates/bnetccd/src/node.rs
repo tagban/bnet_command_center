@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bnetcc_core::ads::AdRotation;
-use bnetcc_core::channel::{AccountId, Channel, ChannelClass, JoinDenial};
+use bnetcc_core::channel::{AccountId, Channel, ChannelClass, JoinDenial, OpError};
 use bnetcc_core::limits::{AdmissionTable, ClientClass, KeyId, KeyRegistry, KeyVerdict, Rejection};
 use bnetcc_core::policy::Policy;
 use bnetcc_proto::bncs::{encode_frame, Frame};
@@ -62,6 +62,29 @@ impl Outbound {
         }
         self.send(&Arc::new(buf))
     }
+}
+
+/// The outcome of an operator moderation action (kick / ban / designate / unban).
+pub enum ModResult {
+    /// The actor does not hold operator in the channel.
+    NotOperator,
+    /// No such channel, or the target is not present.
+    NotFound,
+    /// The actor targeted themselves.
+    CannotTargetSelf,
+    /// Success. For kick/ban, `target_out` is the removed session's fan-out handle (so the
+    /// caller can notify it); `new_operator` is any succession the removal triggered.
+    Ok {
+        target_out: Option<Outbound>,
+        new_operator: Option<AccountId>,
+    },
+}
+
+/// Remove a subscriber by display name from a channel's fan-out list, returning its handle.
+fn pull_subscriber(inner: &mut Inner, key: &[u8], name: &str) -> Option<Outbound> {
+    let subs = inner.subscribers.get_mut(key)?;
+    let pos = subs.iter().position(|(n, _)| n.eq_ignore_ascii_case(name))?;
+    Some(subs.remove(pos).1)
 }
 
 /// The outcome of trying to claim a CD key at `SID_AUTH_CHECK` time.
@@ -645,6 +668,101 @@ impl Node {
             inner.subscribers.remove(key);
         }
         outcome.new_operator
+    }
+
+    /// Whether `display_name` is currently a member of the channel keyed by `key`. Used to
+    /// re-check membership before a talk fans out, so a kicked session cannot keep chatting.
+    #[must_use]
+    pub fn is_member(&self, key: &[u8], display_name: &str) -> bool {
+        let inner = self.inner.lock().expect("node lock");
+        inner
+            .channels
+            .get(key)
+            .is_some_and(|c| c.members().iter().any(|m| m.name.eq_ignore_ascii_case(display_name)))
+    }
+
+    /// Kick the session shown as `target_name` from the channel (operator action). Removes
+    /// them from the roster and the fan-out, returning their outbound handle so the caller
+    /// can notify them, plus any operator succession.
+    pub fn channel_kick(&self, key: &[u8], actor: AccountId, target_name: &str) -> ModResult {
+        let mut inner = self.inner.lock().expect("node lock");
+        let outcome = {
+            let Some(channel) = inner.channels.get_mut(key) else {
+                return ModResult::NotFound;
+            };
+            match channel.kick_by_name(actor, target_name) {
+                Ok(o) => o,
+                Err(OpError::NotOperator) => return ModResult::NotOperator,
+                Err(OpError::NotPresent) => return ModResult::NotFound,
+                Err(OpError::CannotTargetSelf) => return ModResult::CannotTargetSelf,
+            }
+        };
+        let target_out = pull_subscriber(&mut inner, key, target_name);
+        if outcome.should_destroy {
+            inner.channels.remove(key);
+            inner.subscribers.remove(key);
+        }
+        ModResult::Ok {
+            target_out,
+            new_operator: outcome.new_operator,
+        }
+    }
+
+    /// Ban the account behind the session shown as `target_name` and remove that session.
+    pub fn channel_ban(&self, key: &[u8], actor: AccountId, target_name: &str) -> ModResult {
+        let mut inner = self.inner.lock().expect("node lock");
+        let outcome = {
+            let Some(channel) = inner.channels.get_mut(key) else {
+                return ModResult::NotFound;
+            };
+            match channel.ban_by_name(actor, target_name) {
+                Ok((_account, o)) => o,
+                Err(OpError::NotOperator) => return ModResult::NotOperator,
+                Err(OpError::NotPresent) => return ModResult::NotFound,
+                Err(OpError::CannotTargetSelf) => return ModResult::CannotTargetSelf,
+            }
+        };
+        let target_out = pull_subscriber(&mut inner, key, target_name);
+        if outcome.should_destroy {
+            inner.channels.remove(key);
+            inner.subscribers.remove(key);
+        }
+        ModResult::Ok {
+            target_out,
+            new_operator: outcome.new_operator,
+        }
+    }
+
+    /// Nominate the session shown as `target_name` as the operator's heir.
+    pub fn channel_designate(&self, key: &[u8], actor: AccountId, target_name: &str) -> ModResult {
+        let mut inner = self.inner.lock().expect("node lock");
+        let Some(channel) = inner.channels.get_mut(key) else {
+            return ModResult::NotFound;
+        };
+        match channel.designate_by_name(actor, target_name) {
+            Ok(_heir) => ModResult::Ok {
+                target_out: None,
+                new_operator: None,
+            },
+            Err(OpError::NotOperator) => ModResult::NotOperator,
+            Err(OpError::NotPresent) => ModResult::NotFound,
+            Err(OpError::CannotTargetSelf) => ModResult::CannotTargetSelf,
+        }
+    }
+
+    /// Lift a channel ban on `target_account` (resolved by the caller from a name).
+    pub fn channel_unban(&self, key: &[u8], actor: AccountId, target_account: AccountId) -> ModResult {
+        let mut inner = self.inner.lock().expect("node lock");
+        let Some(channel) = inner.channels.get_mut(key) else {
+            return ModResult::NotFound;
+        };
+        match channel.unban(actor, target_account) {
+            Ok(_was_banned) => ModResult::Ok {
+                target_out: None,
+                new_operator: None,
+            },
+            Err(_) => ModResult::NotOperator,
+        }
     }
 
     /// Advertise (or re-advertise) a game. Keyed by lowercased name, so a host updating
