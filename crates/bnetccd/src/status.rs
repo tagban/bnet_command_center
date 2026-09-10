@@ -346,17 +346,18 @@ ul { margin:6px 0; padding-left:20px; }
 <li><b>Staff:</b> <code>/tagban &lt;text&gt;</code>, <code>/ipban &lt;user&gt; [hrs]</code>, <code>/mute &lt;user&gt; [hrs]</code>, and their inverses, plus <code>/bans</code>.</li>
 </ul>
 
-<h2>Discord updates <span class="pill">planned</span></h2>
-<div class="note">Not available in this release yet — this describes how it will work once enabled.</div>
-<p>You create a Discord channel webhook and put its URL in the config; the server posts to that channel. You never share the secret with anyone but your own config file. Planned <code>[discord]</code> options control <b>when</b> data is dropped into Discord:</p>
+<h2>Discord updates</h2>
+<p>Create a Discord channel <b>webhook</b> (Channel → Edit → Integrations → Webhooks) and put its URL in <code>[discord] webhook_url</code>; the server posts to that channel. The URL is a secret — it lives only in your config. Set it to empty (the default) to disable Discord entirely.</p>
 <table>
-<tr><th>Option</th><th>When it posts</th></tr>
-<tr><td><b>Periodic status</b></td><td>A recurring summary (configurable interval) — users online, channels, games, uptime.</td></tr>
-<tr><td><b>Up / down events</b></td><td>When the server starts, and on a clean shutdown — so you notice restarts.</td></tr>
-<tr><td><b>Milestones</b></td><td>Notable moments, e.g. a new peak-connections record.</td></tr>
-<tr><td><b>Games played, last N hours</b></td><td>A rolling count of games hosted in the last N hours, broken down per client/product (e.g. STAR / SEXP / W2BN).</td></tr>
+<tr><th>Config key</th><th>Effect</th></tr>
+<tr><td><code>webhook_url</code></td><td>The Discord webhook URL. Empty = Discord off.</td></tr>
+<tr><td><code>status_interval_mins</code></td><td>Minutes between periodic status posts (default 30).</td></tr>
+<tr><td><code>games_window_hours</code></td><td>Window for the "games hosted per client" figure (default 6).</td></tr>
+<tr><td><code>post_status</code></td><td>Post the periodic summary: users online, channels, live games, uptime, and games hosted per client over the window.</td></tr>
+<tr><td><code>post_events</code></td><td>Post on server start, shutdown, and restart.</td></tr>
+<tr><td><code>post_milestones</code></td><td>Post on a new peak-connections record.</td></tr>
 </table>
-<p class="muted">Each is individually switchable, so you can post just the periodic summary, only events, or everything.</p>
+<p class="muted">Each post type is switchable, so you can send just the periodic summary, only events, or everything. Posts are best-effort — a slow or failed post is dropped, never blocking the server.</p>
 
 </main></body></html>"##;
 

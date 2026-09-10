@@ -143,14 +143,21 @@ Two routes on the public port, for anyone:
 - **`/status.json`** — server name, MOTD, uptime, connections, users online, peak, and channel/game counts. It sends `Access-Control-Allow-Origin: *`, so a site (e.g. bnet.cc) can `fetch()` it cross-origin and render its own widget. Set `[status] public_show_users = true` to also include the online-usernames list (off by default).
 - **`/`** — a ready-made status page that renders the feed and refreshes.
 
-### Discord updates *(planned — not in this release yet)*
+### Discord updates
 
-Point the server at a Discord channel **webhook** (you create it in Discord and put the URL in `bnetccd.toml`; the secret never leaves your config). Planned `[discord]` options control **when** data is posted, each switchable independently:
+Point the server at a Discord channel **webhook** (create it in Discord, paste the URL into `bnetccd.toml`; the secret never leaves your config). `[discord]` options control **when** data is posted, each switchable independently:
 
-- **Periodic status** — a recurring summary (configurable interval): users online, channels, games, uptime.
-- **Up / down events** — a message on startup and clean shutdown.
-- **Milestones** — e.g. a new peak-connections record.
-- **Games played, last *N* hours** — a rolling count of games hosted in the window, broken down per client/product.
+```toml
+[discord]
+webhook_url = "https://discord.com/api/webhooks/…"  # empty (default) disables Discord
+status_interval_mins = 30    # periodic summary cadence
+games_window_hours = 6       # window for "games hosted per client"
+post_status = true           # users online, channels, live games, uptime, games/client
+post_events = true           # server start / shutdown / restart
+post_milestones = true       # e.g. a new peak-connections record
+```
+
+Posts are best-effort — a slow or failed post is logged and dropped, never blocking the server. The webhook client rides the existing rustls stack (no HTTP-client dependency).
 
 ---
 

@@ -419,6 +419,10 @@ struct Bncs {
     /// Fired by staff moderation (a tag ban or IP ban) to force this session off. The read
     /// loop selects on it and breaks, so cleanup runs normally — unlike aborting the task.
     kill: Arc<tokio::sync::Notify>,
+    /// Whether this session currently has a game advertised. Set on the first `STARTADVEX3`
+    /// and cleared when the game stops, so re-advertisements (state updates) do not re-count
+    /// the game in the hosted-games metric.
+    hosting_game: bool,
 }
 
 async fn bncs_session(
@@ -452,6 +456,7 @@ async fn bncs_session(
         flood,
         muted_until_ms: 0,
         kill: Arc::new(tokio::sync::Notify::new()),
+        hosting_game: false,
     };
 
     // Real Battle.net (and Atlas) send SID_PING (0x25) as soon as a game client connects,
@@ -2088,6 +2093,13 @@ impl Bncs {
         let ok = self.node.advertise_game(ad);
         if ok {
             info!(peer = %self.peer, account = %account.name, "game advertised");
+            // Count a game only on its first advertisement; STARTADVEX3 re-fires for state
+            // updates while the game is live.
+            if !self.hosting_game {
+                self.hosting_game = true;
+                let product = self.product.map_or_else(|| "unknown".to_string(), |p| p.to_string());
+                self.node.record_hosted_game(&product);
+            }
         }
         let mut w = Writer::with_capacity(4);
         w.u32(if ok {
@@ -2104,6 +2116,8 @@ impl Bncs {
         if let Some(account) = &self.account {
             self.node.withdraw_game(account.id);
         }
+        // The game is over; a later STARTADVEX3 starts a new one and counts again.
+        self.hosting_game = false;
         Step::Continue
     }
 

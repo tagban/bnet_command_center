@@ -4,6 +4,7 @@
 
 mod admin;
 mod config;
+mod discord;
 mod moderation;
 mod node;
 mod public_status;
@@ -211,6 +212,13 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
     // below and exits with RESTART_EXIT_CODE so the launcher-supervisor relaunches us.
     let restart = Arc::new(tokio::sync::Notify::new());
 
+    // Optional Discord webhook updates. The updater runs on its own task; `discord_cfg` is
+    // kept for the start/stop/restart event posts around this function.
+    let discord_cfg = cfg.discord.clone();
+    if !discord_cfg.webhook_url.trim().is_empty() {
+        tokio::spawn(discord::run(Arc::clone(&node), discord_cfg.clone()));
+    }
+
     // Optional HTTPS admin panel. Off unless configured; a bad address, admin-secret error,
     // or bind failure is logged and never blocks the node from serving clients. The admin
     // credentials + self-signed cert live in `bnetccd-admin/` next to the account database.
@@ -327,12 +335,14 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!(connections = node.connection_count(), "shutdown signal received; stopping");
+            discord::post_event(&discord_cfg, &format!("🔴 **{}** is shutting down.", node.name)).await;
             Ok(())
         }
         () = restart.notified() => {
             // Exit with the agreed code so the launcher-supervisor relaunches us with the
             // (possibly just-edited) config. A standalone daemon simply exits.
             info!(connections = node.connection_count(), "restart requested via admin panel; exiting for relaunch");
+            discord::post_event(&discord_cfg, &format!("🔄 **{}** is restarting.", node.name)).await;
             std::process::exit(RESTART_EXIT_CODE);
         }
     }

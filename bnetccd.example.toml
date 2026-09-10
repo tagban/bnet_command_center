@@ -45,6 +45,17 @@ public_listen = ""
 # only; who is online is opt-in.
 public_show_users = false
 
+[discord]
+# Post server updates to a Discord channel webhook. Empty (the default) disables Discord.
+# Create the webhook in Discord (Channel > Edit > Integrations > Webhooks); the URL is a
+# secret and lives only here. Posts are best-effort and never block the server.
+webhook_url = ""
+status_interval_mins = 30   # cadence of the periodic status summary
+games_window_hours = 6      # window for the "games hosted per client" figure
+post_status = true          # users online, channels, live games, uptime, games/client
+post_events = true          # server start / shutdown / restart
+post_milestones = true      # e.g. a new peak-connections record
+
 [limits]
 # 0 means "derive from RLIMIT_NOFILE", reserving 64 descriptors for listeners, logs and
 # storage handles. The effective ceiling is logged at INFO on startup — you should never

@@ -25,6 +25,9 @@ toml_edit = "0.22"
 tokio-rustls.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
+# Mozilla root certificates for the outbound Discord webhook client (reuses the tokio-rustls
+# stack already here rather than pulling a full HTTP client).
+webpki-roots = "0.26"
 rcgen.workspace = true
 argon2.workspace = true
 rand.workspace = true

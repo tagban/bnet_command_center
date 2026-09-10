@@ -308,6 +308,10 @@ pub struct Node {
     pub files_dir: Option<std::path::PathBuf>,
     /// When this node started, for the status UI's uptime figure.
     started: std::time::Instant,
+    /// Rolling log of hosted-game starts as `(product, when)`, for the Discord "games played
+    /// in the last N hours per client" figure. One entry per game session (first advertise);
+    /// pruned to the query window and hard-capped so it cannot grow without bound.
+    game_log: Mutex<Vec<(String, std::time::Instant)>>,
     /// Display names currently in use across the whole node (lowercased). A second login of
     /// an account already online is disambiguated with `#2`, `#3`… so both can coexist.
     active_names: Mutex<HashSet<String>>,
@@ -417,6 +421,7 @@ impl Node {
             files_dir: cfg.files_dir,
             started: std::time::Instant::now(),
             active_names: Mutex::new(HashSet::new()),
+            game_log: Mutex::new(Vec::new()),
             inner: Mutex::new(Inner::default()),
             admission: Mutex::new(admission),
             connections: AtomicU64::new(0),
@@ -1040,6 +1045,36 @@ impl Node {
     #[must_use]
     pub fn uptime_secs(&self) -> u64 {
         self.started.elapsed().as_secs()
+    }
+
+    /// Record one hosted-game start under `product` (its FourCC, e.g. `STAR`). Called once per
+    /// game session, on its first advertisement.
+    pub fn record_hosted_game(&self, product: &str) {
+        let mut log = self.game_log.lock().expect("game log lock");
+        log.push((product.to_string(), std::time::Instant::now()));
+        // Hard cap so a very long-running, very busy node cannot grow this without bound
+        // between prunes; the newest entries are the ones the window cares about.
+        const CAP: usize = 100_000;
+        if log.len() > CAP {
+            let excess = log.len() - CAP;
+            log.drain(0..excess);
+        }
+    }
+
+    /// Games hosted within `window`, counted per product (sorted by product). Prunes entries
+    /// older than the window as a side effect.
+    #[must_use]
+    pub fn games_hosted_since(&self, window: std::time::Duration) -> Vec<(String, usize)> {
+        let cutoff = std::time::Instant::now().checked_sub(window);
+        let mut log = self.game_log.lock().expect("game log lock");
+        if let Some(cutoff) = cutoff {
+            log.retain(|(_, t)| *t >= cutoff);
+        }
+        let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for (product, _) in log.iter() {
+            *counts.entry(product.clone()).or_default() += 1;
+        }
+        counts.into_iter().collect()
     }
 
     /// How many sessions are logged in (past the CD-key/logon handshake).

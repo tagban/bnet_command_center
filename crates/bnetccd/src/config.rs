@@ -39,6 +39,43 @@ pub struct Config {
     pub channels: ChannelsConfig,
     /// Optional read-only status UI.
     pub status: StatusConfig,
+    /// Optional Discord webhook updates.
+    pub discord: DiscordConfig,
+}
+
+/// Discord webhook updates (see `crate::discord`). Disabled unless `webhook_url` is set.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DiscordConfig {
+    /// Discord channel webhook URL. Empty (the default) disables all Discord posting. The
+    /// operator creates the webhook in Discord and pastes the URL here; it is a secret.
+    pub webhook_url: String,
+    /// Minutes between periodic status posts.
+    pub status_interval_mins: u64,
+    /// Window, in hours, for the "games played per client" figure in the status post.
+    pub games_window_hours: u64,
+    /// Post the periodic status summary.
+    pub post_status: bool,
+    /// Post server start/stop/restart events.
+    pub post_events: bool,
+    /// Post milestones (e.g. a new peak-connections record).
+    pub post_milestones: bool,
+}
+
+impl Default for DiscordConfig {
+    fn default() -> Self {
+        // When a `[discord]` section is present the operator opts in per field, but the
+        // sensible baseline (used for any field they omit) is "post everything, every 30
+        // minutes, over a 6-hour games window". `webhook_url` empty is what keeps it off.
+        Self {
+            webhook_url: String::new(),
+            status_interval_mins: 30,
+            games_window_hours: 6,
+            post_status: true,
+            post_events: true,
+            post_milestones: true,
+        }
+    }
 }
 
 /// The admin panel (`crate::status`) and the public status endpoint (`crate::public_status`).
