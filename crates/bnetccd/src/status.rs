@@ -865,6 +865,9 @@ const DASHBOARD: &str = r##"<!doctype html>
   header h1 { font-size:16px; margin:0; font-weight:600; }
   header .name { color:var(--accent); }
   header .meta { color:var(--muted); font-size:12px; }
+  header nav { margin-left:auto; }
+  header nav a { color:var(--accent); text-decoration:none; font-size:13px; }
+  header nav a:hover { text-decoration:underline; }
   .stale { color:#e6a15a; }
   main { padding:20px; display:grid; gap:20px; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); align-items:start; }
   .tiles { display:flex; gap:14px; flex-wrap:wrap; grid-column:1/-1; }
@@ -887,6 +890,7 @@ const DASHBOARD: &str = r##"<!doctype html>
 <header>
   <h1>BNET Command Center · <span class="name" id="server">…</span></h1>
   <span class="meta" id="meta"></span>
+  <nav><a href="/settings">Settings</a> · <a href="/change-password">Password</a></nav>
 </header>
 <main>
   <div class="tiles">
