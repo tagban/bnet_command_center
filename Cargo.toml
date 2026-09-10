@@ -8,6 +8,7 @@ members = [
     "crates/smoke",
     "crates/bnetccd",
     "crates/bnetcc-storage-sqlite",
+    "crates/bnetcc-launcher",
 ]
 
 [workspace.package]
@@ -15,7 +16,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/YOURORG/bnet-command-center"
+repository = "https://github.com/tagban/bnet_command_center"
 
 [workspace.dependencies]
 bytes = "1"

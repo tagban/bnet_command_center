@@ -156,6 +156,13 @@ name = "bnetcc-crypto"
 version = "0.1.0"
 
 [[package]]
+name = "bnetcc-launcher"
+version = "0.1.0"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "bnetcc-proto"
 version = "0.1.0"
 
