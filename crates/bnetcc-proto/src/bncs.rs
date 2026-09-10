@@ -181,6 +181,11 @@ pub mod sid {
     pub const CLIENTID2: u8 = 0x1E;
     /// Legacy logon: client system information. Informational; no reply.
     pub const SYSTEMINFO: u8 = 0x2B;
+    /// Post-game result report a hosting client sends when a game ends (observed from a real
+    /// W2BN host, 2026-09-09: ~590 bytes, body carries player names + `On map "…"`). Feeds
+    /// per-account win/loss records and the ladder. Wire format still being decoded — see
+    /// `Bncs::game_result`.
+    pub const GAMERESULT: u8 = 0x2C;
     /// Legacy logon: CD-key check for the old flow.
     pub const CDKEY: u8 = 0x30;
     /// Legacy logon: CD-key check, hashed form (War2 BNE and later old clients use this

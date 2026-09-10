@@ -37,6 +37,18 @@ pub struct Config {
     pub admins: AdminsConfig,
     /// Channel behaviour.
     pub channels: ChannelsConfig,
+    /// Optional read-only status UI.
+    pub status: StatusConfig,
+}
+
+/// Optional read-only status dashboard (see `crate::status`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StatusConfig {
+    /// Address to serve the status UI on, e.g. `"127.0.0.1:6114"`. Empty (the default)
+    /// disables it. **Keep it on `127.0.0.1`** — it exposes operational detail (who is
+    /// online, games, channels) and has no authentication.
+    pub listen: String,
 }
 
 /// Channel behaviour.
@@ -51,8 +63,15 @@ pub struct ChannelsConfig {
     /// may enter public channels only — the default), `"none"` (no channels), or `"all"`.
     /// A per-channel `telnet` setting in `[[channels.defined]]` overrides this.
     pub telnet_access: String,
-    /// Pre-defined channels with fixed properties, applied when the channel is created.
-    /// Names not listed here fall back to the name-convention behaviour.
+    /// Maximum users in a **private** (user-created) channel. **`0` means unlimited.**
+    pub private_max: usize,
+    /// Maximum users in a **`Public *`** channel. **`0` means unlimited.**
+    pub public_max: usize,
+    /// Maximum users in an **`Op`/`Clan`** channel. **`0` means unlimited.**
+    pub clan_max: usize,
+    /// Pre-defined channels with fixed properties, applied when the channel is created. A
+    /// `max_users` set on a defined channel overrides the per-category default above (and
+    /// `0` there is unlimited too).
     pub defined: Vec<ChannelDef>,
 }
 
@@ -61,6 +80,10 @@ impl Default for ChannelsConfig {
         Self {
             auto_op_private: false,
             telnet_access: "public".to_string(),
+            // Uncapped by default — operators set a cap deliberately if they want one.
+            private_max: 0,
+            public_max: 0,
+            clan_max: 0,
             defined: Vec::new(),
         }
     }

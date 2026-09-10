@@ -5,6 +5,7 @@
 mod config;
 mod node;
 mod session;
+mod status;
 mod storage;
 mod udp;
 
@@ -175,10 +176,30 @@ async fn run(cfg: Config) -> Result<(), String> {
             auto_op_private: cfg.channels.auto_op_private,
             channel_rules: cfg.channel_rules()?,
             cd_key_uniqueness: cfg.limits.cd_key_uniqueness,
+            channel_caps: node::ChannelCaps {
+                private: cfg.channels.private_max,
+                public: cfg.channels.public_max,
+                clan: cfg.channels.clan_max,
+            },
             udp_socket,
         },
         storage,
     ));
+
+    // Optional read-only status UI. Off unless configured; a bad address or bind failure is
+    // logged and never blocks the node from serving clients.
+    if !cfg.status.listen.is_empty() {
+        match cfg.status.listen.parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                tokio::spawn(status::run(addr, Arc::clone(&node)));
+            }
+            Err(e) => warn!(
+                listen = %cfg.status.listen,
+                error = %e,
+                "invalid status.listen; status UI disabled"
+            ),
+        }
+    }
 
     let limits = SessionLimits {
         max_frame: cfg.limits.max_frame_bytes,

@@ -596,6 +596,9 @@ impl Bncs {
             // "authenticated" before the game can start. We approve every map — see the
             // handler; refusing leaves the host stuck on "Unable to authenticate map".
             sid::CHECKDATAFILE2 => self.check_data_file2(frame),
+            // Post-game result report — the data behind win/loss records and the ladder.
+            // Currently capture-only while the wire format is decoded; see the handler.
+            sid::GAMERESULT => self.game_result(frame).await,
             // Legacy CD-key checks (old-logon flow). We accept the key — CD-key uniqueness
             // is enforced on the modern AUTH_CHECK path via KeyRegistry, not here.
             sid::CDKEY => self.cd_key_reply(sid::CDKEY),
@@ -611,7 +614,7 @@ impl Bncs {
             // Profile reads. Returns empty for every key for now — see the handler; this
             // keeps CVE-2004-2705 shut (no account's keys are ever returned) while letting
             // the client's login-screen and profile reads complete instead of hanging.
-            sid::READUSERDATA => self.read_user_data(frame),
+            sid::READUSERDATA => self.read_user_data(frame).await,
             // Keepalive, the UDP detection reply, legacy-logon informational packets, and
             // advertisement telemetry — all accepted but not acted on. FRIENDSLIST is
             // accepted here too; serving real friends data is future work (docs/ROADMAP.md).
@@ -1030,28 +1033,41 @@ impl Bncs {
     /// id, then the account names and key names. The reply echoes the counts and id, then
     /// `accounts * keys` value strings.
     ///
-    /// **Security:** this is CVE-2004-2705's exact vector — a server that returns any key
-    /// of any account leaks password digests. Until per-key ACLs
-    /// (`bnetcc_storage::attr::AttrSchema::filter_readable`) are wired to this path, we
-    /// return an **empty** value for every requested cell. No account data is ever
-    /// disclosed; the client simply sees blank profile fields.
-    fn read_user_data(&mut self, frame: &Frame) -> Step {
+    /// **Security:** this is CVE-2004-2705's exact vector — a server that returns any key of
+    /// any account leaks password digests. Every value here goes through
+    /// `bnetcc_storage::attr::AttrSchema::filter_readable` at the `Actor::Other` level (in
+    /// the storage actor), so only world-readable keys — game records, profile fields,
+    /// non-secret system keys — are ever returned; the password digest and unknown/private
+    /// keys resolve to an empty cell by construction, not by this handler remembering to
+    /// check. Requested keys the account does not have also come back empty.
+    async fn read_user_data(&mut self, frame: &Frame) -> Step {
         let mut r = frame.reader();
-        let parsed = (|| {
-            let accounts = r.u32()?;
-            let keys = r.u32()?;
+        let parsed = (|| -> Result<(usize, usize, u32, Vec<String>, Vec<String>), bnetcc_proto::ProtoError> {
+            let accounts = (r.u32()? as usize).min(64);
+            let keys = (r.u32()? as usize).min(64);
             let request_id = r.u32()?;
-            Ok::<_, bnetcc_proto::ProtoError>((accounts, keys, request_id))
+            let mut account_names = Vec::with_capacity(accounts);
+            for _ in 0..accounts {
+                account_names.push(String::from_utf8_lossy(r.cstr(64)?).into_owned());
+            }
+            let mut key_names = Vec::with_capacity(keys);
+            for _ in 0..keys {
+                key_names.push(String::from_utf8_lossy(r.cstr(256)?).into_owned());
+            }
+            Ok((accounts, keys, request_id, account_names, key_names))
         })();
-        let Ok((accounts, keys, request_id)) = parsed else {
+        let Ok((accounts, keys, request_id, account_names, key_names)) = parsed else {
             return Step::Close;
         };
-        // Bound the response so a malformed request cannot make us emit a huge frame.
-        let cells = (accounts as u64).saturating_mul(keys as u64).min(256) as usize;
-        let mut w = Writer::with_capacity(16 + cells);
-        w.u32(accounts).u32(keys).u32(request_id);
-        for _ in 0..cells {
-            w.cstr(b""); // ACL-filtered value; empty until real filtering is wired.
+        let attr_keys: Vec<bnetcc_storage::attr::AttrKey> =
+            key_names.iter().map(|k| bnetcc_storage::attr::AttrKey::new(k)).collect();
+        let mut w = Writer::with_capacity(32 + accounts * keys);
+        w.u32(accounts as u32).u32(keys as u32).u32(request_id);
+        for name in &account_names {
+            let readable = self.node.read_readable_attrs(name, attr_keys.clone()).await;
+            for key in &attr_keys {
+                w.cstr(readable.get(key).map_or(b"".as_slice(), |v| v.as_bytes()));
+            }
         }
         self.send(&Frame::new(sid::READUSERDATA, w.finish()))
     }
@@ -1378,12 +1394,57 @@ impl Bncs {
                 let msg = format!("You are {}{op}.", account.name);
                 self.send(&chat_event(EventId::Info, 0, 0, b"", msg.as_bytes()))
             }
+            "ver" | "version" => {
+                let msg = format!(
+                    "{} — bnetccd v{}",
+                    self.node.name,
+                    env!("CARGO_PKG_VERSION")
+                );
+                self.send(&chat_event(EventId::Info, 0, 0, b"", msg.as_bytes()))
+            }
+            "who" | "users" => {
+                // With no argument, list the current channel; otherwise the named one.
+                let target_key = if _arg.is_empty() {
+                    key.to_vec()
+                } else {
+                    normalize_channel_name(_arg.as_bytes())
+                };
+                let names = self.node.channel_occupant_names(&target_key);
+                if names.is_empty() {
+                    return self.send(&chat_event(
+                        EventId::Info,
+                        0,
+                        0,
+                        b"",
+                        b"No such channel, or it is empty.",
+                    ));
+                }
+                let header = format!("Users in channel ({}): {}", names.len(), names.join(", "));
+                self.send(&chat_event(EventId::Info, 0, 0, b"", header.as_bytes()))
+            }
+            "help" | "?" => {
+                // Keep this list in sync with the arms above. Operator/moderation and
+                // whisper/friends commands are not yet implemented (they need cross-session
+                // routing and per-channel op/ban state) — see docs/ROADMAP.md.
+                for line in [
+                    "Commands: /help, /join <channel>, /me <action>, /who [channel],",
+                    "  /whoami, /ver",
+                ] {
+                    if matches!(
+                        self.send(&chat_event(EventId::Info, 0, 0, b"", line.as_bytes())),
+                        Step::Close
+                    ) {
+                        return Step::Close;
+                    }
+                }
+                Step::Continue
+            }
             _ => self.send(&chat_event(
                 EventId::Error,
                 0,
                 0,
                 b"",
-                b"That is not a valid command.",
+                b"That is not a valid command. Type /help for the list.",
             )),
         }
     }
@@ -1581,6 +1642,69 @@ impl Bncs {
         w.u32(1); // 1 = approved
         self.send(&Frame::new(sid::CHECKDATAFILE2, w.finish()))
     }
+
+    /// `SID_GAMERESULT` (0x2C): a host reports the outcome of a finished game. Body layout,
+    /// decoded from a real W2BN host (2026-09-09): `(u32)` header, `(u32)` slot count,
+    /// `(u32)[count]` per-slot result codes (1 win, 2 loss, 3 draw, 4 disconnect, 0 empty),
+    /// `(cstring)[count]` player names, then a human-readable score-screen string.
+    ///
+    /// We record **only the reporting account's own slot**, matched by name: a client must
+    /// not be able to report outcomes for other players (the classic ladder-forgery vector —
+    /// every player's client reports its own game). The outcome increments the PvPGN-style
+    /// `Record\<product>\0\wins`/`losses`/`draws`/`disconnects` counters, served back via
+    /// `SID_READUSERDATA`. No reply is expected. A solo game reports a draw, not a loss.
+    async fn game_result(&mut self, frame: &Frame) -> Step {
+        let Some(account) = self.account.clone() else {
+            return Step::Continue;
+        };
+        let Some(product) = self.product.map(|p| p.to_string()) else {
+            return Step::Continue;
+        };
+        let mut r = frame.reader();
+        let parsed = (|| -> Result<(Vec<u32>, Vec<String>), bnetcc_proto::ProtoError> {
+            let _header = r.u32()?;
+            let count = (r.u32()? as usize).min(16);
+            let mut results = Vec::with_capacity(count);
+            for _ in 0..count {
+                results.push(r.u32()?);
+            }
+            let mut names = Vec::with_capacity(count);
+            for _ in 0..count {
+                names.push(String::from_utf8_lossy(r.cstr(64)?).into_owned());
+            }
+            Ok((results, names))
+        })();
+        let Ok((results, names)) = parsed else {
+            debug!(peer = %self.peer, "malformed SID_GAMERESULT; ignoring");
+            return Step::Continue;
+        };
+        let outcome = names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(&account.name))
+            .and_then(|i| results.get(i).copied())
+            .and_then(crate::storage::GameOutcome::from_code);
+        match outcome {
+            Some(o) => match self.node.record_game(account.id, &product, o).await {
+                Ok(total) => info!(
+                    peer = %self.peer,
+                    account = %account.name,
+                    product = %product,
+                    outcome = ?o,
+                    new_total = total,
+                    "recorded game result"
+                ),
+                Err(e) => {
+                    warn!(peer = %self.peer, error = %e, "failed to record game result")
+                }
+            },
+            None => debug!(
+                peer = %self.peer,
+                account = %account.name,
+                "SID_GAMERESULT carried no recordable result for this player"
+            ),
+        }
+        Step::Continue
+    }
 }
 
 fn encode(frame: &Frame) -> Option<Wire> {
@@ -1712,17 +1836,25 @@ mod tests {
     /// tests do not care about: `SID_PING` (sent on connect and unprompted) and
     /// `SID_CHATEVENT` (MOTD, joins, and other async chat events).
     async fn recv_frame(stream: &mut TcpStream) -> Frame {
-        let mut buf = RecvBuf::with_capacity(256);
         loop {
-            match decode_frame(&mut buf, DEFAULT_MAX_FRAME) {
-                Ok(Some(f)) if f.id == sid::PING || f.id == sid::CHATEVENT => continue,
-                Ok(Some(f)) => return f,
-                _ => {}
+            // Read *exactly* one frame. TCP may deliver several frames in a single read, so a
+            // helper that buffered locally and returned the first would discard the surplus
+            // bytes when its buffer dropped — a timing-dependent flake under load (the next
+            // call would read fresh and miss the already-consumed frame). Reading the 4-byte
+            // header, then exactly `len - 4` body bytes (`len` includes the header), never
+            // consumes past the frame boundary, so no state has to persist between calls.
+            let mut header = [0u8; bnetcc_proto::bncs::HEADER_LEN];
+            stream.read_exact(&mut header).await.expect("read frame header");
+            assert_eq!(header[0], bnetcc_proto::bncs::MAGIC, "bad frame magic");
+            let id = header[1];
+            let total = u16::from_le_bytes([header[2], header[3]]) as usize;
+            let mut body = vec![0u8; total.saturating_sub(bnetcc_proto::bncs::HEADER_LEN)];
+            stream.read_exact(&mut body).await.expect("read frame body");
+            // Skip keepalives and asynchronous chat events, as before.
+            if id == sid::PING || id == sid::CHATEVENT {
+                continue;
             }
-            let tail = buf.writable_tail(256);
-            let n = stream.read(tail).await.expect("read");
-            assert_ne!(n, 0, "peer closed before sending a frame");
-            buf.commit(n, 256);
+            return Frame { id, body }
         }
     }
 

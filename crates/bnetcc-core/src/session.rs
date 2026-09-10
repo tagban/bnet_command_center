@@ -162,6 +162,7 @@ impl SessionState {
                     | sid::NEWS_INFO
                     | sid::GETADVLISTEX
                     | sid::STARTADVEX3
+                    | sid::GAMERESULT
                     | sid::NOTIFYJOIN
                     | sid::LEAVEGAME
                     | sid::QUERYREALMS2

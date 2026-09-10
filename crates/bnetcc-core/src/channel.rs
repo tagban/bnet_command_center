@@ -261,7 +261,8 @@ impl Channel {
         if self.position(account).is_some() {
             return Err(JoinDenial::AlreadyPresent);
         }
-        if self.members.len() >= self.max_users {
+        // `max_users == 0` means unlimited — there is no cap to hit.
+        if self.max_users != 0 && self.members.len() >= self.max_users {
             return Err(JoinDenial::Full);
         }
 

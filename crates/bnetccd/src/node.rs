@@ -161,14 +161,16 @@ pub struct Node {
     pub name: String,
     /// Message of the day.
     pub motd: String,
-    /// Maximum users per channel.
-    pub channel_max_users: usize,
+    /// Per-category default channel size caps (`0` = unlimited).
+    pub channel_caps: ChannelCaps,
     /// Configured advertisement banners. Empty means we never answer `SID_CHECKAD`,
     /// which leaves the client showing whatever it already has.
     pub ads: AdRotation,
     /// Directory of operator-supplied files served over BNFTP (version-check MPQ,
     /// `icons.bni`, `tos.txt`, ad images). `None` refuses every BNFTP request.
     pub files_dir: Option<std::path::PathBuf>,
+    /// When this node started, for the status UI's uptime figure.
+    started: std::time::Instant,
     inner: Mutex<Inner>,
     /// One table for every client class. Counts are keyed by `(class, address)`, so a
     /// Brood War client and a chat-gateway bot from the same address are accounted
@@ -212,9 +214,37 @@ pub struct NodeConfig {
     pub channel_rules: crate::config::ChannelRules,
     /// Whether to enforce one live session per CD key. Off lets a fleet share a key.
     pub cd_key_uniqueness: bool,
+    /// Per-category default channel size caps (`0` = unlimited).
+    pub channel_caps: ChannelCaps,
     /// Shared UDP socket bound to `:6112` for sending the login-time UDP ping; `None` if the
     /// bind failed (classic clients then keep the No-UDP flag and games stay greyed).
     pub udp_socket: Option<Arc<tokio::net::UdpSocket>>,
+}
+
+/// Default per-category channel size caps. `0` means unlimited for that category. A
+/// per-channel `max_users` in `[[channels.defined]]` overrides the category default.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChannelCaps {
+    /// Private (user-created) channels.
+    pub private: usize,
+    /// `Public *` channels.
+    pub public: usize,
+    /// `Op`/`Clan` channels.
+    pub clan: usize,
+}
+
+impl ChannelCaps {
+    /// The cap for a channel, chosen from its name category (see
+    /// [`bnetcc_core::channel::classify_name`]). `Op` and `Clan` share the clan cap.
+    #[must_use]
+    pub fn for_name(&self, display: &str) -> usize {
+        use bnetcc_core::channel::NameKind;
+        match bnetcc_core::channel::classify_name(display) {
+            NameKind::Public => self.public,
+            NameKind::OpOrClan => self.clan,
+            NameKind::Private => self.private,
+        }
+    }
 }
 
 impl Node {
@@ -233,9 +263,10 @@ impl Node {
             udp_socket: cfg.udp_socket,
             name: cfg.name,
             motd: cfg.motd,
-            channel_max_users: 40,
+            channel_caps: cfg.channel_caps,
             ads: AdRotation::default(),
             files_dir: cfg.files_dir,
+            started: std::time::Instant::now(),
             inner: Mutex::new(Inner::default()),
             admission: Mutex::new(admission),
             connections: AtomicU64::new(0),
@@ -306,6 +337,27 @@ impl Node {
     /// Look up an account by name, case-insensitively.
     pub async fn account(&self, name: &str) -> Option<Account> {
         self.storage.account_by_name(name).await
+    }
+
+    /// Record one finished-game outcome against an account's `Record\<product>\0\` counters.
+    /// Returns the new counter value, or an error string for logging.
+    pub async fn record_game(
+        &self,
+        account_id: bnetcc_core::AccountId,
+        product: &str,
+        outcome: crate::storage::GameOutcome,
+    ) -> Result<u64, String> {
+        self.storage.record_game(account_id, product, outcome).await
+    }
+
+    /// Read the given attribute keys for an account by name, filtered to what any peer may
+    /// read (records, profile, non-secret system keys). Safe to return to a client.
+    pub async fn read_readable_attrs(
+        &self,
+        account_name: &str,
+        keys: Vec<bnetcc_storage::attr::AttrKey>,
+    ) -> bnetcc_storage::attr::AttrMap {
+        self.storage.read_readable_attrs(account_name, keys).await
     }
 
     /// Create an account.
@@ -389,6 +441,63 @@ impl Node {
         names
     }
 
+    /// Display names of everyone currently in the channel keyed by `key` (already
+    /// normalised), for the `/who` command. Empty if no such live channel exists.
+    #[must_use]
+    pub fn channel_occupant_names(&self, key: &[u8]) -> Vec<String> {
+        let inner = self.inner.lock().expect("node lock");
+        inner
+            .channels
+            .get(key)
+            .map(|c| c.members().iter().map(|m| m.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// A read-only snapshot of the node for the status UI (`crate::status`). Takes the node
+    /// lock once and copies out owned, serialisable data.
+    #[must_use]
+    pub fn status_snapshot(&self) -> crate::status::Snapshot {
+        let now = std::time::Instant::now();
+        // `connection_count` reads an atomic, not the node lock, so taking it inside the
+        // lock below is safe.
+        let connections = self.connection_count();
+        let inner = self.inner.lock().expect("node lock");
+        let mut channels: Vec<crate::status::ChannelInfo> = inner
+            .channels
+            .values()
+            .map(|c| {
+                let users: Vec<String> = c.members().iter().map(|m| m.name.clone()).collect();
+                crate::status::ChannelInfo {
+                    name: c.display().to_string(),
+                    user_count: users.len(),
+                    users,
+                }
+            })
+            .collect();
+        channels.sort_by(|a, b| a.name.cmp(&b.name));
+        let online_users = channels.iter().map(|c| c.user_count).sum();
+        let mut games: Vec<crate::status::GameInfo> = inner
+            .games
+            .values()
+            .map(|g| crate::status::GameInfo {
+                name: String::from_utf8_lossy(&g.name).into_owned(),
+                host_ip: g.host_ip.to_string(),
+                port: g.port,
+                game_type: g.game_type,
+                elapsed_secs: now.saturating_duration_since(g.created).as_secs(),
+            })
+            .collect();
+        games.sort_by(|a, b| a.name.cmp(&b.name));
+        crate::status::Snapshot {
+            server_name: self.name.clone(),
+            uptime_secs: now.saturating_duration_since(self.started).as_secs(),
+            connections,
+            online_users,
+            channels,
+            games,
+        }
+    }
+
     /// Join a channel, creating it if it does not exist.
     ///
     /// Returns the roster as seen *before* this user arrived (for `EID_SHOWUSER`), plus
@@ -422,10 +531,15 @@ impl Node {
         let topic = rule.as_ref().and_then(|r| r.topic.clone());
 
         let mut inner = self.inner.lock().expect("node lock");
-        let default_max = self.channel_max_users;
+        let channel_caps = self.channel_caps;
         let auto_op_private = self.auto_op_private;
         let channel = inner.channels.entry(key.clone()).or_insert_with(|| {
-            let max_users = rule.as_ref().and_then(|r| r.max_users).unwrap_or(default_max);
+            // A defined channel's explicit max wins; otherwise the per-category default,
+            // chosen from the channel's name (private/public/clan). `0` = unlimited.
+            let max_users = rule
+                .as_ref()
+                .and_then(|r| r.max_users)
+                .unwrap_or_else(|| channel_caps.for_name(&display));
             let mut c = Channel::new(key.clone(), display.clone(), ChannelClass::Local, max_users);
             // A defined channel that is marked public never auto-ops; otherwise apply the
             // name convention ("Op <name>"/"Clan <name>" op only <name>, private per config).
@@ -599,6 +713,9 @@ pub(crate) fn test_node() -> Node {
             auto_op_private: true,
             channel_rules: crate::config::ChannelRules::default(),
             cd_key_uniqueness: true,
+            // Tests that exercise the size cap construct channels with an explicit max via
+            // bnetcc_core directly; the node default here is uncapped.
+            channel_caps: ChannelCaps::default(),
             udp_socket: None,
         },
         storage,
