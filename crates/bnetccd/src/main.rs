@@ -242,7 +242,19 @@ async fn run(cfg: Config) -> Result<(), String> {
     // Socket sharding: bind N SO_REUSEPORT listeners so several accept loops share the port
     // and the kernel spreads new connections across them (each with its own accept backlog).
     // `accept_shards = 1` is the ordinary single-listener case.
-    let shards = cfg.listen.accept_shards.clamp(1, 64);
+    let requested_shards = cfg.listen.accept_shards.clamp(1, 64);
+    // SO_REUSEPORT sharding is a Unix feature; on other platforms a single listener is used.
+    let shards = if cfg!(unix) {
+        requested_shards
+    } else {
+        if requested_shards > 1 {
+            warn!(
+                requested = requested_shards,
+                "accept_shards > 1 is not supported on this platform (no SO_REUSEPORT); using 1"
+            );
+        }
+        1
+    };
     let mut listeners = Vec::with_capacity(shards);
     for _ in 0..shards {
         listeners.push(
@@ -270,14 +282,18 @@ async fn run(cfg: Config) -> Result<(), String> {
     Ok(())
 }
 
-/// Build a listening socket with `SO_REUSEADDR` + `SO_REUSEPORT` so several accept loops can
-/// share one port; the kernel load-balances new connections across them. A backlog of 1024
-/// is requested per shard (the OS clamps it to `somaxconn`).
+/// Build a listening socket with `SO_REUSEADDR` (plus `SO_REUSEPORT` on Unix) so several
+/// accept loops can share one port; the kernel load-balances new connections across them. A
+/// backlog of 1024 is requested per shard (the OS clamps it to `somaxconn`).
+///
+/// `SO_REUSEPORT` does not exist on Windows, so it is set only on Unix; the shard count is
+/// forced to 1 elsewhere (see the shard loop in [`run`]).
 fn reuseport_listener(addr: std::net::SocketAddr) -> std::io::Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
     let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     sock.set_reuse_address(true)?;
+    #[cfg(unix)]
     sock.set_reuse_port(true)?;
     sock.set_nonblocking(true)?;
     sock.bind(&addr.into())?;
@@ -285,9 +301,6 @@ fn reuseport_listener(addr: std::net::SocketAddr) -> std::io::Result<TcpListener
     TcpListener::from_std(std::net::TcpListener::from(sock))
 }
 
-/// One accept loop for a (possibly sharded) listener: accept, apply the global connection
-/// ceiling, and spawn a session task per connection. A per-connection accept error (EMFILE,
-/// a peer that vanished) is logged and never ends the loop.
 /// Wall-clock milliseconds since the Unix epoch, for ban-expiry checks.
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -295,6 +308,9 @@ fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// One accept loop for a (possibly sharded) listener: accept, apply the global connection
+/// ceiling, and spawn a session task per connection. A per-connection accept error (EMFILE,
+/// a peer that vanished) is logged and never ends the loop.
 async fn accept_loop(
     listener: TcpListener,
     node: Arc<Node>,
