@@ -56,6 +56,15 @@ post_status = true          # users online, channels, live games, uptime, games/
 post_events = true          # server start / shutdown / restart
 post_milestones = true      # e.g. a new peak-connections record
 
+[stats_push]
+# Push the public status JSON to your own website on an interval. Outbound-only, so no port
+# to forward — the right model for a node behind residential NAT. Empty url = disabled. The
+# body is the same JSON as the public /status.json endpoint.
+url = ""                    # e.g. "https://mysite.com/bnet/ingest"
+interval_secs = 60
+token = ""                  # optional; sent as "Authorization: Bearer <token>" — a secret
+include_users = false       # include the online-usernames list in the pushed JSON
+
 [limits]
 # 0 means "derive from RLIMIT_NOFILE", reserving 64 descriptors for listeners, logs and
 # storage handles. The effective ceiling is logged at INFO on startup — you should never

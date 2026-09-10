@@ -41,6 +41,29 @@ pub struct Config {
     pub status: StatusConfig,
     /// Optional Discord webhook updates.
     pub discord: DiscordConfig,
+    /// Optional stats push to an external website.
+    pub stats_push: StatsPushConfig,
+}
+
+/// Push the public status JSON to an external URL on an interval (see `crate::stats_push`).
+/// Disabled unless `url` is set. Outbound-only, so it needs no forwarded port.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StatsPushConfig {
+    /// The `https://` endpoint on your site that receives the stats POST. Empty disables it.
+    pub url: String,
+    /// Seconds between pushes (minimum 5).
+    pub interval_secs: u64,
+    /// Optional bearer token; sent as `Authorization: Bearer <token>` if set. A secret.
+    pub token: String,
+    /// Whether the pushed JSON includes the online-usernames list.
+    pub include_users: bool,
+}
+
+impl Default for StatsPushConfig {
+    fn default() -> Self {
+        Self { url: String::new(), interval_secs: 60, token: String::new(), include_users: false }
+    }
 }
 
 /// Discord webhook updates (see `crate::discord`). Disabled unless `webhook_url` is set.

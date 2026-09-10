@@ -319,6 +319,17 @@ ul { margin:6px 0; padding-left:20px; }
 </ul>
 <p class="muted">Set <code>[status] public_show_users = true</code> to also list who is online; it is off by default (counts only).</p>
 
+<h2>Push stats to your own site</h2>
+<p>Instead of your site pulling the feed, the server can <b>POST</b> the same JSON to a URL you configure, on an interval. This is outbound-only, so a server behind a home router needs no extra forwarded port for it.</p>
+<table>
+<tr><th>Config key</th><th>Effect</th></tr>
+<tr><td><code>[stats_push] url</code></td><td>Your site's ingest endpoint (https). Empty = disabled.</td></tr>
+<tr><td><code>interval_secs</code></td><td>Seconds between pushes (minimum 5; default 60).</td></tr>
+<tr><td><code>token</code></td><td>Optional; sent as <code>Authorization: Bearer &lt;token&gt;</code> so your endpoint can authenticate the POST.</td></tr>
+<tr><td><code>include_users</code></td><td>Whether the pushed JSON includes the online-usernames list.</td></tr>
+</table>
+<p class="muted">The body is identical to <code>/status.json</code>. Best-effort, on its own task — a slow or failing endpoint never affects the server.</p>
+
 <h2>Configuration (<code>bnetccd.toml</code>)</h2>
 <p class="muted">Edit on the <a href="/settings">Settings</a> page (which writes the file and keeps a <code>.bak</code>) or by hand. Most changes apply on the next restart; the Restart button is on Settings.</p>
 <table>

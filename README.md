@@ -159,6 +159,25 @@ post_milestones = true       # e.g. a new peak-connections record
 
 Posts are best-effort — a slow or failed post is logged and dropped, never blocking the server. The webhook client rides the existing rustls stack (no HTTP-client dependency).
 
+### Push stats to your own site
+
+If you run a website elsewhere, the server can **POST** the status JSON to it on an interval — the same payload as `/status.json`. This is outbound-only, so a node behind residential NAT needs no forwarded port for it.
+
+```toml
+[stats_push]
+url = "https://mysite.com/bnet/ingest"   # empty (default) disables it
+interval_secs = 60
+token = ""              # optional; sent as "Authorization: Bearer <token>"
+include_users = false   # include the online-usernames list in the payload
+```
+
+Your endpoint receives a JSON body like:
+
+```json
+{"server_name":"…","motd":"…","version":"0.2.3","uptime_secs":3600,
+ "connections":42,"users_online":30,"peak_connections":51,"channels":4,"games":2}
+```
+
 ---
 
 ## Building

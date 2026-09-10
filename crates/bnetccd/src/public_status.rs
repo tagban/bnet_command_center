@@ -102,7 +102,9 @@ async fn read_path(stream: &mut TcpStream) -> Option<String> {
     }
 }
 
-fn json_response(node: &Node, show_users: bool) -> String {
+/// Build the public status feed as a JSON string. Shared by the public endpoint and the
+/// outbound stats push (`crate::stats_push`).
+pub(crate) fn snapshot_json(node: &Node, show_users: bool) -> String {
     let snap = PublicSnapshot {
         server_name: node.name.clone(),
         motd: node.motd.clone(),
@@ -115,8 +117,11 @@ fn json_response(node: &Node, show_users: bool) -> String {
         games: node.games().len(),
         users: show_users.then(|| node.online_names()),
     };
-    let body = serde_json::to_string(&snap).unwrap_or_else(|_| "{}".to_string());
-    http_response("200 OK", "application/json; charset=utf-8", &body, true)
+    serde_json::to_string(&snap).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn json_response(node: &Node, show_users: bool) -> String {
+    http_response("200 OK", "application/json; charset=utf-8", &snapshot_json(node, show_users), true)
 }
 
 /// Build an HTTP/1.1 response. `cors` adds `Access-Control-Allow-Origin: *` so the JSON feed

@@ -7,8 +7,10 @@ mod config;
 mod discord;
 mod moderation;
 mod node;
+mod outbound;
 mod public_status;
 mod session;
+mod stats_push;
 mod status;
 mod storage;
 mod udp;
@@ -217,6 +219,11 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
     let discord_cfg = cfg.discord.clone();
     if !discord_cfg.webhook_url.trim().is_empty() {
         tokio::spawn(discord::run(Arc::clone(&node), discord_cfg.clone()));
+    }
+
+    // Optional stats push to an external website (outbound-only, no forwarded port needed).
+    if !cfg.stats_push.url.trim().is_empty() {
+        tokio::spawn(stats_push::run(Arc::clone(&node), cfg.stats_push.clone()));
     }
 
     // Optional HTTPS admin panel. Off unless configured; a bad address, admin-secret error,
