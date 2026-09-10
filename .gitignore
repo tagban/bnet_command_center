@@ -4,6 +4,7 @@
 bnetccd.toml
 node.key
 /bnetccd-admin/
+/bnetccd-bans.json
 *.db
 *.db-wal
 *.db-shm

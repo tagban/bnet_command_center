@@ -24,22 +24,77 @@ use bnetcc_core::limits::{AdmissionTable, ClientClass, KeyId, KeyRegistry, KeyVe
 use bnetcc_core::policy::Policy;
 use bnetcc_proto::bncs::{encode_frame, Frame};
 use bnetcc_proto::chat::normalize_channel_name;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
+
+use crate::moderation::BanStore;
 
 /// Bytes ready for the wire, shared by every recipient of a broadcast.
 pub type Wire = Arc<Vec<u8>>;
+
+/// A per-session personal ignore ("squelch") list: the base account names whose channel
+/// chat this session does not want to see. Lives on [`Outbound`] so channel fan-out can
+/// consult the *recipient's* list cheaply. The `any` flag keeps the common case (nobody
+/// ignored) to a single relaxed load with no locking on the broadcast hot path.
+#[derive(Debug, Default)]
+pub struct IgnoreSet {
+    any: std::sync::atomic::AtomicBool,
+    names: Mutex<HashSet<String>>,
+}
+
+impl IgnoreSet {
+    /// Add a name (stored lowercased). Returns whether it was newly added.
+    pub fn add(&self, name: &str) -> bool {
+        let mut g = self.names.lock().expect("ignore lock");
+        let added = g.insert(name.to_ascii_lowercase());
+        self.any.store(!g.is_empty(), Ordering::Relaxed);
+        added
+    }
+
+    /// Remove a name. Returns whether it was present.
+    pub fn remove(&self, name: &str) -> bool {
+        let mut g = self.names.lock().expect("ignore lock");
+        let removed = g.remove(&name.to_ascii_lowercase());
+        self.any.store(!g.is_empty(), Ordering::Relaxed);
+        removed
+    }
+
+    /// Whether `lowercased` (an already-lowercased base name) is ignored. Short-circuits on
+    /// the empty case without locking.
+    #[must_use]
+    pub fn contains(&self, lowercased: &str) -> bool {
+        if !self.any.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.names.lock().expect("ignore lock").contains(lowercased)
+    }
+
+    /// The ignored names, for the `/squelch` listing.
+    #[must_use]
+    pub fn list(&self) -> Vec<String> {
+        self.names.lock().expect("ignore lock").iter().cloned().collect()
+    }
+}
 
 /// The write side of one connection.
 #[derive(Debug, Clone)]
 pub struct Outbound {
     tx: mpsc::Sender<Wire>,
+    /// This session's personal ignore list, shared across every clone of the handle (each
+    /// channel subscription is a clone), so a `/squelch` takes effect everywhere at once.
+    ignores: Arc<IgnoreSet>,
 }
 
 impl Outbound {
     /// Wrap a sender.
     #[must_use]
-    pub const fn new(tx: mpsc::Sender<Wire>) -> Self {
-        Self { tx }
+    pub fn new(tx: mpsc::Sender<Wire>) -> Self {
+        Self { tx, ignores: Arc::new(IgnoreSet::default()) }
+    }
+
+    /// This session's personal ignore list.
+    #[must_use]
+    pub fn ignores(&self) -> &Arc<IgnoreSet> {
+        &self.ignores
     }
 
     /// Queue pre-encoded bytes.
@@ -165,6 +220,18 @@ pub struct GameAd {
     pub created: std::time::Instant,
 }
 
+/// A logged-in session, registered so staff moderation can reach it across channels — to
+/// resolve its address for an IP ban, or to force it off for a tag ban.
+struct SessionEntry {
+    /// The peer address this session connected from.
+    ip: IpAddr,
+    /// Its write side, so a removal notice can be queued before it is cut.
+    out: Outbound,
+    /// A one-shot signal the read loop selects on; firing it makes the session close
+    /// cleanly (running its normal cleanup), unlike aborting the task.
+    kill: Arc<Notify>,
+}
+
 /// Everything one node shares between connections.
 pub struct Node {
     /// Effective policy, already narrowed by the hub if federated.
@@ -219,6 +286,11 @@ pub struct Node {
     /// (`record_key_holder_name`); empty until then, since `SID_AUTH_CHECK` happens
     /// before the account is known.
     key_holder_names: Mutex<HashMap<KeyId, String>>,
+    /// Staff-set tag bans, IP bans, and mutes, persisted to disk. See [`BanStore`].
+    pub bans: BanStore,
+    /// Every logged-in session, keyed by lowercased display name, so staff moderation can
+    /// reach a session in any channel (or none). Populated at logon, cleared on disconnect.
+    sessions: Mutex<HashMap<String, SessionEntry>>,
 }
 
 /// The config-derived settings a [`Node`] is built from, bundled so the constructor takes
@@ -250,6 +322,8 @@ pub struct NodeConfig {
     /// Shared UDP socket bound to `:6112` for sending the login-time UDP ping; `None` if the
     /// bind failed (classic clients then keep the No-UDP flag and games stay greyed).
     pub udp_socket: Option<Arc<tokio::net::UdpSocket>>,
+    /// Where to persist staff bans/mutes. `None` keeps them in memory only (tests).
+    pub bans_path: Option<std::path::PathBuf>,
 }
 
 /// Default per-category channel size caps. `0` means unlimited for that category. A
@@ -307,6 +381,8 @@ impl Node {
             // 500ms matches observed real-Battle.net behaviour — see KeyRegistry's docs.
             key_registry: Mutex::new(KeyRegistry::new(500)),
             key_holder_names: Mutex::new(HashMap::new()),
+            bans: BanStore::load(cfg.bans_path),
+            sessions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -808,7 +884,21 @@ impl Node {
     /// Encoding happens once in the caller; this clones an `Arc` per recipient. A
     /// subscriber whose queue is full is dropped from the fanout and returned, so the
     /// caller can close it — it must never block the other 199 users.
-    pub fn broadcast(&self, key: &[u8], wire: &Wire, exclude: Option<&str>) -> Vec<String> {
+    ///
+    /// `exclude` skips one session by its display name (real Battle.net does not echo your
+    /// own talk back to you). `sender_base`, when set, is the sender's *base* account name:
+    /// a recipient who has personally squelched that account is skipped, so `/squelch` hides
+    /// all of that account's sessions. System events (join/leave/kick) pass `None`.
+    pub fn broadcast(
+        &self,
+        key: &[u8],
+        wire: &Wire,
+        exclude: Option<&str>,
+        sender_base: Option<&str>,
+    ) -> Vec<String> {
+        // Lowercase the sender once (not per recipient); the empty-ignore fast path in
+        // `IgnoreSet::contains` means well-behaved channels never touch a lock here.
+        let sender_lc = sender_base.map(str::to_ascii_lowercase);
         let inner = self.inner.lock().expect("node lock");
         let Some(subs) = inner.subscribers.get(key) else {
             return Vec::new();
@@ -818,11 +908,74 @@ impl Node {
             if exclude.is_some_and(|e| name.eq_ignore_ascii_case(e)) {
                 continue;
             }
+            if let Some(sl) = &sender_lc {
+                if out.ignores().contains(sl) {
+                    continue;
+                }
+            }
             if !out.send(wire) {
                 stalled.push(name.clone());
             }
         }
         stalled
+    }
+
+    /// Register a logged-in session so staff moderation can reach it later. Pair with
+    /// [`Self::unregister_session`] on disconnect.
+    pub fn register_session(&self, display_name: &str, ip: IpAddr, out: Outbound, kill: Arc<Notify>) {
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .insert(display_name.to_ascii_lowercase(), SessionEntry { ip, out, kill });
+    }
+
+    /// Drop a session from the moderation registry.
+    pub fn unregister_session(&self, display_name: &str) {
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .remove(&display_name.to_ascii_lowercase());
+    }
+
+    /// The address a currently-online session connected from, by display name.
+    #[must_use]
+    pub fn session_ip(&self, display_name: &str) -> Option<IpAddr> {
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .get(&display_name.to_ascii_lowercase())
+            .map(|e| e.ip)
+    }
+
+    /// Force off every session on `ip`, queueing `notice` to each first. Returns how many
+    /// were signalled. The sessions close cleanly (normal cleanup runs); the queued notice
+    /// flushes because the writer drains its queue before the socket shuts down.
+    pub fn disconnect_ip(&self, ip: IpAddr, notice: &Wire) -> usize {
+        let sessions = self.sessions.lock().expect("sessions lock");
+        let mut n = 0;
+        for entry in sessions.values() {
+            if entry.ip == ip {
+                let _ = entry.out.send(notice);
+                entry.kill.notify_one();
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Force off every session whose (lowercased) display name contains `substring_lower`,
+    /// queueing `notice` to each. Returns how many were signalled.
+    pub fn disconnect_name_matches(&self, substring_lower: &str, notice: &Wire) -> usize {
+        let sessions = self.sessions.lock().expect("sessions lock");
+        let mut n = 0;
+        for (name, entry) in sessions.iter() {
+            if name.contains(substring_lower) {
+                let _ = entry.out.send(notice);
+                entry.kill.notify_one();
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Whether an account currently holds operator in a channel.
@@ -886,6 +1039,7 @@ pub(crate) fn test_node() -> Node {
             // bnetcc_core directly; the node default here is uncapped.
             channel_caps: ChannelCaps::default(),
             udp_socket: None,
+            bans_path: None,
         },
         storage,
     )
@@ -980,10 +1134,60 @@ mod tests {
         n.join_channel(b"chat", 2, "b", 0, Vec::new(), o2).unwrap();
 
         let wire = Arc::new(vec![0xFFu8, 0x0F, 4, 0]);
-        let stalled = n.broadcast(b"chat", &wire, Some("a"));
+        let stalled = n.broadcast(b"chat", &wire, Some("a"), None);
         assert!(stalled.is_empty());
         assert!(r1.try_recv().is_err(), "sender must not receive their own talk");
         assert!(r2.try_recv().is_ok());
+    }
+
+    #[test]
+    fn a_squelcher_does_not_receive_the_squelched_accounts_talk() {
+        let n = node();
+        let (listener, mut lrx) = outbound(4);
+        let (speaker, _srx) = outbound(4);
+        // The listener squelches the speaker's base account name.
+        listener.ignores().add("Bob");
+        n.join_channel(b"chat", 1, "alice", 0, Vec::new(), listener).unwrap();
+        n.join_channel(b"chat", 2, "Bob", 0, Vec::new(), speaker).unwrap();
+
+        let wire = Arc::new(vec![0xFFu8, 0x0F, 4, 0]);
+        // Bob (base "Bob") talks; Alice has squelched Bob, so she receives nothing.
+        let stalled = n.broadcast(b"chat", &wire, Some("Bob"), Some("Bob"));
+        assert!(stalled.is_empty());
+        assert!(lrx.try_recv().is_err(), "squelched account's talk must be withheld");
+
+        // A different speaker still reaches Alice.
+        let stalled = n.broadcast(b"chat", &wire, Some("carol"), Some("carol"));
+        assert!(stalled.is_empty());
+        assert!(lrx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn moderation_registry_resolves_ip_and_disconnects_selectively() {
+        let n = node();
+        let (o1, mut r1) = outbound(4);
+        let (o2, mut r2) = outbound(4);
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+        n.register_session("Bob", ip1, o1, Arc::new(Notify::new()));
+        n.register_session("BNU-Eve", ip2, o2, Arc::new(Notify::new()));
+
+        // /ipban resolves an online user's address.
+        assert_eq!(n.session_ip("bob"), Some(ip1));
+        assert_eq!(n.session_ip("nobody"), None);
+
+        let notice = Arc::new(vec![1u8, 2, 3]);
+        // An IP ban disconnects only the sessions on that address, queueing them a notice.
+        assert_eq!(n.disconnect_ip(ip1, &notice), 1);
+        assert!(r1.try_recv().is_ok(), "the disconnected session gets the notice");
+        assert!(r2.try_recv().is_err(), "the untouched session gets nothing");
+
+        // A tag ban disconnects by name substring (case-insensitive).
+        assert_eq!(n.disconnect_name_matches("bnu-", &notice), 1);
+        assert!(r2.try_recv().is_ok());
+
+        n.unregister_session("Bob");
+        assert_eq!(n.session_ip("Bob"), None);
     }
 
     #[test]
@@ -997,7 +1201,7 @@ mod tests {
         let wire = Arc::new(vec![0xFFu8, 0x0F, 4, 0]);
         let mut stalled = Vec::new();
         for _ in 0..8 {
-            stalled = n.broadcast(b"chat", &wire, None);
+            stalled = n.broadcast(b"chat", &wire, None, None);
         }
         assert_eq!(stalled, vec!["slow".to_string()], "the slow subscriber must be named");
         // The healthy subscriber still got every message.

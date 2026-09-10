@@ -416,6 +416,9 @@ struct Bncs {
     flood: FloodTracker,
     /// Epoch-millis until which this session is muted for flooding (`0` = not muted).
     muted_until_ms: u64,
+    /// Fired by staff moderation (a tag ban or IP ban) to force this session off. The read
+    /// loop selects on it and breaks, so cleanup runs normally — unlike aborting the task.
+    kill: Arc<tokio::sync::Notify>,
 }
 
 async fn bncs_session(
@@ -448,6 +451,7 @@ async fn bncs_session(
         game_port: 6112,
         flood,
         muted_until_ms: 0,
+        kill: Arc::new(tokio::sync::Notify::new()),
     };
 
     // Real Battle.net (and Atlas) send SID_PING (0x25) as soon as a game client connects,
@@ -475,22 +479,31 @@ async fn bncs_session(
         };
 
         let tail = buf.writable_tail(READ_CHUNK);
-        let n = match tokio::time::timeout(deadline, rd.read(tail)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => {
+        let n = tokio::select! {
+            // Staff forced this session off (tag/IP ban). Break to run normal cleanup; any
+            // removal notice already queued flushes as the writer drains before shutdown.
+            () = s.kill.notified() => {
                 buf.commit(0, READ_CHUNK);
-                let class = s.class;
-                s.cleanup();
-                drop(tx);
-                drop(s);
-                let _ = writer.await;
-                return (Err(e), class);
-            }
-            Err(_) => {
-                buf.commit(0, READ_CHUNK);
-                debug!(peer = %s.peer, state = s.state.name(), "session timed out");
+                debug!(peer = %s.peer, "session closed by staff moderation");
                 break;
             }
+            r = tokio::time::timeout(deadline, rd.read(tail)) => match r {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => {
+                    buf.commit(0, READ_CHUNK);
+                    let class = s.class;
+                    s.cleanup();
+                    drop(tx);
+                    drop(s);
+                    let _ = writer.await;
+                    return (Err(e), class);
+                }
+                Err(_) => {
+                    buf.commit(0, READ_CHUNK);
+                    debug!(peer = %s.peer, state = s.state.name(), "session timed out");
+                    break;
+                }
+            },
         };
         buf.commit(n, READ_CHUNK);
         if n == 0 {
@@ -570,14 +583,16 @@ impl Bncs {
             let new_op = self.node.leave_channel(&key, &leaver);
             let leave = chat_event(EventId::Leave, self.flags, 0, leaver.as_bytes(), b"");
             if let Some(wire) = encode(&leave) {
-                let _ = self.node.broadcast(&key, &wire, Some(&leaver));
+                let _ = self.node.broadcast(&key, &wire, Some(&leaver), None);
             }
             if let Some(op) = new_op {
                 debug!(channel = ?String::from_utf8_lossy(&key), new_operator = op, "operator inherited");
             }
         }
-        // Free this session's display name so its `#N` slot can be reused.
+        // Free this session's display name so its `#N` slot can be reused, and drop it from
+        // the moderation directory.
         if !self.display_name.is_empty() {
+            self.node.unregister_session(&self.display_name);
             self.node.release_name(&self.display_name);
         }
     }
@@ -928,7 +943,15 @@ impl Bncs {
             None => false,
             Some(account) => {
                 let expected = logon_proof(client_token, server_token, &account.password_hash);
-                if proofs_match(&proof, &expected) {
+                if !proofs_match(&proof, &expected) {
+                    false
+                } else if self.node.bans.is_tag_banned(&account.name) {
+                    // A staff `/tagban` refuses any account whose name matches the banned
+                    // substring, even with the correct password. Reported as a plain logon
+                    // failure — the protocol has no "you are banned" status here.
+                    info!(peer = %self.peer, account = %account.name, "logon refused: name is tag-banned");
+                    false
+                } else {
                     info!(peer = %self.peer, account = %account.name, "logon accepted");
                     for &key in &self.claimed_keys {
                         self.node.record_key_holder_name(key, account.name.clone());
@@ -942,10 +965,16 @@ impl Bncs {
                     // Claim a server-wide-unique display name (Name, or Name#2/#3… if this
                     // account is already online elsewhere) for the life of this session.
                     self.display_name = self.node.claim_name(&account.name);
+                    // Register with the moderation directory so staff can reach this session
+                    // (resolve its IP, or force it off) from any channel.
+                    self.node.register_session(
+                        &self.display_name,
+                        self.peer.ip(),
+                        self.out.clone(),
+                        Arc::clone(&self.kill),
+                    );
                     self.account = Some(account);
                     true
-                } else {
-                    false
                 }
             }
         };
@@ -1316,7 +1345,7 @@ impl Bncs {
                     &self.statstring,
                 );
                 if let Some(wire) = encode(&ev) {
-                    let _ = self.node.broadcast(&joined.key, &wire, Some(&self.display_name));
+                    let _ = self.node.broadcast(&joined.key, &wire, Some(&self.display_name), None);
                 }
                 // 4. A per-channel topic/greeting, if this channel defines one.
                 if let Some(topic) = &joined.topic {
@@ -1331,7 +1360,7 @@ impl Bncs {
         self.node.leave_channel(key, &self.display_name);
         let ev = chat_event(EventId::Leave, self.flags, 0, self.display_name.as_bytes(), b"");
         if let Some(wire) = encode(&ev) {
-            let _ = self.node.broadcast(key, &wire, Some(&self.display_name));
+            let _ = self.node.broadcast(key, &wire, Some(&self.display_name), None);
         }
     }
 
@@ -1381,10 +1410,17 @@ impl Bncs {
         if !self.ensure_member(&key) {
             return Step::Continue;
         }
+        // Server-wide mute (a staff `/mute`): the line is silently dropped, matching how a
+        // flood mute is handled above. Enforced here, after membership, so a muted account
+        // still counts as present but cannot broadcast.
+        if self.node.bans.is_muted(&account.name, now) {
+            return Step::Continue;
+        }
         let ev = chat_event(EventId::Talk, self.flags, 0, self.display_name.as_bytes(), &text);
         if let Some(wire) = encode(&ev) {
-            // Real Battle.net does not echo your own channel talk back to you.
-            let stalled = self.node.broadcast(&key, &wire, Some(&self.display_name));
+            // Real Battle.net does not echo your own channel talk back to you. `sender_base`
+            // lets recipients who have squelched this account drop the line.
+            let stalled = self.node.broadcast(&key, &wire, Some(&self.display_name), Some(&account.name));
             if !stalled.is_empty() {
                 debug!(count = stalled.len(), "dropped stalled subscribers from fanout");
             }
@@ -1463,10 +1499,13 @@ impl Bncs {
                 if !self.ensure_member(key) {
                     return Step::Continue;
                 }
+                if self.node.bans.is_muted(&account.name, now_ms()) {
+                    return Step::Continue;
+                }
                 let body = sanitize_chat_text(_arg.as_bytes());
                 let ev = chat_event(EventId::Emote, self.flags, 0, self.display_name.as_bytes(), &body);
                 if let Some(wire) = encode(&ev) {
-                    let _ = self.node.broadcast(key, &wire, None);
+                    let _ = self.node.broadcast(key, &wire, None, Some(&account.name));
                 }
                 Step::Continue
             }
@@ -1474,6 +1513,17 @@ impl Bncs {
             "ban" => self.op_ban(_arg, account, key),
             "unban" => self.op_unban(_arg, account, key).await,
             "designate" | "heir" => self.op_designate(_arg, account, key),
+            // Personal ignore — any user. Hides a chosen account's channel chat from you.
+            "squelch" | "ignore" => self.squelch(_arg),
+            "unsquelch" | "unignore" => self.unsquelch(_arg),
+            // Staff-only (Blizzard-rep / sysop) moderation.
+            "tagban" => self.staff_tagban(_arg, account),
+            "tagunban" => self.staff_tagunban(_arg, account),
+            "ipban" => self.staff_ipban(_arg, account),
+            "ipunban" => self.staff_ipunban(_arg, account),
+            "mute" => self.staff_mute(_arg, account),
+            "unmute" => self.staff_unmute(_arg, account),
+            "bans" => self.staff_bans(account),
             "whoami" => {
                 let op = if self.node.is_operator(key, account.id) {
                     " (operator)"
@@ -1512,12 +1562,21 @@ impl Bncs {
                 self.send(&chat_event(EventId::Info, 0, 0, b"", header.as_bytes()))
             }
             "help" | "?" => {
-                // Keep this list in sync with the arms above. Whisper/friends/ignore commands
-                // are still pending (they need cross-session routing) — see docs/ROADMAP.md.
-                for line in [
+                // Keep this list in sync with the arms above. Whisper/friends commands are
+                // still pending (they need cross-session routing) — see docs/ROADMAP.md.
+                let mut lines = vec![
                     "Commands: /help, /join <channel>, /me <action>, /who [channel], /whoami, /ver",
+                    "Personal: /squelch <user>, /unsquelch <user>",
                     "Operator: /kick <user>, /ban <user>, /unban <user>, /designate <user>",
-                ] {
+                ];
+                // Only staff see the staff commands listed.
+                if self.node.admins.is_admin(&account.name) {
+                    lines.push(
+                        "Staff: /tagban <text>, /tagunban <text>, /ipban <user> [hrs], \
+                         /ipunban <ip>, /mute <user> [hrs], /unmute <user>, /bans",
+                    );
+                }
+                for line in lines {
                     if matches!(
                         self.send(&chat_event(EventId::Info, 0, 0, b"", line.as_bytes())),
                         Step::Close
@@ -1644,11 +1703,229 @@ impl Bncs {
             }
         }
         if let Some(wire) = encode(&chat_event(EventId::Leave, 0, 0, target.as_bytes(), b"")) {
-            let _ = self.node.broadcast(key, &wire, None);
+            let _ = self.node.broadcast(key, &wire, None, None);
         }
         if let Some(op) = new_operator {
             debug!(new_operator = op, "operator inherited after a removal");
         }
+    }
+
+    // -- personal ignore (any user) ---------------------------------------------
+
+    /// `/squelch <user>` — personally ignore an account: its channel chat is hidden from you
+    /// (all of its sessions). Reversible with `/unsquelch`. Not a moderation action.
+    fn squelch(&self, arg: &str) -> Step {
+        let target = base_name(arg.trim());
+        if target.is_empty() {
+            // No argument: show who this session is currently ignoring.
+            let ignored = self.out.ignores().list();
+            return if ignored.is_empty() {
+                self.info("You are not squelching anyone. Usage: /squelch <user>")
+            } else {
+                self.info(&format!("Squelched: {}", ignored.join(", ")))
+            };
+        }
+        if target.eq_ignore_ascii_case(base_name(&self.display_name)) {
+            return self.op_error("You cannot squelch yourself.");
+        }
+        if self.out.ignores().add(target) {
+            self.info(&format!("You will no longer see messages from {target}."))
+        } else {
+            self.info(&format!("{target} is already squelched."))
+        }
+    }
+
+    /// `/unsquelch <user>` — stop ignoring an account.
+    fn unsquelch(&self, arg: &str) -> Step {
+        let target = base_name(arg.trim());
+        if target.is_empty() {
+            return self.op_error("Usage: /unsquelch <user>");
+        }
+        if self.out.ignores().remove(target) {
+            self.info(&format!("You will now see messages from {target} again."))
+        } else {
+            self.info(&format!("{target} was not squelched."))
+        }
+    }
+
+    // -- staff moderation (Blizzard-rep / sysop only) ---------------------------
+
+    /// Whether the acting account is a configured server administrator.
+    fn require_staff(&self, account: &Account) -> bool {
+        self.node.admins.is_admin(&account.name)
+    }
+
+    /// The refusal shown to a non-staff account that tries a staff command.
+    fn staff_denied(&self) -> Step {
+        self.op_error("That command is restricted to server administrators.")
+    }
+
+    /// Send an informational line to the actor.
+    fn info(&self, msg: &str) -> Step {
+        self.send(&chat_event(EventId::Info, 0, 0, b"", msg.as_bytes()))
+    }
+
+    /// `/tagban <text>` — refuse any account whose name contains `text` (e.g. a clan prefix
+    /// like `BNU-`), and disconnect everyone online who already matches. Persists.
+    fn staff_tagban(&self, arg: &str, account: &Account) -> Step {
+        if !self.require_staff(account) {
+            return self.staff_denied();
+        }
+        let sub = arg.trim();
+        if sub.is_empty() {
+            return self.op_error("Usage: /tagban <text>  (bans any name containing <text>)");
+        }
+        if !self.node.bans.add_tag(sub) {
+            return self.op_error(&format!("'{sub}' is already tag-banned."));
+        }
+        let count = match removal_notice("You have been removed from this server by an administrator.") {
+            Some(w) => self.node.disconnect_name_matches(&sub.to_ascii_lowercase(), &w),
+            None => 0,
+        };
+        info!(admin = %account.name, tag = %sub, removed = count, "tag banned");
+        self.info(&format!(
+            "Tag-banned '{sub}': {count} online user(s) removed; matching logins are now refused."
+        ))
+    }
+
+    /// `/tagunban <text>` — lift a tag ban.
+    fn staff_tagunban(&self, arg: &str, account: &Account) -> Step {
+        if !self.require_staff(account) {
+            return self.staff_denied();
+        }
+        let sub = arg.trim();
+        if sub.is_empty() {
+            return self.op_error("Usage: /tagunban <text>");
+        }
+        if self.node.bans.remove_tag(sub) {
+            info!(admin = %account.name, tag = %sub, "tag unbanned");
+            self.info(&format!("Tag ban '{sub}' lifted."))
+        } else {
+            self.op_error(&format!("'{sub}' is not tag-banned."))
+        }
+    }
+
+    /// `/ipban <user> [hours]` — ban an online user's address for `hours` (default 24; `0`
+    /// or `perm` = permanent) and disconnect every session on it. Persists.
+    fn staff_ipban(&self, arg: &str, account: &Account) -> Step {
+        if !self.require_staff(account) {
+            return self.staff_denied();
+        }
+        let mut it = arg.split_whitespace();
+        let Some(user) = it.next() else {
+            return self.op_error("Usage: /ipban <user> [hours]  (0 or 'perm' = permanent)");
+        };
+        let Some(ip) = self.node.session_ip(user) else {
+            return self.op_error("No such user online.");
+        };
+        if ip == self.peer.ip() {
+            return self.op_error("That is your own address; refusing to ban yourself.");
+        }
+        let now = now_ms();
+        let (hours_opt, human) = match parse_ban_duration(it.next(), 24) {
+            Some(d) => d,
+            None => return self.op_error("Hours must be a whole number, 0, or 'perm'."),
+        };
+        let expiry = match hours_opt {
+            Some(hours) => now.saturating_add(hours.saturating_mul(3_600_000)),
+            None => crate::moderation::NEVER,
+        };
+        self.node.bans.ban_ip(ip, expiry, now);
+        let count = match removal_notice("You have been banned from this server by an administrator.") {
+            Some(w) => self.node.disconnect_ip(ip, &w),
+            None => 0,
+        };
+        info!(admin = %account.name, %ip, removed = count, "ip banned");
+        self.info(&format!("Banned {ip} {human}: {count} session(s) disconnected."))
+    }
+
+    /// `/ipunban <ip>` — lift an IP ban.
+    fn staff_ipunban(&self, arg: &str, account: &Account) -> Step {
+        if !self.require_staff(account) {
+            return self.staff_denied();
+        }
+        let Ok(ip) = arg.trim().parse::<std::net::IpAddr>() else {
+            return self.op_error("Usage: /ipunban <ip address>");
+        };
+        if self.node.bans.unban_ip(ip, now_ms()) {
+            info!(admin = %account.name, %ip, "ip unbanned");
+            self.info(&format!("IP ban on {ip} lifted."))
+        } else {
+            self.op_error(&format!("{ip} is not banned."))
+        }
+    }
+
+    /// `/mute <user> [hours]` — silence an account's chat across the whole server (default
+    /// indefinite; a number sets hours). The user stays connected; their lines are dropped.
+    fn staff_mute(&self, arg: &str, account: &Account) -> Step {
+        if !self.require_staff(account) {
+            return self.staff_denied();
+        }
+        let mut it = arg.split_whitespace();
+        let Some(user) = it.next() else {
+            return self.op_error("Usage: /mute <user> [hours]  (no hours = indefinite)");
+        };
+        let base = base_name(user).to_string();
+        let now = now_ms();
+        // Default: indefinite (until /unmute). A mute is reversible and does not disconnect,
+        // so a permanent default is safe here (unlike /ipban's 24h default).
+        let (hours_opt, human) = match parse_ban_duration(it.next(), 0) {
+            Some(d) => d,
+            None => return self.op_error("Hours must be a whole number, 0, or 'perm'."),
+        };
+        let (expiry, human) = match hours_opt {
+            Some(hours) => (now.saturating_add(hours.saturating_mul(3_600_000)), human),
+            None => (crate::moderation::NEVER, "indefinitely".to_string()),
+        };
+        self.node.bans.mute(&base, expiry, now);
+        info!(admin = %account.name, user = %base, "muted");
+        self.info(&format!("Muted {base} {human}."))
+    }
+
+    /// `/unmute <user>` — lift a server mute.
+    fn staff_unmute(&self, arg: &str, account: &Account) -> Step {
+        if !self.require_staff(account) {
+            return self.staff_denied();
+        }
+        let base = base_name(arg.trim());
+        if base.is_empty() {
+            return self.op_error("Usage: /unmute <user>");
+        }
+        if self.node.bans.unmute(base, now_ms()) {
+            info!(admin = %account.name, user = %base, "unmuted");
+            self.info(&format!("{base} is no longer muted."))
+        } else {
+            self.op_error(&format!("{base} is not muted."))
+        }
+    }
+
+    /// `/bans` — list the active tag bans, IP bans, and mutes.
+    fn staff_bans(&self, account: &Account) -> Step {
+        if !self.require_staff(account) {
+            return self.staff_denied();
+        }
+        let now = now_ms();
+        let snap = self.node.bans.snapshot(now);
+        let mut lines = Vec::new();
+        if snap.tags.is_empty() && snap.ip_bans.is_empty() && snap.mutes.is_empty() {
+            lines.push("No active bans or mutes.".to_string());
+        } else {
+            if !snap.tags.is_empty() {
+                lines.push(format!("Tag bans: {}", snap.tags.join(", ")));
+            }
+            for (ip, exp) in &snap.ip_bans {
+                lines.push(format!("IP ban: {ip} ({})", fmt_remaining(*exp, now)));
+            }
+            for (name, exp) in &snap.mutes {
+                lines.push(format!("Mute: {name} ({})", fmt_remaining(*exp, now)));
+            }
+        }
+        for line in lines {
+            if matches!(self.info(&line), Step::Close) {
+                return Step::Close;
+            }
+        }
+        Step::Continue
     }
 
     /// `SID_CHECKAD` — the client tells us which banner it is showing; we answer with
@@ -1913,6 +2190,49 @@ fn encode(frame: &Frame) -> Option<Wire> {
     let mut buf = Vec::with_capacity(frame.wire_len());
     encode_frame(frame, &mut buf).ok()?;
     Some(Arc::new(buf))
+}
+
+/// The base account name behind a display name — strips any `#N` coexistence suffix, so
+/// moderation and squelch target the account rather than one particular session.
+fn base_name(name: &str) -> &str {
+    name.split('#').next().unwrap_or(name)
+}
+
+/// A pre-encoded error line delivered to a session just before staff force it off.
+fn removal_notice(msg: &str) -> Option<Wire> {
+    encode(&chat_event(EventId::Error, 0, 0, b"", msg.as_bytes()))
+}
+
+/// Parse an optional `[hours]` duration argument for `/ipban` and `/mute`.
+///
+/// Returns `Some((Some(hours), human))` for a finite duration, `Some((None, "permanently"))`
+/// for a permanent ban (`0`, `perm`, or `permanent`), or `None` if the token is malformed.
+/// When the token is absent, `default_hours` applies (`0` meaning permanent).
+fn parse_ban_duration(token: Option<&str>, default_hours: u64) -> Option<(Option<u64>, String)> {
+    let permanent = || (None, "permanently".to_string());
+    match token {
+        None if default_hours == 0 => Some(permanent()),
+        None => Some((Some(default_hours), format!("for {default_hours}h"))),
+        Some(t)
+            if t == "0" || t.eq_ignore_ascii_case("perm") || t.eq_ignore_ascii_case("permanent") =>
+        {
+            Some(permanent())
+        }
+        Some(t) => t.parse::<u64>().ok().map(|h| (Some(h), format!("for {h}h"))),
+    }
+}
+
+/// Human-readable remaining time for a ban expiry (epoch-millis), for the `/bans` listing.
+fn fmt_remaining(expiry_ms: u64, now_ms: u64) -> String {
+    if expiry_ms == crate::moderation::NEVER {
+        return "permanent".to_string();
+    }
+    let secs = expiry_ms.saturating_sub(now_ms) / 1000;
+    if secs >= 3600 {
+        format!("{}h {}m left", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}m left", secs / 60)
+    }
 }
 
 // ---------------------------------------------------------------------------

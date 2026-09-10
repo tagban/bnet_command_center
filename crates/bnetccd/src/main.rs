@@ -4,6 +4,7 @@
 
 mod admin;
 mod config;
+mod moderation;
 mod node;
 mod session;
 mod status;
@@ -165,6 +166,19 @@ async fn run(cfg: Config) -> Result<(), String> {
         }
     };
 
+    // Staff bans persist to a JSON file next to the account database (in-memory storage keeps
+    // them in memory only). Same derivation as the admin panel's `bnetccd-admin/`.
+    let bans_path = if cfg.storage.path.is_empty() {
+        None
+    } else {
+        Some(
+            std::path::Path::new(&cfg.storage.path)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map_or_else(|| PathBuf::from("bnetccd-bans.json"), |p| p.join("bnetccd-bans.json")),
+        )
+    };
+
     let node = Arc::new(Node::new(
         node::NodeConfig {
             policy: policy.clone(),
@@ -183,6 +197,7 @@ async fn run(cfg: Config) -> Result<(), String> {
                 clan: cfg.channels.clan_max,
             },
             udp_socket,
+            bans_path,
         },
         storage,
     ));
@@ -273,6 +288,13 @@ fn reuseport_listener(addr: std::net::SocketAddr) -> std::io::Result<TcpListener
 /// One accept loop for a (possibly sharded) listener: accept, apply the global connection
 /// ceiling, and spawn a session task per connection. A per-connection accept error (EMFILE,
 /// a peer that vanished) is logged and never ends the loop.
+/// Wall-clock milliseconds since the Unix epoch, for ban-expiry checks.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 async fn accept_loop(
     listener: TcpListener,
     node: Arc<Node>,
@@ -282,6 +304,13 @@ async fn accept_loop(
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                // Shed banned addresses at the door — before a session task is spawned — so a
+                // staff `/ipban` sheds an attacker's reconnects cheaply. This inherently
+                // covers every session and alt on that address.
+                if node.bans.is_ip_banned(peer.ip(), now_ms()) {
+                    drop(stream);
+                    continue;
+                }
                 if node.connection_count() >= u64::from(max_connections) {
                     // Refuse at the door rather than accepting and failing later.
                     drop(stream);

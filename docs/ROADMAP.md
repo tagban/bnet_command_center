@@ -149,8 +149,10 @@ These are captured so they are not lost; each needs real design work, not just a
 
 - [ ] `HubSerialized` ordering end to end, with the optional `arrival_jitter_window_ms`
       fairness window (default off) from `docs/WARNET.md` §4.
-- [ ] Full operator command set: `/designate`, `/kick`, `/ban`, `/squelch`, `/rejoin`,
-      moderated channels, `EID_USERFLAGS` propagation.
+- [x] Operator command set: `/designate`, `/kick`, `/ban`, `/unban`, and personal `/squelch`.
+      Staff (sysop) moderation: `/tagban`, `/ipban`, `/mute` (+ inverses, `/bans`), persisted
+      to `bnetccd-bans.json`. Still pending: `/rejoin`, moderated channels, `EID_USERFLAGS`
+      propagation, and cross-session `/whisper`/`/friends` (which need federation's routing).
 - [ ] Registered-bot accounts as a first-class concept.
 - [ ] Key-registry admin surface: live keys and holders, ban/unban, and a report of how
       many distinct keys a fleet operator is running.
