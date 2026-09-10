@@ -47,6 +47,7 @@ pub fn run<S: Storage>(s: &mut S) {
     attributes(s);
     bans(s);
     counting(s);
+    enumeration_and_deletion(s);
 }
 
 /// Account creation, lookup and credentials.
@@ -245,4 +246,41 @@ pub fn counting<S: Storage>(s: &mut S) {
     // A failed creation must not change the count.
     let _ = s.create_account(account("Reaver"));
     assert_eq!(s.account_count().expect("count"), before + 1);
+}
+
+/// Paged enumeration and account deletion, for the admin user list.
+///
+/// # Panics
+///
+/// On divergence.
+pub fn enumeration_and_deletion<S: Storage>(s: &mut S) {
+    let a = s.create_account(account("EnumOne")).expect("create");
+    let b = s.create_account(account("EnumTwo")).expect("create");
+    s.attrs_put(a.id, attrs(&[(r"profile\location", "keep")])).expect("attr");
+
+    // A page large enough for everything includes both new accounts, and the list is
+    // ordered by id ascending.
+    let total = s.account_count().expect("count");
+    let all = s.list_accounts(0, u32::try_from(total).unwrap_or(u32::MAX)).expect("list");
+    assert!(all.iter().any(|acc| acc.id == a.id));
+    assert!(all.iter().any(|acc| acc.id == b.id));
+    assert!(all.windows(2).all(|w| w[0].id < w[1].id), "list_accounts is ordered by id");
+
+    // `limit` caps the page and `offset` advances the window.
+    let first = s.list_accounts(0, 1).expect("first");
+    assert_eq!(first.len(), 1);
+    let second = s.list_accounts(1, 1).expect("second");
+    assert_eq!(second.len(), 1);
+    assert_ne!(first[0].id, second[0].id, "offset skips the earlier account");
+
+    // Deletion removes the account, its lookups, and its attributes.
+    s.delete_account(a.id).expect("delete");
+    assert!(s.account_by_id(a.id).expect("by id").is_none());
+    assert!(s.account_by_name("EnumOne").expect("by name").is_none());
+    assert!(s.attrs_all(a.id).expect("attrs").is_empty(), "attributes are removed with the account");
+    // The freed name can be registered again, with a fresh id.
+    let reborn = s.create_account(account("EnumOne")).expect("recreate");
+    assert_ne!(reborn.id, a.id, "a deleted id is not reused");
+    // Deleting an absent account is a no-op, not an error.
+    s.delete_account(999_999).expect("idempotent delete");
 }

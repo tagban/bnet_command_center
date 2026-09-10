@@ -406,6 +406,32 @@ impl Storage for SqliteStorage {
         Ok(n as u64)
     }
 
+    fn list_accounts(&mut self, offset: u64, limit: u32) -> Result<Vec<Account>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT * FROM accounts ORDER BY id LIMIT ?1 OFFSET ?2")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(params![limit as i64, offset as i64], Self::row_to_account)
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    fn delete_account(&mut self, id: AccountId) -> Result<()> {
+        // attrs and bans are removed by ON DELETE CASCADE (foreign_keys is ON). Idempotent:
+        // deleting a row that is not there affects zero rows and is still Ok.
+        self.conn
+            .prepare_cached("DELETE FROM accounts WHERE id = ?1")
+            .map_err(map_err)?
+            .execute(params![id as i64])
+            .map_err(map_err)?;
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<()> {
         // Every write here is already committed; this exists so the trait has one place
         // to force a WAL checkpoint at shutdown.

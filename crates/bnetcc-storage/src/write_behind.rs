@@ -258,6 +258,21 @@ impl<B: Storage> Storage for WriteBehind<B> {
         self.backend.account_count()
     }
 
+    fn list_accounts(&mut self, offset: u64, limit: u32) -> Result<Vec<Account>> {
+        // Accounts themselves are write-through; only attributes are buffered, so the
+        // backend's list is authoritative.
+        self.backend.list_accounts(offset, limit)
+    }
+
+    fn delete_account(&mut self, id: AccountId) -> Result<()> {
+        // Drop any buffered attributes for the account so a later flush cannot resurrect
+        // rows for an id the backend has just removed.
+        if self.dirty.remove(&id).is_some() {
+            self.dirty_attrs = self.dirty.values().map(BTreeLen::len_of).sum();
+        }
+        self.backend.delete_account(id)
+    }
+
     fn flush(&mut self) -> Result<()> {
         let now = self.last_flush_ms;
         self.flush_now(now)
@@ -492,6 +507,12 @@ mod tests {
         }
         fn account_count(&mut self) -> Result<u64> {
             self.0.account_count()
+        }
+        fn list_accounts(&mut self, offset: u64, limit: u32) -> Result<Vec<Account>> {
+            self.0.list_accounts(offset, limit)
+        }
+        fn delete_account(&mut self, id: AccountId) -> Result<()> {
+            self.0.delete_account(id)
         }
         fn flush(&mut self) -> Result<()> {
             self.0.flush()

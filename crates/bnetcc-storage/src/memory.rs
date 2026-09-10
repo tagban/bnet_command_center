@@ -126,6 +126,26 @@ impl Storage for MemoryStorage {
         Ok(self.accounts.len() as u64)
     }
 
+    fn list_accounts(&mut self, offset: u64, limit: u32) -> Result<Vec<Account>> {
+        let mut ids: Vec<AccountId> = self.accounts.keys().copied().collect();
+        ids.sort_unstable();
+        Ok(ids
+            .into_iter()
+            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+            .take(limit as usize)
+            .filter_map(|id| self.accounts.get(&id).cloned())
+            .collect())
+    }
+
+    fn delete_account(&mut self, id: AccountId) -> Result<()> {
+        if let Some(account) = self.accounts.remove(&id) {
+            self.by_name.remove(&account.name.to_ascii_lowercase());
+        }
+        self.attrs.remove(&id);
+        self.bans.retain(|(acct, _), _| *acct != id);
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }

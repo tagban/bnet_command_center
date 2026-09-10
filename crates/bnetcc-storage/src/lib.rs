@@ -172,6 +172,23 @@ pub trait Storage: Send + 'static {
     /// Backend failure.
     fn account_count(&mut self) -> Result<u64>;
 
+    /// A page of accounts ordered by id, for the admin user list: skip `offset`, return at
+    /// most `limit`. **Bounded and paged**, never a full load (see [`Self::account_count`]);
+    /// the admin UI pages through rather than pulling every account into RAM.
+    ///
+    /// # Errors
+    ///
+    /// Backend failure.
+    fn list_accounts(&mut self, offset: u64, limit: u32) -> Result<Vec<Account>>;
+
+    /// Permanently delete an account together with its attributes and bans. **Write-through.**
+    /// Idempotent: deleting an absent account is `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Backend failure.
+    fn delete_account(&mut self, id: AccountId) -> Result<()>;
+
     /// Flush anything buffered. Called on a timer and at shutdown.
     ///
     /// # Errors
