@@ -398,6 +398,11 @@ struct Bncs {
     /// this session ever logged in.
     claimed_keys: Vec<KeyId>,
     account: Option<Account>,
+    /// The session's server-wide-unique display name — the account name, or `Name#2`/`#3`…
+    /// when that account is already online. Assigned at logon (claimed from the node's name
+    /// registry), released on disconnect. This, not the account name, is what other users
+    /// see in chat, so several logins of one account appear distinctly and coexist.
+    display_name: String,
     channel: Option<Vec<u8>>,
     flags: u32,
     /// The game-hosting port the client announced via `SID_NETGAMEPORT`; defaults to the
@@ -429,6 +434,7 @@ async fn bncs_session(
         statstring: Vec::new(),
         claimed_keys: Vec::new(),
         account: None,
+        display_name: String::new(),
         channel: None,
         flags: 0,
         game_port: 6112,
@@ -549,16 +555,20 @@ impl Bncs {
         if let Some(account) = &self.account {
             self.node.withdraw_game(account.id);
         }
-        if let (Some(key), Some(account)) = (self.channel.take(), self.account.as_ref()) {
-            let name = account.name.clone();
-            let new_op = self.node.leave_channel(&key, account.id);
-            let leave = chat_event(EventId::Leave, self.flags, 0, name.as_bytes(), b"");
+        if let Some(key) = self.channel.take() {
+            let leaver = self.display_name.clone();
+            let new_op = self.node.leave_channel(&key, &leaver);
+            let leave = chat_event(EventId::Leave, self.flags, 0, leaver.as_bytes(), b"");
             if let Some(wire) = encode(&leave) {
-                let _ = self.node.broadcast(&key, &wire, Some(account.id));
+                let _ = self.node.broadcast(&key, &wire, Some(&leaver));
             }
             if let Some(op) = new_op {
                 debug!(channel = ?String::from_utf8_lossy(&key), new_operator = op, "operator inherited");
             }
+        }
+        // Free this session's display name so its `#N` slot can be reused.
+        if !self.display_name.is_empty() {
+            self.node.release_name(&self.display_name);
         }
     }
 
@@ -919,6 +929,9 @@ impl Bncs {
                         self.flags |= user_flags::ADMIN | user_flags::BLIZZARD_REP;
                         info!(peer = %self.peer, account = %account.name, "administrator logged on");
                     }
+                    // Claim a server-wide-unique display name (Name, or Name#2/#3… if this
+                    // account is already online elsewhere) for the life of this session.
+                    self.display_name = self.node.claim_name(&account.name);
                     self.account = Some(account);
                     true
                 } else {
@@ -1173,13 +1186,14 @@ impl Bncs {
     }
 
     fn enter_chat(&mut self, _frame: &Frame) -> Step {
-        let Some(account) = self.account.clone() else {
+        if self.account.is_none() {
             return Step::Close;
-        };
+        }
+        // The unique display name (with any #N), so a duplicate login sees itself correctly.
         let mut w = Writer::with_capacity(64);
-        w.cstr(account.name.as_bytes())
+        w.cstr(self.display_name.as_bytes())
             .cstr(self.statstring.as_slice())
-            .cstr(account.name.as_bytes());
+            .cstr(self.display_name.as_bytes());
         if matches!(self.send(&Frame::new(sid::ENTERCHAT, w.finish())), Step::Close) {
             return Step::Close;
         }
@@ -1215,13 +1229,13 @@ impl Bncs {
                 self.channel = Some(prev);
                 return Step::Continue;
             }
-            self.leave_current(&prev, account);
+            self.leave_current(&prev);
         }
 
         match self.node.join_channel(
             requested,
             account.id,
-            &account.name,
+            &self.display_name,
             self.flags,
             self.statstring.clone(),
             self.out.clone(),
@@ -1278,7 +1292,7 @@ impl Bncs {
                         EventId::ShowUser,
                         self.flags,
                         0,
-                        account.name.as_bytes(),
+                        self.display_name.as_bytes(),
                         &self.statstring,
                     )),
                     Step::Close
@@ -1291,11 +1305,11 @@ impl Bncs {
                     EventId::Join,
                     self.flags,
                     0,
-                    account.name.as_bytes(),
+                    self.display_name.as_bytes(),
                     &self.statstring,
                 );
                 if let Some(wire) = encode(&ev) {
-                    let _ = self.node.broadcast(&joined.key, &wire, Some(account.id));
+                    let _ = self.node.broadcast(&joined.key, &wire, Some(&self.display_name));
                 }
                 // 4. A per-channel topic/greeting, if this channel defines one.
                 if let Some(topic) = &joined.topic {
@@ -1306,11 +1320,11 @@ impl Bncs {
         }
     }
 
-    fn leave_current(&mut self, key: &[u8], account: &Account) {
-        self.node.leave_channel(key, account.id);
-        let ev = chat_event(EventId::Leave, self.flags, 0, account.name.as_bytes(), b"");
+    fn leave_current(&mut self, key: &[u8]) {
+        self.node.leave_channel(key, &self.display_name);
+        let ev = chat_event(EventId::Leave, self.flags, 0, self.display_name.as_bytes(), b"");
         if let Some(wire) = encode(&ev) {
-            let _ = self.node.broadcast(key, &wire, Some(account.id));
+            let _ = self.node.broadcast(key, &wire, Some(&self.display_name));
         }
     }
 
@@ -1318,8 +1332,8 @@ impl Bncs {
     /// channels or enter a game). Leave the current channel but keep the connection —
     /// there is no reply, and the client typically joins another channel next.
     fn leave_chat(&mut self) -> Step {
-        if let (Some(key), Some(account)) = (self.channel.take(), self.account.clone()) {
-            self.leave_current(&key, &account);
+        if let Some(key) = self.channel.take() {
+            self.leave_current(&key);
         }
         Step::Continue
     }
@@ -1345,10 +1359,10 @@ impl Bncs {
             return self.slash_command(&text, &account, &key);
         }
 
-        let ev = chat_event(EventId::Talk, self.flags, 0, account.name.as_bytes(), &text);
+        let ev = chat_event(EventId::Talk, self.flags, 0, self.display_name.as_bytes(), &text);
         if let Some(wire) = encode(&ev) {
             // Real Battle.net does not echo your own channel talk back to you.
-            let stalled = self.node.broadcast(&key, &wire, Some(account.id));
+            let stalled = self.node.broadcast(&key, &wire, Some(&self.display_name));
             if !stalled.is_empty() {
                 debug!(count = stalled.len(), "dropped stalled subscribers from fanout");
             }
@@ -1379,7 +1393,7 @@ impl Bncs {
             }
             "me" | "emote" => {
                 let body = sanitize_chat_text(_arg.as_bytes());
-                let ev = chat_event(EventId::Emote, self.flags, 0, account.name.as_bytes(), &body);
+                let ev = chat_event(EventId::Emote, self.flags, 0, self.display_name.as_bytes(), &body);
                 if let Some(wire) = encode(&ev) {
                     let _ = self.node.broadcast(key, &wire, None);
                 }

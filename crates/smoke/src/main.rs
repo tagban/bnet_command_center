@@ -333,7 +333,7 @@ fn serve(mut sock: TcpStream, shared: Arc<Shared>) {
 
     if let (Some(key), Some((id, name))) = (joined, account) {
         if let Some(c) = shared.channels.lock().expect("channels").get_mut(&key) {
-            c.leave(id);
+            c.leave(&name);
         }
         let list = shared
             .subscribers

@@ -13,7 +13,7 @@
 //! bytes. A 200-user channel therefore costs one encode and 200 pointer clones, not 200
 //! encodes. Channel fanout, not connection count, is the real scaling limit at this size.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -102,8 +102,11 @@ pub struct Account {
 #[derive(Default)]
 struct Inner {
     channels: HashMap<Vec<u8>, Channel>,
-    /// Subscribers per channel, keyed by normalised channel name.
-    subscribers: HashMap<Vec<u8>, Vec<(AccountId, Outbound)>>,
+    /// Subscribers per channel, keyed by normalised channel name. Each entry is a
+    /// `(display_name, Outbound)` pair: the display name (server-wide unique, with any
+    /// `#N` suffix) is the per-session fanout key, so two sessions of one account each
+    /// receive their own copy and self-exclusion is per-session.
+    subscribers: HashMap<Vec<u8>, Vec<(String, Outbound)>>,
     /// Advertised games, keyed by lowercased game name. A node is a directory of the
     /// games its clients host; the games themselves are peer-to-peer (`SID_STARTADVEX3`
     /// to advertise, `SID_GETADVLISTEX` to discover). See [`GameAd`].
@@ -171,12 +174,17 @@ pub struct Node {
     pub files_dir: Option<std::path::PathBuf>,
     /// When this node started, for the status UI's uptime figure.
     started: std::time::Instant,
+    /// Display names currently in use across the whole node (lowercased). A second login of
+    /// an account already online is disambiguated with `#2`, `#3`… so both can coexist.
+    active_names: Mutex<HashSet<String>>,
     inner: Mutex<Inner>,
     /// One table for every client class. Counts are keyed by `(class, address)`, so a
     /// Brood War client and a chat-gateway bot from the same address are accounted
     /// separately — which is the entire point of per-type limits.
     admission: Mutex<AdmissionTable>,
     connections: AtomicU64,
+    /// Highest live connection count seen since startup, for the status UI.
+    peak_connections: AtomicU64,
     /// Accounts live behind this actor, not the `Mutex<Inner>` above — persistence is a
     /// disk write, and a disk write must never happen inside a lock that channel fanout
     /// also takes. See `crate::storage`.
@@ -267,9 +275,11 @@ impl Node {
             ads: AdRotation::default(),
             files_dir: cfg.files_dir,
             started: std::time::Instant::now(),
+            active_names: Mutex::new(HashSet::new()),
             inner: Mutex::new(Inner::default()),
             admission: Mutex::new(admission),
             connections: AtomicU64::new(0),
+            peak_connections: AtomicU64::new(0),
             storage,
             // 500ms matches observed real-Battle.net behaviour — see KeyRegistry's docs.
             key_registry: Mutex::new(KeyRegistry::new(500)),
@@ -296,9 +306,16 @@ impl Node {
             .expect("admission lock")
             .admit(class, ip, limits);
         if r.is_ok() {
-            self.connections.fetch_add(1, Ordering::Relaxed);
+            let live = self.connections.fetch_add(1, Ordering::Relaxed) + 1;
+            self.peak_connections.fetch_max(live, Ordering::Relaxed);
         }
         r
+    }
+
+    /// The highest live connection count seen since startup, for the status UI.
+    #[must_use]
+    pub fn peak_connections(&self) -> u64 {
+        self.peak_connections.load(Ordering::Relaxed)
     }
 
     /// Release a connection of `class`.
@@ -337,6 +354,30 @@ impl Node {
     /// Look up an account by name, case-insensitively.
     pub async fn account(&self, name: &str) -> Option<Account> {
         self.storage.account_by_name(name).await
+    }
+
+    /// Claim a server-wide-unique display name for a new session: `base` if it is free,
+    /// otherwise `base#2`, `base#3`, … (the lowest free suffix). Lets several logins of one
+    /// account coexist, each shown distinctly. Pair every claim with [`Self::release_name`].
+    #[must_use]
+    pub fn claim_name(&self, base: &str) -> String {
+        let mut names = self.active_names.lock().expect("names lock");
+        let mut candidate = base.to_string();
+        let mut n = 1u32;
+        // `HashSet::insert` returns false when the (lowercased) name is already present.
+        while !names.insert(candidate.to_ascii_lowercase()) {
+            n += 1;
+            candidate = format!("{base}#{n}");
+        }
+        candidate
+    }
+
+    /// Release a display name claimed with [`Self::claim_name`], freeing it for reuse.
+    pub fn release_name(&self, display: &str) {
+        self.active_names
+            .lock()
+            .expect("names lock")
+            .remove(&display.to_ascii_lowercase());
     }
 
     /// Record one finished-game outcome against an account's `Record\<product>\0\` counters.
@@ -458,19 +499,24 @@ impl Node {
     #[must_use]
     pub fn status_snapshot(&self) -> crate::status::Snapshot {
         let now = std::time::Instant::now();
-        // `connection_count` reads an atomic, not the node lock, so taking it inside the
-        // lock below is safe.
+        // These read atomics, not the node lock, so taking them inside the lock is safe.
         let connections = self.connection_count();
+        let peak_connections = self.peak_connections();
         let inner = self.inner.lock().expect("node lock");
         let mut channels: Vec<crate::status::ChannelInfo> = inner
             .channels
             .values()
             .map(|c| {
                 let users: Vec<String> = c.members().iter().map(|m| m.name.clone()).collect();
+                // Resolve the operator's account to its display name for the UI.
+                let operator = c.operator().and_then(|op| {
+                    c.members().iter().find(|m| m.account == op).map(|m| m.name.clone())
+                });
                 crate::status::ChannelInfo {
                     name: c.display().to_string(),
                     user_count: users.len(),
                     users,
+                    operator,
                 }
             })
             .collect();
@@ -484,14 +530,17 @@ impl Node {
                 host_ip: g.host_ip.to_string(),
                 port: g.port,
                 game_type: g.game_type,
+                has_password: !g.password.is_empty(),
                 elapsed_secs: now.saturating_duration_since(g.created).as_secs(),
             })
             .collect();
         games.sort_by(|a, b| a.name.cmp(&b.name));
         crate::status::Snapshot {
             server_name: self.name.clone(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_secs: now.saturating_duration_since(self.started).as_secs(),
             connections,
+            peak_connections,
             online_users,
             channels,
             games,
@@ -577,17 +626,19 @@ impl Node {
             .subscribers
             .entry(key)
             .or_default()
-            .push((account, out));
+            .push((display_name.to_string(), out));
         Ok((joined, existing))
     }
 
-    /// Leave a channel, destroying it if it is now empty and not persistent.
-    pub fn leave_channel(&self, key: &[u8], account: AccountId) -> Option<AccountId> {
+    /// Leave a channel, destroying it if it is now empty and not persistent. Keyed on the
+    /// session's unique display name, so it removes exactly that session even when others
+    /// share its account.
+    pub fn leave_channel(&self, key: &[u8], display_name: &str) -> Option<AccountId> {
         let mut inner = self.inner.lock().expect("node lock");
         let channel = inner.channels.get_mut(key)?;
-        let outcome = channel.leave(account);
+        let outcome = channel.leave(display_name);
         if let Some(subs) = inner.subscribers.get_mut(key) {
-            subs.retain(|(id, _)| *id != account);
+            subs.retain(|(name, _)| !name.eq_ignore_ascii_case(display_name));
         }
         if outcome.should_destroy {
             inner.channels.remove(key);
@@ -639,18 +690,18 @@ impl Node {
     /// Encoding happens once in the caller; this clones an `Arc` per recipient. A
     /// subscriber whose queue is full is dropped from the fanout and returned, so the
     /// caller can close it — it must never block the other 199 users.
-    pub fn broadcast(&self, key: &[u8], wire: &Wire, exclude: Option<AccountId>) -> Vec<AccountId> {
+    pub fn broadcast(&self, key: &[u8], wire: &Wire, exclude: Option<&str>) -> Vec<String> {
         let inner = self.inner.lock().expect("node lock");
         let Some(subs) = inner.subscribers.get(key) else {
             return Vec::new();
         };
         let mut stalled = Vec::new();
-        for (id, out) in subs {
-            if Some(*id) == exclude {
+        for (name, out) in subs {
+            if exclude.is_some_and(|e| name.eq_ignore_ascii_case(e)) {
                 continue;
             }
             if !out.send(wire) {
-                stalled.push(*id);
+                stalled.push(name.clone());
             }
         }
         stalled
@@ -771,6 +822,38 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_display_names_get_a_numeric_suffix() {
+        let n = node();
+        assert_eq!(n.claim_name("Fish"), "Fish");
+        assert_eq!(n.claim_name("Fish"), "Fish#2");
+        // Collisions are case-insensitive; the caller's casing is preserved in the result.
+        assert_eq!(n.claim_name("fish"), "fish#3");
+        // Releasing a slot frees it for reuse (lowest free suffix wins).
+        n.release_name("Fish#2");
+        assert_eq!(n.claim_name("Fish"), "Fish#2");
+    }
+
+    #[test]
+    fn two_sessions_of_one_account_coexist_with_distinct_names() {
+        // The name registry hands duplicate logins distinct display names; channel
+        // membership keys on that name, so both sessions of one account can be present.
+        let n = node();
+        let (o1, _r1) = outbound(4);
+        let (o2, _r2) = outbound(4);
+        n.join_channel(b"chat", 7, "Fish", 0, Vec::new(), o1).unwrap();
+        let (_, existing) = n.join_channel(b"chat", 7, "Fish#2", 0, Vec::new(), o2).unwrap();
+        assert_eq!(existing.len(), 1, "the second session sees the first already present");
+        assert_eq!(
+            n.channel_occupant_names(b"chat").len(),
+            2,
+            "both sessions of the account coexist in the channel"
+        );
+        // Leaving by one display name removes only that session.
+        n.leave_channel(b"chat", "Fish");
+        assert_eq!(n.channel_occupant_names(b"chat"), vec!["Fish#2".to_string()]);
+    }
+
+    #[test]
     fn a_broadcast_reaches_everyone_except_the_excluded_sender() {
         let n = node();
         let (o1, mut r1) = outbound(4);
@@ -779,7 +862,7 @@ mod tests {
         n.join_channel(b"chat", 2, "b", 0, Vec::new(), o2).unwrap();
 
         let wire = Arc::new(vec![0xFFu8, 0x0F, 4, 0]);
-        let stalled = n.broadcast(b"chat", &wire, Some(1));
+        let stalled = n.broadcast(b"chat", &wire, Some("a"));
         assert!(stalled.is_empty());
         assert!(r1.try_recv().is_err(), "sender must not receive their own talk");
         assert!(r2.try_recv().is_ok());
@@ -798,7 +881,7 @@ mod tests {
         for _ in 0..8 {
             stalled = n.broadcast(b"chat", &wire, None);
         }
-        assert_eq!(stalled, vec![1], "the slow subscriber must be named");
+        assert_eq!(stalled, vec!["slow".to_string()], "the slow subscriber must be named");
         // The healthy subscriber still got every message.
         let mut got = 0;
         while fast_rx.try_recv().is_ok() {
@@ -813,7 +896,7 @@ mod tests {
         let (out, _rx) = outbound(4);
         n.join_channel(b"temp", 1, "a", 0, Vec::new(), out).unwrap();
         assert_eq!(n.channel_names().len(), 1);
-        n.leave_channel(b"temp", 1);
+        n.leave_channel(b"temp", "a");
         assert!(n.channel_names().is_empty());
     }
 

@@ -24,10 +24,14 @@ use crate::node::Node;
 pub struct Snapshot {
     /// Server display name.
     pub server_name: String,
+    /// Daemon version (`CARGO_PKG_VERSION`).
+    pub version: String,
     /// Seconds since the node started.
     pub uptime_secs: u64,
     /// Total live connections of every kind (game, gateway, BNFTP, pending).
     pub connections: u64,
+    /// Highest live connection count seen since startup.
+    pub peak_connections: u64,
     /// Users currently sitting in a channel (a subset of `connections`).
     pub online_users: usize,
     /// Active channels, sorted by name.
@@ -42,6 +46,8 @@ pub struct ChannelInfo {
     pub name: String,
     pub user_count: usize,
     pub users: Vec<String>,
+    /// Display name of the channel operator, if any.
+    pub operator: Option<String>,
 }
 
 /// One advertised game.
@@ -51,6 +57,8 @@ pub struct GameInfo {
     pub host_ip: String,
     pub port: u16,
     pub game_type: u16,
+    /// Whether the game requires a join password.
+    pub has_password: bool,
     pub elapsed_secs: u64,
 }
 
@@ -151,6 +159,7 @@ const DASHBOARD: &str = r##"<!doctype html>
 <main>
   <div class="tiles">
     <div class="tile"><div class="n num" id="t-conns">–</div><div class="l">Connections</div></div>
+    <div class="tile"><div class="n num" id="t-peak">–</div><div class="l">Peak</div></div>
     <div class="tile"><div class="n num" id="t-users">–</div><div class="l">In channels</div></div>
     <div class="tile"><div class="n num" id="t-channels">–</div><div class="l">Channels</div></div>
     <div class="tile"><div class="n num" id="t-games">–</div><div class="l">Games</div></div>
@@ -175,9 +184,11 @@ async function tick() {
     const r = await fetch('status.json', {cache:'no-store'});
     const d = await r.json();
     $('server').textContent = d.server_name || 'node';
-    $('meta').textContent = 'uptime ' + fmtDur(d.uptime_secs) + ' · updated ' + new Date().toLocaleTimeString();
+    $('meta').textContent = 'v' + (d.version || '?') + ' · uptime ' + fmtDur(d.uptime_secs) +
+      ' · updated ' + new Date().toLocaleTimeString();
     $('meta').classList.remove('stale');
     $('t-conns').textContent = d.connections;
+    $('t-peak').textContent = d.peak_connections;
     $('t-users').textContent = d.online_users;
     $('t-channels').textContent = d.channels.length;
     $('t-games').textContent = d.games.length;
@@ -185,15 +196,17 @@ async function tick() {
     $('gm-count').textContent = d.games.length + ' advertised';
 
     $('channels').innerHTML = d.channels.length ? (
-      '<table><thead><tr><th>Channel</th><th>Users</th><th>Names</th></tr></thead><tbody>' +
+      '<table><thead><tr><th>Channel</th><th>Users</th><th>Operator</th><th>Names</th></tr></thead><tbody>' +
       d.channels.map(c => '<tr><td>'+esc(c.name)+'</td><td class="num">'+c.user_count+
+        '</td><td class="users">'+(c.operator?esc(c.operator):'—')+
         '</td><td class="users">'+esc((c.users||[]).join(', '))+'</td></tr>').join('') +
       '</tbody></table>'
     ) : '<div class="empty">No active channels.</div>';
 
     $('games').innerHTML = d.games.length ? (
       '<table><thead><tr><th>Game</th><th>Host</th><th>Type</th><th>Age</th></tr></thead><tbody>' +
-      d.games.map(g => '<tr><td>'+esc(g.name)+'</td><td class="users">'+esc(g.host_ip)+':'+g.port+
+      d.games.map(g => '<tr><td>'+esc(g.name)+(g.has_password?' 🔒':'')+
+        '</td><td class="users">'+esc(g.host_ip)+':'+g.port+
         '</td><td class="num">'+g.game_type+'</td><td class="num">'+fmtDur(g.elapsed_secs)+'</td></tr>').join('') +
       '</tbody></table>'
     ) : '<div class="empty">No games advertised.</div>';

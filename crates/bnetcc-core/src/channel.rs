@@ -234,8 +234,29 @@ impl Channel {
         self.seq
     }
 
-    fn position(&self, account: AccountId) -> Option<usize> {
+    fn position_by_account(&self, account: AccountId) -> Option<usize> {
         self.members.iter().position(|m| m.account == account)
+    }
+
+    /// Locate a member by display name (case-insensitive). Display names are unique
+    /// server-wide (the node appends `#2`, `#3`… to duplicates), so this identifies one
+    /// specific session even when several sessions share an account.
+    fn position_by_name(&self, name: &str) -> Option<usize> {
+        self.members.iter().position(|m| m.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The base name with any `#N` disambiguation suffix stripped, for matching an
+    /// "Op <name>"/"Clan <name>" grant: `Fish#2` → `Fish`. A name without a numeric suffix
+    /// is returned unchanged.
+    fn base_name(name: &str) -> &str {
+        match name.rsplit_once('#') {
+            Some((base, suffix))
+                if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                base
+            }
+            _ => name,
+        }
     }
 
     /// Add a user to the channel.
@@ -258,7 +279,7 @@ impl Channel {
         if self.bans.contains(&account) {
             return Err(JoinDenial::Banned);
         }
-        if self.position(account).is_some() {
+        if self.position_by_name(&name).is_some() {
             return Err(JoinDenial::AlreadyPresent);
         }
         // `max_users == 0` means unlimited — there is no cap to hit.
@@ -271,8 +292,10 @@ impl Channel {
                 OpGrant::None => false,
                 OpGrant::FirstArrival => self.members.is_empty(),
                 // "Op <name>" / "Clan <name>": only the named account is auto-opped, and
-                // whenever they arrive — not merely whoever shows up first.
-                OpGrant::NameMatch(op_name) => name.eq_ignore_ascii_case(op_name),
+                // whenever they arrive — not merely whoever shows up first. Match the base
+                // name so a disambiguated session (e.g. `Fish#2`) still qualifies under
+                // "Op Fish".
+                OpGrant::NameMatch(op_name) => Self::base_name(&name).eq_ignore_ascii_case(op_name),
             };
         let flags = if granted_operator {
             base_flags | user_flags::OPERATOR
@@ -301,13 +324,35 @@ impl Channel {
     /// is **still present**; otherwise the channel is left with no operator. Operator
     /// does not drift to the longest-present user, because that would make leaving a way
     /// to hand operator to a rival.
-    pub fn leave(&mut self, account: AccountId) -> LeaveOutcome {
-        let Some(idx) = self.position(account) else {
-            return LeaveOutcome::default();
-        };
+    pub fn leave(&mut self, name: &str) -> LeaveOutcome {
+        match self.position_by_name(name) {
+            Some(idx) => self.remove_at(idx),
+            None => LeaveOutcome::default(),
+        }
+    }
+
+    /// Remove the first session of an account. Used by operator kick/ban, which target an
+    /// account rather than one specific session.
+    fn leave_account(&mut self, account: AccountId) -> LeaveOutcome {
+        match self.position_by_account(account) {
+            Some(idx) => self.remove_at(idx),
+            None => LeaveOutcome::default(),
+        }
+    }
+
+    /// Remove the member at `idx` and handle operator succession.
+    ///
+    /// Operator is an account-level role, so it only vacates when the departing session
+    /// held it *and* no other session of that account remains; it then passes to the first
+    /// designated heir still present.
+    fn remove_at(&mut self, idx: usize) -> LeaveOutcome {
+        let account = self.members[idx].account;
         self.members.remove(idx);
-        self.heirs.retain(|&h| h != account);
         self.bump();
+        let account_gone = self.position_by_account(account).is_none();
+        if account_gone {
+            self.heirs.retain(|&h| h != account);
+        }
 
         let mut out = LeaveOutcome {
             now_empty: self.members.is_empty(),
@@ -317,16 +362,16 @@ impl Channel {
             ..LeaveOutcome::default()
         };
 
-        if self.operator == Some(account) {
+        if account_gone && self.operator == Some(account) {
             self.operator = None;
             let heir = self
                 .heirs
                 .iter()
                 .copied()
-                .find(|&h| self.position(h).is_some());
+                .find(|&h| self.position_by_account(h).is_some());
             if let Some(h) = heir {
                 self.operator = Some(h);
-                if let Some(pos) = self.position(h) {
+                if let Some(pos) = self.position_by_account(h) {
                     self.members[pos].flags |= user_flags::OPERATOR;
                 }
                 self.heirs.retain(|&x| x != h);
@@ -349,7 +394,7 @@ impl Channel {
         if by == heir {
             return Err(OpError::CannotTargetSelf);
         }
-        if self.position(heir).is_none() {
+        if self.position_by_account(heir).is_none() {
             return Err(OpError::NotPresent);
         }
         self.heirs.retain(|&h| h != heir);
@@ -370,10 +415,10 @@ impl Channel {
         if by == target {
             return Err(OpError::CannotTargetSelf);
         }
-        if self.position(target).is_none() {
+        if self.position_by_account(target).is_none() {
             return Err(OpError::NotPresent);
         }
-        Ok(self.leave(target))
+        Ok(self.leave_account(target))
     }
 
     /// Ban a user from the channel and remove them.
@@ -389,7 +434,7 @@ impl Channel {
             return Err(OpError::CannotTargetSelf);
         }
         self.bans.insert(target);
-        Ok(self.leave(target))
+        Ok(self.leave_account(target))
     }
 
     /// Lift a channel ban.
@@ -604,7 +649,7 @@ mod tests {
         let mut c = chan(ChannelClass::Local);
         join(&mut c, 1).unwrap();
         join(&mut c, 2).unwrap();
-        let out = c.leave(1);
+        let out = c.leave("user1");
         assert_eq!(out.new_operator, None);
         assert_eq!(c.operator(), None, "operator must not drift to the next user");
     }
@@ -615,7 +660,7 @@ mod tests {
         join(&mut c, 1).unwrap();
         join(&mut c, 2).unwrap();
         c.designate(1, 2).unwrap();
-        let out = c.leave(1);
+        let out = c.leave("user1");
         assert_eq!(out.new_operator, Some(2));
         assert!(c.is_operator(2));
         assert_eq!(
@@ -632,8 +677,8 @@ mod tests {
         join(&mut c, 2).unwrap();
         join(&mut c, 3).unwrap();
         c.designate(1, 2).unwrap();
-        c.leave(2);
-        let out = c.leave(1);
+        c.leave("user2");
+        let out = c.leave("user1");
         assert_eq!(out.new_operator, None);
         assert_eq!(c.operator(), None);
     }
@@ -646,8 +691,8 @@ mod tests {
         }
         c.designate(1, 2).unwrap();
         c.designate(1, 3).unwrap();
-        c.leave(2);
-        assert_eq!(c.leave(1).new_operator, Some(3));
+        c.leave("user2");
+        assert_eq!(c.leave("user1").new_operator, Some(3));
     }
 
     #[test]
@@ -656,7 +701,7 @@ mod tests {
         let mut c = chan(ChannelClass::Local);
         join(&mut c, 1).unwrap();
         join(&mut c, 2).unwrap();
-        c.leave(1);
+        c.leave("user1");
         let out = join(&mut c, 1).unwrap();
         assert!(!out.granted_operator);
         assert_eq!(c.operator(), None);
@@ -666,7 +711,7 @@ mod tests {
     fn an_empty_channel_grants_operator_to_the_next_arrival() {
         let mut c = chan(ChannelClass::Local);
         join(&mut c, 1).unwrap();
-        let out = c.leave(1);
+        let out = c.leave("user1");
         assert!(out.now_empty);
         assert!(out.should_destroy);
         // In practice the caller destroys it here; if it is kept, the invariant holds.
@@ -677,7 +722,7 @@ mod tests {
     fn official_channels_survive_becoming_empty() {
         let mut c = chan(ChannelClass::Official);
         join(&mut c, 1).unwrap();
-        let out = c.leave(1);
+        let out = c.leave("user1");
         assert!(out.now_empty);
         assert!(!out.should_destroy);
     }
@@ -752,7 +797,7 @@ mod tests {
     fn leaving_a_channel_you_are_not_in_is_a_no_op() {
         let mut c = chan(ChannelClass::Local);
         join(&mut c, 1).unwrap();
-        let out = c.leave(999);
+        let out = c.leave("user999");
         assert_eq!(out, LeaveOutcome::default());
         assert_eq!(c.len(), 1);
     }
@@ -773,7 +818,7 @@ mod tests {
                 }
                 2 => c.designate(1, 2).unwrap(),
                 _ => {
-                    c.leave(1);
+                    c.leave("user1");
                 }
             }
             assert!(c.seq() > last, "step {step} did not advance the sequence");
@@ -794,7 +839,7 @@ mod tests {
                         let _ = c.join(a, format!("u{a}"), 0, Vec::new());
                     }
                     1 => {
-                        c.leave(a);
+                        c.leave(&format!("u{a}"));
                     }
                     2 => {
                         let _ = c.designate(a, b);
