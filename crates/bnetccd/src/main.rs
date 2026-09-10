@@ -224,10 +224,18 @@ async fn run(cfg: Config) -> Result<(), String> {
         idle_timeout: Duration::from_secs(cfg.limits.idle_timeout_secs),
     };
 
-    let listener = TcpListener::bind(cfg.listen.bncs)
-        .await
-        .map_err(|e| format!("cannot bind {}: {e}", cfg.listen.bncs))?;
-    info!(addr = %cfg.listen.bncs, "listening for BNCS and chat-gateway clients");
+    // Socket sharding: bind N SO_REUSEPORT listeners so several accept loops share the port
+    // and the kernel spreads new connections across them (each with its own accept backlog).
+    // `accept_shards = 1` is the ordinary single-listener case.
+    let shards = cfg.listen.accept_shards.clamp(1, 64);
+    let mut listeners = Vec::with_capacity(shards);
+    for _ in 0..shards {
+        listeners.push(
+            reuseport_listener(cfg.listen.bncs)
+                .map_err(|e| format!("cannot bind {}: {e}", cfg.listen.bncs))?,
+        );
+    }
+    info!(addr = %cfg.listen.bncs, shards, "listening for BNCS and chat-gateway clients");
 
     if cfg.federation.enabled {
         // Phase 2. The link is one outbound mTLS connection to the hub; a node never
@@ -236,39 +244,60 @@ async fn run(cfg: Config) -> Result<(), String> {
         warn!(hub = %cfg.federation.hub, "federation is configured but not yet implemented");
     }
 
-    let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok((stream, peer)) => {
-                        if node.connection_count() >= u64::from(max_connections) {
-                            // Refuse at the door rather than accepting and failing later.
-                            drop(stream);
-                            continue;
-                        }
-                        let node = Arc::clone(&node);
-                        tokio::spawn(async move {
-                            session::handle(stream, peer, node, limits).await;
-                        });
-                    }
-                    Err(e) => {
-                        // A per-connection accept error (EMFILE, a peer that vanished)
-                        // must never end the accept loop.
-                        warn!(error = %e, "accept failed");
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                }
-            }
-            _ = &mut shutdown => {
-                info!("shutdown signal received");
-                break;
-            }
-        }
+    for listener in listeners {
+        tokio::spawn(accept_loop(listener, Arc::clone(&node), limits, max_connections));
     }
+
+    let _ = tokio::signal::ctrl_c().await;
+    info!("shutdown signal received");
 
     info!(connections = node.connection_count(), "stopping");
     Ok(())
+}
+
+/// Build a listening socket with `SO_REUSEADDR` + `SO_REUSEPORT` so several accept loops can
+/// share one port; the kernel load-balances new connections across them. A backlog of 1024
+/// is requested per shard (the OS clamps it to `somaxconn`).
+fn reuseport_listener(addr: std::net::SocketAddr) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    sock.set_reuse_address(true)?;
+    sock.set_reuse_port(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(1024)?;
+    TcpListener::from_std(std::net::TcpListener::from(sock))
+}
+
+/// One accept loop for a (possibly sharded) listener: accept, apply the global connection
+/// ceiling, and spawn a session task per connection. A per-connection accept error (EMFILE,
+/// a peer that vanished) is logged and never ends the loop.
+async fn accept_loop(
+    listener: TcpListener,
+    node: Arc<Node>,
+    limits: SessionLimits,
+    max_connections: u32,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                if node.connection_count() >= u64::from(max_connections) {
+                    // Refuse at the door rather than accepting and failing later.
+                    drop(stream);
+                    continue;
+                }
+                let node = Arc::clone(&node);
+                tokio::spawn(async move {
+                    session::handle(stream, peer, node, limits).await;
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, "accept failed");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
 }
 
 /// Best-effort file descriptor limit for this process.

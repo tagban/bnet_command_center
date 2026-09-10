@@ -357,6 +357,10 @@ pub struct ListenConfig {
     pub bncs: SocketAddr,
     /// Admin, health and Prometheus metrics.
     pub admin: SocketAddr,
+    /// Number of `SO_REUSEPORT` accept-loop shards for the BNCS listener. `0` or `1` is a
+    /// single listener; higher values spread accept + connection-setup across cores and give
+    /// each shard its own accept backlog, for very high connect rates. Capped at 64.
+    pub accept_shards: usize,
 }
 
 impl Default for ListenConfig {
@@ -364,6 +368,7 @@ impl Default for ListenConfig {
         Self {
             bncs: "0.0.0.0:6112".parse().expect("valid default"),
             admin: "127.0.0.1:6115".parse().expect("valid default"),
+            accept_shards: 1,
         }
     }
 }

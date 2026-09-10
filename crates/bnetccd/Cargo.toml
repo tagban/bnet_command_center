@@ -13,6 +13,7 @@ bnetcc-proto = { path = "../bnetcc-proto" }
 bnetcc-storage = { path = "../bnetcc-storage" }
 bnetcc-storage-sqlite = { path = "../bnetcc-storage-sqlite" }
 tokio.workspace = true
+socket2.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
