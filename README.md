@@ -1,5 +1,7 @@
 # BNET Command Center
 
+[![CI](https://github.com/tagban/bnet_command_center/actions/workflows/ci.yml/badge.svg)](https://github.com/tagban/bnet_command_center/actions/workflows/ci.yml)
+
 A federated Classic Battle.net server in Rust. **[bnet.cc](https://bnet.cc)**
 
 Built clean-slate, informed by what PvPGN and BNETDocs Atlas got right and wrong. Two
@@ -90,6 +92,38 @@ The full evidence table is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §2
 
 ---
 
+## Download & run (no build)
+
+Prebuilt archives for Linux, macOS (Intel + Apple Silicon), and Windows are attached to
+each [GitHub Release](https://github.com/tagban/bnet_command_center/releases), and to every
+manual run of the [Release workflow](https://github.com/tagban/bnet_command_center/actions/workflows/release.yml)
+(as downloadable artifacts — use the **Run workflow** button to get a build without cutting a
+version). Each archive holds two executables:
+
+- **`bnetcc-launcher`** — start here. On first run it writes a `bnetccd.toml`, then launches
+  the server, printing the game port and the admin-panel URL. The server prints a one-time
+  admin password to the same console on its first run.
+- **`bnetccd`** — the server itself, for when you want to manage the config by hand.
+
+```sh
+# macOS / Linux — unpack and run
+tar xzf bnet-command-center-*-*.tar.gz && cd bnet-command-center-*/
+./bnetcc-launcher
+```
+
+```
+REM Windows — unzip, then in that folder
+bnetcc-launcher.exe
+```
+
+Game clients then connect to the host machine on port **6112**; the admin panel is at
+**https://127.0.0.1:6114** (self-signed cert — the browser warns once). To grant yourself
+staff powers (`/tagban`, `/ipban`, `/mute`), add your account name to `[admins]` in the
+generated `bnetccd.toml` and restart. macOS/Linux may need `ulimit -n` raised for large
+tests; Windows SmartScreen may warn on first launch of an unsigned binary.
+
+---
+
 ## Building
 
 ```sh
@@ -168,8 +202,7 @@ and the complete matrix.
 ## Licence
 
 `Apache-2.0 OR MIT`, the Rust convention. Apache-2.0 additionally carries an explicit
-patent grant. `LICENSE-MIT` is in the tree; add `LICENSE-APACHE` from
-<https://www.apache.org/licenses/LICENSE-2.0.txt> before publishing.
+patent grant. Both `LICENSE-MIT` and `LICENSE-APACHE` are in the tree.
 
 **Before publishing anything, read [`docs/LEGAL.md`](docs/LEGAL.md).** Two things matter:
 PvPGN's WarCraft III SRP sources are **AGPL-3.0** and must not be read by anyone

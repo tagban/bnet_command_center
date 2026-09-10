@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# One in-flight run per ref; a new push cancels the previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # rusqlite is built with the "bundled" feature, so it compiles SQLite from C. All
+      # three runners ship a C toolchain (gcc/clang/MSVC), so no extra setup is needed.
+      - name: Build
+        run: cargo build --workspace --locked --verbose
+      - name: Test
+        run: cargo test --workspace --locked --verbose
+
+  lint:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The tree is intentionally hand-formatted, so there is no rustfmt gate; clippy is the
+      # correctness gate and is kept at zero warnings.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

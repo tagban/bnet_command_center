@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Manual runs produce the same archives as downloadable workflow artifacts (no Release),
+  # so you can grab a build to test on other machines without cutting a version.
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to create the GitHub Release on a tag
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binaries
+        run: >
+          cargo build --release --locked --target ${{ matrix.target }}
+          -p bnetccd -p bnetcc-launcher
+
+      # Version label: the tag name on a tag build, otherwise a short dev-SHA.
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="bnet-command-center-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
+          staging="dist/$name"
+          bindir="target/${{ matrix.target }}/release"
+          mkdir -p "$staging"
+          cp "$bindir/bnetccd" "$bindir/bnetcc-launcher" "$staging/"
+          cp bnetccd.example.toml README.md LICENSE-MIT LICENSE-APACHE "$staging/"
+          tar -C dist -czf "$name.tar.gz" "$name"
+          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "bnet-command-center-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
+          $staging = "dist/$name"
+          $bindir = "target/${{ matrix.target }}/release"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "$bindir/bnetccd.exe","$bindir/bnetcc-launcher.exe" $staging
+          Copy-Item bnetccd.example.toml,README.md,LICENSE-MIT,LICENSE-APACHE $staging
+          Compress-Archive -Path $staging -DestinationPath "$name.zip"
+          "ASSET=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
