@@ -189,6 +189,38 @@ struct Inner {
     /// games its clients host; the games themselves are peer-to-peer (`SID_STARTADVEX3`
     /// to advertise, `SID_GETADVLISTEX` to discover). See [`GameAd`].
     games: HashMap<Vec<u8>, GameAd>,
+    /// Per-channel queue of pending leave-notification frames (each a pre-encoded
+    /// `EID_LEAVE`). Membership *state* is updated immediately when a user leaves; only the
+    /// *notification* is deferred here so a burst of departures (a load test disconnecting
+    /// thousands at once) coalesces into one batched write per subscriber instead of one
+    /// per departure, which is what a bounded outbound queue can actually absorb. Flushed by
+    /// [`Node::flush_pending`] on a timer and, to preserve ordering, before any immediate
+    /// broadcast on the same channel.
+    pending_leaves: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+}
+
+/// Flush a channel's queued leave notifications: concatenate them into one buffer (BNCS
+/// accepts back-to-back `SID_CHATEVENT` frames) and hand every subscriber the same `Arc`, so
+/// N departures cost one queue slot per subscriber rather than N. Takes `&mut Inner` because
+/// it both drains `pending_leaves` and reads `subscribers`.
+fn flush_leaves_locked(inner: &mut Inner, key: &[u8]) {
+    let Some(events) = inner.pending_leaves.remove(key) else {
+        return;
+    };
+    if events.is_empty() {
+        return;
+    }
+    let Some(subs) = inner.subscribers.get(key) else {
+        return; // channel gone; nobody left to notify
+    };
+    let mut batch = Vec::with_capacity(events.iter().map(Vec::len).sum());
+    for e in &events {
+        batch.extend_from_slice(e);
+    }
+    let batch = Arc::new(batch);
+    for (_name, out) in subs {
+        let _ = out.send(&batch);
+    }
 }
 
 /// A game advertised by a hosting client, tracked so other clients can discover it via
@@ -742,6 +774,7 @@ impl Node {
         if outcome.should_destroy {
             inner.channels.remove(key);
             inner.subscribers.remove(key);
+            inner.pending_leaves.remove(key);
         }
         outcome.new_operator
     }
@@ -777,6 +810,7 @@ impl Node {
         if outcome.should_destroy {
             inner.channels.remove(key);
             inner.subscribers.remove(key);
+            inner.pending_leaves.remove(key);
         }
         ModResult::Ok {
             target_out,
@@ -802,6 +836,7 @@ impl Node {
         if outcome.should_destroy {
             inner.channels.remove(key);
             inner.subscribers.remove(key);
+            inner.pending_leaves.remove(key);
         }
         ModResult::Ok {
             target_out,
@@ -899,7 +934,11 @@ impl Node {
         // Lowercase the sender once (not per recipient); the empty-ignore fast path in
         // `IgnoreSet::contains` means well-behaved channels never touch a lock here.
         let sender_lc = sender_base.map(str::to_ascii_lowercase);
-        let inner = self.inner.lock().expect("node lock");
+        let mut inner = self.inner.lock().expect("node lock");
+        // Ordering: any queued leaves for this channel must reach subscribers before this
+        // (later) event, so a departure can never arrive after a same-name rejoin. Flushing
+        // here also means chat activity propagates pending leaves promptly.
+        flush_leaves_locked(&mut inner, key);
         let Some(subs) = inner.subscribers.get(key) else {
             return Vec::new();
         };
@@ -918,6 +957,31 @@ impl Node {
             }
         }
         stalled
+    }
+
+    /// Queue a pre-encoded `EID_LEAVE` frame to be delivered to the channel's subscribers in
+    /// the next coalesced flush, rather than broadcast immediately. The leaver has already
+    /// been removed from the subscriber list, so the batch never reaches them and no
+    /// exclusion is needed. A no-op if the channel has no remaining subscribers.
+    pub fn enqueue_leave(&self, key: &[u8], frame: Vec<u8>) {
+        let mut inner = self.inner.lock().expect("node lock");
+        if inner.subscribers.contains_key(key) {
+            inner.pending_leaves.entry(key.to_vec()).or_default().push(frame);
+        }
+    }
+
+    /// Flush every channel's queued leave notifications. Called on a short timer so
+    /// departures still propagate on an otherwise-idle channel; an active channel also
+    /// flushes via [`Self::broadcast`].
+    pub fn flush_pending(&self) {
+        let mut inner = self.inner.lock().expect("node lock");
+        if inner.pending_leaves.is_empty() {
+            return;
+        }
+        let keys: Vec<Vec<u8>> = inner.pending_leaves.keys().cloned().collect();
+        for key in keys {
+            flush_leaves_locked(&mut inner, &key);
+        }
     }
 
     /// Register a logged-in session so staff moderation can reach it later. Pair with
@@ -1188,6 +1252,35 @@ mod tests {
 
         n.unregister_session("Bob");
         assert_eq!(n.session_ip("Bob"), None);
+    }
+
+    #[test]
+    fn leaves_are_coalesced_into_one_batched_write() {
+        let n = node();
+        let (obs, mut r) = outbound(64);
+        n.join_channel(b"chat", 1, "obs", 0, Vec::new(), obs).unwrap();
+        // Two departures enqueue their leave frames; nothing is delivered yet.
+        n.enqueue_leave(b"chat", vec![0xFF, 0x0F, 4, 0]);
+        n.enqueue_leave(b"chat", vec![0xFF, 0x0F, 4, 0]);
+        assert!(r.try_recv().is_err(), "leaves are deferred, not sent per-departure");
+        // One flush delivers both, concatenated into a single frame (one queue slot).
+        n.flush_pending();
+        let batch = r.try_recv().expect("one batched frame");
+        assert_eq!(batch.len(), 8, "two 4-byte leave frames in one buffer");
+        assert!(r.try_recv().is_err(), "exactly one batched write, not one per leave");
+    }
+
+    #[test]
+    fn a_broadcast_flushes_pending_leaves_before_its_own_event() {
+        let n = node();
+        let (obs, mut r) = outbound(64);
+        n.join_channel(b"chat", 1, "obs", 0, Vec::new(), obs).unwrap();
+        n.enqueue_leave(b"chat", vec![0xFF, 0x0F, 4, 0]);
+        // An immediate event (a talk) must not jump ahead of an already-queued leave.
+        let talk = Arc::new(vec![0xFFu8, 0x0F, 5, 0, 0]);
+        n.broadcast(b"chat", &talk, None, None);
+        assert_eq!(r.try_recv().expect("leave first").len(), 4);
+        assert_eq!(r.try_recv().expect("then the talk").len(), 5);
     }
 
     #[test]

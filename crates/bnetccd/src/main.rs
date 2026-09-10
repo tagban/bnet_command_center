@@ -285,6 +285,20 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
         warn!(hub = %cfg.federation.hub, "federation is configured but not yet implemented");
     }
 
+    // Coalesced leave notifications flush on this cadence, so departures still propagate on
+    // an idle channel (an active one also flushes on each broadcast). 75ms keeps the delay
+    // imperceptible while collapsing a mass-disconnect burst into a handful of batched writes.
+    {
+        let node = Arc::clone(&node);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(75));
+            loop {
+                tick.tick().await;
+                node.flush_pending();
+            }
+        });
+    }
+
     for listener in listeners {
         tokio::spawn(accept_loop(listener, Arc::clone(&node), limits, max_connections));
     }

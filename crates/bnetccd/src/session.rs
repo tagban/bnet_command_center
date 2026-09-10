@@ -582,8 +582,10 @@ impl Bncs {
             let leaver = self.display_name.clone();
             let new_op = self.node.leave_channel(&key, &leaver);
             let leave = chat_event(EventId::Leave, self.flags, 0, leaver.as_bytes(), b"");
-            if let Some(wire) = encode(&leave) {
-                let _ = self.node.broadcast(&key, &wire, Some(&leaver), None);
+            // Coalesced: a mass disconnect enqueues N leaves that flush as one batched write
+            // per subscriber, instead of N broadcasts that overflow a bounded outbound queue.
+            if let Some(bytes) = encode_vec(&leave) {
+                self.node.enqueue_leave(&key, bytes);
             }
             if let Some(op) = new_op {
                 debug!(channel = ?String::from_utf8_lossy(&key), new_operator = op, "operator inherited");
@@ -1362,8 +1364,8 @@ impl Bncs {
     fn leave_current(&mut self, key: &[u8]) {
         self.node.leave_channel(key, &self.display_name);
         let ev = chat_event(EventId::Leave, self.flags, 0, self.display_name.as_bytes(), b"");
-        if let Some(wire) = encode(&ev) {
-            let _ = self.node.broadcast(key, &wire, Some(&self.display_name), None);
+        if let Some(bytes) = encode_vec(&ev) {
+            self.node.enqueue_leave(key, bytes);
         }
     }
 
@@ -1705,8 +1707,8 @@ impl Bncs {
                 let _ = out.send(&wire);
             }
         }
-        if let Some(wire) = encode(&chat_event(EventId::Leave, 0, 0, target.as_bytes(), b"")) {
-            let _ = self.node.broadcast(key, &wire, None, None);
+        if let Some(bytes) = encode_vec(&chat_event(EventId::Leave, 0, 0, target.as_bytes(), b"")) {
+            self.node.enqueue_leave(key, bytes);
         }
         if let Some(op) = new_operator {
             debug!(new_operator = op, "operator inherited after a removal");
@@ -2190,9 +2192,15 @@ impl Bncs {
 }
 
 fn encode(frame: &Frame) -> Option<Wire> {
+    encode_vec(frame).map(Arc::new)
+}
+
+/// Encode a frame to owned bytes (not yet wrapped in an `Arc`). Used where the bytes are
+/// buffered for later coalescing — see [`crate::node::Node::enqueue_leave`].
+fn encode_vec(frame: &Frame) -> Option<Vec<u8>> {
     let mut buf = Vec::with_capacity(frame.wire_len());
     encode_frame(frame, &mut buf).ok()?;
-    Some(Arc::new(buf))
+    Some(buf)
 }
 
 /// The base account name behind a display name — strips any `#N` coexistence suffix, so
