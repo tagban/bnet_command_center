@@ -174,9 +174,34 @@ accounts = []
 # channels always auto-op and "Public *" channels never do — this governs only private
 # channels. Off by default.
 auto_op_private = false
-# Non-public channels a telnet/chat-gateway user may enter. Gateway users are otherwise
-# confined to "Public *" channels; they never reach arbitrary private or Op/Clan channels.
-telnet_channels = ["Open Tech Support"]
+# Global telnet/chat-gateway channel access: "public" (public channels only — default),
+# "none", or "all". Per-channel `telnet` below overrides this.
+telnet_access = "public"
+# Per-category user caps (0 = unlimited).
+private_max = 0
+public_max = 0
+clan_max = 0
+
+# Per-product default channel: a client that joins WITHOUT naming a channel lands here.
+# A client that names a channel is honoured as-is. Keyed by product FourCC.
+[channels.default_channel]
+STAR = "StarCraft"
+SEXP = "Brood War"
+W2BN = "War2 BNE"
+DRTL = "Diablo"
+
+# Pre-defined channels. Each is an [[channels.defined]] block. `products` restricts entry
+# to those game clients (empty/unset = any); `min_flag` gates on a chat flag; `max_users`
+# overrides the category cap.
+# [[channels.defined]]
+# name = "War2 BNE"
+# products = ["W2BN"]      # only Warcraft II BNE clients may join
+# max_users = 100
+# persist = true
+# [[channels.defined]]
+# name = "Staff"
+# min_flag = "admin"       # admin | speaker | operator
+# listed = false
 
 # [versions]
 # Restrict which client version bytes may connect. Off by default (any version is

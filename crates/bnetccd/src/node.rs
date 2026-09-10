@@ -734,12 +734,14 @@ impl Node {
     /// # Errors
     ///
     /// [`JoinDenial`] when the channel is full, the user is banned, or already present.
+    #[allow(clippy::too_many_arguments)] // one call site; a params struct would not earn it
     pub fn join_channel(
         &self,
         raw_name: &[u8],
         account: AccountId,
         display_name: &str,
         base_flags: u32,
+        product: Option<&str>,
         statstring: Vec<u8>,
         out: Outbound,
     ) -> Result<(JoinedChannel, Vec<ChannelOccupant>), JoinDenial> {
@@ -749,11 +751,20 @@ impl Node {
         }
         let display = String::from_utf8_lossy(raw_name).trim().to_string();
 
-        // A defined channel may gate entry on a required flag (e.g. a staff channel).
+        // A defined channel may gate entry on a required flag (e.g. a staff channel) or on
+        // the client's product (e.g. War2 BNE only) — see `crate::config::ResolvedChannel`.
         let rule = self.channel_rules.get(&key).cloned();
         if let Some(rule) = &rule {
             if rule.min_flag != 0 && base_flags & rule.min_flag == 0 {
                 return Err(JoinDenial::Restricted);
+            }
+            if !rule.products.is_empty() {
+                let allowed = product
+                    .map(str::to_ascii_uppercase)
+                    .is_some_and(|p| rule.products.contains(&p));
+                if !allowed {
+                    return Err(JoinDenial::Restricted);
+                }
             }
         }
         let topic = rule.as_ref().and_then(|r| r.topic.clone());
@@ -1244,7 +1255,7 @@ mod tests {
         // A private channel (test_node enables auto_op_private), so the first arrival is
         // opped. Op/Clan channels op only their named account — covered in bnetcc-core.
         let (joined, existing) = n
-            .join_channel(b"Zealot's Hangout", 1, "Zealot", 0, Vec::new(), out)
+            .join_channel(b"Zealot's Hangout", 1, "Zealot", 0, None, Vec::new(), out)
             .unwrap();
         assert!(joined.outcome.granted_operator);
         assert_eq!(joined.outcome.flags & user_flags::OPERATOR, user_flags::OPERATOR);
@@ -1257,8 +1268,8 @@ mod tests {
         let n = node();
         let (o1, _r1) = outbound(4);
         let (o2, _r2) = outbound(4);
-        n.join_channel(b"Blizzard Tech", 1, "a", 0, Vec::new(), o1).unwrap();
-        let (_, existing) = n.join_channel(b"  blizzard   TECH ", 2, "b", 0, Vec::new(), o2).unwrap();
+        n.join_channel(b"Blizzard Tech", 1, "a", 0, None, Vec::new(), o1).unwrap();
+        let (_, existing) = n.join_channel(b"  blizzard   TECH ", 2, "b", 0, None, Vec::new(), o2).unwrap();
         assert_eq!(existing.len(), 1, "second user must land in the same channel");
     }
 
@@ -1281,8 +1292,8 @@ mod tests {
         let n = node();
         let (o1, _r1) = outbound(4);
         let (o2, _r2) = outbound(4);
-        n.join_channel(b"chat", 7, "Fish", 0, Vec::new(), o1).unwrap();
-        let (_, existing) = n.join_channel(b"chat", 7, "Fish#2", 0, Vec::new(), o2).unwrap();
+        n.join_channel(b"chat", 7, "Fish", 0, None, Vec::new(), o1).unwrap();
+        let (_, existing) = n.join_channel(b"chat", 7, "Fish#2", 0, None, Vec::new(), o2).unwrap();
         assert_eq!(existing.len(), 1, "the second session sees the first already present");
         assert_eq!(
             n.channel_occupant_names(b"chat").len(),
@@ -1299,8 +1310,8 @@ mod tests {
         let n = node();
         let (o1, mut r1) = outbound(4);
         let (o2, mut r2) = outbound(4);
-        n.join_channel(b"chat", 1, "a", 0, Vec::new(), o1).unwrap();
-        n.join_channel(b"chat", 2, "b", 0, Vec::new(), o2).unwrap();
+        n.join_channel(b"chat", 1, "a", 0, None, Vec::new(), o1).unwrap();
+        n.join_channel(b"chat", 2, "b", 0, None, Vec::new(), o2).unwrap();
 
         let wire = Arc::new(vec![0xFFu8, 0x0F, 4, 0]);
         let stalled = n.broadcast(b"chat", &wire, Some("a"), None);
@@ -1316,8 +1327,8 @@ mod tests {
         let (speaker, _srx) = outbound(4);
         // The listener squelches the speaker's base account name.
         listener.ignores().add("Bob");
-        n.join_channel(b"chat", 1, "alice", 0, Vec::new(), listener).unwrap();
-        n.join_channel(b"chat", 2, "Bob", 0, Vec::new(), speaker).unwrap();
+        n.join_channel(b"chat", 1, "alice", 0, None, Vec::new(), listener).unwrap();
+        n.join_channel(b"chat", 2, "Bob", 0, None, Vec::new(), speaker).unwrap();
 
         let wire = Arc::new(vec![0xFFu8, 0x0F, 4, 0]);
         // Bob (base "Bob") talks; Alice has squelched Bob, so she receives nothing.
@@ -1363,7 +1374,7 @@ mod tests {
     fn leaves_are_coalesced_into_one_batched_write() {
         let n = node();
         let (obs, mut r) = outbound(64);
-        n.join_channel(b"chat", 1, "obs", 0, Vec::new(), obs).unwrap();
+        n.join_channel(b"chat", 1, "obs", 0, None, Vec::new(), obs).unwrap();
         // Two departures enqueue their leave frames; nothing is delivered yet.
         n.enqueue_leave(b"chat", vec![0xFF, 0x0F, 4, 0]);
         n.enqueue_leave(b"chat", vec![0xFF, 0x0F, 4, 0]);
@@ -1379,7 +1390,7 @@ mod tests {
     fn a_broadcast_flushes_pending_leaves_before_its_own_event() {
         let n = node();
         let (obs, mut r) = outbound(64);
-        n.join_channel(b"chat", 1, "obs", 0, Vec::new(), obs).unwrap();
+        n.join_channel(b"chat", 1, "obs", 0, None, Vec::new(), obs).unwrap();
         n.enqueue_leave(b"chat", vec![0xFF, 0x0F, 4, 0]);
         // An immediate event (a talk) must not jump ahead of an already-queued leave.
         let talk = Arc::new(vec![0xFFu8, 0x0F, 5, 0, 0]);
@@ -1393,8 +1404,8 @@ mod tests {
         let n = node();
         let (slow, _slow_rx) = outbound(1); // fills immediately
         let (fast, mut fast_rx) = outbound(64);
-        n.join_channel(b"chat", 1, "slow", 0, Vec::new(), slow).unwrap();
-        n.join_channel(b"chat", 2, "fast", 0, Vec::new(), fast).unwrap();
+        n.join_channel(b"chat", 1, "slow", 0, None, Vec::new(), slow).unwrap();
+        n.join_channel(b"chat", 2, "fast", 0, None, Vec::new(), fast).unwrap();
 
         let wire = Arc::new(vec![0xFFu8, 0x0F, 4, 0]);
         let mut stalled = Vec::new();
@@ -1414,7 +1425,7 @@ mod tests {
     fn an_empty_channel_is_destroyed_on_the_last_departure() {
         let n = node();
         let (out, _rx) = outbound(4);
-        n.join_channel(b"temp", 1, "a", 0, Vec::new(), out).unwrap();
+        n.join_channel(b"temp", 1, "a", 0, None, Vec::new(), out).unwrap();
         assert_eq!(n.channel_names().len(), 1);
         n.leave_channel(b"temp", "a");
         assert!(n.channel_names().is_empty());

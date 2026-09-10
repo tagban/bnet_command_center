@@ -140,6 +140,10 @@ pub struct ChannelsConfig {
     /// `max_users` set on a defined channel overrides the per-category default above (and
     /// `0` there is unlimited too).
     pub defined: Vec<ChannelDef>,
+    /// Per-product default channel: product FourCC (e.g. `STAR`, `W2BN`) → channel name a
+    /// client of that product lands in **only when it joins without naming a channel**. A
+    /// client that requests a specific channel is honoured as-is.
+    pub default_channel: BTreeMap<String, String>,
 }
 
 impl Default for ChannelsConfig {
@@ -152,6 +156,7 @@ impl Default for ChannelsConfig {
             public_max: 0,
             clan_max: 0,
             defined: Vec::new(),
+            default_channel: BTreeMap::new(),
         }
     }
 }
@@ -183,6 +188,10 @@ pub struct ChannelDef {
     /// Restrict entry to users carrying a chat flag: `"admin"`, `"speaker"`, or unset
     /// (anyone). Ties into flag-limited channels.
     pub min_flag: Option<String>,
+    /// Restrict entry to specific game products by FourCC (e.g. `["W2BN"]` so only Warcraft
+    /// II BNE clients may join). Unset or empty = open to every product. Matched
+    /// case-insensitively.
+    pub products: Option<Vec<String>>,
 }
 
 /// Global default for telnet/chat-gateway channel access.
@@ -223,6 +232,9 @@ pub struct ResolvedChannel {
     pub game_only: bool,
     /// Required chat-flag bitmask for entry; 0 = open to anyone.
     pub min_flag: u32,
+    /// Allowed product FourCCs (upper-case), empty = open to every product. A joining client
+    /// whose product is not listed is refused.
+    pub products: Vec<String>,
 }
 
 /// Resolved, validated channel rules: the global telnet default plus the defined channels
@@ -234,6 +246,9 @@ pub struct ChannelRules {
     #[allow(dead_code)]
     pub telnet_access: TelnetAccess,
     by_key: HashMap<Vec<u8>, ResolvedChannel>,
+    /// Product FourCC (upper-case) → default channel name, for clients that join without
+    /// naming one.
+    default_channel: HashMap<String, String>,
 }
 
 impl ChannelRules {
@@ -241,6 +256,12 @@ impl ChannelRules {
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<&ResolvedChannel> {
         self.by_key.get(key)
+    }
+
+    /// The default channel for a product (its FourCC as a string), if one is configured.
+    #[must_use]
+    pub fn default_channel(&self, product: &str) -> Option<&str> {
+        self.default_channel.get(&product.to_ascii_uppercase()).map(String::as_str)
     }
 
     /// Every defined channel that should appear in the channel list.
@@ -772,6 +793,14 @@ impl Config {
                     ))
                 }
             };
+            let products: Vec<String> = def
+                .products
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|p| p.trim().to_ascii_uppercase())
+                .filter(|p| !p.is_empty())
+                .collect();
             let resolved = ResolvedChannel {
                 display: display.to_string(),
                 listed: def.listed.unwrap_or(true),
@@ -782,12 +811,22 @@ impl Config {
                 telnet,
                 game_only: def.game_only.unwrap_or(false),
                 min_flag,
+                products,
             };
             if by_key.insert(key, resolved).is_some() {
                 return Err(format!("two channels.defined entries resolve to {display:?}"));
             }
         }
-        Ok(ChannelRules { telnet_access, by_key })
+
+        let default_channel: HashMap<String, String> = self
+            .channels
+            .default_channel
+            .iter()
+            .filter(|(_, chan)| !chan.trim().is_empty())
+            .map(|(product, chan)| (product.trim().to_ascii_uppercase(), chan.trim().to_string()))
+            .collect();
+
+        Ok(ChannelRules { telnet_access, by_key, default_channel })
     }
 }
 
@@ -801,6 +840,27 @@ mod tests {
         assert_eq!(cfg.server.mode, "gaming");
         assert_eq!(cfg.listen.bncs.port(), 6112);
         assert!(!cfg.federation.enabled);
+    }
+
+    #[test]
+    fn product_restriction_and_default_channel_resolve() {
+        let cfg = Config::from_toml(
+            r#"
+            [[channels.defined]]
+            name = "War2 BNE"
+            products = ["w2bn"]
+
+            [channels.default_channel]
+            star = "StarCraft"
+            "#,
+        )
+        .unwrap();
+        let rules = cfg.channel_rules().unwrap();
+        let key = bnetcc_proto::chat::normalize_channel_name(b"War2 BNE");
+        assert_eq!(rules.get(&key).unwrap().products, vec!["W2BN".to_string()], "products upper-cased");
+        assert_eq!(rules.default_channel("STAR"), Some("StarCraft"));
+        assert_eq!(rules.default_channel("star"), Some("StarCraft"), "lookup is case-insensitive");
+        assert_eq!(rules.default_channel("SEXP"), None);
     }
 
     #[test]

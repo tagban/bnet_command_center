@@ -1275,6 +1275,19 @@ impl Bncs {
 
     /// Join a channel by name, from either `SID_JOINCHANNEL` or a `/join` command.
     fn do_join(&mut self, requested: &[u8], account: &Account) -> Step {
+        // If the client named no channel, fall back to its product's default channel (when one
+        // is configured); otherwise honour exactly what it asked for.
+        let product = self.product.map(|p| p.to_string());
+        let requested: Vec<u8> = if String::from_utf8_lossy(requested).trim().is_empty() {
+            product
+                .as_deref()
+                .and_then(|p| self.node.channel_rules.default_channel(p))
+                .map_or_else(|| requested.to_vec(), |chan| chan.as_bytes().to_vec())
+        } else {
+            requested.to_vec()
+        };
+        let requested = requested.as_slice();
+
         // Leave the current channel first; joining your current channel returns you to
         // the previous one on real Battle.net, but leaving unconditionally is the
         // behaviour clients cope with and is far easier to reason about.
@@ -1292,6 +1305,7 @@ impl Bncs {
             account.id,
             &self.display_name,
             self.flags,
+            product.as_deref(),
             self.statstring.clone(),
             self.out.clone(),
         ) {
