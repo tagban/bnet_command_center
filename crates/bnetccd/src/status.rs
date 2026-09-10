@@ -375,6 +375,24 @@ ul { margin:6px 0; padding-left:20px; }
 /// How many accounts one page of the user list shows.
 const USERS_PAGE_SIZE: u32 = 50;
 
+/// Products a per-IP override can be set for from the panel — the classic BNCS product codes.
+/// A fixed pick-list keeps the editor typo-proof: no hand-typed FourCCs (which is how a bad
+/// value like "TELNET" once got in). Telnet/chat clients are limited by the gateway per-IP
+/// field, not here.
+const KNOWN_PRODUCTS: &[(&str, &str)] = &[
+    ("STAR", "StarCraft"),
+    ("SEXP", "Brood War"),
+    ("SSHR", "StarCraft Shareware"),
+    ("JSTR", "StarCraft (Japan)"),
+    ("DRTL", "Diablo"),
+    ("DSHR", "Diablo Shareware"),
+    ("D2DV", "Diablo II"),
+    ("D2XP", "Diablo II: LoD"),
+    ("W2BN", "Warcraft II BNE"),
+    ("WAR3", "Warcraft III: RoC"),
+    ("W3XP", "Warcraft III: TFT"),
+];
+
 /// `GET /users` — the user-management list, one page at a time.
 async fn users_page(node: &Node, req: &Request, flash: Option<(bool, &str)>) -> Response {
     let offset: u64 = req.query.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -892,6 +910,9 @@ a {{ color:var(--accent); }} .row {{ display:flex; align-items:center; gap:10px;
 .row3 {{ display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }}
 .hdr {{ margin:24px 0 4px; padding-top:14px; border-top:1px solid var(--line); font-weight:600; font-size:14px; }}
 label.cb {{ margin:0; text-transform:none; letter-spacing:0; color:var(--fg); }}
+.prodgrid {{ display:grid; grid-template-columns:repeat(2,1fr); gap:6px 12px; }}
+label.prod {{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin:0; text-transform:none; letter-spacing:0; color:var(--fg); font-size:13px; }}
+label.prod input {{ width:64px; }}
 code {{ background:#0f1115; border:1px solid var(--line); border-radius:4px; padding:1px 5px; font-size:12px; }}
 .muted {{ color:var(--muted); font-size:12px; }}
 </style></head><body><div class="card">{inner}</div></body></html>"##
@@ -957,7 +978,17 @@ fn settings_page(admin: &Admin, config_path: &Path, flash: Option<(bool, &str)>)
     let game_per_ip = cfg_int(&doc, &["limits", "clients", "game_default", "per_ip"], 8);
     let gw_per_ip = cfg_int(&doc, &["limits", "clients", "gateway", "per_ip"], 1);
     let bnftp_per_ip = cfg_int(&doc, &["limits", "clients", "bnftp", "per_ip"], 4);
-    let products = html_escape(&cfg_products_text(&doc));
+    let products_grid = KNOWN_PRODUCTS
+        .iter()
+        .map(|(code, name)| {
+            let v = cfg_int(&doc, &["limits", "clients", "products", code, "per_ip"], -1);
+            let val = if v >= 0 { v.to_string() } else { String::new() };
+            format!(
+                r#"<label class="prod"><span>{name} <code>{code}</code></span><input name="prod_{code}" type="number" min="0" value="{val}" placeholder="—"></label>"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
     let channels_defined = html_escape(&cfg_channels_text(&doc));
     let admins = html_escape(&cfg_admin_list(&doc));
     // Public status
@@ -1015,8 +1046,8 @@ fn settings_page(admin: &Admin, config_path: &Path, flash: Option<(bool, &str)>)
 <input name="gateway_per_ip" type="number" min="0" value="{gw_per_ip}">
 <input name="bnftp_per_ip" type="number" min="0" value="{bnftp_per_ip}">
 </div>
-<label for="po">Per-product overrides — one <code>PRODUCT=limit</code> per line (e.g. <code>DRTL=1</code>)</label>
-<textarea id="po" name="product_overrides" rows="3" style="width:100%;box-sizing:border-box" placeholder="DRTL=1&#10;W2BN=8">{products}</textarea>
+<label>Per-IP limit per game (blank = no override, use the game default)</label>
+<div class="prodgrid">{products_grid}</div>
 <label for="ad">Staff accounts (comma or newline separated) — get /tagban, /ipban, /mute</label>
 <textarea id="ad" name="admins" rows="2" style="width:100%;box-sizing:border-box">{admins}</textarea>
 
@@ -1166,30 +1197,36 @@ fn do_settings_config(req: &Request, admin: &Admin, config_path: &Path) -> Respo
         set_cfg(&mut doc, &["admins", "accounts"], toml_edit::value(arr));
     }
 
-    // Per-product per-IP overrides: rebuild the whole products table from the textarea, so a
-    // removed line clears its override. Each line is `PRODUCT=limit`.
-    if let Some(v) = req.form.get("product_overrides") {
+    // Per-product per-IP overrides come from a fixed pick-list of known products (so no one
+    // can hand-type a bad FourCC like "TELNET"). Rebuild the products table: keep any existing
+    // override for a product NOT in the list (a hand-added exotic one), then apply the form.
+    {
         let mut table = toml_edit::Table::new();
-        for line in v.split(['\n', '\r']).map(str::trim).filter(|s| !s.is_empty()) {
-            let Some((product, num)) = line.split_once('=') else {
-                return html_page(settings_page(
-                    admin,
-                    config_path,
-                    Some((false, &format!("Product override '{line}' must be PRODUCT=number."))),
-                ));
-            };
-            let (product, num) = (product.trim(), num.trim());
-            match num.parse::<i64>() {
-                Ok(n) if n >= 0 && !product.is_empty() => {
+        if let Some(existing) =
+            cfg_get(&doc, &["limits", "clients", "products"]).and_then(toml_edit::Item::as_table)
+        {
+            for (code, item) in existing.iter() {
+                if !KNOWN_PRODUCTS.iter().any(|(k, _)| k.eq_ignore_ascii_case(code)) {
+                    table.insert(code, item.clone());
+                }
+            }
+        }
+        for (code, _) in KNOWN_PRODUCTS {
+            let raw = req.form.get(&format!("prod_{code}")).map(|s| s.trim()).unwrap_or("");
+            if raw.is_empty() {
+                continue;
+            }
+            match raw.parse::<i64>() {
+                Ok(n) if n >= 0 => {
                     let mut entry = toml_edit::Table::new();
                     entry["per_ip"] = toml_edit::value(n);
-                    table.insert(product, toml_edit::Item::Table(entry));
+                    table.insert(code, toml_edit::Item::Table(entry));
                 }
                 _ => {
                     return html_page(settings_page(
                         admin,
                         config_path,
-                        Some((false, &format!("Product override '{line}' must be PRODUCT=number (≥0)."))),
+                        Some((false, &format!("Per-IP limit for {code} must be a whole number ≥ 0."))),
                     ))
                 }
             }
@@ -1259,15 +1296,27 @@ fn do_settings_config(req: &Request, admin: &Admin, config_path: &Path) -> Respo
         set_cfg(&mut doc, &["channels", "defined"], toml_edit::Item::ArrayOfTables(aot));
     }
 
-    // Validate the whole document still deserialises as a Config (catches out-of-range values,
-    // bad combinations, and any structural mistake) before writing anything.
+    // Validate the whole document before writing. Deserialising as a Config catches
+    // structural/out-of-range errors, but the deeper checks (product FourCCs, channel
+    // definitions, federation-needs-a-hub) run when the policy and channel rules are built —
+    // exactly the checks the daemon does at startup. Running them here means a value that
+    // would crash the next start (e.g. a bad product code like "TELNET") is rejected at save.
     let serialized = doc.to_string();
-    if let Err(e) = toml::from_str::<Config>(&serialized) {
-        return html_page(settings_page(
-            admin,
-            config_path,
-            Some((false, &format!("Rejected — the result is not a valid config: {e}"))),
-        ));
+    let parsed = match toml::from_str::<Config>(&serialized) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return html_page(settings_page(
+                admin,
+                config_path,
+                Some((false, &format!("Rejected — not a valid config: {e}"))),
+            ))
+        }
+    };
+    if let Err(e) = parsed.policy() {
+        return html_page(settings_page(admin, config_path, Some((false, &format!("Rejected — {e}")))));
+    }
+    if let Err(e) = parsed.channel_rules() {
+        return html_page(settings_page(admin, config_path, Some((false, &format!("Rejected — {e}")))));
     }
 
     // Back up the current file (best-effort — absent on a first-ever save), then write.
@@ -1318,24 +1367,6 @@ fn cfg_int(doc: &toml_edit::DocumentMut, path: &[&str], default: i64) -> i64 {
 
 fn cfg_bool(doc: &toml_edit::DocumentMut, path: &[&str], default: bool) -> bool {
     cfg_get(doc, path).and_then(|i| i.as_bool()).unwrap_or(default)
-}
-
-/// Render `[limits.clients.products]` as `PRODUCT=per_ip` lines for the settings textarea.
-fn cfg_products_text(doc: &toml_edit::DocumentMut) -> String {
-    cfg_get(doc, &["limits", "clients", "products"])
-        .and_then(|i| i.as_table())
-        .map(|t| {
-            t.iter()
-                .filter_map(|(k, v)| {
-                    v.as_table_like()
-                        .and_then(|pt| pt.get("per_ip"))
-                        .and_then(toml_edit::Item::as_integer)
-                        .map(|n| format!("{k}={n}"))
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default()
 }
 
 /// `on`/absent checkbox helper: an HTML checkbox is present in the form only when ticked.
