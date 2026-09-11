@@ -200,7 +200,13 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr, node: Arc<Node>, limits
 /// We use PvPGN's `<PLATFORM>ver1.mpq` naming (`IX86ver1.mpq`, `PMACver1.mpq`,
 /// `XMACver1.mpq`) — the scheme under which a stock PvPGN `files/` directory ships all
 /// three platforms. An unrecognised or absent platform falls back to `IX86`.
-fn version_mpq_name(platform: Option<FourCc>) -> String {
+/// The CheckRevision MPQ name to hand a client. Two naming conventions exist and the
+/// client parses the name it is given: the original `IX86ver1.mpq` (StarCraft, Diablo,
+/// Warcraft II) and the later `ver-IX86-1.mpq` that Diablo II and WarCraft III expect.
+/// A WarCraft III 1.27a client handed the old form aborts with "There was an error
+/// handling the request" before it ever fetches the file (observed 2026-09-10); Atlas
+/// serves the `ver-` form to everyone. Both files ship in the operator's files directory.
+fn version_mpq_name(platform: Option<FourCc>, product: Option<FourCc>) -> String {
     let plat = platform
         .map(|p| {
             let a = p.as_ascii();
@@ -211,7 +217,15 @@ fn version_mpq_name(platform: Option<FourCc>) -> String {
             }
         })
         .unwrap_or_else(|| "IX86".to_string());
-    format!("{plat}ver1.mpq")
+    let modern = matches!(
+        product,
+        Some(p) if p == product::WAR3 || p == product::W3XP || p == product::D2DV || p == product::D2XP
+    );
+    if modern {
+        format!("ver-{plat}-1.mpq")
+    } else {
+        format!("{plat}ver1.mpq")
+    }
 }
 
 /// The BNI icon file to advertise for a client's product. StarCraft/Brood War and
@@ -794,7 +808,10 @@ impl Bncs {
         );
         let logon_type: u32 = if srp { 0x02 } else { 0x00 };
 
-        let mpq = version_mpq_name(self.platform);
+        let mpq = version_mpq_name(self.platform, self.product);
+        // The file's real modification time, so a client that caches the MPQ by filetime
+        // (WarCraft III does) decides correctly whether to re-fetch it; 0 if we lack the file.
+        let mpq_filetime = self.node.file_mtime(mpq.as_bytes()).map_or(0, unix_to_filetime);
         let mut w = Writer::with_capacity(64);
         w.u32(logon_type)
             .u32(self.server_token)
@@ -802,7 +819,7 @@ impl Bncs {
             // UDP listener answers). A zero here tells the client not to bother, leaving
             // game hosting disabled. See crate::udp.
             .u32(self.server_token)
-            .u64(0) // CheckRevision MPQ filetime
+            .u64(mpq_filetime) // CheckRevision MPQ filetime
             .cstr(mpq.as_bytes())
             .cstr(b"A=1 B=1 C=1 4 A=A^S B=B^C C=C^A A=A^B");
         if srp {
@@ -1250,9 +1267,10 @@ impl Bncs {
                 "SID_STARTVERSIONING (legacy)"
             );
         }
-        let mpq = version_mpq_name(self.platform);
+        let mpq = version_mpq_name(self.platform, self.product);
+        let mpq_filetime = self.node.file_mtime(mpq.as_bytes()).map_or(0, unix_to_filetime);
         let mut w = Writer::with_capacity(64);
-        w.u64(0) // MPQ filetime
+        w.u64(mpq_filetime) // MPQ filetime
             .cstr(mpq.as_bytes())
             .cstr(b"A=1 B=1 C=1 4 A=A^S B=B^C C=C^A A=A^B");
         let step = self.send(&Frame::new(sid::STARTVERSIONING, w.finish()));
@@ -2978,6 +2996,17 @@ mod tests {
         let reply = recv_frame(s).await;
         assert_eq!(reply.id, sid::ENTERCHAT);
         String::from_utf8_lossy(reply.reader().cstr(64).unwrap()).into_owned()
+    }
+
+    #[test]
+    fn warcraft_three_and_diablo_two_get_the_ver_dash_mpq_name() {
+        let ix86 = Some(bnetcc_proto::FourCc::from_ascii(b"IX86"));
+        assert_eq!(version_mpq_name(ix86, Some(product::W3XP)), "ver-IX86-1.mpq");
+        assert_eq!(version_mpq_name(ix86, Some(product::WAR3)), "ver-IX86-1.mpq");
+        assert_eq!(version_mpq_name(ix86, Some(product::D2XP)), "ver-IX86-1.mpq");
+        assert_eq!(version_mpq_name(ix86, Some(product::SEXP)), "IX86ver1.mpq");
+        assert_eq!(version_mpq_name(ix86, Some(product::W2BN)), "IX86ver1.mpq");
+        assert_eq!(version_mpq_name(None, None), "IX86ver1.mpq");
     }
 
     #[tokio::test]
