@@ -916,7 +916,13 @@ impl Bncs {
             product::auth_family(product),
             Some(product::AuthFamily::Srp)
         );
-        let logon_type: u32 = if srp { 0x02 } else { 0x00 };
+        // A WarCraft III node can be configured for the legacy X-SHA-1 logon instead of
+        // NLS/SRP (config `server.wc3_logon = "legacy"`). Legacy advertises logon type 0 and
+        // omits the 128-byte RSA signature the NLS path carries — the signature WC3 verifies
+        // after the proof and that only a patched/loadered client accepts (docs/LEGAL.md §3,
+        // docs/WARCRAFT3.md §3.7). The 0x53/0x54 handlers stay wired either way.
+        let nls = srp && !self.node.wc3_legacy_logon;
+        let logon_type: u32 = if nls { 0x02 } else { 0x00 };
 
         let mpq = version_mpq_name(self.platform, self.product, self.version_byte);
         // The file's real modification time, so a client that caches the MPQ by filetime
@@ -931,11 +937,26 @@ impl Bncs {
             .u32(self.server_token)
             .u64(mpq_filetime) // CheckRevision MPQ filetime
             .cstr(mpq.as_bytes())
-            .cstr(b"A=1 B=1 C=1 4 A=A^S B=B^C C=C^A A=A^B");
+            // CheckRevision value string. We fail *open* on the version check (we never
+            // recompute the hash), so any well-formed formula the client can run is fine —
+            // but WarCraft III should get the real `ver-IX86-1.mpq` formula that a stock
+            // server sends (confirmed against a bnetdocs / PvPGN Pro capture), not a
+            // placeholder. Other products keep the neutral placeholder until each one's real
+            // formula is captured; a wrong formula still costs nothing here.
+            .cstr(if matches!(product, product::WAR3 | product::W3XP) {
+                b"B=454282227 C=2370009462 A=2264812340 4 A=A^S B=B-C C=C-A A=A+B".as_slice()
+            } else {
+                b"A=1 B=1 C=1 4 A=A^S B=B^C C=C^A A=A^B".as_slice()
+            });
         if srp {
-            // WarCraft III expects a 128-byte RSA signature here and verifies it against
-            // Blizzard's public key. We cannot produce one, so WC3 requires a patched
-            // client. See docs/LEGAL.md §3 — this is a designed-in block, not a gap.
+            // The `SID_AUTH_INFO` reply for WarCraft III carries a 128-byte RSA signature
+            // field — a W3XP/WAR3 *product* field the client's parser expects regardless of
+            // logon type, so it must be present on the legacy path (logon type 0) too or the
+            // client rejects the reply as an "invalid Battle.net server" before the version
+            // check. We cannot produce a valid signature (no Blizzard key); on the NLS path
+            // the client *verifies* it and only a patched client accepts our zeros
+            // (docs/LEGAL.md §3). The legacy path advertises logon type 0, under which the
+            // client does not verify this field.
             w.bytes(&[0u8; 128]);
         }
         let step = self.send(&Frame::new(sid::AUTH_INFO, w.finish()));
@@ -1158,10 +1179,12 @@ impl Bncs {
         for &key in &self.claimed_keys {
             self.node.record_key_holder_name(key, account.name.clone());
         }
-        // Sysops carry the Battle.net Administrator flag and the Blizzard-rep
-        // tag (the staff icon) in every channel they enter.
+        // Sysops carry the Battle.net Administrator flag (the sysop icon) in every channel
+        // they enter — not the Blizzard-representative flag, which is Blizzard's own staff
+        // marker and the wrong identity for a private-server operator. A custom operator icon
+        // (bnet.cc) can later be mapped to this flag in the product icons.bni.
         if self.node.admins.is_admin(&account.name) {
-            self.flags |= user_flags::ADMIN | user_flags::BLIZZARD_REP;
+            self.flags |= user_flags::ADMIN;
             info!(peer = %self.peer, account = %account.name, "administrator logged on");
         }
         // Apply any admin-assigned flags stored on the account (staff, speaker,
@@ -1172,7 +1195,17 @@ impl Bncs {
         self.node.record_login(account.id, now_ms() / 1000);
         // Claim a server-wide-unique display name (Name, or Name#2/#3… if this
         // account is already online elsewhere) for the life of this session.
-        self.display_name = self.node.claim_name(&account.name);
+        //
+        // WarCraft III accounts are stored realm-qualified (`Name@bncc`) to keep them in a
+        // namespace separate from the X-SHA-1 products' accounts. But real Battle.net shows a
+        // user their *own* name with no realm suffix — an `@` in your own name is illegal to
+        // the WC3 client, which then refuses to enter chat. The `@realm` form is only for
+        // cross-realm (federated) users; for a user on this server's own realm we present the
+        // bare name everywhere (ENTERCHAT reply, chat events, user list). X-SHA-1 names never
+        // contain `@`, so this strip is a no-op for them. See docs/WARCRAFT3.md §3.6.
+        let local_suffix = format!("@{}", self.node.realm);
+        let display_base = account.name.strip_suffix(&local_suffix).unwrap_or(&account.name);
+        self.display_name = self.node.claim_name(display_base);
         // Register with the moderation directory so staff can reach this session
         // (resolve its IP, or force it off) from any channel.
         self.node.register_session(
@@ -1345,12 +1378,18 @@ impl Bncs {
                         .cstr(b"This account is banned from this server.");
                 } else {
                     self.finish_logon(account).await;
-                    w.u32(nls_status::PROOF_OK).bytes(&server_proof).cstr(b"");
+                    // Status + M2 and *nothing else*. The additional-info string is only
+                    // sent with a custom error (0x0F). A real WarCraft III client validates
+                    // the exact `0x54` body length: for a non-error status it expects exactly
+                    // 24 bytes (4 + 20) and drops the connection if a trailing byte follows.
+                    // A bnetdocs (PvPGN Pro) capture confirmed the 24-byte form; our earlier
+                    // trailing empty-string null was the post-logon "connection lost" drop.
+                    w.u32(nls_status::PROOF_OK).bytes(&server_proof);
                 }
             }
             Ok(None) => {
                 info!(peer = %self.peer, "NLS logon (0x54): wrong password (M1 mismatch)");
-                w.u32(nls_status::PROOF_WRONG_PASSWORD).bytes(&[0u8; 20]).cstr(b"");
+                w.u32(nls_status::PROOF_WRONG_PASSWORD).bytes(&[0u8; 20]);
             }
             Err(_) => return Step::Close,
         }
@@ -2942,6 +2981,65 @@ mod tests {
         addr
     }
 
+    /// A test server whose WarCraft III clients are offered the legacy X-SHA-1 logon
+    /// (`server.wc3_logon = "legacy"`) instead of NLS/SRP.
+    async fn spawn_server_legacy_wc3() -> std::net::SocketAddr {
+        let node = Arc::new(crate::node::test_node_with(|c| c.wc3_legacy_logon = true));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let limits = SessionLimits::default();
+        tokio::spawn(async move {
+            loop {
+                let (stream, peer) = listener.accept().await.expect("accept");
+                tokio::spawn(handle(stream, peer, Arc::clone(&node), limits));
+            }
+        });
+        addr
+    }
+
+    /// With `server.wc3_logon = "legacy"`, a WarCraft III client is offered the X-SHA-1
+    /// logon — logon type 0 and no 128-byte RSA signature — and logs in over
+    /// `SID_LOGONRESPONSE2` against the plain X-SHA-1 account namespace, the same flow
+    /// StarCraft uses and the one a StarCraft-hash loader drives. This is the escape from
+    /// the NLS-only signature an unpatched client cannot satisfy (docs/WARCRAFT3.md §3.7).
+    #[tokio::test]
+    async fn warcraft_three_uses_the_legacy_xsha1_logon_when_configured() {
+        const CLIENT_TOKEN: u32 = 0xCAFE_BABE;
+        let addr = spawn_server_legacy_wc3().await;
+        let mut s = connect(addr).await;
+
+        send_frame(&mut s, &auth_info_frame_for(product::W3XP)).await;
+        let info = recv_frame(&mut s).await;
+        assert_eq!(info.id, sid::AUTH_INFO);
+        let mut ir = info.reader();
+        assert_eq!(ir.u32().unwrap(), 0x00, "legacy WC3 is offered logon type 0, not NLS");
+        let server_token = ir.u32().unwrap();
+        assert!(
+            info.body.ends_with(&[0u8; 128]),
+            "the 128-byte signature field stays present (a W3XP product field); logon type 0 \
+             tells the client not to verify it"
+        );
+
+        send_frame(&mut s, &auth_check_frame(1, 777)).await;
+        assert_eq!(recv_frame(&mut s).await.reader().u32().unwrap(), auth_check_status::PASSED);
+
+        // Create and log in with the StarCraft-style double hash, into the plain namespace.
+        let h1 = bnetcc_crypto::password_hash("hunter2");
+        let mut cw = Writer::with_capacity(32);
+        cw.bytes(&h1).cstr(b"Tagban");
+        send_frame(&mut s, &Frame::new(sid::CREATEACCOUNT2, cw.finish())).await;
+        assert_eq!(recv_frame(&mut s).await.reader().u32().unwrap(), 0x00, "account creation");
+
+        let proof = bnetcc_crypto::logon_proof(CLIENT_TOKEN, server_token, &h1);
+        let mut lw = Writer::with_capacity(32);
+        lw.u32(CLIENT_TOKEN).u32(server_token).bytes(&proof).cstr(b"Tagban");
+        send_frame(&mut s, &Frame::new(sid::LOGONRESPONSE2, lw.finish())).await;
+        assert_eq!(recv_frame(&mut s).await.reader().u32().unwrap(), logon_status::SUCCESS, "logon");
+
+        // Logged in as the plain X-SHA-1 name, not the SRP realm name `Tagban@bncc`.
+        assert_eq!(enter_chat_name(&mut s).await, "Tagban");
+    }
+
     /// Drive a full modern-flow login as a game test client: handshake, create the
     /// account, log in, enter chat. Leaves the stream logged in and ready for game or
     /// channel packets. Returns the connected stream.
@@ -3095,10 +3193,12 @@ mod tests {
         send_frame(s, &Frame::new(sid::AUTH_ACCOUNTLOGONPROOF, w.finish())).await;
         let reply = recv_frame(s).await;
         assert_eq!(reply.id, sid::AUTH_ACCOUNTLOGONPROOF);
+        // Non-error 0x54 is exactly status + M2, no trailing string (a real WC3 client drops
+        // on any extra byte); only the custom-error status (0x0F) carries a message.
+        assert_eq!(reply.body.len(), 4 + 20, "0x54 (ok / wrong-password) is status + M2 only");
         let mut r = reply.reader();
         let status = r.u32().unwrap();
         let m2: [u8; 20] = r.array().unwrap();
-        let _info = r.cstr(256).unwrap();
         if status != nls_status::PROOF_OK {
             assert_eq!(m2, [0u8; 20]);
             return Err(status);
@@ -3155,7 +3255,10 @@ mod tests {
         // refused as "no such account": the proof would hash it and never match anyway.
         assert_eq!(wc3_logon(&mut s, "TAGBAN@BNCC", "hunter2").await, Err(nls_status::LOGON_NO_ACCOUNT));
         assert_eq!(wc3_logon(&mut s, "TAGBAN", "hunter2").await, Ok(()));
-        assert_eq!(enter_chat_name(&mut s).await, "Tagban@bncc");
+        // The client is shown its own name bare — real Battle.net never puts a realm suffix
+        // on your own name, and the WC3 client refuses an '@' in it (docs/WARCRAFT3.md §3.6).
+        // The '@bncc' form stays internal (storage/lookup); see `finish_logon`.
+        assert_eq!(enter_chat_name(&mut s).await, "Tagban");
     }
 
     #[tokio::test]
@@ -3166,38 +3269,48 @@ mod tests {
         assert_eq!(wc3_logon(&mut s, "Zealot", "wrong").await, Err(nls_status::PROOF_WRONG_PASSWORD));
         // Still not logged in: chat entry is a protocol violation and closes the stream.
         assert_eq!(wc3_logon(&mut s, "Zealot", "right").await, Ok(()));
-        assert_eq!(enter_chat_name(&mut s).await, "Zealot@bncc");
+        assert_eq!(enter_chat_name(&mut s).await, "Zealot");
     }
 
     #[tokio::test]
-    async fn realm_accounts_and_xsha1_accounts_with_the_same_name_coexist() {
+    async fn account_names_are_globally_unique_across_namespaces() {
         let addr = spawn_server().await;
         // A Brood War player registers "Zealot" the X-SHA-1 way …
-        let mut sc = login(addr, "Zealot", "pw", 503).await;
-        // … and a WarCraft III player registers "Zealot" too: a different account, in the
-        // realm, and both are online at once under distinct names.
+        let _sc = login(addr, "Zealot", "pw", 503).await;
+        // … so a WarCraft III player cannot also take "Zealot". The two would be stored as
+        // "Zealot" and "Zealot@bncc", but both render as the bare chat name "Zealot" — allowing
+        // both lets one account shadow/impersonate the other. The bare name is reserved across
+        // both namespaces at creation.
         let mut w3 = wc3_handshake(addr, 504).await;
-        assert_eq!(wc3_create(&mut w3, "Zealot", "pw2").await, nls_status::CREATE_OK);
-        assert_eq!(wc3_logon(&mut w3, "Zealot", "pw2").await, Ok(()));
-        assert_eq!(enter_chat_name(&mut w3).await, "Zealot@bncc");
+        assert_eq!(wc3_create(&mut w3, "Zealot", "pw2").await, nls_status::CREATE_NAME_EXISTS);
 
-        // An X-SHA-1 client cannot register into the realm namespace.
-        let mut cw = Writer::with_capacity(32);
-        cw.bytes(&[0u8; 20]).cstr(b"Grunt@bncc");
-        send_frame(&mut sc, &Frame::new(sid::CREATEACCOUNT2, cw.finish())).await;
-        // (sc is past login; CREATEACCOUNT2 is not accepted in-channel, so use a fresh
-        // connection at the right state.)
-        drop(sc);
+        // And the reverse: a name first claimed by a WarCraft III (realm) account is then
+        // unavailable to an X-SHA-1 client.
+        assert_eq!(wc3_create(&mut w3, "Grunt", "pw3").await, nls_status::CREATE_OK);
         let mut fresh = connect(addr).await;
         send_frame(&mut fresh, &auth_info_frame()).await;
         let _ = recv_frame(&mut fresh).await;
         send_frame(&mut fresh, &auth_check_frame(1, 505)).await;
         let _ = recv_frame(&mut fresh).await;
+        let h1 = bnetcc_crypto::password_hash("pw3");
         let mut cw = Writer::with_capacity(32);
-        cw.bytes(&[0u8; 20]).cstr(b"Grunt@bncc");
+        cw.bytes(&h1).cstr(b"Grunt");
         send_frame(&mut fresh, &Frame::new(sid::CREATEACCOUNT2, cw.finish())).await;
-        let created = recv_frame(&mut fresh).await;
-        assert_eq!(created.reader().u32().unwrap(), 0x02, "'@' is reserved for realms");
+        assert_eq!(
+            recv_frame(&mut fresh).await.reader().u32().unwrap(),
+            0x04,
+            "name is taken by the realm account"
+        );
+
+        // An X-SHA-1 client still cannot put a literal '@' in a created name (reserved for realms).
+        let mut cw = Writer::with_capacity(32);
+        cw.bytes(&[0u8; 20]).cstr(b"Foo@bncc");
+        send_frame(&mut fresh, &Frame::new(sid::CREATEACCOUNT2, cw.finish())).await;
+        assert_eq!(
+            recv_frame(&mut fresh).await.reader().u32().unwrap(),
+            0x02,
+            "'@' is reserved for realms"
+        );
     }
 
     #[tokio::test]

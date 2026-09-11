@@ -458,6 +458,16 @@ pub struct ServerConfig {
     /// namespace from the X-SHA-1 products' accounts and are shown as `Name@<realm>`, the
     /// way real Battle.net shows WC3 users across gateways. See `docs/WARCRAFT3.md` §3.6.
     pub realm: String,
+    /// WarCraft III logon method: `"nls"` (SRP, the modern default) or `"legacy"`.
+    ///
+    /// On the NLS path the `SID_AUTH_INFO` reply carries a 128-byte RSA signature that WC3
+    /// verifies *after* the login proof; we cannot produce a valid one, so an unpatched
+    /// client drops the instant it processes `SID_AUTH_ACCOUNTLOGONPROOF` (docs/LEGAL.md §3,
+    /// docs/WARCRAFT3.md §3.7). `"legacy"` advertises logon type 0 and omits the signature,
+    /// so a client driven through a StarCraft-hash loader logs in over `SID_LOGONRESPONSE2`
+    /// against the **X-SHA-1** account namespace (plain `Name`, not `Name@<realm>`) — the
+    /// same flow StarCraft uses. Does not change the NLS handlers, which stay available.
+    pub wc3_logon: String,
 }
 
 impl Default for ServerConfig {
@@ -467,6 +477,7 @@ impl Default for ServerConfig {
             mode: "gaming".into(),
             motd: "Welcome to Command Center.".into(),
             realm: "bncc".into(),
+            wc3_logon: "nls".into(),
         }
     }
 }
@@ -480,6 +491,21 @@ impl ServerConfig {
     pub fn parsed_mode(&self) -> Result<ServerMode, String> {
         ServerMode::parse(&self.mode)
             .map_err(|bad| format!("unknown server.mode {bad:?}: expected gaming, warnet or both"))
+    }
+
+    /// Whether WarCraft III should use the legacy X-SHA-1 logon instead of NLS/SRP.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the offending value.
+    pub fn wc3_legacy_logon(&self) -> Result<bool, String> {
+        match self.wc3_logon.trim().to_ascii_lowercase().as_str() {
+            "nls" | "srp" => Ok(false),
+            "legacy" | "xsha1" | "old" => Ok(true),
+            other => {
+                Err(format!("unknown server.wc3_logon {other:?}: expected \"nls\" or \"legacy\""))
+            }
+        }
     }
 }
 
@@ -701,6 +727,7 @@ impl Config {
     /// Returns a message describing the first problem found.
     pub fn validate(&self) -> Result<(), String> {
         self.server.parsed_mode()?;
+        self.server.wc3_legacy_logon()?;
         self.policy()?;
         if self.limits.outbound_queue == 0 {
             return Err("limits.outbound_queue must be at least 1".into());

@@ -194,6 +194,7 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
             name: cfg.server.name.clone(),
             motd: cfg.server.motd.clone(),
             realm: cfg.server.realm.clone(),
+            wc3_legacy_logon: cfg.server.wc3_legacy_logon()?,
             gateway_allowlist: cfg.limits.gateway_allowlist.clone(),
             version_policy,
             files_dir,

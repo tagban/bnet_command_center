@@ -303,6 +303,9 @@ pub struct Node {
     pub motd: String,
     /// Realm name for realm-scoped (WarCraft III) accounts — `Name@<realm>`.
     pub realm: String,
+    /// Serve WarCraft III the legacy X-SHA-1 logon (logon type 0, no RSA signature) instead
+    /// of NLS/SRP. Read in `session::auth_info`. See `config::ServerConfig::wc3_logon`.
+    pub wc3_legacy_logon: bool,
     /// Per-category default channel size caps (`0` = unlimited).
     pub channel_caps: ChannelCaps,
     /// Configured advertisement banners. Empty means we never answer `SID_CHECKAD`,
@@ -358,6 +361,8 @@ pub struct NodeConfig {
     pub motd: String,
     /// Realm name for realm-scoped (WarCraft III) accounts.
     pub realm: String,
+    /// Serve WarCraft III the legacy X-SHA-1 logon rather than NLS/SRP.
+    pub wc3_legacy_logon: bool,
     /// Addresses exempt from the one-gateway-connection-per-IP rule.
     pub gateway_allowlist: Vec<IpAddr>,
     /// Client version restriction.
@@ -424,6 +429,7 @@ impl Node {
             name: cfg.name,
             motd: cfg.motd,
             realm: cfg.realm,
+            wc3_legacy_logon: cfg.wc3_legacy_logon,
             channel_caps: cfg.channel_caps,
             ads: AdRotation::default(),
             files_dir: cfg.files_dir,
@@ -602,6 +608,20 @@ impl Node {
         name: &str,
         credential: bnetcc_storage::model::Credential,
     ) -> Result<Account, crate::storage::CreateAccountError> {
+        // Account names are globally unique across the two credential namespaces: a WarCraft
+        // III realm account (`Name@<realm>`) and an X-SHA-1 account (`Name`) can never share a
+        // bare name. They render as the same chat name, so allowing both lets two accounts
+        // race for one identity — the later login gets `Name#2` and could shadow or
+        // impersonate the other (e.g. a clan owner's name). Reserve the bare name in *both*
+        // namespaces at creation; storage already enforces uniqueness within each.
+        let (bare, realm) = bnetcc_storage::split_realm(name);
+        let sibling = match realm {
+            Some(_) => bare.to_string(),               // realm account also reserves plain `Name`
+            None => format!("{bare}@{}", self.realm),  // plain account also reserves `Name@<realm>`
+        };
+        if self.account(&sibling).await.is_some() {
+            return Err(crate::storage::CreateAccountError::NameTaken);
+        }
         self.storage.create_account(name, credential).await
     }
 
@@ -1210,30 +1230,37 @@ pub struct ChannelOccupant {
 /// tests can drive a real `Node` without a database.
 #[cfg(test)]
 pub(crate) fn test_node() -> Node {
+    test_node_with(|_| {})
+}
+
+/// A test node whose `NodeConfig` can be tweaked before construction — e.g. to turn on
+/// `wc3_legacy_logon`. `test_node()` is the no-op default.
+#[cfg(test)]
+pub(crate) fn test_node_with(tweak: impl FnOnce(&mut NodeConfig)) -> Node {
     let storage = crate::storage::spawn(Box::new(bnetcc_storage::memory::MemoryStorage::new()));
-    Node::new(
-        NodeConfig {
-            policy: Policy::for_mode(bnetcc_core::policy::ServerMode::Gaming),
-            name: "Test".into(),
-            motd: "motd".into(),
-            realm: "bncc".into(),
-            gateway_allowlist: Vec::new(),
-            version_policy: crate::config::VersionPolicy::default(),
-            files_dir: None,
-            admins: crate::config::AdminsConfig::default(),
-            // Tests exercise the classic "first joiner of a normal channel is opped"
-            // behaviour, which in production is the opt-in private-channel case.
-            auto_op_private: true,
-            channel_rules: crate::config::ChannelRules::default(),
-            cd_key_uniqueness: true,
-            // Tests that exercise the size cap construct channels with an explicit max via
-            // bnetcc_core directly; the node default here is uncapped.
-            channel_caps: ChannelCaps::default(),
-            udp_socket: None,
-            bans_path: None,
-        },
-        storage,
-    )
+    let mut cfg = NodeConfig {
+        policy: Policy::for_mode(bnetcc_core::policy::ServerMode::Gaming),
+        name: "Test".into(),
+        motd: "motd".into(),
+        realm: "bncc".into(),
+        wc3_legacy_logon: false,
+        gateway_allowlist: Vec::new(),
+        version_policy: crate::config::VersionPolicy::default(),
+        files_dir: None,
+        admins: crate::config::AdminsConfig::default(),
+        // Tests exercise the classic "first joiner of a normal channel is opped"
+        // behaviour, which in production is the opt-in private-channel case.
+        auto_op_private: true,
+        channel_rules: crate::config::ChannelRules::default(),
+        cd_key_uniqueness: true,
+        // Tests that exercise the size cap construct channels with an explicit max via
+        // bnetcc_core directly; the node default here is uncapped.
+        channel_caps: ChannelCaps::default(),
+        udp_socket: None,
+        bans_path: None,
+    };
+    tweak(&mut cfg);
+    Node::new(cfg, storage)
 }
 
 #[cfg(test)]

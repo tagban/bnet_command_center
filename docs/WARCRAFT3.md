@@ -12,14 +12,26 @@ independent references · ⚠️ from one reference or extrapolated · ❌ not i
 
 ## 1. The short version
 
-**Status 2026-09-10: the login gate is built.** When this investigation started a
-WarCraft III client could not get past the login screen: the version check passed, the
-client sent `SID_AUTH_ACCOUNTLOGON` (0x53), and nothing answered it. That is now
-implemented end to end (§6 lists what landed). The table below is the before/after:
+**Status 2026-09-11: DONE — a real client is in chat.** An actual WarCraft III: TFT client
+(`W3XP`, `IX86`, version byte `0x1B`), through a loader that handles the client-side
+server-signature check, now logs in, enters chat, joins a channel, and types. The last two
+blockers past the built login gate were: the `SID_AUTH_ACCOUNTLOGONPROOF` (0x54) reply had to
+be **exactly** status + M2 with **no** trailing string (24 bytes — a real client drops on the
+extra byte), and the client must be shown its **own name without the `@realm` suffix**. The
+hard-won requirements, red herrings, and the byte-diff-against-bnetdocs method that isolated
+them are written up in **`docs/WARCRAFT3-FIELD-NOTES.md`** — read that if a client connects
+but then drops "connection lost."
+
+When this investigation started a WarCraft III client could not get past the login screen:
+the version check passed, the client sent `SID_AUTH_ACCOUNTLOGON` (0x53), and nothing answered
+it. That is now implemented end to end (§6 lists what landed). The table below is the
+before/after:
 
 | Piece | State | Where |
 |---|---|---|
-| `SID_AUTH_INFO` reply for WC3 (logon type `0x02`, 128 zero bytes where the RSA signature goes) | ✅ | `session.rs::auth_info` |
+| `SID_AUTH_INFO` reply for WC3 (logon type `0x02`, real `ver-IX86-1.mpq` checkrevision formula, 128 zero bytes where the RSA signature goes — the field must be *present*) | ✅ | `session.rs::auth_info` |
+| `SID_AUTH_ACCOUNTLOGONPROOF` (0x54) reply is status + M2 only for non-error status — **no** trailing string (24 bytes; a real client drops on an extra byte) | ✅ confirmed vs real client + bnetdocs | `session.rs::auth_account_logon_proof` |
+| Client shown its own name **bare** (local `@realm` stripped) in ENTERCHAT/chat/userlist | ✅ | `session.rs::finish_logon` |
 | `SID_AUTH_CHECK` with two CD keys (base + expansion) | ⚠️ layout extrapolated, never captured | `session.rs::auth_check` |
 | State machine accepts 0x52/0x53/0x54 in `Authenticating` and advances to `LoggedIn` on 0x54 | ✅ | `bnetcc-core/src/session.rs` |
 | `Credential::Srp { salt, verifier }` in the storage model and SQLite backend | ✅ | `bnetcc-storage`, `bnetcc-storage-sqlite` |
@@ -31,9 +43,11 @@ implemented end to end (§6 lists what landed). The table below is the before/af
 | Empty `SID_FRIENDSLIST` / `SID_NEWS_INFO` replies | ✅ | `session.rs` |
 | A test client that speaks SRP | ✅ in-process tests in `session.rs`, and `massload`'s `srp_login` | `massload/src/bot.rs` |
 
-⚠️ None of this has met a real patched client yet. The evidence is the crypto known-answer
-vectors (cross-checked against an independent Python implementation), the in-process
-end-to-end tests, and the bot. §7 lists what only a capture can settle.
+✅ This has now met a real client end to end (2026-09-11): create-account → NLS proof →
+enter chat → join channel → chat, observed in the server log for a live `W3XP` client. The
+earlier evidence (crypto known-answer vectors vs an independent Python model, in-process
+end-to-end tests, and the bot) all held up; the remaining gap was the two wire details above.
+See `docs/WARCRAFT3-FIELD-NOTES.md` for the full account.
 
 Chat and commands are product-agnostic and work unchanged. Clans and the in-client
 ladder/profile are the next phase (§5).
