@@ -26,12 +26,27 @@
 //! how an advertisement image is fetched, tying the `SID_CHECKAD` response to the
 //! transfer that satisfies it.
 //!
-//! **BNFTP v2 (`0x0200`)** is what WarCraft III uses to fetch its CheckRevision MPQ. Its
-//! request omits `start_position`/`filetime` (a 20-byte header) and places the filename
-//! *after* the header rather than inside the declared length. [`decode_request`] handles
-//! both versions; we serve v2 with the same response header (no CD-key challenge — a
-//! private server gates on nothing there, and a real patched WC3 client fetches the file
-//! with a plain response, same as PvPGN).
+//! **BNFTP v2 (`0x0200`)** is what WarCraft III uses to fetch its CheckRevision MPQ, and it
+//! is a **three-phase handshake**, not a single request/response (BNETDocs doc 6):
+//!
+//! ```text
+//!  1. C→S  u16 length | u16 version(0x0200) | u32 platform | u32 product
+//!          u32 banner_id | u32 banner_ext                 (20 bytes; NO filename)
+//!  2. S→C  u32 server token                               (the challenge)
+//!  3. C→S  u32 start_pos | u64 filetime | u32 client_token
+//!          u32 key_length | u32 key_product | u32 key_public | u32 unknown
+//!          u32[5] key_hash | cstr filename                (filename arrives HERE)
+//!  4. S→C  u32 length | u32 file_size | u32 banner_id | u32 banner_ext
+//!          u64 filetime | cstr filename | file data       (u32 length, no "type" word)
+//! ```
+//!
+//! The client sends step 1 and then **waits for the server token** before it will send the
+//! filename — so a server that skips step 2 and answers with a file deadlocks it. A private
+//! server does not gate file access on the CD key, so the token is arbitrary and the key
+//! fields in step 3 are ignored; only the filename is needed. [`decode_request`] parses
+//! step 1, [`decode_v2_challenge_filename`] parses step 3, and [`encode_response_header_v2`]
+//! frames step 4. Because the client names the file in step 3, every WarCraft III patch is
+//! served the file *it* asks for, with no per-version guessing.
 
 use crate::buf::{Reader, Writer};
 use crate::error::{FourCc, ProtoError, Result};
@@ -233,6 +248,58 @@ pub fn encode_response_header(header: &ResponseHeader) -> Vec<u8> {
     out
 }
 
+/// Encode the BNFTP **v2** file-transfer response header (the fourth phase of the v2
+/// handshake — see the module docs). It differs from v1: a **`u32`** length (not `u16`),
+/// and **no "type" word**. The file bytes follow immediately after the filename string.
+#[must_use]
+pub fn encode_response_header_v2(header: &ResponseHeader) -> Vec<u8> {
+    let mut body = Writer::with_capacity(64);
+    body.u32(header.file_size)
+        .u32(header.ad_id)
+        .u32(header.ad_extension)
+        .u64(header.filetime)
+        .cstr(&header.filename);
+    let body = body.finish();
+
+    let total = u32::try_from(body.len() + 4).unwrap_or(u32::MAX); // + the u32 length field
+    let mut out = Vec::with_capacity(body.len() + 4);
+    out.extend_from_slice(&total.to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Length of the fixed part of the client's v2 challenge-response, before the filename:
+/// `start_pos(4) filetime(8) client_token(4) key_length(4) key_product(4) key_public(4)
+/// unknown(4) key_hash(20)` = 52 bytes.
+pub const V2_CHALLENGE_FIXED: usize = 52;
+
+/// Parse the client's response to the v2 server-token challenge and return the requested
+/// filename. The fixed fields (resume position, filetime, client token, CD-key block) are
+/// not needed to serve a file — a private server does not gate file access on the CD key —
+/// so only the trailing filename is returned.
+///
+/// Returns `Ok(None)` if the whole response has not arrived yet.
+///
+/// # Errors
+///
+/// [`ProtoError::FrameTooLarge`] if the filename exceeds [`MAX_FILENAME`].
+pub fn decode_v2_challenge_filename(buf: &[u8]) -> Result<Option<Vec<u8>>> {
+    if buf.len() < V2_CHALLENGE_FIXED {
+        return Ok(None);
+    }
+    let rest = &buf[V2_CHALLENGE_FIXED..];
+    match rest.iter().position(|&b| b == 0) {
+        Some(nul) => {
+            let name = rest[..nul].to_vec();
+            if name.len() > MAX_FILENAME {
+                return Err(ProtoError::FrameTooLarge { len: name.len(), max: MAX_FILENAME });
+            }
+            Ok(Some(name))
+        }
+        None => Ok(None), // filename has not fully arrived yet
+    }
+}
+
 /// Reject anything that is not a plain filename.
 ///
 /// **This is the security boundary of the whole file-serving path.** The filename comes
@@ -431,6 +498,48 @@ mod tests {
         assert_eq!(r.u32().unwrap(), 0);
         assert_eq!(r.u64().unwrap(), 0x01D9_0000_0000_0000);
         assert_eq!(r.cstr(MAX_FILENAME).unwrap(), b"icons.bni");
+    }
+
+    #[test]
+    fn v2_challenge_response_yields_the_filename() {
+        // Phase 3 of the v2 handshake: 52 fixed bytes then a NUL-terminated filename.
+        let mut buf = vec![0u8; V2_CHALLENGE_FIXED];
+        buf.extend_from_slice(b"ver-IX86-1.mpq\0");
+        assert_eq!(
+            decode_v2_challenge_filename(&buf).unwrap().as_deref(),
+            Some(&b"ver-IX86-1.mpq"[..])
+        );
+        // A different patch asks for a different file — served verbatim, no per-version logic.
+        let mut buf2 = vec![0u8; V2_CHALLENGE_FIXED];
+        buf2.extend_from_slice(b"IX86ver1.mpq\0");
+        assert_eq!(
+            decode_v2_challenge_filename(&buf2).unwrap().as_deref(),
+            Some(&b"IX86ver1.mpq"[..])
+        );
+        // Incomplete (fixed block only, no filename yet) waits rather than erroring.
+        assert_eq!(decode_v2_challenge_filename(&[0u8; V2_CHALLENGE_FIXED]).unwrap(), None);
+        assert_eq!(decode_v2_challenge_filename(&[0u8; 10]).unwrap(), None);
+    }
+
+    #[test]
+    fn v2_response_header_uses_a_u32_length_and_no_type_word() {
+        let header = ResponseHeader {
+            kind: 0,
+            file_size: 11_931,
+            ad_id: 0,
+            ad_extension: 0,
+            filetime: 0x01D9_0000_0000_0000,
+            filename: b"ver-IX86-1.mpq".to_vec(),
+        };
+        let bytes = encode_response_header_v2(&header);
+        let mut r = Reader::new(&bytes);
+        let declared = r.u32().unwrap() as usize;
+        assert_eq!(declared, bytes.len(), "v2 length spans the header, excludes file data");
+        assert_eq!(r.u32().unwrap(), 11_931, "file size follows the u32 length directly");
+        assert_eq!(r.u32().unwrap(), 0, "banner id");
+        assert_eq!(r.u32().unwrap(), 0, "banner ext");
+        assert_eq!(r.u64().unwrap(), 0x01D9_0000_0000_0000);
+        assert_eq!(r.cstr(MAX_FILENAME).unwrap(), b"ver-IX86-1.mpq");
     }
 
     #[test]

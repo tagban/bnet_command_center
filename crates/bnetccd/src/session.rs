@@ -202,11 +202,19 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr, node: Arc<Node>, limits
 /// three platforms. An unrecognised or absent platform falls back to `IX86`.
 /// The CheckRevision MPQ name to hand a client. Two naming conventions exist and the
 /// client parses the name it is given: the original `IX86ver1.mpq` (StarCraft, Diablo,
-/// Warcraft II) and the later `ver-IX86-1.mpq` that Diablo II and WarCraft III expect.
-/// A WarCraft III 1.27a client handed the old form aborts with "There was an error
-/// handling the request" before it ever fetches the file (observed 2026-09-10); Atlas
-/// serves the `ver-` form to everyone. Both files ship in the operator's files directory.
-fn version_mpq_name(platform: Option<FourCc>, product: Option<FourCc>) -> String {
+/// Warcraft II) and the later `ver-IX86-1.mpq` that Diablo II and newer WarCraft III expect.
+///
+/// **WarCraft III straddles both**, keyed by the version byte (from PvPGN's versioncheck
+/// config): 1.26 and older (`<= 0x1A`) use the old `IX86ver1.mpq`, while 1.27+ use
+/// `ver-IX86-1.mpq`. Handing a client the wrong one makes it fail its version check and, on
+/// the BNFTP v2 path, re-request in a loop until it gives up. Diablo II uses the `ver-` form.
+/// Both files ship in the operator's files directory. `version_byte` is `None` where the
+/// game version is not known (e.g. a bare BNFTP fallback), which selects the modern name.
+fn version_mpq_name(
+    platform: Option<FourCc>,
+    product: Option<FourCc>,
+    version_byte: Option<u32>,
+) -> String {
     let plat = platform
         .map(|p| {
             let a = p.as_ascii();
@@ -217,10 +225,14 @@ fn version_mpq_name(platform: Option<FourCc>, product: Option<FourCc>) -> String
             }
         })
         .unwrap_or_else(|| "IX86".to_string());
-    let modern = matches!(
-        product,
-        Some(p) if p == product::WAR3 || p == product::W3XP || p == product::D2DV || p == product::D2XP
-    );
+    // WarCraft III's naming depends on the patch level.
+    if matches!(product, Some(p) if p == product::WAR3 || p == product::W3XP) {
+        return match version_byte {
+            Some(v) if v <= 0x1A => format!("{plat}ver1.mpq"),
+            _ => format!("ver-{plat}-1.mpq"),
+        };
+    }
+    let modern = matches!(product, Some(p) if p == product::D2DV || p == product::D2XP);
     if modern {
         format!("ver-{plat}-1.mpq")
     } else {
@@ -261,17 +273,16 @@ async fn bnftp_session(
     node: Arc<Node>,
     limits: SessionLimits,
 ) -> std::io::Result<()> {
-    // Accumulate until the whole fixed-plus-filename request has arrived.
-    let mut buf = Vec::with_capacity(64);
     let mut chunk = [0u8; 512];
+
+    // --- Phase 1: the initial request. v1 carries the filename; v2 (WarCraft III) is just a
+    // 20-byte header and the filename arrives later (phase 3). ---
+    let mut buf = Vec::with_capacity(64);
     let request = loop {
         match bnftp::decode_request(&buf) {
             Ok(Some(req)) => break req,
             Ok(None) => {}
             Err(e) => {
-                // Loud (was debug) and carries the raw bytes: a BNFTP request our decoder
-                // can't parse is exactly the WarCraft III CheckRevision failure we just
-                // chased, so make the next one self-diagnosing instead of silent.
                 warn!(%peer, error = %e, bytes = %hex_preview(&buf), "malformed BNFTP request");
                 return Ok(());
             }
@@ -293,33 +304,66 @@ async fn bnftp_session(
         debug!(%peer, "BNFTP request but no files directory is configured; refusing");
         return Ok(());
     };
-    // WarCraft III's BNFTP v2 request names no file — it sends the header and waits for the
-    // server to serve the product's version-check MPQ (the one advertised in SID_AUTH_INFO).
-    // Derive that name from the request's platform/product; otherwise serve exactly what was
-    // asked for. Without this the two sides deadlock and the client times out (~10s), which is
-    // what stalled every WC3 login. (docs/WARCRAFT3.md, docs/PROTOCOL-NOTES.md §5a.)
-    let requested: Vec<u8> = if request.version == bnftp::VERSION_2 && request.filename.is_empty() {
-        let derived = version_mpq_name(Some(request.platform), Some(request.product));
-        info!(%peer, product = %request.product, file = %derived, "BNFTP v2 header-only request; serving the version-check MPQ");
-        derived.into_bytes()
+
+    // Resolve the requested filename and the response framing. v2 is a three-phase handshake
+    // (docs/PROTOCOL-NOTES.md §5a, BNETDocs doc 6): the client sent its 20-byte header and is
+    // now WAITING for a u32 server-token challenge before it sends the filename. Skipping the
+    // challenge is what deadlocked every WarCraft III login. The token is arbitrary (a private
+    // server does not gate file access on the CD key) and the client names the file itself, so
+    // every WC3 patch is served the file it asks for with no per-version guessing.
+    let is_v2 = request.version == bnftp::VERSION_2;
+    let requested: Vec<u8> = if is_v2 {
+        // Phase 2: send the challenge.
+        stream.write_all(&rand::random::<u32>().to_le_bytes()).await?;
+        stream.flush().await?;
+        // Phase 3: read the client's response; the filename is at its tail.
+        let mut cbuf = Vec::with_capacity(96);
+        loop {
+            match bnftp::decode_v2_challenge_filename(&cbuf) {
+                Ok(Some(name)) => break name,
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(%peer, error = %e, bytes = %hex_preview(&cbuf), "bad BNFTP v2 challenge response");
+                    return Ok(());
+                }
+            }
+            if cbuf.len() > bnftp::MAX_REQUEST {
+                debug!(%peer, "BNFTP v2 challenge response exceeded the size cap");
+                return Ok(());
+            }
+            let n = tokio::time::timeout(limits.handshake_timeout, stream.read(&mut chunk))
+                .await
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "bnftp v2 challenge"))??;
+            if n == 0 {
+                return Ok(());
+            }
+            cbuf.extend_from_slice(&chunk[..n]);
+        }
     } else {
         request.filename.clone()
     };
+
+    // Defensive fallback: if a v2 client somehow named nothing, serve the product's
+    // version-check MPQ (the file we advertise in SID_AUTH_INFO).
+    let requested = if is_v2 && requested.is_empty() {
+        // The BNFTP request carries no game version byte, so fall back to the modern name.
+        version_mpq_name(Some(request.platform), Some(request.product), None).into_bytes()
+    } else {
+        requested
+    };
+
     let Some(name) = bnftp::sanitize_filename(&requested) else {
-        warn!(
-            peer = %peer,
-            filename = %String::from_utf8_lossy(&requested),
-            "BNFTP filename rejected by the traversal guard"
-        );
+        warn!(%peer, filename = %String::from_utf8_lossy(&requested), "BNFTP filename rejected by the traversal guard");
         return Ok(());
     };
+    if is_v2 {
+        info!(%peer, product = %request.product, file = %name, "BNFTP v2 request");
+    }
 
     let path = dir.join(name);
     let bytes = match tokio::fs::read(&path).await {
         Ok(b) => b,
         Err(e) => {
-            // Loud (was debug): a client asking for a file we don't have is worth seeing —
-            // it's the difference between "we rejected the request" and "we're missing a file".
             warn!(%peer, file = %name, error = %e, "BNFTP file not found or unreadable");
             return Ok(());
         }
@@ -337,22 +381,23 @@ async fn bnftp_session(
         ad_id: request.ad_id,
         ad_extension: request.ad_extension,
         filetime,
-        // Echo the file we actually serve. For a v2 header-only request the client sent no
-        // filename, so `request.filename` is empty — naming the derived file here is both
-        // correct and what a client expects to see in the response.
         filename: name.as_bytes().to_vec(),
     };
-    // Send header + file, then report the *delivered* byte count. Logging after the flush
-    // (rather than before the write) means a truncated or failed transfer surfaces as a WARN
-    // instead of a misleading "serving…" line — exactly the ambiguity that made the earlier
-    // 8192-byte truncation hard to attribute.
+    // Phase 4 (v2) / the single response (v1). v2 frames the header with a u32 length and no
+    // "type" word. Log after the flush so a truncated transfer surfaces as a WARN rather than
+    // a misleading success line.
+    let response_header = if is_v2 {
+        bnftp::encode_response_header_v2(&header)
+    } else {
+        bnftp::encode_response_header(&header)
+    };
     let send = async {
-        stream.write_all(&bnftp::encode_response_header(&header)).await?;
+        stream.write_all(&response_header).await?;
         stream.write_all(&bytes).await?;
         stream.flush().await
     };
     match send.await {
-        Ok(()) => info!(%peer, file = %name, bytes = bytes.len(), "BNFTP file delivered"),
+        Ok(()) => info!(%peer, file = %name, bytes = bytes.len(), v2 = is_v2, "BNFTP file delivered"),
         Err(e) => warn!(%peer, file = %name, bytes = bytes.len(), error = %e, "BNFTP transfer failed mid-send"),
     }
     Ok(())
@@ -873,7 +918,7 @@ impl Bncs {
         );
         let logon_type: u32 = if srp { 0x02 } else { 0x00 };
 
-        let mpq = version_mpq_name(self.platform, self.product);
+        let mpq = version_mpq_name(self.platform, self.product, self.version_byte);
         // The file's real modification time, so a client that caches the MPQ by filetime
         // (WarCraft III does) decides correctly whether to re-fetch it; 0 if we lack the file.
         let mpq_filetime = self.node.file_mtime(mpq.as_bytes()).map_or(0, unix_to_filetime);
@@ -1343,7 +1388,7 @@ impl Bncs {
                 "SID_STARTVERSIONING (legacy)"
             );
         }
-        let mpq = version_mpq_name(self.platform, self.product);
+        let mpq = version_mpq_name(self.platform, self.product, self.version_byte);
         let mpq_filetime = self.node.file_mtime(mpq.as_bytes()).map_or(0, unix_to_filetime);
         let mut w = Writer::with_capacity(64);
         w.u64(mpq_filetime) // MPQ filetime
@@ -3077,12 +3122,17 @@ mod tests {
     #[test]
     fn warcraft_three_and_diablo_two_get_the_ver_dash_mpq_name() {
         let ix86 = Some(bnetcc_proto::FourCc::from_ascii(b"IX86"));
-        assert_eq!(version_mpq_name(ix86, Some(product::W3XP)), "ver-IX86-1.mpq");
-        assert_eq!(version_mpq_name(ix86, Some(product::WAR3)), "ver-IX86-1.mpq");
-        assert_eq!(version_mpq_name(ix86, Some(product::D2XP)), "ver-IX86-1.mpq");
-        assert_eq!(version_mpq_name(ix86, Some(product::SEXP)), "IX86ver1.mpq");
-        assert_eq!(version_mpq_name(ix86, Some(product::W2BN)), "IX86ver1.mpq");
-        assert_eq!(version_mpq_name(None, None), "IX86ver1.mpq");
+        // WarCraft III depends on the patch: 1.27+ (>=0x1B) gets the ver- name, 1.26 (0x1A)
+        // and older get the classic name; unknown version defaults to the modern name.
+        assert_eq!(version_mpq_name(ix86, Some(product::W3XP), Some(0x1B)), "ver-IX86-1.mpq");
+        assert_eq!(version_mpq_name(ix86, Some(product::WAR3), Some(0x1C)), "ver-IX86-1.mpq");
+        assert_eq!(version_mpq_name(ix86, Some(product::W3XP), Some(0x1A)), "IX86ver1.mpq");
+        assert_eq!(version_mpq_name(ix86, Some(product::WAR3), None), "ver-IX86-1.mpq");
+        // Diablo II always uses the ver- name; the classic games use the old name.
+        assert_eq!(version_mpq_name(ix86, Some(product::D2XP), None), "ver-IX86-1.mpq");
+        assert_eq!(version_mpq_name(ix86, Some(product::SEXP), None), "IX86ver1.mpq");
+        assert_eq!(version_mpq_name(ix86, Some(product::W2BN), None), "IX86ver1.mpq");
+        assert_eq!(version_mpq_name(None, None, None), "IX86ver1.mpq");
     }
 
     #[tokio::test]
