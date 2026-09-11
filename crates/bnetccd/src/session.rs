@@ -269,7 +269,10 @@ async fn bnftp_session(
             Ok(Some(req)) => break req,
             Ok(None) => {}
             Err(e) => {
-                debug!(%peer, error = %e, "malformed BNFTP request");
+                // Loud (was debug) and carries the raw bytes: a BNFTP request our decoder
+                // can't parse is exactly the WarCraft III CheckRevision failure we just
+                // chased, so make the next one self-diagnosing instead of silent.
+                warn!(%peer, error = %e, bytes = %hex_preview(&buf), "malformed BNFTP request");
                 return Ok(());
             }
         }
@@ -303,7 +306,9 @@ async fn bnftp_session(
     let bytes = match tokio::fs::read(&path).await {
         Ok(b) => b,
         Err(e) => {
-            debug!(%peer, file = %name, error = %e, "BNFTP file not found or unreadable");
+            // Loud (was debug): a client asking for a file we don't have is worth seeing —
+            // it's the difference between "we rejected the request" and "we're missing a file".
+            warn!(%peer, file = %name, error = %e, "BNFTP file not found or unreadable");
             return Ok(());
         }
     };

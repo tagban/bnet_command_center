@@ -26,8 +26,12 @@
 //! how an advertisement image is fetched, tying the `SID_CHECKAD` response to the
 //! transfer that satisfies it.
 //!
-//! BNFTP v2 (`0x0200`) inserts a CD-key challenge before the transfer. Not implemented;
-//! v1 covers every file a private server needs to serve.
+//! **BNFTP v2 (`0x0200`)** is what WarCraft III uses to fetch its CheckRevision MPQ. Its
+//! request omits `start_position`/`filetime` (a 20-byte header) and places the filename
+//! *after* the header rather than inside the declared length. [`decode_request`] handles
+//! both versions; we serve v2 with the same response header (no CD-key challenge — a
+//! private server gates on nothing there, and a real patched WC3 client fetches the file
+//! with a plain response, same as PvPGN).
 
 use crate::buf::{Reader, Writer};
 use crate::error::{FourCc, ProtoError, Result};
@@ -91,10 +95,70 @@ pub struct ResponseHeader {
 /// [`ProtoError::FrameTooLarge`] if the declared length is implausible, or a parse error
 /// for a malformed body. Both are fatal to the connection and to nothing else.
 pub fn decode_request(buf: &[u8]) -> Result<Option<Request>> {
-    if buf.len() < 2 {
+    // Both the length and version words are needed to choose the layout.
+    if buf.len() < 4 {
         return Ok(None);
     }
     let declared = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+    if declared > MAX_REQUEST {
+        return Err(ProtoError::FrameTooLarge {
+            len: declared,
+            max: MAX_REQUEST,
+        });
+    }
+    let version = u16::from_le_bytes([buf[2], buf[3]]);
+
+    // WarCraft III speaks BNFTP **v2** (0x0200), and its request differs from v1 in two ways
+    // that together made our v1-only decoder reject it outright — which is why a WC3 client
+    // could never fetch its CheckRevision MPQ and stalled forever in "versioning" (it never
+    // reached SID_AUTH_CHECK). In v2 the `declared` length is the *header* length (it omits
+    // `start_position` and `filetime`, so the real header is 20 bytes, not v1's 32+) and the
+    // filename follows the header rather than living inside `declared`. Only platform,
+    // product and the filename are needed to serve a file, so read those and ignore the rest
+    // of the header (the ad-banner dwords), which keeps this robust to header-size variation.
+    if version == VERSION_2 {
+        // len(2) + ver(2) + platform(4) + product(4) = 12 bytes minimum; real clients send 20.
+        if declared < 12 {
+            return Err(ProtoError::FrameTooLarge {
+                len: declared,
+                max: MAX_REQUEST,
+            });
+        }
+        if buf.len() < declared {
+            return Ok(None);
+        }
+        let mut r = Reader::new(&buf[4..declared]);
+        let platform = r.fourcc()?;
+        let product = r.fourcc()?;
+        // Remaining header bytes (ad-banner id/extension) are not needed to serve a file.
+        let ad_id = r.u32().unwrap_or(0);
+        let ad_extension = r.u32().unwrap_or(0);
+        // The NUL-terminated filename follows the fixed header, starting at `declared`.
+        let rest = &buf[declared..];
+        let Some(nul) = rest.iter().position(|&b| b == 0) else {
+            return Ok(None); // filename has not fully arrived yet
+        };
+        let filename = rest[..nul].to_vec();
+        if filename.len() > MAX_FILENAME {
+            return Err(ProtoError::FrameTooLarge {
+                len: filename.len(),
+                max: MAX_FILENAME,
+            });
+        }
+        return Ok(Some(Request {
+            version,
+            platform,
+            product,
+            ad_id,
+            ad_extension,
+            start_position: 0,
+            filetime: 0,
+            filename,
+        }));
+    }
+
+    // v1 (StarCraft, Diablo, Warcraft II BNE, old Mac): `declared` spans the whole request,
+    // filename included, and the header carries start_position + filetime.
     if !(24..=MAX_REQUEST).contains(&declared) {
         return Err(ProtoError::FrameTooLarge {
             len: declared,
@@ -287,6 +351,32 @@ mod tests {
         let decoded = decode_request(&encode_request(&req)).unwrap().unwrap();
         assert_eq!(decoded.ad_id, 7);
         assert_eq!(decoded.ad_extension, extension::smk().0);
+    }
+
+    #[test]
+    fn a_warcraft_three_v2_request_decodes() {
+        // Built from a real WC3/W3XP capture: 20-byte header (len, ver=0x0200, platform,
+        // product, ad_id, ad_ext), then the filename after the header — no start_position or
+        // filetime. This is the request our v1-only decoder used to reject, stranding WC3.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&20u16.to_le_bytes()); // header length
+        buf.extend_from_slice(&VERSION_2.to_le_bytes()); // 0x0200
+        buf.extend_from_slice(b"68XI"); // IX86 on the wire (reversed)
+        buf.extend_from_slice(b"PX3W"); // W3XP on the wire (reversed)
+        buf.extend_from_slice(&0u32.to_le_bytes()); // ad_id
+        buf.extend_from_slice(&0u32.to_le_bytes()); // ad_extension
+        buf.extend_from_slice(b"ver-IX86-1.mpq\0"); // filename, after the 20-byte header
+
+        // A partial buffer (header only, no filename yet) must wait, not error.
+        assert_eq!(decode_request(&buf[..20]).unwrap(), None);
+
+        let req = decode_request(&buf).unwrap().expect("v2 request decodes");
+        assert_eq!(req.version, VERSION_2);
+        assert_eq!(req.platform, FourCc::from_ascii(b"IX86"));
+        assert_eq!(req.product, product::W3XP);
+        assert_eq!(req.filename, b"ver-IX86-1.mpq");
+        // And that name passes the traversal guard, so it will actually be served.
+        assert_eq!(sanitize_filename(&req.filename), Some("ver-IX86-1.mpq"));
     }
 
     #[test]
