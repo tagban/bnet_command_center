@@ -337,12 +337,24 @@ async fn bnftp_session(
         ad_id: request.ad_id,
         ad_extension: request.ad_extension,
         filetime,
-        filename: request.filename.clone(),
+        // Echo the file we actually serve. For a v2 header-only request the client sent no
+        // filename, so `request.filename` is empty — naming the derived file here is both
+        // correct and what a client expects to see in the response.
+        filename: name.as_bytes().to_vec(),
     };
-    info!(%peer, file = %name, bytes = bytes.len(), "serving BNFTP file");
-    stream.write_all(&bnftp::encode_response_header(&header)).await?;
-    stream.write_all(&bytes).await?;
-    stream.flush().await?;
+    // Send header + file, then report the *delivered* byte count. Logging after the flush
+    // (rather than before the write) means a truncated or failed transfer surfaces as a WARN
+    // instead of a misleading "serving…" line — exactly the ambiguity that made the earlier
+    // 8192-byte truncation hard to attribute.
+    let send = async {
+        stream.write_all(&bnftp::encode_response_header(&header)).await?;
+        stream.write_all(&bytes).await?;
+        stream.flush().await
+    };
+    match send.await {
+        Ok(()) => info!(%peer, file = %name, bytes = bytes.len(), "BNFTP file delivered"),
+        Err(e) => warn!(%peer, file = %name, bytes = bytes.len(), error = %e, "BNFTP transfer failed mid-send"),
+    }
     Ok(())
 }
 
