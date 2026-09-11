@@ -30,6 +30,8 @@ motd = "Welcome to Command Center."
 # BNCS and the chat gateway share this port; they are told apart by the first byte a
 # client sends (0x01 game, 0x02 BNFTP, 0x03/0x43/0x63 chat gateway).
 bncs = "0.0.0.0:6112"
+# Health check + Prometheus metrics endpoint. Keep it loopback.
+admin = "127.0.0.1:6115"
 # Number of accept loops sharing the port (SO_REUSEPORT, Unix only; forced to 1 elsewhere).
 accept_shards = 1
 
