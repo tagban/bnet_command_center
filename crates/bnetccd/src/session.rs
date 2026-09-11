@@ -293,10 +293,22 @@ async fn bnftp_session(
         debug!(%peer, "BNFTP request but no files directory is configured; refusing");
         return Ok(());
     };
-    let Some(name) = bnftp::sanitize_filename(&request.filename) else {
-        debug!(
+    // WarCraft III's BNFTP v2 request names no file — it sends the header and waits for the
+    // server to serve the product's version-check MPQ (the one advertised in SID_AUTH_INFO).
+    // Derive that name from the request's platform/product; otherwise serve exactly what was
+    // asked for. Without this the two sides deadlock and the client times out (~10s), which is
+    // what stalled every WC3 login. (docs/WARCRAFT3.md, docs/PROTOCOL-NOTES.md §5a.)
+    let requested: Vec<u8> = if request.version == bnftp::VERSION_2 && request.filename.is_empty() {
+        let derived = version_mpq_name(Some(request.platform), Some(request.product));
+        info!(%peer, product = %request.product, file = %derived, "BNFTP v2 header-only request; serving the version-check MPQ");
+        derived.into_bytes()
+    } else {
+        request.filename.clone()
+    };
+    let Some(name) = bnftp::sanitize_filename(&requested) else {
+        warn!(
             peer = %peer,
-            filename = %String::from_utf8_lossy(&request.filename),
+            filename = %String::from_utf8_lossy(&requested),
             "BNFTP filename rejected by the traversal guard"
         );
         return Ok(());

@@ -133,12 +133,16 @@ pub fn decode_request(buf: &[u8]) -> Result<Option<Request>> {
         // Remaining header bytes (ad-banner id/extension) are not needed to serve a file.
         let ad_id = r.u32().unwrap_or(0);
         let ad_extension = r.u32().unwrap_or(0);
-        // The NUL-terminated filename follows the fixed header, starting at `declared`.
+        // A real WarCraft III client sends **only** the header and then waits for the server
+        // to serve the product's version-check MPQ — it never sends a filename. So an absent
+        // filename is not "request incomplete", it *is* the request: return it with an empty
+        // filename and let the caller derive the file from (platform, product). (If a client
+        // ever does append a NUL-terminated filename after the header, honour it verbatim.)
         let rest = &buf[declared..];
-        let Some(nul) = rest.iter().position(|&b| b == 0) else {
-            return Ok(None); // filename has not fully arrived yet
+        let filename = match rest.iter().position(|&b| b == 0) {
+            Some(nul) => rest[..nul].to_vec(),
+            None => Vec::new(),
         };
-        let filename = rest[..nul].to_vec();
         if filename.len() > MAX_FILENAME {
             return Err(ProtoError::FrameTooLarge {
                 len: filename.len(),
@@ -365,18 +369,24 @@ mod tests {
         buf.extend_from_slice(b"PX3W"); // W3XP on the wire (reversed)
         buf.extend_from_slice(&0u32.to_le_bytes()); // ad_id
         buf.extend_from_slice(&0u32.to_le_bytes()); // ad_extension
-        buf.extend_from_slice(b"ver-IX86-1.mpq\0"); // filename, after the 20-byte header
+        buf.extend_from_slice(b"ver-IX86-1.mpq\0"); // optional filename, after the 20-byte header
 
-        // A partial buffer (header only, no filename yet) must wait, not error.
-        assert_eq!(decode_request(&buf[..20]).unwrap(), None);
+        // An incomplete header still waits.
+        assert_eq!(decode_request(&buf[..19]).unwrap(), None);
 
-        let req = decode_request(&buf).unwrap().expect("v2 request decodes");
-        assert_eq!(req.version, VERSION_2);
-        assert_eq!(req.platform, FourCc::from_ascii(b"IX86"));
-        assert_eq!(req.product, product::W3XP);
-        assert_eq!(req.filename, b"ver-IX86-1.mpq");
-        // And that name passes the traversal guard, so it will actually be served.
-        assert_eq!(sanitize_filename(&req.filename), Some("ver-IX86-1.mpq"));
+        // Header-only (exactly the 20 bytes the real client sends) is a COMPLETE request with
+        // an empty filename — not "still waiting". The caller serves the version MPQ for the
+        // (platform, product) pair. This is the deadlock fix: previously we waited forever.
+        let hdr_only = decode_request(&buf[..20]).unwrap().expect("header-only decodes");
+        assert_eq!(hdr_only.version, VERSION_2);
+        assert_eq!(hdr_only.platform, FourCc::from_ascii(b"IX86"));
+        assert_eq!(hdr_only.product, product::W3XP);
+        assert!(hdr_only.filename.is_empty(), "header-only request carries no filename");
+
+        // And if a client does append a filename, it is honoured verbatim.
+        let named = decode_request(&buf).unwrap().expect("v2 request with filename decodes");
+        assert_eq!(named.filename, b"ver-IX86-1.mpq");
+        assert_eq!(sanitize_filename(&named.filename), Some("ver-IX86-1.mpq"));
     }
 
     #[test]
