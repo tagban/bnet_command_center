@@ -64,8 +64,11 @@ pub mod user_flags {
     pub const ADMIN: u32 = 0x08;
     /// No UDP support.
     ///
-    /// Real Battle.net never responds to UDP for `W2BN`, `DRTL` or `DSHR`, so those
-    /// products always carry this flag. Set it unconditionally for them.
+    /// Real Battle.net never answers UDP for `DRTL`/`DSHR` (Diablo, Diablo Shareware), so
+    /// those clients always show this flag — set it unconditionally for them (see
+    /// `product::always_no_udp`, applied on both the modern and legacy logon paths).
+    /// `W2BN` is **not** in that set: a real Warcraft II BNE client does complete the UDP
+    /// check (captured 2026-09-09), so it must not be forced No-UDP.
     pub const NO_UDP: u32 = 0x10;
     /// Squelched (ignored) by the recipient.
     pub const SQUELCHED: u32 = 0x20;

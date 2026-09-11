@@ -106,6 +106,13 @@ impl<'a> Statstring<'a> {
 /// `PXES`), which is how the client identifies the user's product and icon. The zeroed
 /// fields stand in for stats we do not track yet. This mirrors the shape a real server
 /// sends for a fresh account and is enough for a client to render the user in its list.
+///
+/// **Diablo (`DRTL`/`DSHR`) is special-cased.** Its statstring is nine gameplay fields —
+/// level, class, difficulty, the four attributes, gold, spawned — and a fresh character is
+/// a level-1 Warrior (`1 0 0 30 10 20 25 0 0`), not the all-zero shape. A real Diablo server
+/// sends this exact line for an empty statstring; the all-zero form makes other clients
+/// render a level-0 character with no attributes. See `docs/PROTOCOL-NOTES.md` §8 and
+/// [`layout::DIABLO_DEFAULT`] (which `build_default(DRTL)` reproduces).
 #[must_use]
 pub fn build_default(product: FourCc) -> Vec<u8> {
     let a = product.as_ascii();
@@ -118,8 +125,12 @@ pub fn build_default(product: FourCc) -> Vec<u8> {
     }
     let mut s = Vec::with_capacity(29);
     s.extend_from_slice(&reversed);
-    s.extend_from_slice(b" 0 0 0 0 0 0 0 0 ");
-    s.extend_from_slice(&reversed);
+    if product == crate::product::DRTL || product == crate::product::DSHR {
+        s.extend_from_slice(b" 1 0 0 30 10 20 25 0 0");
+    } else {
+        s.extend_from_slice(b" 0 0 0 0 0 0 0 0 ");
+        s.extend_from_slice(&reversed);
+    }
     s
 }
 
@@ -233,6 +244,28 @@ pub mod layout {
 mod tests {
     use super::*;
     use crate::product;
+
+    #[test]
+    fn diablo_gets_its_documented_default_statstring() {
+        // DRTL's default must be the level-1 Warrior line, and must match the documented
+        // constant exactly so the two never drift.
+        assert_eq!(build_default(product::DRTL), layout::DIABLO_DEFAULT);
+        // Shareware carries the same fresh-character stats under its own (reversed) tag.
+        assert_eq!(build_default(product::DSHR), b"RHSD 1 0 0 30 10 20 25 0 0");
+        // The default parses back as a Diablo statstring: product tag + nine fields.
+        let default = build_default(product::DRTL);
+        let s = Statstring::parse(&default);
+        assert_eq!(s.product(), Some(product::DRTL));
+        assert_eq!(s.fields().len(), layout::DIABLO_FIELDS);
+        assert_eq!(s.field_u32(0), Some(1), "level 1");
+        assert_eq!(s.field_u32(3), Some(30), "warrior strength");
+    }
+
+    #[test]
+    fn a_non_diablo_default_keeps_the_generic_shape() {
+        // Unchanged for everything else: reversed tag, eight zeros, reversed tag.
+        assert_eq!(build_default(product::SEXP), b"PXES 0 0 0 0 0 0 0 0 PXES");
+    }
 
     #[test]
     fn the_product_tag_is_read_reversed() {

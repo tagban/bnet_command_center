@@ -1234,6 +1234,14 @@ impl Bncs {
             self.product = Some(product);
             self.version_byte = Some(version_byte);
             self.statstring = statstring::build_default(product);
+            if product::always_no_udp(product) {
+                // Diablo (DRTL/DSHR) never runs the UDP check, so its users always carry the
+                // No-UDP flag. This is the legacy-flow counterpart to the same line in
+                // `auth_info`; without it a Diablo user — which only ever logs in through
+                // this path — would be shown to others without the flag. See
+                // `product::always_no_udp` and `spawn_udp_ping` (which skips the ping here).
+                self.flags |= user_flags::NO_UDP;
+            }
             info!(
                 peer = %self.peer,
                 product = %product,
@@ -3115,6 +3123,155 @@ mod tests {
         assert!(
             list_game_names(&mut viewer).await.is_empty(),
             "a game must not outlive the connection hosting it"
+        );
+    }
+
+    /// Drive a full **legacy-flow** (Diablo I) login as a real `DRTL` client would:
+    /// `SID_STARTVERSIONING` → `SID_REPORTVERSION` → icon negotiation → legacy account
+    /// creation → `SID_LOGONRESPONSE` (0x29) → `SID_ENTERCHAT`. Asserts the Diablo-specific
+    /// replies (the `icons.bni` filename and the level-1 Warrior default statstring) as it
+    /// goes. Returns the logged-in stream, in chat and ready to join a channel.
+    async fn diablo_login(addr: std::net::SocketAddr, user: &str, password: &str) -> TcpStream {
+        const CLIENT_TOKEN: u32 = 0x1234_5678;
+        let mut s = connect(addr).await;
+
+        // SID_STARTVERSIONING (0x06): platform, product, version byte (Diablo reports 0x2A).
+        let mut vw = Writer::with_capacity(16);
+        vw.fourcc(bnetcc_proto::FourCc::from_ascii(b"IX86"))
+            .fourcc(product::DRTL)
+            .u32(0x2A);
+        send_frame(&mut s, &Frame::new(sid::STARTVERSIONING, vw.finish())).await;
+        assert_eq!(recv_frame(&mut s).await.id, sid::STARTVERSIONING, "version reply");
+
+        // SID_REPORTVERSION (0x07): the handler ignores the body; result 0x02 == success.
+        send_frame(&mut s, &Frame::new(sid::REPORTVERSION, Writer::new().finish())).await;
+        let rv = recv_frame(&mut s).await;
+        assert_eq!(rv.id, sid::REPORTVERSION);
+        assert_eq!(rv.reader().u32().unwrap(), 0x02, "legacy version check should pass");
+
+        // SID_GETICONDATA (0x2D): Diablo must be handed `icons.bni`, not `icons_STAR.bni`.
+        send_frame(&mut s, &Frame::new(sid::GETICONDATA, Writer::new().finish())).await;
+        let icon = recv_frame(&mut s).await;
+        assert_eq!(icon.id, sid::GETICONDATA);
+        let mut ir = icon.reader();
+        let _filetime = ir.u64().unwrap();
+        assert_eq!(ir.cstr(64).unwrap(), b"icons.bni", "Diablo icon file selection");
+
+        // Legacy account creation (SID_CREATEACCOUNT, 0x2A): single-hash password + name.
+        let h1 = bnetcc_crypto::password_hash(password);
+        let mut cw = Writer::with_capacity(32);
+        cw.bytes(&h1).cstr(user.as_bytes());
+        send_frame(&mut s, &Frame::new(sid::CREATEACCOUNT, cw.finish())).await;
+        assert_eq!(
+            recv_frame(&mut s).await.reader().u32().unwrap(),
+            0x00,
+            "legacy account creation"
+        );
+
+        // SID_LOGONRESPONSE (0x29): the legacy flow issues no server token, so the client
+        // computes its proof with the server token it puts in the packet — real clients send 0.
+        let proof = bnetcc_crypto::logon_proof(CLIENT_TOKEN, 0, &h1);
+        let mut lw = Writer::with_capacity(32);
+        lw.u32(CLIENT_TOKEN).u32(0).bytes(&proof).cstr(user.as_bytes());
+        send_frame(&mut s, &Frame::new(sid::LOGONRESPONSE, lw.finish())).await;
+        let logon = recv_frame(&mut s).await;
+        assert_eq!(logon.id, sid::LOGONRESPONSE);
+        assert_eq!(logon.reader().u32().unwrap(), 1, "legacy logon: 1 == success");
+
+        // SID_ENTERCHAT: the reply's second string is our own statstring — the Diablo default.
+        send_frame(&mut s, &Frame::new(sid::ENTERCHAT, Writer::new().finish())).await;
+        let enter = recv_frame(&mut s).await;
+        assert_eq!(enter.id, sid::ENTERCHAT);
+        let mut er = enter.reader();
+        let _name = er.cstr(64).unwrap();
+        assert_eq!(
+            er.cstr(64).unwrap(),
+            bnetcc_proto::statstring::layout::DIABLO_DEFAULT,
+            "a fresh Diablo user gets the level-1 Warrior default statstring"
+        );
+        s
+    }
+
+    /// Send `SID_JOINCHANNEL` with the first-join flag for `channel`. The reply (a snapshot
+    /// of chat events) is left on the socket for the caller to read as it needs.
+    async fn join_channel_first(stream: &mut TcpStream, channel: &str) {
+        let mut w = Writer::with_capacity(32);
+        w.u32(0x01).cstr(channel.as_bytes()); // 0x01 = first join
+        send_frame(stream, &Frame::new(sid::JOINCHANNEL, w.finish())).await;
+    }
+
+    /// Read the next `SID_CHATEVENT`, skipping keepalives. Returns (event id, flags,
+    /// username, text). Panics on any non-chat, non-ping frame — the tests only call it
+    /// where a chat event is expected.
+    async fn recv_chatevent(stream: &mut TcpStream) -> (u32, u32, Vec<u8>, Vec<u8>) {
+        loop {
+            let mut header = [0u8; bnetcc_proto::bncs::HEADER_LEN];
+            stream.read_exact(&mut header).await.expect("chat header");
+            assert_eq!(header[0], bnetcc_proto::bncs::MAGIC, "bad frame magic");
+            let id = header[1];
+            let total = u16::from_le_bytes([header[2], header[3]]) as usize;
+            let mut body = vec![0u8; total.saturating_sub(bnetcc_proto::bncs::HEADER_LEN)];
+            stream.read_exact(&mut body).await.expect("chat body");
+            if id == sid::PING {
+                continue;
+            }
+            assert_eq!(id, sid::CHATEVENT, "expected a chat event");
+            let frame = Frame { id, body };
+            let mut r = frame.reader();
+            let event = r.u32().unwrap();
+            let flags = r.u32().unwrap();
+            let _ping = r.u32().unwrap();
+            let _ip = r.u32().unwrap();
+            let _acct = r.u32().unwrap();
+            let _reg = r.u32().unwrap();
+            let username = r.cstr(64).unwrap().to_vec();
+            let text = r.cstr(512).unwrap().to_vec();
+            return (event, flags, username, text);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_diablo_client_completes_the_legacy_login() {
+        // The whole legacy handshake succeeds end-to-end and the Diablo-specific asserts
+        // inside the helper (icon file, default statstring) hold.
+        let addr = spawn_server().await;
+        let _s = diablo_login(addr, "Wanderer", "pw").await;
+    }
+
+    #[tokio::test]
+    async fn a_diablo_user_carries_no_udp_and_diablo_stats_in_channel() {
+        let addr = spawn_server().await;
+
+        // A modern StarCraft client joins a channel first...
+        let mut modern = login(addr, "Watcher", "pw", 7).await;
+        join_channel_first(&mut modern, "Diablo").await;
+        // ...and its own SHOWUSER in the join snapshot must NOT carry No-UDP (the control:
+        // SEXP completes the UDP check, so it is never forced No-UDP).
+        let watcher_flags = loop {
+            let (event, flags, name, _) = recv_chatevent(&mut modern).await;
+            if event == EventId::ShowUser as u32 && name.as_slice() == b"Watcher" {
+                break flags;
+            }
+        };
+        assert_eq!(watcher_flags & user_flags::NO_UDP, 0, "SEXP is not a No-UDP product");
+
+        // A Diablo client logs in through the legacy flow and joins the same channel.
+        let mut diablo = diablo_login(addr, "Diabloer", "pw").await;
+        join_channel_first(&mut diablo, "Diablo").await;
+
+        // The modern client sees the Diablo user arrive (EID_JOIN) carrying its flags and
+        // statstring: No-UDP must be set, and the statstring must be the Diablo default.
+        let (_event, flags, _name, text) = loop {
+            let ev = recv_chatevent(&mut modern).await;
+            if ev.0 == EventId::Join as u32 && ev.2.as_slice() == b"Diabloer" {
+                break ev;
+            }
+        };
+        assert_ne!(flags & user_flags::NO_UDP, 0, "Diablo users always carry the No-UDP flag");
+        assert_eq!(
+            text.as_slice(),
+            bnetcc_proto::statstring::layout::DIABLO_DEFAULT,
+            "the Diablo default statstring reaches other clients in the channel"
         );
     }
 }
