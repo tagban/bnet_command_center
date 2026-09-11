@@ -7,6 +7,11 @@ license.workspace = true
 description = "Battle.net cryptographic primitives: XSHA-1, BSHA-1, NLS/SRP"
 
 [dependencies]
+# Standard SHA-1 for NLS (WarCraft III's SRP variant). RustCrypto, MIT/Apache-2.0.
+sha1 = "0.10"
+# 256-bit modular exponentiation for NLS. MIT/Apache-2.0.
+num-bigint = "0.4"
+num-traits = "0.2"
 
 [lints.rust]
 unsafe_code = "forbid"

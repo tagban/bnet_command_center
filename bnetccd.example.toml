@@ -25,6 +25,11 @@ name = "Command Center"
 # A hub can narrow this but a node can never widen it.
 mode = "gaming"
 motd = "Welcome to Command Center."
+# Realm name for WarCraft III accounts. WarCraft III logs in with SRP, so its accounts
+# cannot share a password with the other games' accounts; they live in their own
+# namespace and appear as `Name@<realm>` in chat, whispers and bans. Names typed in the
+# WarCraft III client never include the suffix. See docs/WARCRAFT3.md.
+realm = "bncc"
 
 [listen]
 # BNCS and the chat gateway share this port; they are told apart by the first byte a

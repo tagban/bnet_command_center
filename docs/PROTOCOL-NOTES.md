@@ -173,6 +173,17 @@ Parameters: `g = 47` (`0x2F`); `N` (256-bit) =
 Server stores `(salt s, verifier v = g^x mod N)`. Because `v` does not permit client
 impersonation, it can safely be cached at federation nodes — see `FEDERATION.md` §4.
 
+✅ **Implemented 2026-09-10** in `bnetcc-crypto::nls` (server and client sides, clean-room
+from this spec) with the `0x52`/`0x53`/`0x54` handlers in `bnetccd`. The byte-order rules
+that make or break it, verified by an independent Python reference and round-trip tests:
+every wire integer is 32 bytes little-endian zero-padded and is hashed in that form; `x`
+is little-endian from its digest; `u` is big-endian from its four bytes; `I` hashes `N`
+little-endian (`6C0E97ED…01F8` as bytes). `0x53` always answers 72 bytes (zeroed on
+failure). WarCraft III accounts live in their own realm as `Name@<realm>` (config
+`server.realm`, default `bncc`) because an SRP verifier and an X-SHA-1 digest cannot be
+derived from one another. Full write-up: `WARCRAFT3.md`. ⚠️ Not yet exercised by a real
+patched client — the in-process test client and the massload bot are the evidence so far.
+
 ---
 
 ## 4. Chat

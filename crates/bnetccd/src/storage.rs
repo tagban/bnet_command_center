@@ -96,7 +96,7 @@ enum Command {
     },
     CreateAccount {
         name: String,
-        password_hash: [u8; 20],
+        credential: Credential,
         resp: oneshot::Sender<Result<Account, CreateAccountError>>,
     },
     /// Increment one `Record\<product>\0\<counter>` for an account, atomically on the
@@ -133,10 +133,11 @@ enum Command {
         flags: u32,
         resp: oneshot::Sender<Result<(), String>>,
     },
-    /// Reset an account's password to a new X-SHA-1 digest (write-through).
+    /// Reset an account's password from plaintext (write-through). The stored credential's
+    /// family decides what is derived and stored.
     ResetPassword {
         account_id: AccountId,
-        digest: [u8; 20],
+        password: String,
         resp: oneshot::Sender<Result<(), String>>,
     },
     /// Permanently delete an account and its data (write-through).
@@ -190,18 +191,19 @@ impl StorageHandle {
         rx.await.unwrap_or(None)
     }
 
-    /// Register a new account with an X-SHA-1 password digest.
+    /// Register a new account with the given credential (an X-SHA-1 digest, or a WarCraft
+    /// III salt and verifier for a realm-qualified `Name@<realm>`).
     pub async fn create_account(
         &self,
         name: &str,
-        password_hash: [u8; 20],
+        credential: Credential,
     ) -> Result<Account, CreateAccountError> {
         let (resp, rx) = oneshot::channel();
         if self
             .0
             .send(Command::CreateAccount {
                 name: name.to_string(),
-                password_hash,
+                credential,
                 resp,
             })
             .is_err()
@@ -281,10 +283,12 @@ impl StorageHandle {
         rx.await.unwrap_or_else(|_| Err("storage actor is gone".into()))
     }
 
-    /// Reset an account's password to a new X-SHA-1 digest.
-    pub async fn reset_password(&self, account_id: AccountId, digest: [u8; 20]) -> Result<(), String> {
+    /// Reset an account's password from plaintext. An X-SHA-1 account gets a new digest; a
+    /// WarCraft III realm account gets a fresh salt and verifier.
+    pub async fn reset_password(&self, account_id: AccountId, password: &str) -> Result<(), String> {
         let (resp, rx) = oneshot::channel();
-        if self.0.send(Command::ResetPassword { account_id, digest, resp }).is_err() {
+        let password = password.to_string();
+        if self.0.send(Command::ResetPassword { account_id, password, resp }).is_err() {
             return Err("storage actor is gone".into());
         }
         rx.await.unwrap_or_else(|_| Err("storage actor is gone".into()))
@@ -322,19 +326,16 @@ pub fn spawn(mut backend: Box<dyn Storage + Send>) -> StorageHandle {
                             .and_then(to_account);
                         let _ = resp.send(found);
                     }
-                    Command::CreateAccount { name, password_hash, resp } => {
+                    Command::CreateAccount { name, credential, resp } => {
                         let req = NewAccount {
                             name: name.clone(),
-                            credential: Credential::Xsha1 { digest: password_hash },
+                            credential,
                             created_at: now_secs(),
                             attrs: bnetcc_storage::attr::AttrMap::new(),
                         };
                         let result = match backend.create_account(req) {
                             Ok(a) => to_account(a).ok_or_else(|| {
-                                CreateAccountError::Backend(
-                                    "newly created account did not carry an XSHA1 credential"
-                                        .into(),
-                                )
+                                CreateAccountError::Backend("account conversion failed".into())
                             }),
                             Err(StorageError::NameTaken) => Err(CreateAccountError::NameTaken),
                             Err(StorageError::InvalidName(why)) => {
@@ -406,10 +407,34 @@ pub fn spawn(mut backend: Box<dyn Storage + Send>) -> StorageHandle {
                         let result = backend.attrs_put(account_id, one).map_err(|e| e.to_string());
                         let _ = resp.send(result);
                     }
-                    Command::ResetPassword { account_id, digest, resp } => {
-                        let result = backend
-                            .set_credential(account_id, Credential::Xsha1 { digest })
-                            .map_err(|e| e.to_string());
+                    Command::ResetPassword { account_id, password, resp } => {
+                        // Derive the same family the account already has: the family is the
+                        // account's identity (an SRP account lives in a realm and only a
+                        // WarCraft III client can use it), not a property of the password.
+                        let result = match backend.account_by_id(account_id) {
+                            Ok(Some(acct)) => {
+                                let credential = match acct.credential {
+                                    Credential::Xsha1 { .. } => Credential::Xsha1 {
+                                        digest: bnetcc_crypto::password_hash(&password),
+                                    },
+                                    Credential::Srp { .. } => {
+                                        // The verifier binds the bare name (the client
+                                        // hashes what the user typed, upper-cased), never
+                                        // the realm suffix.
+                                        let (bare, _) = bnetcc_storage::split_realm(&acct.name);
+                                        let salt: [u8; 32] = rand::random();
+                                        let verifier =
+                                            bnetcc_crypto::nls::verifier(bare, &password, &salt);
+                                        Credential::Srp { salt, verifier }
+                                    }
+                                };
+                                backend
+                                    .set_credential(account_id, credential)
+                                    .map_err(|e| e.to_string())
+                            }
+                            Ok(None) => Err("no such account".to_string()),
+                            Err(e) => Err(e.to_string()),
+                        };
                         let _ = resp.send(result);
                     }
                     Command::DeleteUser { account_id, resp } => {
@@ -449,18 +474,11 @@ pub fn spawn(mut backend: Box<dyn Storage + Send>) -> StorageHandle {
 }
 
 fn to_account(a: bnetcc_storage::model::Account) -> Option<Account> {
-    match a.credential {
-        Credential::Xsha1 { digest } => Some(Account {
-            id: a.id,
-            name: a.name,
-            password_hash: digest,
-        }),
-        // WC3's SRP accounts don't exist yet on this path (SID_AUTH_ACCOUNTCREATE/LOGON
-        // are unimplemented — see docs/HANDOFF.md). Nothing calling this today can
-        // produce one, but returning `None` rather than panicking keeps that true if
-        // storage is ever shared with a future SRP path that populates the same table.
-        Credential::Srp { .. } => None,
-    }
+    Some(Account {
+        id: a.id,
+        name: a.name,
+        credential: a.credential,
+    })
 }
 
 fn now_secs() -> u64 {
@@ -476,7 +494,10 @@ mod tests {
     #[tokio::test]
     async fn user_management_round_trip_through_the_actor() {
         let h = spawn(Box::new(MemoryStorage::new()));
-        let acct = h.create_account("Zealot", [1u8; 20]).await.expect("create");
+        let acct = h
+            .create_account("Zealot", Credential::Xsha1 { digest: [1u8; 20] })
+            .await
+            .expect("create");
 
         // Flags start empty, round-trip through set/get.
         assert_eq!(h.user_flags(acct.id).await, 0);
@@ -499,10 +520,34 @@ mod tests {
         assert_eq!(u.losses, 1);
         assert_eq!(u.last_login, Some(1_700_000_500));
 
-        // Reset and delete both succeed; the account is gone afterwards.
-        h.reset_password(acct.id, [9u8; 20]).await.expect("reset");
+        // A reset derives the account's own family from the plaintext. Then delete; the
+        // account is gone afterwards.
+        h.reset_password(acct.id, "newpass").await.expect("reset");
+        let reset = h.account_by_name("Zealot").await.expect("still there");
+        assert_eq!(
+            reset.credential,
+            Credential::Xsha1 { digest: bnetcc_crypto::password_hash("newpass") }
+        );
         h.delete_user(acct.id).await.expect("delete");
         assert!(h.account_by_name("Zealot").await.is_none());
         assert!(h.list_users(0, 10).await.iter().all(|u| u.id != acct.id));
+    }
+
+    #[tokio::test]
+    async fn a_realm_account_resets_to_a_fresh_salt_and_verifier() {
+        // A WarCraft III account is stored as `Name@realm` with an SRP credential. An
+        // operator reset must derive a verifier that the *bare* name's client proof matches.
+        let h = spawn(Box::new(MemoryStorage::new()));
+        let acct = h
+            .create_account("Zealot@bncc", Credential::Srp { salt: [1u8; 32], verifier: [2u8; 32] })
+            .await
+            .expect("create");
+        h.reset_password(acct.id, "hunter2").await.expect("reset");
+        let reset = h.account_by_name("zealot@BNCC").await.expect("still there");
+        let Credential::Srp { salt, verifier } = reset.credential else {
+            panic!("family must be preserved");
+        };
+        assert_ne!(salt, [1u8; 32], "a reset draws a new salt");
+        assert_eq!(verifier, bnetcc_crypto::nls::verifier("Zealot", "hunter2", &salt));
     }
 }

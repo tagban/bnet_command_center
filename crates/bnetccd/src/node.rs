@@ -180,11 +180,11 @@ pub struct Account {
     pub id: AccountId,
     /// Display name, as registered.
     pub name: String,
-    /// `XSHA1(lowercase(password))`.
-    ///
-    /// Password-equivalent. In a federation this never leaves the hub; see
-    /// `docs/FEDERATION.md` §4.
-    pub password_hash: [u8; 20],
+    /// How the account proves itself: an X-SHA-1 digest (password-equivalent — in a
+    /// federation it never leaves the hub, `docs/FEDERATION.md` §4) or a WarCraft III SRP
+    /// salt and verifier (safe to cache at a node). Which one decides which logon flow can
+    /// use the account.
+    pub credential: bnetcc_storage::model::Credential,
 }
 
 #[derive(Default)]
@@ -252,6 +252,9 @@ pub struct GameAd {
     pub parameter: u16,
     /// Host-supplied state/flags.
     pub state: u32,
+    /// The host's product. Listings are per product: a WarCraft III client cannot parse a
+    /// StarCraft statstring, nor the reverse, so a game is only ever shown to its own kind.
+    pub product: Option<bnetcc_proto::FourCc>,
     /// Host's advertised game port.
     pub port: u16,
     /// Host's address, as seen by the node.
@@ -298,6 +301,8 @@ pub struct Node {
     pub name: String,
     /// Message of the day.
     pub motd: String,
+    /// Realm name for realm-scoped (WarCraft III) accounts — `Name@<realm>`.
+    pub realm: String,
     /// Per-category default channel size caps (`0` = unlimited).
     pub channel_caps: ChannelCaps,
     /// Configured advertisement banners. Empty means we never answer `SID_CHECKAD`,
@@ -351,6 +356,8 @@ pub struct NodeConfig {
     pub name: String,
     /// Message of the day.
     pub motd: String,
+    /// Realm name for realm-scoped (WarCraft III) accounts.
+    pub realm: String,
     /// Addresses exempt from the one-gateway-connection-per-IP rule.
     pub gateway_allowlist: Vec<IpAddr>,
     /// Client version restriction.
@@ -416,6 +423,7 @@ impl Node {
             udp_socket: cfg.udp_socket,
             name: cfg.name,
             motd: cfg.motd,
+            realm: cfg.realm,
             channel_caps: cfg.channel_caps,
             ads: AdRotation::default(),
             files_dir: cfg.files_dir,
@@ -520,9 +528,11 @@ impl Node {
         self.storage.set_user_flags(account_id, flags & ASSIGNABLE_FLAGS).await
     }
 
-    /// Reset an account's password to a new X-SHA-1 digest.
-    pub async fn reset_password(&self, account_id: AccountId, digest: [u8; 20]) -> Result<(), String> {
-        self.storage.reset_password(account_id, digest).await
+    /// Reset an account's password from plaintext. The stored credential's family decides
+    /// what is derived: an X-SHA-1 digest, or a fresh SRP salt and verifier for a WarCraft
+    /// III realm account.
+    pub async fn reset_password(&self, account_id: AccountId, password: &str) -> Result<(), String> {
+        self.storage.reset_password(account_id, password).await
     }
 
     /// Permanently delete an account and its data.
@@ -590,9 +600,9 @@ impl Node {
     pub async fn create_account(
         &self,
         name: &str,
-        password_hash: [u8; 20],
+        credential: bnetcc_storage::model::Credential,
     ) -> Result<Account, crate::storage::CreateAccountError> {
-        self.storage.create_account(name, password_hash).await
+        self.storage.create_account(name, credential).await
     }
 
     /// Try to claim a CD key for a session that has not logged in yet.
@@ -1206,6 +1216,7 @@ pub(crate) fn test_node() -> Node {
             policy: Policy::for_mode(bnetcc_core::policy::ServerMode::Gaming),
             name: "Test".into(),
             motd: "motd".into(),
+            realm: "bncc".into(),
             gateway_allowlist: Vec::new(),
             version_policy: crate::config::VersionPolicy::default(),
             files_dir: None,
@@ -1242,10 +1253,17 @@ mod tests {
     #[tokio::test]
     async fn accounts_are_case_insensitive_and_unique() {
         let n = node();
-        let a = n.create_account("Zealot", [1u8; 20]).await.unwrap();
+        use bnetcc_storage::model::Credential;
+        let a = n
+            .create_account("Zealot", Credential::Xsha1 { digest: [1u8; 20] })
+            .await
+            .unwrap();
         assert_eq!(n.account("zealot").await.unwrap().id, a.id);
         assert_eq!(n.account("ZEALOT").await.unwrap().id, a.id);
-        assert!(n.create_account("zEaLoT", [2u8; 20]).await.is_err());
+        assert!(n
+            .create_account("zEaLoT", Credential::Xsha1 { digest: [2u8; 20] })
+            .await
+            .is_err());
     }
 
     #[test]

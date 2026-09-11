@@ -334,6 +334,35 @@ pub mod auth_check_status {
     pub const SECOND_KEY: u32 = 0x010;
 }
 
+/// Status codes for the WarCraft III NLS logon packets (`docs/WARCRAFT3.md` §3.4).
+pub mod nls_status {
+    /// `SID_AUTH_ACCOUNTLOGON` reply: challenge follows, send the proof.
+    pub const LOGON_OK: u32 = 0x00;
+    /// `SID_AUTH_ACCOUNTLOGON` reply: no such account (the client offers to create one).
+    pub const LOGON_NO_ACCOUNT: u32 = 0x01;
+    /// `SID_AUTH_ACCOUNTLOGON` reply: account needs upgrading (never sent by us).
+    pub const LOGON_UPGRADE: u32 = 0x05;
+    /// `SID_AUTH_ACCOUNTLOGONPROOF` reply: logged on; `M2` follows.
+    pub const PROOF_OK: u32 = 0x00;
+    /// `SID_AUTH_ACCOUNTLOGONPROOF` reply: wrong password.
+    pub const PROOF_WRONG_PASSWORD: u32 = 0x02;
+    /// `SID_AUTH_ACCOUNTLOGONPROOF` reply: account closed.
+    pub const PROOF_ACCOUNT_CLOSED: u32 = 0x06;
+    /// `SID_AUTH_ACCOUNTLOGONPROOF` reply: an e-mail should be registered (client then
+    /// sends `SID_SETEMAIL`). Not used.
+    pub const PROOF_EMAIL_WANTED: u32 = 0x0E;
+    /// `SID_AUTH_ACCOUNTLOGONPROOF` reply: custom error; the trailing string is shown.
+    pub const PROOF_CUSTOM_ERROR: u32 = 0x0F;
+    /// `SID_AUTH_ACCOUNTCREATE` reply: created.
+    pub const CREATE_OK: u32 = 0x00;
+    /// `SID_AUTH_ACCOUNTCREATE` reply: name already exists.
+    pub const CREATE_NAME_EXISTS: u32 = 0x04;
+    /// `SID_AUTH_ACCOUNTCREATE` reply: name too short or blank.
+    pub const CREATE_TOO_SHORT: u32 = 0x07;
+    /// `SID_AUTH_ACCOUNTCREATE` reply: name contains an illegal character.
+    pub const CREATE_ILLEGAL_CHAR: u32 = 0x08;
+}
+
 /// `SID_STARTADVEX3` (0x1C) server status codes.
 pub mod advertise_status {
     /// Game created.

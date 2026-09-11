@@ -445,8 +445,7 @@ async fn do_user_reset(req: &Request, node: &Node) -> Response {
     if new.is_empty() {
         return users_page(node, req, Some((false, "The new password cannot be empty."))).await;
     }
-    let digest = bnetcc_crypto::password_hash(new);
-    let flash = match node.reset_password(id, digest).await {
+    let flash = match node.reset_password(id, new).await {
         Ok(()) => (true, "Password reset. Give the user the new password.".to_string()),
         Err(e) => (false, format!("Could not reset password: {e}")),
     };

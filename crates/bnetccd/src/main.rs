@@ -193,6 +193,7 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
             policy: policy.clone(),
             name: cfg.server.name.clone(),
             motd: cfg.server.motd.clone(),
+            realm: cfg.server.realm.clone(),
             gateway_allowlist: cfg.limits.gateway_allowlist.clone(),
             version_policy,
             files_dir,

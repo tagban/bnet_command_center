@@ -210,6 +210,23 @@ pub trait Storage: Send + 'static {
 pub fn validate_account_name(name: &str) -> Result<()> {
     const MIN: usize = 2; // Shortest name allowed — a product decision, see docs.
     const MAX: usize = 15; // Battle.net truncates beyond this.
+    // `Name@realm` designates a realm-scoped account — WarCraft III's SRP accounts live in
+    // their own realm (`docs/WARCRAFT3.md` §3.6). The length rules apply to the bare name
+    // and the realm is checked on its own, so a 15-character name keeps its whole budget
+    // whichever realm it is in.
+    let (name, realm) = split_realm(name);
+    if let Some(realm) = realm {
+        if realm.is_empty() || realm.len() > MAX {
+            return Err(StorageError::InvalidName(format!(
+                "realm must be 1 to {MAX} characters"
+            )));
+        }
+        if !realm.is_ascii() || realm.bytes().any(|b| b <= 0x20 || b == 0x7F) {
+            return Err(StorageError::InvalidName(
+                "realm contains whitespace, control or non-ASCII characters".into(),
+            ));
+        }
+    }
     if name.len() < MIN {
         return Err(StorageError::InvalidName(format!(
             "shorter than {MIN} characters"
@@ -249,9 +266,35 @@ pub fn validate_account_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Split `Name@realm` into `("Name", Some("realm"))`; a name with no `@` is `(name, None)`.
+///
+/// The split is at the **last** `@`, so a realm never contains one. This is the single
+/// definition of what a realm-qualified account name looks like.
+#[must_use]
+pub fn split_realm(name: &str) -> (&str, Option<&str>) {
+    match name.rfind('@') {
+        Some(i) => (&name[..i], Some(&name[i + 1..])),
+        None => (name, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn realm_qualified_names_apply_the_length_rules_to_the_bare_name() {
+        assert!(validate_account_name("Tagban@bncc").is_ok());
+        assert!(validate_account_name(&format!("{}@bncc", "a".repeat(15))).is_ok());
+        assert!(validate_account_name(&format!("{}@bncc", "a".repeat(16))).is_err());
+        assert!(validate_account_name("a@bncc").is_err(), "bare name too short");
+        assert!(validate_account_name("ab@").is_err(), "empty realm");
+        assert!(validate_account_name("ab@x y").is_err(), "whitespace in realm");
+        assert!(validate_account_name(&format!("ab@{}", "r".repeat(16))).is_err());
+        assert_eq!(split_realm("Tagban@bncc"), ("Tagban", Some("bncc")));
+        assert_eq!(split_realm("a@b@c"), ("a@b", Some("c")));
+        assert_eq!(split_realm("Tagban"), ("Tagban", None));
+    }
 
     #[test]
     fn ordinary_names_are_accepted() {
@@ -271,7 +314,7 @@ mod tests {
     fn names_punctuation_is_not_restricted_by_a_storage_choice() {
         // PvPGN bans these because the filename is the account name. We do not store
         // names as filenames, so there is no reason to inherit that.
-        for n in ["a.b", "a*b", "a?b", "a!b", "a@b"] {
+        for n in ["a.b", "a*b", "a?b", "a!b", "ab@b"] {
             assert!(validate_account_name(n).is_ok(), "{n} was rejected");
         }
     }

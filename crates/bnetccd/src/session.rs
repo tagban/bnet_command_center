@@ -14,11 +14,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bnetcc_core::limits::{ClientClass, FloodTracker, FloodVerdict, KeyId};
 use bnetcc_core::policy::FloodPenalty;
 use bnetcc_core::session::SessionState;
+use bnetcc_storage::model::Credential;
 use bnetcc_crypto::{logon_proof, proofs_match, xsha1_bytes};
 use bnetcc_proto::bncs::{
     advertise_status, auth_check_status, decode_frame, encode_frame, logon_status, sid, Frame,
-    ProtocolSelector, DEFAULT_MAX_FRAME,
-};
+    ProtocolSelector, DEFAULT_MAX_FRAME, nls_status};
 use bnetcc_proto::buf::{RecvBuf, Writer};
 use bnetcc_proto::chat::{
     chat_event, normalize_channel_name, sanitize_chat_text, user_flags, EventId,
@@ -423,6 +423,23 @@ struct Bncs {
     /// and cleared when the game stops, so re-advertisements (state updates) do not re-count
     /// the game in the hosted-games metric.
     hosting_game: bool,
+    /// An NLS logon in flight: set by `SID_AUTH_ACCOUNTLOGON`, consumed by the proof.
+    srp: Option<SrpPending>,
+}
+
+/// The server-side state of one WarCraft III logon between the challenge (0x53) and the
+/// proof (0x54). Dropped as soon as the proof is answered, whichever way it went.
+struct SrpPending {
+    /// The account being logged into (realm-qualified name).
+    account: Account,
+    /// The name the client typed, which is what its `M1` hashes.
+    bare_name: String,
+    salt: [u8; 32],
+    verifier: [u8; 32],
+    /// Our private exponent for this logon only.
+    b: [u8; 32],
+    client_public: [u8; 32],
+    server_public: [u8; 32],
 }
 
 async fn bncs_session(
@@ -457,6 +474,7 @@ async fn bncs_session(
         muted_until_ms: 0,
         kill: Arc::new(tokio::sync::Notify::new()),
         hosting_game: false,
+        srp: None,
     };
 
     // Real Battle.net (and Atlas) send SID_PING (0x25) as soon as a game client connects,
@@ -620,6 +638,10 @@ impl Bncs {
             sid::REPORTVERSION => self.report_version(frame),
             sid::LOGONRESPONSE => self.logon(frame, sid::LOGONRESPONSE).await,
             sid::LOGONRESPONSE2 => self.logon(frame, sid::LOGONRESPONSE2).await,
+            // WarCraft III's NLS/SRP logon (docs/WARCRAFT3.md §3).
+            sid::AUTH_ACCOUNTCREATE => self.auth_account_create(frame).await,
+            sid::AUTH_ACCOUNTLOGON => self.auth_account_logon(frame).await,
+            sid::AUTH_ACCOUNTLOGONPROOF => self.auth_account_logon_proof(frame).await,
             sid::CREATEACCOUNT => self.create_account_legacy(frame).await,
             sid::CREATEACCOUNT2 => self.create_account2(frame).await,
             sid::ENTERCHAT => self.enter_chat(frame),
@@ -627,7 +649,7 @@ impl Bncs {
             sid::LEAVECHAT => self.leave_chat(),
             sid::CHATCOMMAND => self.chat_command(frame).await,
             sid::GETCHANNELLIST => self.channel_list(),
-            sid::GETADVLISTEX => self.game_list(),
+            sid::GETADVLISTEX => self.game_list(frame),
             sid::CHECKAD => self.check_ad(frame),
             sid::STARTADVEX3 => self.advertise(frame),
             // A game ended (STOPADV is also sent spuriously on logoff, which is harmless —
@@ -657,14 +679,16 @@ impl Bncs {
             // keeps CVE-2004-2705 shut (no account's keys are ever returned) while letting
             // the client's login-screen and profile reads complete instead of hanging.
             sid::READUSERDATA => self.read_user_data(frame).await,
+            // Friends and news are not stored yet; both get an empty, well-formed reply so
+            // the client's panels settle instead of waiting (WarCraft III asks for both
+            // right after logon). Serving real data is future work (docs/ROADMAP.md).
+            sid::FRIENDSLIST => self.friends_list(),
+            sid::NEWS_INFO => self.news_info(),
             // Keepalive, the UDP detection reply, legacy-logon informational packets, and
-            // advertisement telemetry — all accepted but not acted on. FRIENDSLIST is
-            // accepted here too; serving real friends data is future work (docs/ROADMAP.md).
+            // advertisement telemetry — all accepted but not acted on.
             sid::NULL
             | sid::PING
             | sid::UDPPINGRESPONSE
-            | sid::NEWS_INFO
-            | sid::FRIENDSLIST
             | sid::NOTIFYJOIN
             | sid::CLICKAD
             | sid::CLIENTID
@@ -949,8 +973,16 @@ impl Bncs {
         let ok = match self.node.account(&name).await {
             None => false,
             Some(account) => {
-                let expected = logon_proof(client_token, server_token, &account.password_hash);
-                if !proofs_match(&proof, &expected) {
+                // An X-SHA-1 proof can only be checked against an X-SHA-1 credential. A
+                // WarCraft III (SRP) account is invisible to this flow — and it lives in
+                // its own realm anyway, so the name would not have matched.
+                let proof_ok = match &account.credential {
+                    Credential::Xsha1 { digest } => {
+                        proofs_match(&proof, &logon_proof(client_token, server_token, digest))
+                    }
+                    Credential::Srp { .. } => false,
+                };
+                if !proof_ok {
                     false
                 } else if self.node.bans.is_tag_banned(&account.name) {
                     // A staff `/tagban` refuses any account whose name matches the banned
@@ -959,34 +991,7 @@ impl Bncs {
                     info!(peer = %self.peer, account = %account.name, "logon refused: name is tag-banned");
                     false
                 } else {
-                    info!(peer = %self.peer, account = %account.name, "logon accepted");
-                    for &key in &self.claimed_keys {
-                        self.node.record_key_holder_name(key, account.name.clone());
-                    }
-                    // Sysops carry the Battle.net Administrator flag and the Blizzard-rep
-                    // tag (the staff icon) in every channel they enter.
-                    if self.node.admins.is_admin(&account.name) {
-                        self.flags |= user_flags::ADMIN | user_flags::BLIZZARD_REP;
-                        info!(peer = %self.peer, account = %account.name, "administrator logged on");
-                    }
-                    // Apply any admin-assigned flags stored on the account (staff, speaker,
-                    // special guest), masked to the assignable set. This is how the panel's
-                    // per-account flag/staff changes take effect — at the next logon.
-                    self.flags |= self.node.user_flags(account.id).await;
-                    // Note the logon time for the admin user list (fire-and-forget).
-                    self.node.record_login(account.id, now_ms() / 1000);
-                    // Claim a server-wide-unique display name (Name, or Name#2/#3… if this
-                    // account is already online elsewhere) for the life of this session.
-                    self.display_name = self.node.claim_name(&account.name);
-                    // Register with the moderation directory so staff can reach this session
-                    // (resolve its IP, or force it off) from any channel.
-                    self.node.register_session(
-                        &self.display_name,
-                        self.peer.ip(),
-                        self.out.clone(),
-                        Arc::clone(&self.kill),
-                    );
-                    self.account = Some(account);
+                    self.finish_logon(account).await;
                     true
                 }
             }
@@ -1004,6 +1009,214 @@ impl Bncs {
             });
         }
         self.send(&Frame::new(reply_id, w.finish()))
+    }
+
+    /// Everything a successful logon does after the proof checks out, shared by the
+    /// X-SHA-1 flows and the WarCraft III NLS flow: key-holder bookkeeping, admin and
+    /// stored flags, the logon timestamp, the server-wide-unique display name, and the
+    /// moderation registry. Sets `self.account`, which is what lets the state machine
+    /// advance to `LoggedIn`.
+    async fn finish_logon(&mut self, account: Account) {
+        info!(peer = %self.peer, account = %account.name, "logon accepted");
+        for &key in &self.claimed_keys {
+            self.node.record_key_holder_name(key, account.name.clone());
+        }
+        // Sysops carry the Battle.net Administrator flag and the Blizzard-rep
+        // tag (the staff icon) in every channel they enter.
+        if self.node.admins.is_admin(&account.name) {
+            self.flags |= user_flags::ADMIN | user_flags::BLIZZARD_REP;
+            info!(peer = %self.peer, account = %account.name, "administrator logged on");
+        }
+        // Apply any admin-assigned flags stored on the account (staff, speaker,
+        // special guest), masked to the assignable set. This is how the panel's
+        // per-account flag/staff changes take effect — at the next logon.
+        self.flags |= self.node.user_flags(account.id).await;
+        // Note the logon time for the admin user list (fire-and-forget).
+        self.node.record_login(account.id, now_ms() / 1000);
+        // Claim a server-wide-unique display name (Name, or Name#2/#3… if this
+        // account is already online elsewhere) for the life of this session.
+        self.display_name = self.node.claim_name(&account.name);
+        // Register with the moderation directory so staff can reach this session
+        // (resolve its IP, or force it off) from any channel.
+        self.node.register_session(
+            &self.display_name,
+            self.peer.ip(),
+            self.out.clone(),
+            Arc::clone(&self.kill),
+        );
+        self.account = Some(account);
+    }
+
+    /// The bare name a WarCraft III client typed, as a string, or `None` if it contains
+    /// `@`. The realm is the server's business: the client's verifier and proof hash the
+    /// typed name exactly, so a name typed *with* a suffix could never match a verifier
+    /// created without one. Refusing `@` outright keeps that from ever looking like a
+    /// wrong password. See `docs/WARCRAFT3.md` §3.6.
+    fn realm_bare_name(&self, typed: &[u8]) -> Option<String> {
+        let typed = String::from_utf8_lossy(typed).into_owned();
+        (!typed.contains('@')).then_some(typed)
+    }
+
+    /// The realm-qualified account name for a bare WarCraft III name.
+    fn qualified_name(&self, bare: &str) -> String {
+        format!("{bare}@{}", self.node.realm)
+    }
+
+    /// `SID_AUTH_ACCOUNTCREATE` (0x52): a WarCraft III client registers a salt and
+    /// verifier for a name. The account is created in this node's realm as `Name@<realm>`,
+    /// so it can never collide with an X-SHA-1 account of the same spelling. Reply is a
+    /// single status DWORD (`nls_status::CREATE_*`); creation does not log the client in,
+    /// it sends `SID_AUTH_ACCOUNTLOGON` next.
+    async fn auth_account_create(&mut self, frame: &Frame) -> Step {
+        let mut r = frame.reader();
+        let parsed = (|| {
+            let salt: [u8; 32] = r.array()?;
+            let verifier: [u8; 32] = r.array()?;
+            let username = read_username(&mut r)?;
+            Ok::<_, bnetcc_proto::ProtoError>((salt, verifier, username))
+        })();
+        let Ok((salt, verifier, username)) = parsed else {
+            return Step::Close;
+        };
+        let status = match self.realm_bare_name(&username) {
+            None => nls_status::CREATE_ILLEGAL_CHAR,
+            Some(bare) => {
+                let qualified = self.qualified_name(&bare);
+                match self
+                    .node
+                    .create_account(&qualified, Credential::Srp { salt, verifier })
+                    .await
+                {
+                    Ok(account) => {
+                        info!(peer = %self.peer, account = %account.name, "account created (NLS)");
+                        nls_status::CREATE_OK
+                    }
+                    Err(crate::storage::CreateAccountError::NameTaken) => nls_status::CREATE_NAME_EXISTS,
+                    Err(crate::storage::CreateAccountError::Invalid(why)) => {
+                        debug!(peer = %self.peer, name = %qualified, reason = %why, "NLS account creation refused");
+                        if why.contains("shorter") {
+                            nls_status::CREATE_TOO_SHORT
+                        } else {
+                            nls_status::CREATE_ILLEGAL_CHAR
+                        }
+                    }
+                    Err(crate::storage::CreateAccountError::Backend(why)) => {
+                        warn!(peer = %self.peer, reason = %why, "NLS account creation failed in storage");
+                        return Step::Close;
+                    }
+                }
+            }
+        };
+        let mut w = Writer::with_capacity(4);
+        w.u32(status);
+        self.send(&Frame::new(sid::AUTH_ACCOUNTCREATE, w.finish()))
+    }
+
+    /// `SID_AUTH_ACCOUNTLOGON` (0x53): the client sends its public key `A` and the name;
+    /// we answer with the account's salt and our public key `B`. The reply is always 72
+    /// bytes — status, `s[32]`, `B[32]` — zeroed on failure, which is what the client
+    /// expects. A fresh `b` is drawn per logon and kept only until the proof is answered.
+    async fn auth_account_logon(&mut self, frame: &Frame) -> Step {
+        let mut r = frame.reader();
+        let parsed = (|| {
+            let client_public: [u8; 32] = r.array()?;
+            let username = read_username(&mut r)?;
+            Ok::<_, bnetcc_proto::ProtoError>((client_public, username))
+        })();
+        let Ok((client_public, username)) = parsed else {
+            return Step::Close;
+        };
+        // A new challenge invalidates any earlier one.
+        self.srp = None;
+
+        let mut w = Writer::with_capacity(72);
+        let account = match self.realm_bare_name(&username) {
+            Some(bare) => self.node.account(&self.qualified_name(&bare)).await.map(|a| (bare, a)),
+            None => None,
+        };
+        match account {
+            Some((bare_name, account)) => {
+                let Credential::Srp { salt, verifier } = account.credential.clone() else {
+                    // Cannot happen by construction (only SRP accounts carry a realm), but
+                    // refuse rather than guess if storage ever hands us one.
+                    w.u32(nls_status::LOGON_NO_ACCOUNT).bytes(&[0u8; 64]);
+                    return self.send(&Frame::new(sid::AUTH_ACCOUNTLOGON, w.finish()));
+                };
+                let b: [u8; 32] = rand::random();
+                // The modular exponentiation is CPU work; keep it off the reactor
+                // (docs/ARCHITECTURE.md §3).
+                let server_public =
+                    match tokio::task::spawn_blocking(move || bnetcc_crypto::nls::server_public(&verifier, &b)).await
+                    {
+                        Ok(v) => v,
+                        Err(_) => return Step::Close,
+                    };
+                self.srp = Some(SrpPending {
+                    account,
+                    bare_name,
+                    salt,
+                    verifier,
+                    b,
+                    client_public,
+                    server_public,
+                });
+                w.u32(nls_status::LOGON_OK).bytes(&salt).bytes(&server_public);
+            }
+            None => {
+                debug!(peer = %self.peer, name = %String::from_utf8_lossy(&username), "NLS logon: no such account");
+                w.u32(nls_status::LOGON_NO_ACCOUNT).bytes(&[0u8; 64]);
+            }
+        }
+        self.send(&Frame::new(sid::AUTH_ACCOUNTLOGON, w.finish()))
+    }
+
+    /// `SID_AUTH_ACCOUNTLOGONPROOF` (0x54): the client's `M1`. Verified against the
+    /// challenge from `auth_account_logon`; on success the reply carries our `M2` and the
+    /// session is logged in. Reply: status, `M2[20]` (zeroed on failure), info string.
+    async fn auth_account_logon_proof(&mut self, frame: &Frame) -> Step {
+        let Ok(client_proof) = frame.reader().array::<20>() else {
+            return Step::Close;
+        };
+        // A proof with no outstanding challenge is a protocol violation.
+        let Some(p) = self.srp.take() else {
+            debug!(peer = %self.peer, "NLS proof without a challenge; closing");
+            return Step::Close;
+        };
+        let verdict = tokio::task::spawn_blocking(move || {
+            bnetcc_crypto::nls::server_verify(
+                &p.bare_name,
+                &p.salt,
+                &p.verifier,
+                &p.b,
+                &p.client_public,
+                &p.server_public,
+                &client_proof,
+            )
+            .map(|m2| (m2, p.account))
+        })
+        .await;
+
+        let mut w = Writer::with_capacity(32);
+        match verdict {
+            Ok(Some((server_proof, account))) => {
+                if self.node.bans.is_tag_banned(&account.name) {
+                    // Same rule as the X-SHA-1 flow, but WarCraft III can show a reason.
+                    info!(peer = %self.peer, account = %account.name, "NLS logon refused: name is tag-banned");
+                    w.u32(nls_status::PROOF_CUSTOM_ERROR)
+                        .bytes(&[0u8; 20])
+                        .cstr(b"This account is banned from this server.");
+                } else {
+                    self.finish_logon(account).await;
+                    w.u32(nls_status::PROOF_OK).bytes(&server_proof).cstr(b"");
+                }
+            }
+            Ok(None) => {
+                debug!(peer = %self.peer, "NLS logon: wrong password");
+                w.u32(nls_status::PROOF_WRONG_PASSWORD).bytes(&[0u8; 20]).cstr(b"");
+            }
+            Err(_) => return Step::Close,
+        }
+        self.send(&Frame::new(sid::AUTH_ACCOUNTLOGONPROOF, w.finish()))
     }
 
     /// `SID_STARTVERSIONING` (0x06), the legacy flow's opener. Payload is platform,
@@ -1185,7 +1398,13 @@ impl Bncs {
 
         // Both packets carry the password hashed **once** (unlike the logon proof, which
         // is a double hash), so storing what arrives is correct.
-        match self.node.create_account(&name, hash).await {
+        // `@` designates a realm-scoped account (WarCraft III's namespace — see
+        // docs/WARCRAFT3.md §3.6); an X-SHA-1 client cannot register into a realm.
+        if name.contains('@') {
+            debug!(peer = %self.peer, name = %name, "account creation refused: '@' is reserved for realms");
+            return Ok(CreateOutcome::Invalid);
+        }
+        match self.node.create_account(&name, Credential::Xsha1 { digest: hash }).await {
             Ok(account) => {
                 // Creation does not log you in; the client sends a logon next.
                 info!(peer = %self.peer, account = %account.name, "account created");
@@ -2013,18 +2232,62 @@ impl Bncs {
         self.send(&Frame::new(sid::GETCHANNELLIST, w.finish()))
     }
 
-    /// `SID_GETADVLISTEX` (0x09): return the games this node currently knows about.
+    /// `SID_FRIENDSLIST` (0x65): the client asks for its friends list. Friends are not
+    /// stored yet (docs/ROADMAP.md), so the reply is an empty list — `(UINT8) count = 0`.
+    fn friends_list(&mut self) -> Step {
+        let mut w = Writer::with_capacity(1);
+        w.u8(0);
+        self.send(&Frame::new(sid::FRIENDSLIST, w.finish()))
+    }
+
+    /// `SID_NEWS_INFO` (0x46): the client asks for news newer than a timestamp. There is
+    /// no news feed; reply with zero entries so the login-screen news panel completes.
+    /// Layout: `(UINT8) entries`, `(UINT32) last logon`, `(UINT32) oldest`, `(UINT32) newest`.
+    fn news_info(&mut self) -> Step {
+        let mut w = Writer::with_capacity(13);
+        w.u8(0).u32(0).u32(0).u32(0);
+        self.send(&Frame::new(sid::NEWS_INFO, w.finish()))
+    }
+
+    /// `SID_GETADVLISTEX` (0x09): return the games this node knows about, filtered the way
+    /// a client expects: only its **own product** (a WarCraft III client cannot parse a
+    /// StarCraft statstring, nor the reverse), by **exact name** when one is given (this
+    /// is how a joiner fetches one host's address — WarCraft III sends the name with a
+    /// count of 1), and capped at the requested **count**.
     ///
-    /// ⚠️ **Wire format unverified against a real client.** Each game entry embeds a
-    /// `sockaddr_in` (address family, big-endian port, host IP) so a joiner can reach the
-    /// host peer-to-peer, followed by status, elapsed seconds, and the name/password/
-    /// statstring strings. The zero-game case sends count 0 then a status DWORD, per
-    /// BNETDocs' ambiguous note. The game test client mirrors this layout; confirm it
-    /// against a real client (e.g. a WinBot create/list cycle) before relying on it.
-    fn game_list(&mut self) -> Step {
+    /// Request: type `u16` + sub-type `u16` (WarCraft III: one `u32` of game flags), a
+    /// viewing filter/mask `u32`, reserved `u32`, count `u32` (`0` = no cap), then name,
+    /// password and statstring strings. A missing or short body lists everything for the
+    /// product. Empty-list status is `0x00` for a plain listing and `0x01` "doesn't
+    /// exist" for a named lookup that found nothing (or when listing is off: warnet mode).
+    ///
+    /// Reply entries embed a `sockaddr_in` (address family, big-endian port, host IP) so
+    /// a joiner can reach the host peer-to-peer, then status, elapsed seconds, and the
+    /// name/password/statstring strings. ⚠️ Layout verified against BNETDocs and two
+    /// independent implementations, not yet against a captured real client.
+    fn game_list(&mut self, frame: &Frame) -> Step {
+        let mut r = frame.reader();
+        let (count, wanted) = (|| {
+            let _type_or_flags = r.u32()?;
+            let _filter_or_mask = r.u32()?;
+            let _reserved = r.u32()?;
+            let count = r.u32()?;
+            let name = r.cstr(CHANNEL_NAME_MAX)?.to_vec();
+            Ok::<_, bnetcc_proto::ProtoError>((count, name))
+        })()
+        .unwrap_or((0, Vec::new()));
+        let wanted = (!wanted.is_empty()).then(|| wanted.to_ascii_lowercase());
+        let cap = if count == 0 { usize::MAX } else { count as usize };
+
         // Warnet mode never lists games; otherwise show what hosts have advertised.
-        let games = if self.node.policy.game_listing.allowed() {
-            self.node.games()
+        let games: Vec<crate::node::GameAd> = if self.node.policy.game_listing.allowed() {
+            self.node
+                .games()
+                .into_iter()
+                .filter(|g| g.product == self.product)
+                .filter(|g| wanted.as_ref().map_or(true, |w| g.name.to_ascii_lowercase() == *w))
+                .take(cap)
+                .collect()
         } else {
             Vec::new()
         };
@@ -2033,7 +2296,12 @@ impl Bncs {
         w.u32(games.len() as u32);
         if games.is_empty() {
             // Zero-game case: a status DWORD stands in for the (absent) entries.
-            w.u32(0x01); // "game does not exist" / empty
+            let status = if wanted.is_some() || !self.node.policy.game_listing.allowed() {
+                0x01 // "game does not exist"
+            } else {
+                0x00 // OK, nothing to list
+            };
+            w.u32(status);
             return self.send(&Frame::new(sid::GETADVLISTEX, w.finish()));
         }
         for g in &games {
@@ -2099,6 +2367,7 @@ impl Bncs {
             game_type,
             parameter,
             state,
+            product: self.product,
             port: self.game_port,
             host_ip,
             host: account.id,
@@ -2366,10 +2635,14 @@ mod tests {
     use super::*;
 
     fn auth_info_frame() -> Frame {
+        auth_info_frame_for(product::SEXP)
+    }
+
+    fn auth_info_frame_for(p: bnetcc_proto::FourCc) -> Frame {
         let mut w = Writer::with_capacity(32);
         w.u32(0)
             .fourcc(bnetcc_proto::FourCc::from_ascii(b"IX86"))
-            .fourcc(product::SEXP)
+            .fourcc(p)
             .u32(0xCD);
         Frame::new(sid::AUTH_INFO, w.finish())
     }
@@ -2578,11 +2851,28 @@ mod tests {
 
     /// Ask for the game list and return each game's name.
     async fn list_game_names(s: &mut TcpStream) -> Vec<String> {
-        send_frame(s, &Frame::new(sid::GETADVLISTEX, Writer::new().finish())).await;
+        list_game_names_for(s, "").await.0
+    }
+
+    /// Ask for the game list, optionally for one game by name (as a joiner does). Returns
+    /// the names and, when the list was empty, the status DWORD.
+    async fn list_game_names_for(s: &mut TcpStream, name: &str) -> (Vec<String>, Option<u32>) {
+        let mut q = Writer::with_capacity(32);
+        q.u32(0) // type / WC3 flags
+            .u32(0) // filter / mask
+            .u32(0) // reserved
+            .u32(20) // count
+            .cstr(name.as_bytes())
+            .cstr(b"")
+            .cstr(b"");
+        send_frame(s, &Frame::new(sid::GETADVLISTEX, q.finish())).await;
         let reply = recv_frame(s).await;
         assert_eq!(reply.id, sid::GETADVLISTEX);
         let mut r = reply.reader();
         let count = r.u32().expect("count");
+        if count == 0 {
+            return (Vec::new(), Some(r.u32().expect("status")));
+        }
         let mut names = Vec::new();
         for _ in 0..count {
             let _game_type = r.u16().unwrap();
@@ -2600,7 +2890,182 @@ mod tests {
             let _statstring = r.cstr(512).unwrap();
             names.push(String::from_utf8_lossy(&name).into_owned());
         }
-        names
+        (names, None)
+    }
+
+    // ---- WarCraft III (NLS/SRP, realm accounts) ------------------------------------
+
+    /// Connect and pass the version check as a Frozen Throne client.
+    async fn wc3_handshake(addr: std::net::SocketAddr, key: u32) -> TcpStream {
+        let mut s = connect(addr).await;
+        send_frame(&mut s, &auth_info_frame_for(product::W3XP)).await;
+        let info = recv_frame(&mut s).await;
+        assert_eq!(info.id, sid::AUTH_INFO);
+        assert_eq!(info.reader().u32().unwrap(), 0x02, "WC3 gets NLS v2 logon type");
+        assert!(info.body.ends_with(&[0u8; 128]), "the 128-byte signature slot is present");
+        send_frame(&mut s, &auth_check_frame(1, key)).await;
+        let check = recv_frame(&mut s).await;
+        assert_eq!(check.reader().u32().unwrap(), auth_check_status::PASSED);
+        s
+    }
+
+    /// `SID_AUTH_ACCOUNTCREATE` with a client-computed salt and verifier; returns the status.
+    async fn wc3_create(s: &mut TcpStream, user: &str, password: &str) -> u32 {
+        let salt = [7u8; 32];
+        let verifier = bnetcc_crypto::nls::verifier(user, password, &salt);
+        let mut w = Writer::with_capacity(80);
+        w.bytes(&salt).bytes(&verifier).cstr(user.as_bytes());
+        send_frame(s, &Frame::new(sid::AUTH_ACCOUNTCREATE, w.finish())).await;
+        let reply = recv_frame(s).await;
+        assert_eq!(reply.id, sid::AUTH_ACCOUNTCREATE);
+        reply.reader().u32().unwrap()
+    }
+
+    /// The 0x53/0x54 exchange. `Err(status)` names the packet's failure status; on success
+    /// the server's `M2` has been checked against the client's own computation.
+    async fn wc3_logon(s: &mut TcpStream, user: &str, password: &str) -> Result<(), u32> {
+        let a = [3u8; 32];
+        let client_public = bnetcc_crypto::nls::client_public(&a);
+        let mut w = Writer::with_capacity(64);
+        w.bytes(&client_public).cstr(user.as_bytes());
+        send_frame(s, &Frame::new(sid::AUTH_ACCOUNTLOGON, w.finish())).await;
+        let reply = recv_frame(s).await;
+        assert_eq!(reply.id, sid::AUTH_ACCOUNTLOGON);
+        assert_eq!(reply.body.len(), 4 + 32 + 32, "0x53 reply is always status + s + B");
+        let mut r = reply.reader();
+        let status = r.u32().unwrap();
+        let salt: [u8; 32] = r.array().unwrap();
+        let server_public: [u8; 32] = r.array().unwrap();
+        if status != nls_status::LOGON_OK {
+            assert_eq!(salt, [0u8; 32]);
+            assert_eq!(server_public, [0u8; 32]);
+            return Err(status);
+        }
+        let (m1, key) =
+            bnetcc_crypto::nls::client_proof(user, password, &salt, &a, &server_public).expect("B != 0");
+        let mut w = Writer::with_capacity(20);
+        w.bytes(&m1);
+        send_frame(s, &Frame::new(sid::AUTH_ACCOUNTLOGONPROOF, w.finish())).await;
+        let reply = recv_frame(s).await;
+        assert_eq!(reply.id, sid::AUTH_ACCOUNTLOGONPROOF);
+        let mut r = reply.reader();
+        let status = r.u32().unwrap();
+        let m2: [u8; 20] = r.array().unwrap();
+        let _info = r.cstr(256).unwrap();
+        if status != nls_status::PROOF_OK {
+            assert_eq!(m2, [0u8; 20]);
+            return Err(status);
+        }
+        assert_eq!(
+            m2,
+            bnetcc_crypto::nls::server_proof_from_key(&client_public, &m1, &key),
+            "the server must prove it knows K"
+        );
+        Ok(())
+    }
+
+    /// `SID_ENTERCHAT`; returns the unique name the server assigned.
+    async fn enter_chat_name(s: &mut TcpStream) -> String {
+        send_frame(s, &Frame::new(sid::ENTERCHAT, Writer::new().finish())).await;
+        let reply = recv_frame(s).await;
+        assert_eq!(reply.id, sid::ENTERCHAT);
+        String::from_utf8_lossy(reply.reader().cstr(64).unwrap()).into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_warcraft_three_client_creates_a_realm_account_and_logs_in() {
+        let addr = spawn_server().await;
+        let mut s = wc3_handshake(addr, 501).await;
+
+        // No account yet: the challenge is refused (zeroed), the client then creates one.
+        assert_eq!(wc3_logon(&mut s, "Tagban", "hunter2").await, Err(nls_status::LOGON_NO_ACCOUNT));
+        assert_eq!(wc3_create(&mut s, "Tagban", "hunter2").await, nls_status::CREATE_OK);
+        assert_eq!(
+            wc3_create(&mut s, "tagban", "other").await,
+            nls_status::CREATE_NAME_EXISTS,
+            "realm names are case-insensitive"
+        );
+        assert_eq!(wc3_create(&mut s, "a", "x").await, nls_status::CREATE_TOO_SHORT);
+
+        // Now the real thing, typed in a different case (the client upper-cases before
+        // hashing, and the realm lookup is case-insensitive). A typed realm suffix is
+        // refused as "no such account": the proof would hash it and never match anyway.
+        assert_eq!(wc3_logon(&mut s, "TAGBAN@BNCC", "hunter2").await, Err(nls_status::LOGON_NO_ACCOUNT));
+        assert_eq!(wc3_logon(&mut s, "TAGBAN", "hunter2").await, Ok(()));
+        assert_eq!(enter_chat_name(&mut s).await, "Tagban@bncc");
+    }
+
+    #[tokio::test]
+    async fn a_wrong_warcraft_three_password_is_refused_at_the_proof() {
+        let addr = spawn_server().await;
+        let mut s = wc3_handshake(addr, 502).await;
+        assert_eq!(wc3_create(&mut s, "Zealot", "right").await, nls_status::CREATE_OK);
+        assert_eq!(wc3_logon(&mut s, "Zealot", "wrong").await, Err(nls_status::PROOF_WRONG_PASSWORD));
+        // Still not logged in: chat entry is a protocol violation and closes the stream.
+        assert_eq!(wc3_logon(&mut s, "Zealot", "right").await, Ok(()));
+        assert_eq!(enter_chat_name(&mut s).await, "Zealot@bncc");
+    }
+
+    #[tokio::test]
+    async fn realm_accounts_and_xsha1_accounts_with_the_same_name_coexist() {
+        let addr = spawn_server().await;
+        // A Brood War player registers "Zealot" the X-SHA-1 way …
+        let mut sc = login(addr, "Zealot", "pw", 503).await;
+        // … and a WarCraft III player registers "Zealot" too: a different account, in the
+        // realm, and both are online at once under distinct names.
+        let mut w3 = wc3_handshake(addr, 504).await;
+        assert_eq!(wc3_create(&mut w3, "Zealot", "pw2").await, nls_status::CREATE_OK);
+        assert_eq!(wc3_logon(&mut w3, "Zealot", "pw2").await, Ok(()));
+        assert_eq!(enter_chat_name(&mut w3).await, "Zealot@bncc");
+
+        // An X-SHA-1 client cannot register into the realm namespace.
+        let mut cw = Writer::with_capacity(32);
+        cw.bytes(&[0u8; 20]).cstr(b"Grunt@bncc");
+        send_frame(&mut sc, &Frame::new(sid::CREATEACCOUNT2, cw.finish())).await;
+        // (sc is past login; CREATEACCOUNT2 is not accepted in-channel, so use a fresh
+        // connection at the right state.)
+        drop(sc);
+        let mut fresh = connect(addr).await;
+        send_frame(&mut fresh, &auth_info_frame()).await;
+        let _ = recv_frame(&mut fresh).await;
+        send_frame(&mut fresh, &auth_check_frame(1, 505)).await;
+        let _ = recv_frame(&mut fresh).await;
+        let mut cw = Writer::with_capacity(32);
+        cw.bytes(&[0u8; 20]).cstr(b"Grunt@bncc");
+        send_frame(&mut fresh, &Frame::new(sid::CREATEACCOUNT2, cw.finish())).await;
+        let created = recv_frame(&mut fresh).await;
+        assert_eq!(created.reader().u32().unwrap(), 0x02, "'@' is reserved for realms");
+    }
+
+    #[tokio::test]
+    async fn the_game_list_is_per_product_and_answers_a_lookup_by_name() {
+        let addr = spawn_server().await;
+        let mut host = wc3_handshake(addr, 506).await;
+        assert_eq!(wc3_create(&mut host, "Host", "pw").await, nls_status::CREATE_OK);
+        assert_eq!(wc3_logon(&mut host, "Host", "pw").await, Ok(()));
+        enter_chat_name(&mut host).await;
+        send_frame(&mut host, &start_adv_frame("DotA 6.83 -apem")).await;
+        assert_eq!(recv_frame(&mut host).await.reader().u32().unwrap(), advertise_status::OK);
+
+        // A Brood War client never sees a WarCraft III game …
+        let mut sc = login(addr, "Marine", "pw", 507).await;
+        assert_eq!(list_game_names_for(&mut sc, "").await, (Vec::new(), Some(0x00)));
+
+        // … a Frozen Throne client does, and can fetch it by name as a joiner.
+        let mut joiner = wc3_handshake(addr, 508).await;
+        assert_eq!(wc3_create(&mut joiner, "Joiner", "pw").await, nls_status::CREATE_OK);
+        assert_eq!(wc3_logon(&mut joiner, "Joiner", "pw").await, Ok(()));
+        enter_chat_name(&mut joiner).await;
+        assert_eq!(list_game_names(&mut joiner).await, vec!["DotA 6.83 -apem".to_string()]);
+        assert_eq!(
+            list_game_names_for(&mut joiner, "dota 6.83 -APEM").await,
+            (vec!["DotA 6.83 -apem".to_string()], None)
+        );
+        assert_eq!(
+            list_game_names_for(&mut joiner, "nope").await,
+            (Vec::new(), Some(0x01)),
+            "a named lookup that misses says the game doesn't exist"
+        );
     }
 
     #[tokio::test]

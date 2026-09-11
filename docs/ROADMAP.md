@@ -156,8 +156,11 @@ These are captured so they are not lost; each needs real design work, not just a
 - [ ] Registered-bot accounts as a first-class concept.
 - [ ] Key-registry admin surface: live keys and holders, ban/unban, and a report of how
       many distinct keys a fleet operator is running.
-- [ ] NLS/SRP-6 (Blizzard variant) — implement from the javaop write-up and RFC 2945,
-      **never** from PvPGN's `bnetsrp3.cpp`, which is AGPL-3.0 (`docs/LEGAL.md` §1).
+- [x] NLS/SRP-6 (Blizzard variant) — done 2026-09-10, clean-room from BNETDocs/javaop/RFC
+      2945 (`bnetcc-crypto::nls`), with `0x52`/`0x53`/`0x54` handlers, realm-scoped
+      `Name@<realm>` accounts, per-product game listing with lookup-by-name, and empty
+      `SID_FRIENDSLIST`/`SID_NEWS_INFO` replies. See `docs/WARCRAFT3.md`. Still to confirm
+      against a real patched client.
 - [ ] WarCraft III: clans (`0x70`–`0x82`), `SID_WARCRAFTGENERAL`, W3 route listener, and an
       **MPQ reader** for `icons-WAR3.bni` — which is an MPQ of `.blp` images, not a BNI.
       Document that WC3 needs a patched client because of the 128-byte RSA server

@@ -454,6 +454,10 @@ pub struct ServerConfig {
     pub mode: String,
     /// Message of the day, shown on first channel join.
     pub motd: String,
+    /// Realm name for realm-scoped accounts. WarCraft III (SRP) accounts are a separate
+    /// namespace from the X-SHA-1 products' accounts and are shown as `Name@<realm>`, the
+    /// way real Battle.net shows WC3 users across gateways. See `docs/WARCRAFT3.md` §3.6.
+    pub realm: String,
 }
 
 impl Default for ServerConfig {
@@ -462,6 +466,7 @@ impl Default for ServerConfig {
             name: "Command Center".into(),
             mode: "gaming".into(),
             motd: "Welcome to Command Center.".into(),
+            realm: "bncc".into(),
         }
     }
 }

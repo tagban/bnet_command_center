@@ -110,6 +110,12 @@ impl<'a> Statstring<'a> {
 pub fn build_default(product: FourCc) -> Vec<u8> {
     let a = product.as_ascii();
     let reversed = [a[3], a[2], a[1], a[0]];
+    // WarCraft III's form is the reversed tag then up to three fields (icon, level, clan
+    // tag), none of which a fresh account has — the bare tag is the safe minimum. ⚠️ The
+    // exact bytes a real server returns are unconfirmed (docs/WARCRAFT3.md §4.3).
+    if product == crate::product::WAR3 || product == crate::product::W3XP {
+        return reversed.to_vec();
+    }
     let mut s = Vec::with_capacity(29);
     s.extend_from_slice(&reversed);
     s.extend_from_slice(b" 0 0 0 0 0 0 0 0 ");
