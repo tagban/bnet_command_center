@@ -508,9 +508,17 @@ async fn bncs_session(
     let mut buf = RecvBuf::with_capacity(READ_CHUNK);
     loop {
         // The short handshake deadline guards only the automated pre-login phase; once the
-        // version check passes, a human may be at the login screen, so use the idle timeout.
+        // version check passes, a human may be at the login screen. But a session that has
+        // passed the version check has already claimed its CD key at SID_AUTH_CHECK, so if it
+        // then goes silent (a dead/zombie socket) it holds that key for the whole deadline —
+        // blocking relogin with "key in use". Bound the not-yet-logged-in window to a few
+        // minutes (ample for a human to type a password) rather than the full idle timeout, so
+        // a zombie releases its key promptly; only a fully logged-in session gets the long idle
+        // timeout. TCP keepalive (set on accept) reaps truly-dead sockets even sooner.
         let deadline = if s.state.in_automated_handshake() {
             limits.handshake_timeout
+        } else if !s.state.authenticated() {
+            Duration::from_secs(180)
         } else {
             limits.idle_timeout
         };
@@ -607,6 +615,19 @@ async fn bncs_session(
 
 impl Bncs {
     fn cleanup(&mut self) {
+        // Temporary WC3 handshake trace (docs/WARCRAFT3.md §7): log where a WC3 session ended
+        // so a client that stalls after SID_AUTH_INFO is diagnosable — `state=versioning` means
+        // it never sent SID_AUTH_CHECK (it rejected our AUTH_INFO reply), `state=authenticating`
+        // means it got stuck in the NLS logon, `logged-in`+ means login succeeded.
+        if matches!(self.product, Some(p) if matches!(product::auth_family(p), Some(product::AuthFamily::Srp))) {
+            info!(
+                peer = %self.peer,
+                product = ?self.product,
+                state = self.state.name(),
+                account = ?self.account.as_ref().map(|a| a.name.as_str()),
+                "WC3 session ended"
+            );
+        }
         let now = now_ms();
         for key in self.claimed_keys.drain(..) {
             self.node.release_key(key, now);
@@ -645,6 +666,21 @@ impl Bncs {
             body = %hex_preview(&frame.body),
             "recv BNCS frame"
         );
+        // Temporary WarCraft III handshake trace (docs/WARCRAFT3.md §7): a real patched WC3
+        // client stalls somewhere after SID_AUTH_INFO and we have no capture of where. Log every
+        // frame from a WC3/W3XP session at INFO — scoped to the SRP auth family, so the
+        // DRTL/STAR/CHAT bot fleet does not flood the log — so the next real connection shows the
+        // exact packet sequence and where it stops. Remove once the WC3 login is confirmed.
+        if matches!(self.product, Some(p) if matches!(product::auth_family(p), Some(product::AuthFamily::Srp))) {
+            info!(
+                peer = %self.peer,
+                id = %format!("{:#04x}", frame.id),
+                len = frame.body.len(),
+                state = self.state.name(),
+                body = %hex_preview(&frame.body),
+                "WC3 frame in"
+            );
+        }
         let step = match frame.id {
             sid::AUTH_INFO => self.auth_info(frame),
             sid::AUTH_CHECK => self.auth_check(frame),
@@ -924,6 +960,16 @@ impl Bncs {
                     for &done in &keys[..i] {
                         self.node.release_key(done, now);
                     }
+                    // Refusals were previously silent server-side (the holder name only went to
+                    // the client). Log it: a blank holder means the key is held by a session
+                    // that claimed it but never finished logging in — i.e. a lingering zombie,
+                    // not a real second player. See the pre-login deadline note above.
+                    warn!(
+                        peer = %self.peer,
+                        product = ?self.product,
+                        holder = %if holder.is_empty() { "<unconfirmed pre-login claim>" } else { holder.as_str() },
+                        "CD-key refused: already in use (one live session per key)"
+                    );
                     let mut status = auth_check_status::KEY_IN_USE;
                     if second {
                         status |= auth_check_status::SECOND_KEY;
@@ -1177,10 +1223,11 @@ impl Bncs {
                     client_public,
                     server_public,
                 });
+                info!(peer = %self.peer, name = %String::from_utf8_lossy(&username), "NLS logon (0x53): challenge issued");
                 w.u32(nls_status::LOGON_OK).bytes(&salt).bytes(&server_public);
             }
             None => {
-                debug!(peer = %self.peer, name = %String::from_utf8_lossy(&username), "NLS logon: no such account");
+                info!(peer = %self.peer, name = %String::from_utf8_lossy(&username), "NLS logon (0x53): no such account");
                 w.u32(nls_status::LOGON_NO_ACCOUNT).bytes(&[0u8; 64]);
             }
         }
@@ -1228,7 +1275,7 @@ impl Bncs {
                 }
             }
             Ok(None) => {
-                debug!(peer = %self.peer, "NLS logon: wrong password");
+                info!(peer = %self.peer, "NLS logon (0x54): wrong password (M1 mismatch)");
                 w.u32(nls_status::PROOF_WRONG_PASSWORD).bytes(&[0u8; 20]).cstr(b"");
             }
             Err(_) => return Step::Close,

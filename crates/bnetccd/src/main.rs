@@ -424,6 +424,19 @@ async fn accept_loop(
                     drop(stream);
                     continue;
                 }
+                // Enable TCP keepalive so a peer that vanishes without a clean close (a killed
+                // bot, a NAT/router drop) is detected and its session reaped in a couple of
+                // minutes instead of lingering until the idle timeout. A zombie session holds
+                // its CD-key claim (→ spurious "key in use" on the client's reconnect) and a
+                // file descriptor (→ "too many open files" under a reconnecting fleet); reaping
+                // it promptly releases both. Best-effort — a failure to set it is harmless.
+                {
+                    use socket2::{SockRef, TcpKeepalive};
+                    let ka = TcpKeepalive::new()
+                        .with_time(Duration::from_secs(60))
+                        .with_interval(Duration::from_secs(15));
+                    let _ = SockRef::from(&stream).set_tcp_keepalive(&ka);
+                }
                 let node = Arc::clone(&node);
                 tokio::spawn(async move {
                     session::handle(stream, peer, node, limits).await;
