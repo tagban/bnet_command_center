@@ -2542,6 +2542,9 @@ impl Bncs {
             std::net::IpAddr::V4(v4) => v4,
             std::net::IpAddr::V6(_) => std::net::Ipv4Addr::UNSPECIFIED,
         };
+        // Kept for the (optional) Discord game announcement below, before `name` moves into
+        // the ad.
+        let game_name = String::from_utf8_lossy(&name).into_owned();
         let ad = crate::node::GameAd {
             name,
             password,
@@ -2564,6 +2567,16 @@ impl Bncs {
                 self.hosting_game = true;
                 let product = self.product.map_or_else(|| "unknown".to_string(), |p| p.to_string());
                 self.node.record_hosted_game(&product);
+                // Announce to the (optional) separate games webhook, fire-and-forget so a slow
+                // webhook never delays the host's STARTADVEX3 reply.
+                if let Some(url) = &self.node.games_announce_webhook {
+                    tokio::spawn(crate::discord::post_game(
+                        url.clone(),
+                        account.name.clone(),
+                        game_name,
+                        product,
+                    ));
+                }
             }
         }
         let mut w = Writer::with_capacity(4);

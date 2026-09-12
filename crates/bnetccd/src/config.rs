@@ -124,6 +124,10 @@ pub struct DiscordConfig {
     pub post_events: bool,
     /// Post milestones (e.g. a new peak-connections record).
     pub post_milestones: bool,
+    /// Post a line to a **separate** webhook whenever any client advertises a game (host,
+    /// game name, product). Empty (the default) disables game announcements even if the main
+    /// `webhook_url` is set, so games can go to their own channel. A secret, like `webhook_url`.
+    pub games_webhook_url: String,
 }
 
 impl Default for DiscordConfig {
@@ -138,6 +142,7 @@ impl Default for DiscordConfig {
             post_status: true,
             post_events: true,
             post_milestones: true,
+            games_webhook_url: String::new(),
         }
     }
 }

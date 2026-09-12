@@ -306,6 +306,9 @@ pub struct Node {
     /// Serve WarCraft III the legacy X-SHA-1 logon (logon type 0, no RSA signature) instead
     /// of NLS/SRP. Read in `session::auth_info`. See `config::ServerConfig::wc3_logon`.
     pub wc3_legacy_logon: bool,
+    /// If set, post a one-line announcement to this Discord webhook when a client advertises
+    /// a game. A separate webhook from the main status one; `None` disables it.
+    pub games_announce_webhook: Option<String>,
     /// Per-category default channel size caps (`0` = unlimited).
     pub channel_caps: ChannelCaps,
     /// Configured advertisement banners. Empty means we never answer `SID_CHECKAD`,
@@ -363,6 +366,8 @@ pub struct NodeConfig {
     pub realm: String,
     /// Serve WarCraft III the legacy X-SHA-1 logon rather than NLS/SRP.
     pub wc3_legacy_logon: bool,
+    /// Optional separate Discord webhook for game announcements (`None` disables).
+    pub games_announce_webhook: Option<String>,
     /// Addresses exempt from the one-gateway-connection-per-IP rule.
     pub gateway_allowlist: Vec<IpAddr>,
     /// Client version restriction.
@@ -430,6 +435,7 @@ impl Node {
             motd: cfg.motd,
             realm: cfg.realm,
             wc3_legacy_logon: cfg.wc3_legacy_logon,
+            games_announce_webhook: cfg.games_announce_webhook,
             channel_caps: cfg.channel_caps,
             ads: AdRotation::default(),
             files_dir: cfg.files_dir,
@@ -1234,6 +1240,7 @@ pub(crate) fn test_node_with(tweak: impl FnOnce(&mut NodeConfig)) -> Node {
         motd: "motd".into(),
         realm: "bncc".into(),
         wc3_legacy_logon: false,
+        games_announce_webhook: None,
         gateway_allowlist: Vec::new(),
         version_policy: crate::config::VersionPolicy::default(),
         files_dir: None,

@@ -195,6 +195,10 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
             motd: cfg.server.motd.clone(),
             realm: cfg.server.realm.clone(),
             wc3_legacy_logon: cfg.server.wc3_legacy_logon()?,
+            games_announce_webhook: {
+                let url = cfg.discord.games_webhook_url.trim();
+                (!url.is_empty()).then(|| url.to_string())
+            },
             gateway_allowlist: cfg.limits.gateway_allowlist.clone(),
             version_policy,
             files_dir,

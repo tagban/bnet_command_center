@@ -100,6 +100,13 @@ fn fmt_uptime(secs: u64) -> String {
     }
 }
 
+/// Announce a newly-advertised game to the separate games webhook. Best-effort and
+/// fire-and-forget: `session::advertise` spawns this so a slow webhook never delays hosting.
+/// `webhook_url` is the caller's `Node::games_announce_webhook` (already known non-empty).
+pub async fn post_game(webhook_url: String, host: String, game: String, product: String) {
+    post(&webhook_url, &format!("🎮 **{host}** is hosting **{game}** ({product})")).await;
+}
+
 /// Post `content` to the webhook. Best-effort: logs and returns on any failure.
 async fn post(webhook_url: &str, content: &str) {
     let body = serde_json::json!({ "content": content }).to_string();
