@@ -608,20 +608,10 @@ impl Node {
         name: &str,
         credential: bnetcc_storage::model::Credential,
     ) -> Result<Account, crate::storage::CreateAccountError> {
-        // Account names are globally unique across the two credential namespaces: a WarCraft
-        // III realm account (`Name@<realm>`) and an X-SHA-1 account (`Name`) can never share a
-        // bare name. They render as the same chat name, so allowing both lets two accounts
-        // race for one identity — the later login gets `Name#2` and could shadow or
-        // impersonate the other (e.g. a clan owner's name). Reserve the bare name in *both*
-        // namespaces at creation; storage already enforces uniqueness within each.
-        let (bare, realm) = bnetcc_storage::split_realm(name);
-        let sibling = match realm {
-            Some(_) => bare.to_string(),               // realm account also reserves plain `Name`
-            None => format!("{bare}@{}", self.realm),  // plain account also reserves `Name@<realm>`
-        };
-        if self.account(&sibling).await.is_some() {
-            return Err(crate::storage::CreateAccountError::NameTaken);
-        }
+        // The realm suffix keeps the WarCraft III (SRP) and X-SHA-1 namespaces distinct both
+        // in storage and on screen (`Tagban@bncc` vs `Tagban`), so the same bare name may be
+        // registered in each — they never collide as a display name. Storage enforces
+        // uniqueness within each namespace.
         self.storage.create_account(name, credential).await
     }
 

@@ -119,14 +119,17 @@ skips it (see `docs/LEGAL.md` §3). It is not something the server can satisfy w
 Blizzard's private key, and it is *not* the cause of a post-login drop (the reference server
 sends zeros and works). Send the field, send zeros, move on.
 
-### 2.4 Present the client its *own* name with no realm suffix
+### 2.4 The realm-qualified name (`Name@realm`) is fine as the client's own name
 
-If you namespace accounts internally (we store WC3 accounts as `Name@bncc` to keep them apart
-from the X-SHA-1 products' accounts), **strip the realm before showing the name to the
-client** — in the `SID_ENTERCHAT` reply, chat events, and the user list. Real Battle.net never
-puts an `@` in your *own* name (the client appends a gateway suffix itself, only for users
-from *other* gateways), and a WC3 client refuses an `@` in its own name. For a single-realm
-server, present bare names everywhere. See `session.rs::finish_logon`.
+We namespace accounts internally as `Name@bncc` (to keep the WC3/SRP and X-SHA-1 credential
+namespaces apart), and we hand that **realm-qualified** name straight back to the client in
+`SID_ENTERCHAT` / chat / the user list. A real WC3 client **accepts its own `Name@bncc`
+name** and displays it — confirmed against a live client. This matches how Battle.net has
+shown WC3 users since the game launched (`Name@Azeroth`, `Name@Lordaeron`, …), and it means a
+WC3 `Tagban@bncc` and an X-SHA-1 `Tagban` are *distinct* display names that coexist with no
+`#N` collision. (Earlier this doc claimed the client *refuses* an `@` in its own name and that
+you must strip it — that was wrong: the post-login drop was the `0x54` trailing byte in §2.1,
+not the name. Stripping the realm is unnecessary.) See `session.rs::finish_logon`.
 
 ### 2.5 Stock WC3 speaks NLS only — do not try to force old-hash
 

@@ -31,7 +31,7 @@ before/after:
 |---|---|---|
 | `SID_AUTH_INFO` reply for WC3 (logon type `0x02`, real `ver-IX86-1.mpq` checkrevision formula, 128 zero bytes where the RSA signature goes — the field must be *present*) | ✅ | `session.rs::auth_info` |
 | `SID_AUTH_ACCOUNTLOGONPROOF` (0x54) reply is status + M2 only for non-error status — **no** trailing string (24 bytes; a real client drops on an extra byte) | ✅ confirmed vs real client + bnetdocs | `session.rs::auth_account_logon_proof` |
-| Client shown its own name **bare** (local `@realm` stripped) in ENTERCHAT/chat/userlist | ✅ | `session.rs::finish_logon` |
+| Client shown its own **realm-qualified** name `Name@bncc` in ENTERCHAT/chat/userlist — a real WC3 client accepts it (the `Name@Azeroth`-style display); distinct from an X-SHA-1 `Name`, so no `#N` collision | ✅ confirmed vs real client | `session.rs::finish_logon` |
 | `SID_AUTH_CHECK` with two CD keys (base + expansion) | ⚠️ layout extrapolated, never captured | `session.rs::auth_check` |
 | State machine accepts 0x52/0x53/0x54 in `Authenticating` and advances to `LoggedIn` on 0x54 | ✅ | `bnetcc-core/src/session.rs` |
 | `Credential::Srp { salt, verifier }` in the storage model and SQLite backend | ✅ | `bnetcc-storage`, `bnetcc-storage-sqlite` |

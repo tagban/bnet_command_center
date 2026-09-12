@@ -1193,19 +1193,15 @@ impl Bncs {
         self.flags |= self.node.user_flags(account.id).await;
         // Note the logon time for the admin user list (fire-and-forget).
         self.node.record_login(account.id, now_ms() / 1000);
-        // Claim a server-wide-unique display name (Name, or Name#2/#3… if this
-        // account is already online elsewhere) for the life of this session.
+        // Claim a server-wide-unique display name (Name, or Name#2/#3… if this exact account
+        // is already online elsewhere) for the life of this session.
         //
-        // WarCraft III accounts are stored realm-qualified (`Name@bncc`) to keep them in a
-        // namespace separate from the X-SHA-1 products' accounts. But real Battle.net shows a
-        // user their *own* name with no realm suffix — an `@` in your own name is illegal to
-        // the WC3 client, which then refuses to enter chat. The `@realm` form is only for
-        // cross-realm (federated) users; for a user on this server's own realm we present the
-        // bare name everywhere (ENTERCHAT reply, chat events, user list). X-SHA-1 names never
-        // contain `@`, so this strip is a no-op for them. See docs/WARCRAFT3.md §3.6.
-        let local_suffix = format!("@{}", self.node.realm);
-        let display_base = account.name.strip_suffix(&local_suffix).unwrap_or(&account.name);
-        self.display_name = self.node.claim_name(display_base);
+        // WarCraft III accounts are stored and shown realm-qualified as `Name@<realm>` — the
+        // way Battle.net has shown WC3 users since the game launched (`Name@Azeroth`, etc.).
+        // The realm suffix is the account's identity here, so a WC3 `Tagban@bncc` and an
+        // X-SHA-1 `Tagban` are distinct names that coexist without a `#N` collision. See
+        // docs/WARCRAFT3.md §3.6.
+        self.display_name = self.node.claim_name(&account.name);
         // Register with the moderation directory so staff can reach this session
         // (resolve its IP, or force it off) from any channel.
         self.node.register_session(
@@ -3255,10 +3251,9 @@ mod tests {
         // refused as "no such account": the proof would hash it and never match anyway.
         assert_eq!(wc3_logon(&mut s, "TAGBAN@BNCC", "hunter2").await, Err(nls_status::LOGON_NO_ACCOUNT));
         assert_eq!(wc3_logon(&mut s, "TAGBAN", "hunter2").await, Ok(()));
-        // The client is shown its own name bare — real Battle.net never puts a realm suffix
-        // on your own name, and the WC3 client refuses an '@' in it (docs/WARCRAFT3.md §3.6).
-        // The '@bncc' form stays internal (storage/lookup); see `finish_logon`.
-        assert_eq!(enter_chat_name(&mut s).await, "Tagban");
+        // Shown realm-qualified, the way Battle.net has shown WC3 users since launch
+        // (Name@Azeroth). This keeps them distinct from any X-SHA-1 account of the same name.
+        assert_eq!(enter_chat_name(&mut s).await, "Tagban@bncc");
     }
 
     #[tokio::test]
@@ -3269,42 +3264,30 @@ mod tests {
         assert_eq!(wc3_logon(&mut s, "Zealot", "wrong").await, Err(nls_status::PROOF_WRONG_PASSWORD));
         // Still not logged in: chat entry is a protocol violation and closes the stream.
         assert_eq!(wc3_logon(&mut s, "Zealot", "right").await, Ok(()));
-        assert_eq!(enter_chat_name(&mut s).await, "Zealot");
+        assert_eq!(enter_chat_name(&mut s).await, "Zealot@bncc");
     }
 
     #[tokio::test]
-    async fn account_names_are_globally_unique_across_namespaces() {
+    async fn realm_accounts_and_xsha1_accounts_with_the_same_name_coexist() {
         let addr = spawn_server().await;
         // A Brood War player registers "Zealot" the X-SHA-1 way …
         let _sc = login(addr, "Zealot", "pw", 503).await;
-        // … so a WarCraft III player cannot also take "Zealot". The two would be stored as
-        // "Zealot" and "Zealot@bncc", but both render as the bare chat name "Zealot" — allowing
-        // both lets one account shadow/impersonate the other. The bare name is reserved across
-        // both namespaces at creation.
+        // … and a WarCraft III player registers "Zealot" too: a distinct account in the realm.
+        // Both are allowed because they render distinctly — "Zealot" vs "Zealot@bncc" — so they
+        // never collide as a chat name.
         let mut w3 = wc3_handshake(addr, 504).await;
-        assert_eq!(wc3_create(&mut w3, "Zealot", "pw2").await, nls_status::CREATE_NAME_EXISTS);
+        assert_eq!(wc3_create(&mut w3, "Zealot", "pw2").await, nls_status::CREATE_OK);
+        assert_eq!(wc3_logon(&mut w3, "Zealot", "pw2").await, Ok(()));
+        assert_eq!(enter_chat_name(&mut w3).await, "Zealot@bncc");
 
-        // And the reverse: a name first claimed by a WarCraft III (realm) account is then
-        // unavailable to an X-SHA-1 client.
-        assert_eq!(wc3_create(&mut w3, "Grunt", "pw3").await, nls_status::CREATE_OK);
+        // An X-SHA-1 client still cannot put a literal '@' in a created name (reserved for realms).
         let mut fresh = connect(addr).await;
         send_frame(&mut fresh, &auth_info_frame()).await;
         let _ = recv_frame(&mut fresh).await;
         send_frame(&mut fresh, &auth_check_frame(1, 505)).await;
         let _ = recv_frame(&mut fresh).await;
-        let h1 = bnetcc_crypto::password_hash("pw3");
         let mut cw = Writer::with_capacity(32);
-        cw.bytes(&h1).cstr(b"Grunt");
-        send_frame(&mut fresh, &Frame::new(sid::CREATEACCOUNT2, cw.finish())).await;
-        assert_eq!(
-            recv_frame(&mut fresh).await.reader().u32().unwrap(),
-            0x04,
-            "name is taken by the realm account"
-        );
-
-        // An X-SHA-1 client still cannot put a literal '@' in a created name (reserved for realms).
-        let mut cw = Writer::with_capacity(32);
-        cw.bytes(&[0u8; 20]).cstr(b"Foo@bncc");
+        cw.bytes(&[0u8; 20]).cstr(b"Grunt@bncc");
         send_frame(&mut fresh, &Frame::new(sid::CREATEACCOUNT2, cw.finish())).await;
         assert_eq!(
             recv_frame(&mut fresh).await.reader().u32().unwrap(),
