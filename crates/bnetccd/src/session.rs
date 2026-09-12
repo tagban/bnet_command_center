@@ -582,19 +582,24 @@ async fn bncs_session(
     let mut buf = RecvBuf::with_capacity(READ_CHUNK);
     loop {
         // The short handshake deadline guards only the automated pre-login phase; once the
-        // version check passes, a human may be at the login screen. But a session that has
-        // passed the version check has already claimed its CD key at SID_AUTH_CHECK, so if it
-        // then goes silent (a dead/zombie socket) it holds that key for the whole deadline —
-        // blocking relogin with "key in use". Bound the not-yet-logged-in window to a few
-        // minutes (ample for a human to type a password) rather than the full idle timeout, so
-        // a zombie releases its key promptly; only a fully logged-in session gets the long idle
-        // timeout. TCP keepalive (set on accept) reaps truly-dead sockets even sooner.
+        // version check passes, a human may be at the login screen. A session that passed the
+        // version check has already claimed its CD key at SID_AUTH_CHECK, so if it then goes
+        // silent (a dead/zombie socket) it holds that key — blocking relogin with "key in
+        // use". Bound the not-yet-logged-in window to a few minutes (ample to type a password)
+        // so a zombie releases its key promptly.
+        //
+        // A *logged-in* session gets a very long deadline, not the old 20-minute one: a game
+        // client sends nothing to the chat connection while it is in a game (which routinely
+        // runs longer than that), and reaping it there is exactly the "connection to
+        // Battle.net has been lost" a player hits on returning to chat. TCP keepalive (set on
+        // accept) still reaps a genuinely dead socket within a few minutes, and staff `kill`
+        // can force one off — so this only stops us reaping a live-but-idle client.
         let deadline = if s.state.in_automated_handshake() {
             limits.handshake_timeout
         } else if !s.state.authenticated() {
             Duration::from_secs(180)
         } else {
-            limits.idle_timeout
+            limits.idle_timeout.max(Duration::from_secs(24 * 3600))
         };
 
         let tail = buf.writable_tail(READ_CHUNK);
