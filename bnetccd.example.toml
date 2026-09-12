@@ -30,6 +30,11 @@ motd = "Welcome to Command Center."
 # namespace and appear as `Name@<realm>` in chat, whispers and bans. Names typed in the
 # WarCraft III client never include the suffix. See docs/WARCRAFT3.md.
 realm = "bncc"
+# WarCraft III logon method: "nls" (SRP, the modern default) or "legacy". "legacy" advertises
+# logon type 0 with no RSA signature so a StarCraft-hash loader can log in over the X-SHA-1
+# path (into the plain, non-@realm namespace); "nls" is what a normal client uses. See
+# docs/WARCRAFT3.md §3.7. Leave "nls" unless you run such a loader.
+wc3_logon = "nls"
 
 [listen]
 # BNCS and the chat gateway share this port; they are told apart by the first byte a
@@ -62,6 +67,10 @@ games_window_hours = 6      # window for the "games hosted per client" figure
 post_status = true          # users online, channels, live games, uptime, games/client
 post_events = true          # server start / shutdown / restart
 post_milestones = true      # e.g. a new peak-connections record
+# Separate webhook for game announcements: when any client advertises a game, a one-line
+# "host is hosting <game> (<product>)" is posted here. Empty disables it independently of
+# webhook_url above, so games can go to their own channel. Also a secret.
+games_webhook_url = ""
 
 [stats_push]
 # Push the public status JSON to your own website on an interval. Outbound-only, so no port

@@ -991,6 +991,12 @@ fn settings_page(admin: &Admin, config_path: &Path, flash: Option<(bool, &str)>)
         &mode,
         &[("gaming", "Gaming (games + chat)"), ("warnet", "Warnet (chat/bots only)"), ("both", "Both")],
     );
+    // WarCraft III logon method <select>.
+    let wc3_logon = cfg_string(&doc, &["server", "wc3_logon"], "nls");
+    let wc3_opts = select_options(
+        &wc3_logon,
+        &[("nls", "NLS / SRP (default)"), ("legacy", "Legacy X-SHA-1 (StarCraft-hash loader)")],
+    );
     // Listeners.
     let bncs = html_escape(&cfg_string(&doc, &["listen", "bncs"], "0.0.0.0:6112"));
     let accept_shards = cfg_int(&doc, &["listen", "accept_shards"], 1);
@@ -1054,6 +1060,7 @@ fn settings_page(admin: &Admin, config_path: &Path, flash: Option<(bool, &str)>)
     let public_users_ck = if cfg_bool(&doc, &["status", "public_show_users"], false) { "checked" } else { "" };
     // Discord
     let d_url = html_escape(&cfg_string(&doc, &["discord", "webhook_url"], ""));
+    let d_games = html_escape(&cfg_string(&doc, &["discord", "games_webhook_url"], ""));
     let d_interval = cfg_int(&doc, &["discord", "status_interval_mins"], 30);
     let d_window = cfg_int(&doc, &["discord", "games_window_hours"], 6);
     let d_status_ck = if cfg_bool(&doc, &["discord", "post_status"], true) { "checked" } else { "" };
@@ -1107,6 +1114,9 @@ fn settings_page(admin: &Admin, config_path: &Path, flash: Option<(bool, &str)>)
 <p class="muted"><b>Gaming</b>: games, realms, ladder + chat. <b>Warnet</b>: chat/bots only — game hosting refused, realm/WC3 listeners don't bind. <b>Both</b>: games available, limits split by class.</p>
 <label for="mo">Message of the day</label>
 <input id="mo" name="server_motd" type="text" value="{motd}" maxlength="200">
+<label for="w3">WarCraft III logon</label>
+<select id="w3" name="server_wc3_logon">{wc3_opts}</select>
+<p class="muted">NLS is what a normal WarCraft III client uses. <b>Legacy</b> advertises the X-SHA-1 logon for a StarCraft-hash loader — leave it on NLS unless you run one. See docs/WARCRAFT3.md §3.7.</p>
 
 <div class="hdr">Network &amp; listeners</div>
 <div class="warn">These need a restart and can lock you out or move ports. Change them only when you know the address is reachable.</div>
@@ -1209,6 +1219,8 @@ fn settings_page(admin: &Admin, config_path: &Path, flash: Option<(bool, &str)>)
 <div class="hdr">Discord updates</div>
 <label for="dw">Webhook URL (empty = disabled)</label>
 <input id="dw" name="discord_webhook" type="text" value="{d_url}" placeholder="https://discord.com/api/webhooks/…">
+<label for="dg">Games webhook URL — separate channel for game announcements (empty = off)</label>
+<input id="dg" name="discord_games_webhook" type="text" value="{d_games}" placeholder="https://discord.com/api/webhooks/…">
 <label>Status interval (mins) / games window (hrs)</label>
 <div class="row2">
 <input name="discord_interval" type="number" min="1" value="{d_interval}">
@@ -1291,7 +1303,9 @@ fn do_settings_config(req: &Request, admin: &Admin, config_path: &Path) -> Respo
     for &(field, path) in &[
         ("server_name", &["server", "name"][..]),
         ("server_mode", &["server", "mode"][..]),
+        ("server_wc3_logon", &["server", "wc3_logon"][..]),
         ("server_motd", &["server", "motd"][..]),
+        ("discord_games_webhook", &["discord", "games_webhook_url"][..]),
         ("listen_bncs", &["listen", "bncs"][..]),
         ("listen_admin", &["listen", "admin"][..]),
         ("status_listen", &["status", "listen"][..]),
