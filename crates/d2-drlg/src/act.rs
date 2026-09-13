@@ -162,7 +162,7 @@ impl<'a> Placement<'a> {
     fn adj2(&mut self) -> bool {
         let n = self.cur;
         if self.initial_dir[n] == -1 {
-            self.seed.next();
+            self.seed.step();
             self.initial_dir[n] = (self.seed.low & 1) as i32 + 1;
             self.cur_dir[n] = self.initial_dir[n];
         } else {
@@ -199,7 +199,7 @@ impl<'a> Placement<'a> {
     fn roll_dir8(&mut self) -> bool {
         let n = self.cur;
         if self.initial_dir[n] == -1 {
-            self.seed.next();
+            self.seed.step();
             self.initial_dir[n] = (self.seed.low & 7) as i32;
             self.cur_dir[n] = self.initial_dir[n];
         } else {
@@ -255,7 +255,7 @@ impl<'a> Placement<'a> {
     fn lde2(&mut self) -> bool {
         let n = self.cur;
         if self.initial_dir[n] == -1 {
-            self.seed.next();
+            self.seed.step();
             self.initial_dir[n] = (self.seed.low & 3) as i32;
             self.cur_dir[n] = self.initial_dir[n];
         } else {
@@ -293,10 +293,10 @@ impl<'a> Placement<'a> {
     fn roll_dir4_flip(&mut self) -> bool {
         let n = self.cur;
         if self.initial_dir[n] == -1 {
-            self.seed.next();
+            self.seed.step();
             self.initial_dir[n] = (self.seed.low & 3) as i32;
             self.cur_dir[n] = self.initial_dir[n];
-            self.seed.next();
+            self.seed.step();
             self.flip[n] = (self.seed.low & 1) as i32;
             self.step[n] = self.flip[n];
         } else {
@@ -363,7 +363,7 @@ impl<'a> Placement<'a> {
         let n = self.cur;
         self.initial_dir[n] = 3;
         self.cur_dir[n] = 3;
-        self.seed.next();
+        self.seed.step();
         let p = self.prev(n);
         let low_bit = self.seed.low & 1 != 0;
         let s = &mut self.coords[n];
@@ -383,7 +383,7 @@ impl<'a> Placement<'a> {
 
     fn orient_fixed(&mut self) -> bool {
         let n = self.cur;
-        self.seed.next();
+        self.seed.step();
         let d = (self.seed.low & 1) as i32;
         self.cur_dir[n] = d;
         self.initial_dir[n] = d;
@@ -396,7 +396,7 @@ impl<'a> Placement<'a> {
 
     fn orient_absolute(&mut self, levels: &Levels) -> bool {
         let n = self.cur;
-        self.seed.next();
+        self.seed.step();
         let d = (self.seed.low & 1) as i32;
         self.cur_dir[n] = d;
         self.initial_dir[n] = d;
@@ -410,7 +410,7 @@ impl<'a> Placement<'a> {
     fn orient_table(&mut self) -> bool {
         let n = self.cur;
         if self.initial_dir[n] == -1 {
-            self.seed.next();
+            self.seed.step();
             self.initial_dir[n] = (self.seed.low & 1) as i32;
             self.cur_dir[n] = self.initial_dir[n];
         } else {
@@ -529,19 +529,19 @@ fn run_placement<'a>(levels: &Levels, difficulty: usize, nodes: &'a [Node], seed
 /// The seed the placement walk rolls: the game seed stepped once, then the act's pre-rolls.
 fn placement_seed(act: u8, game_seed: u32) -> Seed {
     let mut s = Seed::new(game_seed, 0x29A);
-    s.next();
+    s.step();
     match act {
         1 => loop {
             // Act II: re-roll the staff and boss tombs until they differ.
-            s.next();
+            s.step();
             let staff = s.low % 7;
-            s.next();
+            s.step();
             if staff != s.low % 7 {
                 break s;
             }
         },
         2 => {
-            s.next(); // Act III: jungle interlink
+            s.step(); // Act III: jungle interlink
             s
         }
         _ => s,

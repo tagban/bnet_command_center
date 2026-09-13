@@ -22,7 +22,7 @@ impl Seed {
     }
 
     /// Advance one step, returning the full 64-bit state.
-    pub fn next(&mut self) -> u64 {
+    pub fn step(&mut self) -> u64 {
         let state = u64::from(self.low).wrapping_mul(MULTIPLIER).wrapping_add(u64::from(self.high));
         self.low = state as u32;
         self.high = (state >> 32) as u32;
@@ -31,7 +31,7 @@ impl Seed {
 
     /// `RollRandomSeed` (`0x0045C370`): step and return the new low word.
     pub fn roll(&mut self) -> u32 {
-        self.next();
+        self.step();
         self.low
     }
 
@@ -41,7 +41,7 @@ impl Seed {
         if (modulo as i32) < 1 {
             return 0;
         }
-        self.next();
+        self.step();
         if modulo & (modulo - 1) != 0 {
             self.low % modulo
         } else {
@@ -70,7 +70,7 @@ mod tests {
     #[test]
     fn a_step_splits_the_64_bit_state() {
         let mut s = Seed::new(1, 0x29A);
-        assert_eq!(s.next(), 0x6AC6_90C5 + 0x29A);
+        assert_eq!(s.step(), 0x6AC6_90C5 + 0x29A);
         assert_eq!((s.low, s.high), (0x6AC6_935F, 0));
     }
 
