@@ -1,0 +1,95 @@
+//! `Levels.txt`: each area's act, size, fixed offset and generator type.
+
+use d2_formats::excel::Table;
+
+use crate::Error;
+
+/// How an area is generated (`DrlgType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrlgType {
+    /// No generator (the `Null` row).
+    None,
+    /// A grid of preset rooms (`LvlMaze.txt`).
+    Maze,
+    /// One fixed map file (`LvlPrest.txt`): towns and set pieces.
+    Preset,
+    /// Outdoor wilderness.
+    Wilderness,
+}
+
+/// One `Levels.txt` row: the geometry the level generator reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LevelDef {
+    /// `Id`.
+    pub id: i32,
+    /// `Name`.
+    pub name: String,
+    /// `Act`, 0-based.
+    pub act: u8,
+    /// `SizeX`/`SizeY` per difficulty (Normal, Nightmare, Hell), in tiles.
+    pub size: [(i32, i32); 3],
+    /// `OffsetX`/`OffsetY`, in tiles.
+    pub offset: (i32, i32),
+    /// `Depend`: the level this one's offset is relative to (0 = none).
+    pub depend: i32,
+    /// `DrlgType`.
+    pub drlg_type: DrlgType,
+    /// `LevelType`: the `LvlTypes.txt` row naming its tile set.
+    pub level_type: i32,
+}
+
+/// All levels, by id.
+#[derive(Debug, Clone, Default)]
+pub struct Levels {
+    by_id: Vec<Option<LevelDef>>,
+}
+
+impl Levels {
+    /// Parse `Levels.txt`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadTable`] if a column the generator needs is missing.
+    pub fn from_table(t: &Table) -> Result<Self, Error> {
+        for column in ["Id", "Act", "SizeX", "SizeY", "SizeX(N)", "SizeY(N)", "SizeX(H)", "SizeY(H)", "OffsetX", "OffsetY", "Depend", "DrlgType", "LevelType"] {
+            if t.column(column).is_none() {
+                return Err(Error::BadTable { table: "levels.txt", problem: format!("no {column} column") });
+            }
+        }
+        let mut by_id: Vec<Option<LevelDef>> = Vec::new();
+        for row in t.rows() {
+            let int = |c: &str| row.int(c).unwrap_or(0) as i32;
+            let id = int("Id");
+            if id <= 0 {
+                continue; // the Null row
+            }
+            let def = LevelDef {
+                id,
+                name: row.get("Name").unwrap_or_default().to_string(),
+                act: int("Act") as u8,
+                size: [(int("SizeX"), int("SizeY")), (int("SizeX(N)"), int("SizeY(N)")), (int("SizeX(H)"), int("SizeY(H)"))],
+                offset: (int("OffsetX"), int("OffsetY")),
+                depend: int("Depend"),
+                drlg_type: match int("DrlgType") {
+                    1 => DrlgType::Maze,
+                    2 => DrlgType::Preset,
+                    3 => DrlgType::Wilderness,
+                    _ => DrlgType::None,
+                },
+                level_type: int("LevelType"),
+            };
+            let at = id as usize;
+            if by_id.len() <= at {
+                by_id.resize(at + 1, None);
+            }
+            by_id[at] = Some(def);
+        }
+        Ok(Self { by_id })
+    }
+
+    /// A level by id.
+    #[must_use]
+    pub fn get(&self, id: i32) -> Option<&LevelDef> {
+        usize::try_from(id).ok().and_then(|i| self.by_id.get(i)).and_then(Option::as_ref)
+    }
+}

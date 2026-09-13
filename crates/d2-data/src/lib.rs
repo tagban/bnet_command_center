@@ -13,7 +13,10 @@ use std::path::Path;
 use d2_formats::excel::Table;
 use d2_formats::mpq::{self, ArchiveSet, DATA_ARCHIVES};
 
+pub mod levels;
 pub mod stat;
+
+use levels::Levels;
 
 /// Classes in `charstats.txt` order, which is the engine's class id.
 pub const CLASSES: [&str; 7] = ["Amazon", "Sorceress", "Necromancer", "Paladin", "Barbarian", "Druid", "Assassin"];
@@ -76,6 +79,7 @@ pub struct GameData {
     classes: [ClassStats; 7],
     /// `experience.txt` by level (row `"0"` first), one column per class.
     experience: Vec<[u32; 7]>,
+    levels: Levels,
 }
 
 impl GameData {
@@ -92,7 +96,9 @@ impl GameData {
                 .ok_or(Error::MissingTable(name))?;
             Ok(Table::parse(&bytes))
         };
-        Self::from_tables(&read("charstats.txt")?, &read("experience.txt")?)
+        let mut data = Self::from_tables(&read("charstats.txt")?, &read("experience.txt")?)?;
+        data.levels = Levels::from_table(&read("levels.txt")?)?;
+        Ok(data)
     }
 
     /// Build from already-parsed tables.
@@ -143,7 +149,18 @@ impl GameData {
         if levels.len() < 2 {
             return Err(bad("experience.txt", "fewer than two levels".into()));
         }
-        Ok(Self { classes, experience: levels })
+        Ok(Self { classes, experience: levels, levels: Levels::default() })
+    }
+
+    /// `Levels.txt` (empty when built with [`GameData::from_tables`]).
+    #[must_use]
+    pub fn levels(&self) -> &Levels {
+        &self.levels
+    }
+
+    /// Replace the level table — for building rules from tables in tests.
+    pub fn set_levels(&mut self, levels: Levels) {
+        self.levels = levels;
     }
 
     /// A class's starting attributes; `None` for a class id past the seven.
@@ -244,5 +261,7 @@ mod tests {
             assert!(c.vitality > 0 && c.stamina > 0, "{}: {c:?}", CLASSES[usize::from(class)]);
         }
         assert!(data.next_level_experience(0, 1).unwrap() > 0);
+        let town = data.levels().get(1).expect("Rogue Encampment");
+        assert_eq!((town.act, town.drlg_type), (0, levels::DrlgType::Preset));
     }
 }

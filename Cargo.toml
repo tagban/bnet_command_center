@@ -11,6 +11,7 @@ members = [
     "crates/bnetcc-launcher",
     "crates/d2-formats",
     "crates/d2-data",
+    "crates/d2-drlg",
 ]
 
 [workspace.package]
