@@ -17,6 +17,10 @@ pub struct LvlPrest {
     pub level_id: i32,
     /// `Populate`: whether rooms spawn their populate objects.
     pub populate: bool,
+    /// `SizeX`/`SizeY`, in tiles.
+    pub size: (i32, i32),
+    /// `Files`: how many map files the preset rotates through.
+    pub file_count: i32,
     /// `File1`..`File6`, relative to `data\global\tiles`, blanks and `0` dropped.
     pub files: Vec<String>,
 }
@@ -45,6 +49,8 @@ impl LvlPrests {
                 def: row.int("Def").unwrap_or(0) as i32,
                 level_id: row.int("LevelId").unwrap_or(0) as i32,
                 populate: row.int("Populate").unwrap_or(0) != 0,
+                size: (row.int("SizeX").unwrap_or(0) as i32, row.int("SizeY").unwrap_or(0) as i32),
+                file_count: row.int("Files").unwrap_or(0) as i32,
                 files: (1..=6)
                     .filter_map(|i| row.get(&format!("File{i}")))
                     .filter(|f| *f != "0")
@@ -59,6 +65,12 @@ impl LvlPrests {
     #[must_use]
     pub fn for_level(&self, level_id: i32) -> Option<&LvlPrest> {
         self.rows.iter().find(|r| r.level_id == level_id && level_id != 0)
+    }
+
+    /// The row with `Def` = `def` (`TXT_LvlPrest_GetLine`).
+    #[must_use]
+    pub fn by_def(&self, def: i32) -> Option<&LvlPrest> {
+        self.rows.iter().find(|r| r.def == def)
     }
 }
 

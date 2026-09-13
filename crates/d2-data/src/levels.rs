@@ -39,6 +39,11 @@ pub struct LevelDef {
     /// `Waypoint`: the level's bit in a player's waypoint flags (record `+0xE4`), `None` for
     /// a level without a waypoint (255).
     pub waypoint: Option<u8>,
+    /// `Vis0`..`Vis7`: levels seen from this one (0 = none).
+    pub vis: [i32; 8],
+    /// `Warp0`..`Warp7`: the `LvlWarp.txt` id reaching each `Vis` level, -1 for none (an open
+    /// edge rather than a door).
+    pub warp: [i32; 8],
 }
 
 /// All levels, by id.
@@ -81,6 +86,8 @@ impl Levels {
                 },
                 level_type: int("LevelType"),
                 waypoint: row.int("Waypoint").and_then(|w| u8::try_from(w).ok()).filter(|&w| w != 255),
+                vis: std::array::from_fn(|i| int(&format!("Vis{i}"))),
+                warp: std::array::from_fn(|i| row.int(&format!("Warp{i}")).map_or(-1, |w| w as i32)),
             };
             let at = id as usize;
             if by_id.len() <= at {

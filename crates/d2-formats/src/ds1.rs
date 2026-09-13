@@ -1,8 +1,9 @@
 //! DS1 map files: one preset area's tile layers, its preset units, and NPC walk paths.
 //!
 //! The generator needs the size and the units: which monsters (NPCs) and objects the map
-//! places, and where, in subtiles relative to the map's corner. The tile layers are skipped
-//! for now; they come back with collision.
+//! places, and where, in subtiles relative to the map's corner; the outdoor border pieces also
+//! need the wall and floor layers and the substitution groups. Orientation, shadow and tag
+//! layers are skipped; they come back with collision.
 //!
 //! Ported from libd2 `packages/formats/src/ds1.zig` (MIT), which follows the engine's DS1
 //! reader.
@@ -57,6 +58,22 @@ pub struct Unit {
     pub path: Vec<(i32, i32, i32)>,
 }
 
+/// A substitution group (`D2DrlgSubstGroupStrc`): a box of tiles one of whose variants, laid out
+/// to its right, the outdoor generator stamps onto a level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubstGroup {
+    /// Left edge, in tiles.
+    pub x: i32,
+    /// Top edge, in tiles.
+    pub y: i32,
+    /// Width, in tiles.
+    pub w: i32,
+    /// Height, in tiles.
+    pub h: i32,
+    /// Variants to pick from (version 13 and later; 0 before).
+    pub variants: i32,
+}
+
 /// A parsed DS1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ds1 {
@@ -68,8 +85,14 @@ pub struct Ds1 {
     pub height: i32,
     /// Act the map belongs to (0-based), version 8 and later.
     pub act: i32,
+    /// Wall layers: each a raw 32-bit cell per tile, row by row.
+    pub walls: Vec<Vec<u32>>,
+    /// Floor layers, the same way.
+    pub floors: Vec<Vec<u32>>,
     /// Preset units, in file order.
     pub units: Vec<Unit>,
+    /// Substitution groups, in file order.
+    pub subst_groups: Vec<SubstGroup>,
 }
 
 struct Reader<'a> {
@@ -82,6 +105,12 @@ impl Reader<'_> {
         let b = self.bytes.get(self.at..self.at + 4).ok_or(Error::Truncated)?;
         self.at += 4;
         Ok(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn cells(&mut self, n: usize) -> Result<Vec<u32>, Error> {
+        let b = self.bytes.get(self.at..self.at + n * 4).ok_or(Error::Truncated)?;
+        self.at += n * 4;
+        Ok(b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
     }
 
     fn skip(&mut self, n: usize) -> Result<(), Error> {
@@ -127,16 +156,27 @@ impl Ds1 {
             }
         }
         let (width, height) = (raw_w + 1, raw_h + 1);
-        let block = width as usize * height as usize * 4;
+        let cells = width as usize * height as usize;
+        let block = cells * 4;
         if (9..=13).contains(&version) {
             r.skip(8)?;
         }
+        let (mut walls, mut floors) = (Vec::new(), Vec::new());
         if version < 4 {
-            r.skip(block * 4)?; // wall, orientation, floor, reserved
+            walls.push(r.cells(cells)?);
+            r.skip(block)?; // orientation
+            floors.push(r.cells(cells)?);
+            r.skip(block)?; // reserved
         } else {
-            let walls = r.count(64)?;
-            let floors = if version >= 16 { r.count(64)? } else { 1 };
-            r.skip(block * (walls * 2 + floors))?;
+            let wall_layers = r.count(64)?;
+            let floor_layers = if version >= 16 { r.count(64)? } else { 1 };
+            for _ in 0..wall_layers {
+                walls.push(r.cells(cells)?);
+                r.skip(block)?; // orientation
+            }
+            for _ in 0..floor_layers {
+                floors.push(r.cells(cells)?);
+            }
         }
         r.skip(block)?; // shadow
         if (1..=2).contains(&tag_type) {
@@ -157,12 +197,16 @@ impl Ds1 {
             }
         }
 
+        let mut subst_groups = Vec::new();
         if version > 11 && (1..=2).contains(&tag_type) {
             if version > 17 {
                 r.skip(4)?;
             }
-            let groups = r.count(1 << 16)?;
-            r.skip(groups * if version > 12 { 20 } else { 16 })?;
+            for _ in 0..r.count(1 << 16)? {
+                let (x, y, w, h) = (r.i32()?, r.i32()?, r.i32()?, r.i32()?);
+                let variants = if version > 12 { r.i32()? } else { 0 };
+                subst_groups.push(SubstGroup { x, y, w, h, variants });
+            }
         }
 
         if version > 13 {
@@ -183,7 +227,7 @@ impl Ds1 {
                 }
             }
         }
-        Ok(Self { version, width, height, act, units })
+        Ok(Self { version, width, height, act, walls, floors, units, subst_groups })
     }
 }
 
@@ -200,12 +244,16 @@ mod tests {
         // version 18, 2x1 tiles (raw 1, 0), act 0, tag type 0, no files; 1 wall + 1 floor.
         let cells = 2 * 4;
         let mut bytes = le(&[18, 1, 0, 0, 0, 0, 1, 1]);
-        bytes.extend(vec![0u8; cells * 3]); // wall, orientation, floor
+        bytes.extend(le(&[0x0103, 0])); // wall
+        bytes.extend(vec![0u8; cells]); // orientation
+        bytes.extend(le(&[0, 2])); // floor
         bytes.extend(vec![0u8; cells]); // shadow
         bytes.extend(le(&[2, 1, 7, 10, 12, 0, 2, 119, 20, 22, 0])); // two units
         bytes.extend(le(&[1, 2, 10, 12, 11, 13, 1, 14, 16, 2])); // one path of two nodes
         let ds1 = Ds1::parse(&bytes).unwrap();
         assert_eq!((ds1.width, ds1.height), (2, 1));
+        assert_eq!((ds1.walls.clone(), ds1.floors.clone()), (vec![vec![0x0103, 0]], vec![vec![0, 2]]));
+        assert!(ds1.subst_groups.is_empty());
         assert_eq!(ds1.units.len(), 2);
         assert_eq!((ds1.units[1].kind, ds1.units[1].id, ds1.units[1].x), (UnitKind::Object, 119, 20));
         assert_eq!(ds1.units[0].path, vec![(11, 13, 1), (14, 16, 2)], "path attached by position");

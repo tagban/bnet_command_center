@@ -13,6 +13,7 @@
 #![warn(missing_docs)]
 
 pub mod act;
+pub mod outdoor;
 pub mod preset;
 pub mod rng;
 pub mod world;

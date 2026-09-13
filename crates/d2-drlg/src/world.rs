@@ -8,18 +8,12 @@
 //! Room shapes:
 //! - a preset level is cut into 8×8-tile rooms from its corner, the last row and column
 //!   narrower (`DRLGPRESET_BuildArea`, ported in libd2 `preset.zig`), as the town already is;
-//! - a wilderness level is a grid of 8×8-tile cells, each a room or part of a preset piece that
-//!   is itself cut into 8×8 rooms from the cell (`DRLGOUTDOOR_CreateOutdoorRoomExGrid`,
-//!   `0x006750F0`). The client only needs a point inside a room to load it
-//!   (`0x07` → `0x0061B640` → `0x00642630`), so the grid is enough to load a wilderness level
-//!   without generating it here.
-//!
-//! **Voids.** Not every wilderness cell is a room: the border placement blanks some cells
-//! (`DRLGOUTDOOR_SetBlankGridCell`, flag `0x100` without a preset), and a `0x07` pointing into
-//! one would make the client dereference null. Until the outdoor generator is ported, the world
-//! keeps only cells libd2's engine recordings (8 seeds, both difficulties) never show as voids:
-//! a wilderness level's outer ring of cells only near the town, and no level where interior
-//! voids were seen ([`LEVELS_WITH_INTERIOR_VOIDS`]).
+//! - a wilderness level is a grid of 8×8-tile cells, each a room, part of a preset piece that
+//!   is itself cut into 8×8 rooms from the cell, or a void — which is what [`crate::outdoor`]
+//!   works out (`DRLGOUTDOOR_CreateOutdoorRoomExGrid`, `0x006750F0`). The client only needs a
+//!   point inside a room to load it (`0x07` → `0x0061B640` → `0x00642630`), and a `0x07`
+//!   pointing into a void would make it dereference null, so the voids matter and the tiles do
+//!   not.
 //!
 //! Rooms of different levels are near when their gap is under 6 tiles on both axes, as within a
 //! level. The engine links cross-level rooms only through a room's visibility slots
@@ -27,16 +21,14 @@
 //! passage between them are near here and not in the engine; a client then loads terrain it
 //! cannot reach.
 
-use d2_data::levels::{DrlgType, Levels};
+use d2_data::engine::EngineData;
+use d2_data::levels::DrlgType;
+use d2_data::GameData;
 
 use crate::act::Act;
+use crate::outdoor::Act1Outdoors;
 use crate::preset::{PresetLevel, ROOM_TILES, SUBTILES};
 use crate::Coords;
-
-/// Wilderness levels whose recorded layouts have voids inside, not only on their edge: Black
-/// Marsh (a blank cell by the Forgotten Tower) and Tamoe Highland. Left out of the world until
-/// the outdoor generator can say where the voids are.
-pub const LEVELS_WITH_INTERIOR_VOIDS: [i32; 2] = [6, 7];
 
 /// A room: its level and its index in that level's rooms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -62,6 +54,8 @@ pub struct WorldLevel {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct World {
     levels: Vec<WorldLevel>,
+    /// Levels that would be walkable but could not be generated, with why.
+    unbuilt: Vec<(i32, String)>,
 }
 
 /// A level's rooms from its rectangle and generator.
@@ -124,11 +118,13 @@ pub fn reorder_near<T>(list: &mut [T], coords: impl Fn(&T) -> Coords) {
 
 impl World {
     /// The walkable levels of `act`: every level its placement walk laid out and every
-    /// preset or wilderness level depending on one, with the town's rooms taken from `town`.
-    /// Maze levels (reached through warps) and levels overlapping one already taken are left
-    /// out.
+    /// preset or wilderness level depending on one, with the town's rooms taken from `town` and
+    /// the wilderness generated for the act's seed. Maze levels (reached through warps), levels
+    /// overlapping one already taken and levels that cannot be generated (see
+    /// [`World::unbuilt`]) are left out.
     #[must_use]
-    pub fn build(levels: &Levels, act: &Act, town: Option<&PresetLevel>) -> Self {
+    pub fn build(data: &GameData, engine: &EngineData, act: &Act, town: Option<&PresetLevel>) -> Self {
+        let levels = data.levels();
         let placed = act.placed_levels();
         let mut ids = placed.clone();
         for depends_on in &placed {
@@ -138,36 +134,50 @@ impl World {
             ids.append(&mut extra);
         }
         let mut world = Self::default();
-        let town_area = town.map(|t| t.area);
+        let outdoors = if act.act == 0 { Some(Act1Outdoors::new(data, &engine.outdoor, act, act.game_seed)) } else { None };
         for id in ids {
             let Some(def) = levels.get(id) else { continue };
-            if !matches!(def.drlg_type, DrlgType::Preset | DrlgType::Wilderness) || LEVELS_WITH_INTERIOR_VOIDS.contains(&id) {
+            if !matches!(def.drlg_type, DrlgType::Preset | DrlgType::Wilderness) {
                 continue;
             }
             let Some(area) = act.coords(levels, id) else { continue };
             if area.w <= 0 || area.h <= 0 || world.levels.iter().any(|l| overlaps(l.area, area)) {
                 continue;
             }
-            let rooms = match town {
-                Some(t) if t.level_id == id => t.rooms.clone(),
+            let rooms = match (town, def.drlg_type, &outdoors) {
+                (Some(t), _, _) if t.level_id == id => t.rooms.clone(),
+                (_, DrlgType::Wilderness, Some(Ok(outdoors))) => match outdoors.generate(id) {
+                    Ok(level) => level.rooms,
+                    Err(e) => {
+                        world.unbuilt.push((id, e.to_string()));
+                        continue;
+                    }
+                },
+                (_, DrlgType::Wilderness, Some(Err(e))) => {
+                    world.unbuilt.push((id, e.to_string()));
+                    continue;
+                }
+                (_, DrlgType::Wilderness, None) => {
+                    world.unbuilt.push((id, format!("act {} wilderness is not ported", act.act + 1)));
+                    continue;
+                }
                 _ => grid_rooms(area, def.drlg_type),
-            };
-            let rooms = match def.drlg_type {
-                DrlgType::Wilderness => rooms
-                    .into_iter()
-                    .filter(|&r| !on_edge(area, r) || town_area.is_some_and(|t| near(t, r)))
-                    .collect(),
-                _ => rooms,
             };
             world.levels.push(WorldLevel { id, area, rooms });
         }
         world
     }
 
+    /// Levels [`World::build`] left out because they could not be generated, with the reason.
+    #[must_use]
+    pub fn unbuilt(&self) -> &[(i32, String)] {
+        &self.unbuilt
+    }
+
     /// A world from levels already cut into rooms (tests, or a caller with its own generator).
     #[must_use]
     pub fn from_levels(levels: Vec<WorldLevel>) -> Self {
-        Self { levels }
+        Self { levels, unbuilt: Vec::new() }
     }
 
     /// The levels.
@@ -231,11 +241,6 @@ impl World {
     }
 }
 
-/// Whether a room lies on its level's outer ring of cells.
-fn on_edge(area: Coords, r: Coords) -> bool {
-    r.x == area.x || r.y == area.y || r.x + 2 * ROOM_TILES > area.x + area.w || r.y + 2 * ROOM_TILES > area.y + area.h
-}
-
 fn overlaps(a: Coords, b: Coords) -> bool {
     a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
 }
@@ -255,9 +260,8 @@ mod tests {
     }
 
     /// With the operator's install (`BNETCC_D2_DATA_DIR`, `BNETCC_D2_GAME_EXE`): for a few seeds,
-    /// Act I's walkable levels are the camp, the wilderness trunks up to Dark Wood and the
-    /// Monastery pieces,
-    /// and the camp's rooms reach into Blood Moor.
+    /// Act I's walkable levels are the camp, the wilderness from Blood Moor to Tamoe Highland and
+    /// the Monastery pieces, and the camp's rooms reach into Blood Moor.
     #[test]
     fn with_a_real_install_the_camp_borders_blood_moor() {
         let (Ok(dir), Ok(exe)) = (std::env::var("BNETCC_D2_DATA_DIR"), std::env::var("BNETCC_D2_GAME_EXE")) else {
@@ -268,9 +272,10 @@ mod tests {
         for seed in [1u32, 2, 0x1234_5678, 0xBEEF_F00D] {
             let act = Act::build(data.levels(), 0, 0, seed);
             let town = PresetLevel::build(&data, &engine, &act, 1).unwrap();
-            let world = World::build(data.levels(), &act, Some(&town));
+            let world = World::build(&data, &engine, &act, Some(&town));
+            assert!(world.unbuilt().is_empty(), "seed {seed:#x}: {:?}", world.unbuilt());
             let ids: Vec<i32> = world.levels().iter().map(|l| l.id).collect();
-            for id in [1, 2, 3, 4, 5, 17, 26] {
+            for id in [1, 2, 3, 4, 5, 6, 7, 17, 26] {
                 assert!(ids.contains(&id), "seed {seed:#x}: level {id} missing from {ids:?}");
             }
             let camp = &world.levels()[ids.iter().position(|&i| i == 1).unwrap()];
@@ -303,7 +308,7 @@ mod tests {
             let text = std::fs::read_to_string(golden.join(file)).unwrap();
             let act = Act::build(data.levels(), 0, 0, seed);
             let town = PresetLevel::build(&data, &engine, &act, 1).unwrap();
-            let world = World::build(data.levels(), &act, Some(&town));
+            let world = World::build(&data, &engine, &act, Some(&town));
             for line in text.lines() {
                 let Some((level, _)) = number(line, "\"levelId\":", 0) else { continue };
                 let Some(ours) = world.levels().iter().find(|l| l.id == level) else { continue };

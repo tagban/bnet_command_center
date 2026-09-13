@@ -214,7 +214,10 @@ impl GameServer {
         let build = |seed: u32| {
             let act = Act::build(data.levels(), 0, difficulty, seed);
             PresetLevel::build(data, engine, &act, i32::from(TOWN_AREA)).map(|town| {
-                let world = World::build(data.levels(), &act, Some(&town));
+                let world = World::build(data, engine, &act, Some(&town));
+                for (level, why) in world.unbuilt() {
+                    warn!(map_seed = %format!("{seed:#010x}"), level, error = %why, "level not generated; players will not see it");
+                }
                 (town, world)
             })
         };

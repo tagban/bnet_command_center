@@ -555,9 +555,13 @@ pub struct Act {
     pub act: u8,
     /// Difficulty the sizes were taken for (0 Normal, 1 Nightmare, 2 Hell).
     pub difficulty: u8,
+    /// The game seed the act was laid out for.
+    pub game_seed: u32,
     placed: HashMap<i32, Coords>,
     /// `aCurrentDir` of each placed level, for the file picks that read it.
     directions: HashMap<i32, i32>,
+    /// `aCurrentDir` of each placed level and of the node after it in its list.
+    direction_pairs: HashMap<i32, (i32, i32)>,
 }
 
 impl Act {
@@ -575,15 +579,17 @@ impl Act {
         let d = usize::from(difficulty.min(2));
         let mut placed = HashMap::new();
         let mut directions = HashMap::new();
+        let mut direction_pairs = HashMap::new();
         // Each list copies the act seed afresh; none writes it back.
         for &(nodes, gate) in lists {
             let p = run_placement(levels, d, nodes, seed, gate);
             for (i, n) in nodes.iter().enumerate() {
                 placed.insert(n.level, p.coords[i]);
                 directions.insert(n.level, p.cur_dir[i]);
+                direction_pairs.insert(n.level, (p.cur_dir[i], p.cur_dir[i + 1]));
             }
         }
-        Self { act, difficulty, placed, directions }
+        Self { act, difficulty, game_seed, placed, directions, direction_pairs }
     }
 
     /// A level's rectangle in tiles: its placement, or its Depend chain.
@@ -605,6 +611,31 @@ impl Act {
         let mut ids: Vec<i32> = self.placed.keys().copied().collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// A placed level's direction against its predecessor and the direction of the node after it
+    /// in its list (-1 past the end), as the list's second-pass callback reads them
+    /// (`ACT1_fpLevelDataFn2_A`, `0x00677180`, for the wilderness road flags).
+    #[must_use]
+    pub fn direction_pair(&self, level: i32) -> Option<(i32, i32)> {
+        self.direction_pairs.get(&level).copied()
+    }
+
+    /// The previous and next levels a placement list chains to `level` with an open edge
+    /// (`DRLGLEVEL_ParseLevelData` wiring `DRLGACT_SetWarpConnection` with warp -1), in the order
+    /// the lists wire them.
+    #[must_use]
+    pub fn placement_links(&self) -> Vec<(i32, i32)> {
+        let lists: &[&[Node]] = match self.act {
+            0 => &[&ACT1_LIST1, &ACT1_LIST2],
+            1 => &[&ACT2_LIST1, &ACT2_LIST2],
+            3 => &[&ACT4_LIST1, &ACT4_LIST2],
+            _ => &[],
+        };
+        lists
+            .iter()
+            .flat_map(|nodes| nodes.iter().filter(|n| n.prev >= 0).map(|n| (n.level, nodes[n.prev as usize].level)))
+            .collect()
     }
 
     /// The Rogue Encampment's map variant: its own placement direction, 0..=3 for

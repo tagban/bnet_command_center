@@ -16,11 +16,13 @@ use d2_formats::mpq::{self, ArchiveSet, DATA_ARCHIVES};
 
 pub mod engine;
 pub mod levels;
+pub mod lvlsub;
 pub mod monsters;
 pub mod presets;
 pub mod stat;
 
 use levels::Levels;
+use lvlsub::LvlSubs;
 use monsters::Monsters;
 use presets::{LvlPrests, MonPresets, Objects};
 
@@ -87,6 +89,7 @@ pub struct GameData {
     experience: Vec<[u32; 7]>,
     levels: Levels,
     lvl_prests: LvlPrests,
+    lvl_subs: LvlSubs,
     mon_presets: MonPresets,
     monsters: Monsters,
     objects: Objects,
@@ -111,6 +114,7 @@ impl GameData {
         let mut data = Self::from_tables(&read("charstats.txt")?, &read("experience.txt")?)?;
         data.levels = Levels::from_table(&read("levels.txt")?)?;
         data.lvl_prests = LvlPrests::from_table(&read("lvlprest.txt")?)?;
+        data.lvl_subs = LvlSubs::from_table(&read("lvlsub.txt")?)?;
         let monstats = read("monstats.txt")?;
         data.mon_presets =
             MonPresets::from_tables(&read("monpreset.txt")?, &monstats, &read("superuniques.txt")?, &read("monplace.txt")?)?;
@@ -137,6 +141,12 @@ impl GameData {
     #[must_use]
     pub fn lvl_prests(&self) -> &LvlPrests {
         &self.lvl_prests
+    }
+
+    /// `LvlSub.txt`.
+    #[must_use]
+    pub fn lvl_subs(&self) -> &LvlSubs {
+        &self.lvl_subs
     }
 
     /// `MonPreset.txt`, resolved.
@@ -217,6 +227,7 @@ impl GameData {
             experience: levels,
             levels: Levels::default(),
             lvl_prests: LvlPrests::default(),
+            lvl_subs: LvlSubs::default(),
             mon_presets: MonPresets::default(),
             monsters: Monsters::default(),
             objects: Objects::default(),
@@ -348,5 +359,12 @@ mod tests {
         assert!(data.monsters().get(148).unwrap().interact, "Akara talks");
         assert!(!data.monsters().get(152).unwrap().interact, "town rogues do not");
         assert!(data.read_file("data\\global\\tiles\\Act1\\Town\\TownN1.ds1").unwrap().is_some());
+        let moor = data.levels().get(2).unwrap();
+        assert_eq!((moor.vis[3], moor.warp[3], moor.warp[0]), (8, 0, -1), "the Den of Evil through warp 0; no open edges listed");
+        let border = data.lvl_prests().by_def(4).expect("Wild Border 1");
+        assert_eq!((border.size, border.file_count), ((8, 8), 3));
+        let cliffs = data.lvl_subs().group(0);
+        assert_eq!((cliffs.len(), cliffs[0].bord_type, cliffs[0].grid_size), (1, 1, 1));
+        assert!(data.lvl_subs().group(4).len() == 2, "two waypoint pieces");
     }
 }

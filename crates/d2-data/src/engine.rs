@@ -25,6 +25,22 @@ mod address {
     pub const CLOCK_SPEEDS: u32 = 0x0074_43E4;
     /// The six day periods, `{angle, light phase, colour}` (`0x0061BEE0`, `0x0061C240`).
     pub const DAY_PERIODS: u32 = 0x0074_43F0;
+    /// `gaOutdoorsLinkOffsets`: per level edge, the tile offset from a border cell into the
+    /// neighbouring level (`GetOutLinkVisFlag`, `0x00675770` area).
+    pub const OUTDOOR_LINK_OFFSETS: u32 = 0x006F_05D8;
+    /// Border and corner preset ids by road type, one row per direction pair
+    /// (`DRLGOUTPLACE_GetRoadPresetId` / `GetAdjacentRoadPresetId`); rows from 0.
+    pub const OUTDOOR_ROAD_PRESETS: u32 = 0x006F_0620;
+    /// Direction index by `dx + dy * 3`, from -4.
+    pub const OUTDOOR_ROAD_DIRECTIONS: u32 = 0x006F_0FC0;
+    /// Corner row by a pair of edge directions, from -40 (`PlaceAct1245OutdoorBorders`, `0x00675850`).
+    pub const OUTDOOR_CORNERS: u32 = 0x006F_0FE8;
+    /// Act I wilderness road flags: 15 rules of `{level, not level, not level, direction,
+    /// next direction, flag}` (`0x00677180`).
+    pub const OUTDOOR_ROAD_FLAGS: u32 = 0x006F_1258;
+    /// Left/right variants of the vertical border pieces by preset id
+    /// (`DRLGOUTROOM_SpawnVerticalBorderPresets`, `0x0067FE90`).
+    pub const OUTDOOR_VERTICAL_BORDERS: u32 = 0x006F_2680;
     /// `VS_FIXEDFILEINFO` 1.14.3.71.
     pub const FILE_VERSION: (u32, u32) = (0x0001_000E, 0x0003_0047);
 }
@@ -45,6 +61,27 @@ pub struct EngineData {
     /// The day's six periods: the clock angle each starts at and its light phase (0 day, 1 dusk,
     /// 2 night, 3 dawn).
     pub day_periods: [DayPeriod; 6],
+    /// What the wilderness generator looks up.
+    pub outdoor: OutdoorTables,
+}
+
+/// The outdoor (wilderness) generator's lookup tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutdoorTables {
+    /// Per level edge (0..=3), `(x, y)` tile offsets from a border cell's corner into the
+    /// neighbouring level.
+    pub link_offsets: [(i32, i32); 4],
+    /// Preset ids, 13 rows of 4 road types: row `direction + 1` for an edge's border pieces, the
+    /// corner row for a corner.
+    pub road_presets: [[i32; 4]; 13],
+    /// Direction index (0..=3, -1 none) by `dx + dy * 3 + 4`.
+    pub road_directions: [i32; 9],
+    /// Corner row (-1 none) by the pair index `+ 40`.
+    pub corners: [i32; 81],
+    /// Act I road flag rules: `[level, not level, not level, direction, next direction, flag]`.
+    pub road_flags: [[i32; 6]; 15],
+    /// Vertical border piece variants by preset id: `[left, right]`.
+    pub vertical_borders: [[i32; 2]; 16],
 }
 
 /// One period of an act's day.
@@ -94,6 +131,7 @@ impl EngineData {
         let mut periods = [0i32; 18];
         image.i32s(address::DAY_PERIODS, &mut periods).ok_or_else(|| out_of_range("day periods"))?;
         let day_periods: [DayPeriod; 6] = std::array::from_fn(|i| DayPeriod { angle: periods[i * 3], phase: periods[i * 3 + 1] });
+        let outdoor = OutdoorTables::read(&image).ok_or_else(|| out_of_range("outdoor tables"))?;
 
         // GAMELOGON 37, ENTERGAME 1, ping 13; GameFlags 8, LoadAct 12, AssignPlayer 26.
         let sizes_ok = client_packet_sizes[0x68] == 37
@@ -107,10 +145,15 @@ impl EngineData {
         // Angles within a circle, phases 0..=3, a positive speed.
         let clock_ok = clock_speeds[0] > 0
             && day_periods.iter().all(|p| (0..360).contains(&p.angle) && (0..=3).contains(&p.phase));
-        if !sizes_ok || !presets_ok || !clock_ok {
+        // Border pieces 4..=15 on an edge facing the first direction; the corner rows are 1..=12.
+        let outdoor_ok = outdoor.road_presets[1] == [0, 4, 0x16C, 0x31F]
+            && outdoor.road_directions.iter().all(|d| (-1..=3).contains(d))
+            && outdoor.corners.iter().all(|c| (-1..=12).contains(c))
+            && outdoor.road_flags.iter().all(|r| r[5] > 0 && r[5] & (r[5] - 1) == 0);
+        if !sizes_ok || !presets_ok || !clock_ok || !outdoor_ok {
             return Err(bad("tables do not look like 1.14d's".into()));
         }
-        Ok(Self { huffman_code_lengths, client_packet_sizes, server_packet_sizes, preset_objects, clock_speeds, day_periods })
+        Ok(Self { huffman_code_lengths, client_packet_sizes, server_packet_sizes, preset_objects, clock_speeds, day_periods, outdoor })
     }
 
     /// The object class a DS1 preset object (unit type 2) becomes: ids below 150 go through the
@@ -129,6 +172,28 @@ impl EngineData {
     }
 }
 
+impl OutdoorTables {
+    fn read(image: &Image) -> Option<Self> {
+        fn ints<const N: usize>(image: &Image, at: u32) -> Option<[i32; N]> {
+            let mut out = [0i32; N];
+            image.i32s(at, &mut out)?;
+            Some(out)
+        }
+        let links: [i32; 8] = ints(image, address::OUTDOOR_LINK_OFFSETS)?;
+        let presets: [i32; 52] = ints(image, address::OUTDOOR_ROAD_PRESETS)?;
+        let flags: [i32; 90] = ints(image, address::OUTDOOR_ROAD_FLAGS)?;
+        let vertical: [i32; 32] = ints(image, address::OUTDOOR_VERTICAL_BORDERS)?;
+        Some(Self {
+            link_offsets: std::array::from_fn(|i| (links[i * 2], links[i * 2 + 1])),
+            road_presets: std::array::from_fn(|r| std::array::from_fn(|c| presets[r * 4 + c])),
+            road_directions: ints(image, address::OUTDOOR_ROAD_DIRECTIONS)?,
+            corners: ints(image, address::OUTDOOR_CORNERS)?,
+            road_flags: std::array::from_fn(|r| std::array::from_fn(|c| flags[r * 6 + c])),
+            vertical_borders: std::array::from_fn(|i| [vertical[i * 2], vertical[i * 2 + 1]]),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +209,8 @@ mod tests {
         let engine = EngineData::from_game_exe(&std::fs::read(path).unwrap()).expect("1.14d tables");
         assert_eq!(engine.huffman_code_lengths[0], 1, "byte 0 costs one bit");
         assert_eq!(engine.day_periods[2], DayPeriod { angle: 0, phase: 0 }, "a new act's period: day, at angle 0");
+        assert_eq!(engine.outdoor.road_flags[0], [0, 2, 3, 1, 0, 4], "a river flag, not for Blood Moor or Cold Plains");
+        assert_eq!(engine.outdoor.corners[40], -1, "no corner without a turn");
         if let Ok(libd2) = std::env::var("LIBD2_DIR") {
             let bin = std::fs::read(std::path::Path::new(&libd2).join("packages/drlg/src/excel/PresetObjectTable.bin")).unwrap();
             let theirs: Vec<i32> = bin.chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
