@@ -30,8 +30,11 @@ just the decompiler) or reproduced byte-exact; "likely" is flagged as such.
 | Wire Huffman code lengths | `0x7076C0` | 256 | identical, a complete prefix code |
 | Huffman bit masks | `0x7077C0` | 16 | identical |
 
-The server's own C→S framer `0x52BC20` has the same variable-length cases libd2 models (0x14/0x15
-chat, 0x66, 0x6C, and 0xFF = 16 bytes). The server command table is `0x6E0D18` (8-byte
+The server's own C→S framer `0x52BC20` has the same variable-length opcodes libd2 models (0x14/0x15
+chat, 0x66, 0x6C, and 0xFF = 16 bytes), but two of libd2's `cs.sizeOf` rules differ from its
+disassembly: chat is `[op][u16][cstr][cstr][i8 n][n bytes]` (libd2: a 4-byte header and no
+trailing count), and `0x6C` is `7 + u8@1`, read once 6 bytes are present (libd2: `u16@1`).
+`bnetcc-proto::d2gs::client_packet_len` follows the engine. The server command table is `0x6E0D18` (8-byte
 `{handler, flag}`, opcodes 0x00–0x66); 0x67–0x70 are connection packets handled separately (§4).
 The framer `0x52B100` classifies opcodes into three kinds: <0x67 (game commands), 0x67–0x70
 (connection packets), and 0xFF.
@@ -154,6 +157,19 @@ Packet layouts confirmed at the builder:
    the room-activation path (`0x59` for the player itself).
 3. Reject logons whose version field is not `0x0E`, as the engine does, with `0xB4`.
 4. libd2's `gameserver.zig` skips `0x53` and uses raw mode; treat it as a reference, not the spec.
+
+The handshake test (`crates/bnetccd/src/d2gs.rs`, `diablo2.game_server_probe`) implements the
+join table above. Where it had to choose without a confirmed answer, the choice is marked here
+so a client test can overturn it:
+
+- `0x03`'s last field is sent as `0` (the client stores it beside the seed; meaning unread).
+- `0x53` is `(period 2, ticks 0, no eclipse)` — period 2 starts at angle 0 in the engine's
+  period table `0x7443F0`; the client aborts on a period above 5.
+- `0x59` for the player itself is sent just before `0x15`. In the engine it comes from
+  `SendUnitToClient`, and its order relative to `0x15` is not yet read.
+- Map seed `0x12345678` with the spawn beside the Rogue Encampment campfire, from libd2's
+  object dump for that seed; walkability of that exact subtile is not checked.
+- `0x5B` rosters and the post-`04` room stream are not sent.
 
 ## 6. Server packet builders (opcode → function)
 

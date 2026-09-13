@@ -410,6 +410,9 @@ pub struct D2Realm {
     pub address: Option<String>,
     /// Characters per account.
     pub max_characters: usize,
+    /// The game-server handshake test, when `diablo2.game_server_probe` is on and it
+    /// started; `None` answers game creation with "Server Down".
+    pub game_server: Option<Arc<crate::d2gs::GameServer>>,
 }
 
 /// What `SID_LOGONREALMEX` hands a client to present on its realm connection.
@@ -1344,6 +1347,7 @@ pub(crate) fn test_node_with(tweak: impl FnOnce(&mut NodeConfig)) -> Node {
             description: "Test realm".into(),
             address: None,
             max_characters: 4,
+            game_server: None,
         }),
         gateway_allowlist: Vec::new(),
         version_policy: crate::config::VersionPolicy::default(),

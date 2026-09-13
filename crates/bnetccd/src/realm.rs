@@ -16,6 +16,8 @@
 //! **Games are not here yet.** Creating or joining one needs a Diablo II game server, which
 //! this does not include; the lobby answers "server down" / "game does not exist", which the
 //! client shows as ordinary messages. Characters, selection and chat all work without it.
+//! With `diablo2.game_server_probe` on, games can be created and joined against the
+//! handshake test in [`crate::d2gs`] — the client reaches the loading screen and no further.
 //!
 //! Wire layouts are from BNETDocs, cross-checked against the MIT-licensed
 //! `jaenster/d2-dedicated-server` realm (a retail 1.14d client renders its replies) — see
@@ -37,6 +39,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
+use crate::d2gs::{CreateError, JoinError};
 use crate::node::{D2Realm, Node, RealmTicket};
 use crate::session::SessionLimits;
 use crate::storage::CreateCharacterError;
@@ -53,6 +56,41 @@ const UPGRADE_FAILED: u32 = 0x7A;
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// The IPv4 address to send a client to, for the realm or a game. A client on this network
+/// gets the address it reached us on — always reachable from where it is. Anyone else gets
+/// the configured `diablo2.address` (resolved now, so a dynamic-DNS name stays current), or
+/// that same local address if none is configured.
+pub async fn client_facing_ipv4(
+    peer: SocketAddr,
+    local: Option<SocketAddr>,
+    realm: &D2Realm,
+) -> Option<std::net::Ipv4Addr> {
+    use std::net::IpAddr;
+    fn v4(ip: IpAddr) -> Option<std::net::Ipv4Addr> {
+        match ip {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+        }
+    }
+    let local = local.and_then(|a| v4(a.ip()));
+    let peer_is_local =
+        v4(peer.ip()).is_some_and(|ip| ip.is_private() || ip.is_loopback() || ip.is_link_local());
+    if peer_is_local || realm.address.is_none() {
+        return local;
+    }
+    let configured = realm.address.as_deref().unwrap_or_default();
+    if let Ok(ip) = configured.parse::<std::net::Ipv4Addr>() {
+        return Some(ip);
+    }
+    match tokio::net::lookup_host((configured, 0)).await {
+        Ok(addrs) => addrs.filter_map(|a| v4(a.ip())).next().or(local),
+        Err(e) => {
+            warn!(host = configured, error = %e, "could not resolve diablo2.address; using the local address");
+            local
+        }
+    }
 }
 
 /// Whether the byte after the protocol selector begins an MCP frame rather than a BNCS one.
@@ -76,7 +114,8 @@ pub async fn mcp_session(
     let Some(realm) = node.d2_realm.clone() else {
         return Ok(());
     };
-    let mut s = Mcp { node, peer, realm, ticket: None, selected: None };
+    let local = stream.local_addr().ok();
+    let mut s = Mcp { node, peer, local, realm, ticket: None, selected: None };
     let mut buf = RecvBuf::with_capacity(1024);
     let mut chunk = [0u8; 2048];
     loop {
@@ -135,6 +174,8 @@ pub async fn mcp_session(
 struct Mcp {
     node: Arc<Node>,
     peer: SocketAddr,
+    /// The address this realm connection arrived on.
+    local: Option<SocketAddr>,
     realm: D2Realm,
     ticket: Option<RealmTicket>,
     /// The character chosen with `MCP_CHARLOGON`.
@@ -175,7 +216,7 @@ impl Mcp {
                 Some(Frame::new(msg::GAMEINFO, w.finish()))
             }
             msg::CREATEGAME => Some(self.create_game(frame)),
-            msg::JOINGAME => Some(self.join_game(frame)),
+            msg::JOINGAME => Some(self.join_game(frame).await),
             // An empty ladder: the all-zero form the client clears its list with.
             msg::REQUESTLADDERDATA => Some(Frame::new(msg::REQUESTLADDERDATA, vec![0; 14])),
             // Neither has a reply: the client gave up on a create, or asked a character's rank
@@ -410,19 +451,29 @@ impl Mcp {
     }
 
     /// `MCP_CREATEGAME`: `u16 request id, u32 flags, u8, u8, u8, cstr name, cstr password,
-    /// cstr description`. Reply: `u16 request id, u16 token, u16 unknown, u32 result`.
+    /// cstr description`, difficulty in `(flags >> 12) & 3`. Reply: `u16 request id, u16 token,
+    /// u16 unknown, u32 result`.
     fn create_game(&self, frame: &Frame) -> Frame {
         let mut r = frame.reader();
         let request_id = r.u16().unwrap_or(0);
-        let name = (|| {
-            r.u32()?;
+        let (flags, name) = (|| {
+            let flags = r.u32()?;
             r.bytes(3)?;
-            r.cstr(STR_MAX)
+            Ok::<_, bnetcc_proto::ProtoError>((flags, r.cstr(STR_MAX)?))
         })()
-        .map(|n| String::from_utf8_lossy(n).into_owned())
-        .unwrap_or_default();
-        let result = if name.is_empty() || name.len() > 15 {
-            create_game_result::INVALID_NAME
+        .map_or((0, String::new()), |(f, n)| (f, String::from_utf8_lossy(n).into_owned()));
+        let password = String::from_utf8_lossy(r.cstr(STR_MAX).unwrap_or_default()).into_owned();
+        let (token, result) = if name.is_empty() || name.len() > 15 {
+            (0, create_game_result::INVALID_NAME)
+        } else if let Some(game_server) = &self.realm.game_server {
+            match game_server.create(&name, &password, ((flags >> 12) & 3) as u8) {
+                Ok(id) => {
+                    info!(peer = %self.peer, character = ?self.selected, game = %name, "game created");
+                    (id, create_game_result::OK)
+                }
+                Err(CreateError::NameTaken) => (0, create_game_result::NAME_TAKEN),
+                Err(CreateError::Full) => (0, create_game_result::SERVERS_DOWN),
+            }
         } else {
             info!(
                 peer = %self.peer,
@@ -430,20 +481,50 @@ impl Mcp {
                 game = %name,
                 "game creation requested; no Diablo II game server is configured"
             );
-            create_game_result::SERVERS_DOWN
+            (0, create_game_result::SERVERS_DOWN)
         };
         let mut w = Writer::with_capacity(10);
-        w.u16(request_id).u16(0).u16(0).u32(result);
+        w.u16(request_id).u16(token).u16(0).u32(result);
         Frame::new(msg::CREATEGAME, w.finish())
     }
 
     /// `MCP_JOINGAME`: `u16 request id, cstr name, cstr password`. Reply: `u16 request id,
     /// u16 token, u16 unknown, u32 game server IP, u32 game hash, u32 result`. Every field is
-    /// present even on failure — the client reads them all, and only then the result.
-    fn join_game(&self, frame: &Frame) -> Frame {
-        let request_id = frame.reader().u16().unwrap_or(0);
+    /// present even on failure — the client reads them all, and only then the result. The
+    /// token is the game's id on the game server and the IP is in network order: the client
+    /// dials that address on port 4000 and presents the token and hash in `GAMELOGON`.
+    async fn join_game(&self, frame: &Frame) -> Frame {
+        let mut r = frame.reader();
+        let request_id = r.u16().unwrap_or(0);
+        let name = String::from_utf8_lossy(r.cstr(STR_MAX).unwrap_or_default()).into_owned();
+        let password = String::from_utf8_lossy(r.cstr(STR_MAX).unwrap_or_default()).into_owned();
+
+        let ip = client_facing_ipv4(self.peer, self.local, &self.realm).await;
+        let character = match &self.selected {
+            Some(selected) => self.own_character(selected).await,
+            None => None,
+        };
+        let staged = match (&self.realm.game_server, character, ip) {
+            (Some(game_server), Some(character), Some(ip)) => game_server
+                .stage_join(&name, &password, character)
+                .map(|(id, hash)| (id, hash, ip))
+                .map_err(|e| match e {
+                    JoinError::NoSuchGame => join_result::NO_SUCH_GAME,
+                    JoinError::BadPassword => join_result::BAD_PASSWORD,
+                    JoinError::Full => join_result::FULL,
+                }),
+            _ => Err(join_result::NO_SUCH_GAME),
+        };
         let mut w = Writer::with_capacity(18);
-        w.u16(request_id).u16(0).u16(0).u32(0).u32(0).u32(join_result::NO_SUCH_GAME);
+        match staged {
+            Ok((id, hash, ip)) => {
+                info!(peer = %self.peer, character = ?self.selected, game = %name, id, %ip, "sending client to the game server");
+                w.u16(request_id).u16(id).u16(0).bytes(&ip.octets()).u32(hash).u32(join_result::OK);
+            }
+            Err(result) => {
+                w.u16(request_id).u16(0).u16(0).u32(0).u32(0).u32(result);
+            }
+        }
         Frame::new(msg::JOINGAME, w.finish())
     }
 }

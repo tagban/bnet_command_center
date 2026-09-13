@@ -1825,35 +1825,10 @@ impl Bncs {
         self.send(&Frame::new(sid::LOGONREALMEX, w.finish()))
     }
 
-    /// The IPv4 address to send a client to for the realm. A client on this network gets the
-    /// address it reached us on — always reachable from where it is. Anyone else gets the
-    /// configured `diablo2.address` (resolved now, so a dynamic-DNS name stays current), or
-    /// that same local address if none is configured.
+    /// The IPv4 address to send a client to for the realm — see
+    /// [`crate::realm::client_facing_ipv4`].
     async fn realm_address(&self, realm: &crate::node::D2Realm) -> Option<std::net::Ipv4Addr> {
-        use std::net::IpAddr;
-        fn v4(ip: IpAddr) -> Option<std::net::Ipv4Addr> {
-            match ip {
-                IpAddr::V4(v4) => Some(v4),
-                IpAddr::V6(v6) => v6.to_ipv4_mapped(),
-            }
-        }
-        let local = self.local.and_then(|a| v4(a.ip()));
-        let peer_is_local = v4(self.peer.ip())
-            .is_some_and(|ip| ip.is_private() || ip.is_loopback() || ip.is_link_local());
-        if peer_is_local || realm.address.is_none() {
-            return local;
-        }
-        let configured = realm.address.as_deref().unwrap_or_default();
-        if let Ok(ip) = configured.parse::<std::net::Ipv4Addr>() {
-            return Some(ip);
-        }
-        match tokio::net::lookup_host((configured, 0)).await {
-            Ok(addrs) => addrs.filter_map(|a| v4(a.ip())).next().or(local),
-            Err(e) => {
-                warn!(host = configured, error = %e, "could not resolve diablo2.address; using the local address");
-                local
-            }
-        }
+        crate::realm::client_facing_ipv4(self.peer, self.local, realm).await
     }
 
     /// A Diablo II client entering chat as a closed-realm character names it in its
@@ -3238,7 +3213,11 @@ mod tests {
 
     /// Spawn a server on an ephemeral port and return its address.
     async fn spawn_server() -> std::net::SocketAddr {
-        let node = Arc::new(crate::node::test_node());
+        spawn_node(Arc::new(crate::node::test_node())).await
+    }
+
+    /// Serve `node` on an ephemeral port and return its address.
+    async fn spawn_node(node: Arc<Node>) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let limits = SessionLimits::default();
@@ -3975,6 +3954,67 @@ mod tests {
         assert!(stat.starts_with(b"PX2Dbncc,Tyrael,"), "statstring: {stat:02X?}");
         assert_eq!(stat.len(), b"PX2Dbncc,Tyrael,".len() + bnetcc_proto::d2::PORTRAIT_LEN);
         assert_eq!(er.cstr(64).unwrap(), b"Tyrael*Tagban");
+    }
+
+    #[tokio::test]
+    async fn with_the_game_server_test_on_a_realm_client_creates_a_game_and_logs_on_to_it() {
+        use crate::d2gs::tests::{logon_packet, read_frame, spawn, test_tables};
+        use bnetcc_proto::mcp::{create_game_result, join_result, msg};
+
+        let game_server = Arc::new(crate::d2gs::GameServer::new(test_tables()));
+        let game_addr = spawn(Arc::clone(&game_server)).await;
+        let node = crate::node::test_node_with(|c| {
+            if let Some(realm) = c.d2_realm.as_mut() {
+                realm.game_server = Some(Arc::clone(&game_server));
+            }
+        });
+        let addr = spawn_node(Arc::new(node)).await;
+        let mut bncs = d2_login(addr, product::D2XP, "Runner", 9201).await;
+        let mut mcp = enter_realm(&mut bncs, "Runner").await;
+        assert_eq!(create_char(&mut mcp, 4, 0x20, "Wirt").await, 0x00);
+        assert_eq!(char_logon(&mut mcp, "Wirt").await, 0x00);
+
+        let create = |id: u16, name: &[u8]| {
+            let mut w = Writer::new();
+            w.u16(id).u32(0x1000).u8(1).u8(0xFF).u8(8).cstr(name).cstr(b"moo").cstr(b"");
+            w.finish()
+        };
+        mcp_send(&mut mcp, msg::CREATEGAME, create(3, b"cows")).await;
+        let created = mcp_recv(&mut mcp).await.body;
+        let token = u16::from_le_bytes([created[2], created[3]]);
+        assert_eq!(u32::from_le_bytes(created[6..10].try_into().unwrap()), create_game_result::OK);
+        assert_ne!(token, 0);
+        mcp_send(&mut mcp, msg::CREATEGAME, create(4, b"COWS")).await;
+        let taken = mcp_recv(&mut mcp).await.body;
+        assert_eq!(u32::from_le_bytes(taken[6..10].try_into().unwrap()), create_game_result::NAME_TAKEN);
+
+        let join = |password: &[u8]| {
+            let mut w = Writer::new();
+            w.u16(5).cstr(b"cows").cstr(password);
+            w.finish()
+        };
+        mcp_send(&mut mcp, msg::JOINGAME, join(b"oink")).await;
+        let refused = mcp_recv(&mut mcp).await;
+        assert_eq!(refused.body.len(), 18, "every field even on failure");
+        assert_eq!(u32::from_le_bytes(refused.body[14..18].try_into().unwrap()), join_result::BAD_PASSWORD);
+        mcp_send(&mut mcp, msg::JOINGAME, join(b"moo")).await;
+        let joined = mcp_recv(&mut mcp).await;
+        let mut jr = joined.reader();
+        assert_eq!(jr.u16().unwrap(), 5);
+        assert_eq!(jr.u16().unwrap(), token, "the join token is the created game's id");
+        jr.u16().unwrap();
+        assert_eq!(jr.array::<4>().unwrap(), [127, 0, 0, 1], "the game server's address, network order");
+        let hash = jr.u32().unwrap();
+        assert_eq!(jr.u32().unwrap(), join_result::OK);
+
+        // The client drops the realm and dials the game server with the token and hash.
+        let mut game = TcpStream::connect(game_addr).await.unwrap();
+        let mut greeting = [0u8; 2];
+        game.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [0xAF, 0x01]);
+        game.write_all(&logon_packet(token, hash, 4, 0x0E, "Wirt")).await.unwrap();
+        let flags = read_frame(&mut game, &test_tables().huffman).await;
+        assert_eq!(flags, vec![0x01, 1, 0x04, 0x10, 0x10, 0x00, 1, 0, 0x00], "nightmare, expansion");
     }
 
     #[tokio::test]

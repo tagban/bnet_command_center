@@ -90,6 +90,46 @@ address or hostname. A client on the LAN is always handed the LAN address it con
 client from outside is handed the configured address, or the LAN address if none is set —
 which it cannot reach.
 
+### Game-server handshake test (experimental, off by default)
+
+This checks the riskiest part of the future game server — Blizzard's compression and join
+sequence (`docs/D2GS-114D-WIRE.md`) — against a real client, with no world behind it.
+
+```toml
+[diablo2]
+data_dir = "/path/to/Diablo II"   # the folder holding a 1.14d Game.exe
+game_server_probe = true
+```
+
+Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is not (wrong
+`Game.exe`, port 4000 taken). Internet players also need TCP 4000 forwarded; LAN clients don't.
+
+1. Select a character and **Create Game** (Normal). *Expect:* the client leaves the lobby for
+   the loading screen. *Before:* "Server Down".
+2. *Expect it to stop there.* The server sends the join up to "load complete" and nothing
+   after — no town, no NPCs. Close the client (Task Manager if the loading screen will not
+   let go).
+3. Send the log from the moment you clicked Create Game.
+
+What it shows, in order:
+
+```
+game created game=… id=…                       realm accepted MCP_CREATEGAME
+sending client to the game server id=… ip=…    MCP_JOINGAME
+game connection; sending AF 01                 client reached port 4000
+D2GS packet in op=0x68 …  /  GAMELOGON …       the client's logon, every field
+D2GS packets out packets=01… 00                GameFlags + loading
+D2GS packets out packets=02                    load success
+D2GS packet in op=0x6b                         ENTERGAME: the client accepted our compression
+D2GS packets out packets=03… 53… 59… 15… 7e…   act, player, placement
+D2GS packets out packets=04                    load complete
+D2GS packet in op=…                            whatever the client asks for next
+```
+
+The last lines are the point: how far down this list the client gets, and what it sends after
+`04`. No `0x6b` means it did not accept the first frames; a disconnect right after a
+`packets out` line names the packet it rejected.
+
 ## 3. How it fits together
 
 ```

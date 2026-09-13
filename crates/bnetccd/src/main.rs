@@ -4,6 +4,7 @@
 
 mod admin;
 mod config;
+mod d2gs;
 mod discord;
 mod moderation;
 mod node;
@@ -189,6 +190,15 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
         )
     };
 
+    // The realm shares warnet mode's rule for the WarCraft III listeners: a chat-only server
+    // offers no game infrastructure at all.
+    let offer_d2_realm = cfg.diablo2.realm && policy.mode != bnetcc_core::policy::ServerMode::Warnet;
+    let d2_game_server = if offer_d2_realm && cfg.diablo2.game_server_probe {
+        d2gs::GameServer::start(&cfg.diablo2.data_dir, cfg.listen.bncs.ip()).await
+    } else {
+        None
+    };
+
     let node = Arc::new(Node::new(
         node::NodeConfig {
             policy: policy.clone(),
@@ -200,18 +210,16 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
                 let url = cfg.discord.games_webhook_url.trim();
                 (!url.is_empty()).then(|| url.to_string())
             },
-            // The realm shares warnet mode's rule for the WarCraft III listeners: a chat-only
-            // server offers no game infrastructure at all.
-            d2_realm: (cfg.diablo2.realm && policy.mode != bnetcc_core::policy::ServerMode::Warnet)
-                .then(|| node::D2Realm {
-                    name: cfg.server.realm.clone(),
-                    description: cfg.diablo2.description.clone(),
-                    address: {
-                        let a = cfg.diablo2.address.trim();
-                        (!a.is_empty()).then(|| a.to_string())
-                    },
-                    max_characters: cfg.diablo2.max_characters as usize,
-                }),
+            d2_realm: offer_d2_realm.then(|| node::D2Realm {
+                name: cfg.server.realm.clone(),
+                description: cfg.diablo2.description.clone(),
+                address: {
+                    let a = cfg.diablo2.address.trim();
+                    (!a.is_empty()).then(|| a.to_string())
+                },
+                max_characters: cfg.diablo2.max_characters as usize,
+                game_server: d2_game_server,
+            }),
             gateway_allowlist: cfg.limits.gateway_allowlist.clone(),
             version_policy,
             files_dir,

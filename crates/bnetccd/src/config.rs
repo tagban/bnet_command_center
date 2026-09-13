@@ -67,6 +67,13 @@ pub struct Diablo2Config {
     pub address: String,
     /// Characters per account, `1..=18`.
     pub max_characters: u32,
+    /// The operator's Diablo II 1.14d install folder. `Game.exe` is read from it at startup
+    /// for the engine's wire tables; nothing from it is copied into this server's files.
+    pub data_dir: String,
+    /// **Experimental test.** Let clients create and join games against the game-server
+    /// handshake test on port 4000 (`crate::d2gs`): a joining client gets Blizzard's join
+    /// sequence and stops at the loading screen — there is no world yet. Needs `data_dir`.
+    pub game_server_probe: bool,
 }
 
 impl Default for Diablo2Config {
@@ -76,6 +83,8 @@ impl Default for Diablo2Config {
             description: "Diablo II closed realm".into(),
             address: String::new(),
             max_characters: 18,
+            data_dir: String::new(),
+            game_server_probe: false,
         }
     }
 }
@@ -778,6 +787,9 @@ impl Config {
         }
         if !(1..=18).contains(&self.diablo2.max_characters) {
             return Err("diablo2.max_characters must be between 1 and 18".into());
+        }
+        if self.diablo2.game_server_probe && self.diablo2.data_dir.trim().is_empty() {
+            return Err("diablo2.game_server_probe needs diablo2.data_dir (the folder holding Game.exe)".into());
         }
         Ok(())
     }
