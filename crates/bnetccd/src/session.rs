@@ -1188,12 +1188,18 @@ impl Bncs {
             self.server_token
         };
 
-        let ok = match self.node.account(&name).await {
-            None => false,
+        let status = match self.node.account(&name).await {
+            None => {
+                info!(peer = %self.peer, account = %name, "logon refused: no such account");
+                logon_status::NO_SUCH_ACCOUNT
+            }
+            // An X-SHA-1 proof can only be checked against an X-SHA-1 credential. A WarCraft
+            // III (SRP) account is invisible to this flow — it lives in its own realm, so the
+            // name would not normally have matched.
+            Some(account) if !matches!(account.credential, Credential::Xsha1 { .. }) => {
+                logon_status::NO_SUCH_ACCOUNT
+            }
             Some(account) => {
-                // An X-SHA-1 proof can only be checked against an X-SHA-1 credential. A
-                // WarCraft III (SRP) account is invisible to this flow — and it lives in
-                // its own realm anyway, so the name would not have matched.
                 let proof_ok = match &account.credential {
                     Credential::Xsha1 { digest } => {
                         proofs_match(&proof, &logon_proof(client_token, server_token, digest))
@@ -1201,16 +1207,19 @@ impl Bncs {
                     Credential::Srp { .. } => false,
                 };
                 if !proof_ok {
-                    false
+                    // Said as such: a client told "no such account" for a mistyped password
+                    // offers to create the account it already has.
+                    info!(peer = %self.peer, account = %account.name, "logon refused: wrong password");
+                    logon_status::WRONG_PASSWORD
                 } else if self.node.bans.is_tag_banned(&account.name) {
                     // A staff `/tagban` refuses any account whose name matches the banned
                     // substring, even with the correct password. Reported as a plain logon
                     // failure — the protocol has no "you are banned" status here.
                     info!(peer = %self.peer, account = %account.name, "logon refused: name is tag-banned");
-                    false
+                    logon_status::NO_SUCH_ACCOUNT
                 } else {
                     self.finish_logon(account).await;
-                    true
+                    logon_status::SUCCESS
                 }
             }
         };
@@ -1218,13 +1227,9 @@ impl Bncs {
         let mut w = Writer::with_capacity(8);
         if reply_id == sid::LOGONRESPONSE {
             // Legacy: 1 = success, 0 = failure (no distinct no-account/wrong-password).
-            w.u32(u32::from(ok));
+            w.u32(u32::from(status == logon_status::SUCCESS));
         } else {
-            w.u32(if ok {
-                logon_status::SUCCESS
-            } else {
-                logon_status::NO_SUCH_ACCOUNT
-            });
+            w.u32(status);
         }
         self.send(&Frame::new(reply_id, w.finish()))
     }
@@ -4003,6 +4008,29 @@ mod tests {
         assert_eq!(mcp_recv(&mut mcp).await.reader().u32().unwrap(), 0x0A);
         let mut rest = Vec::new();
         assert_eq!(mcp.read_to_end(&mut rest).await.unwrap(), 0, "and the connection is closed");
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_is_reported_as_a_wrong_password() {
+        let addr = spawn_server().await;
+        drop(d2_login(addr, product::D2XP, "Mistyper", 9401).await); // registers the account
+
+        let attempt = |user: &'static str, password: &'static str, key: u32| async move {
+            let mut s = connect(addr).await;
+            send_frame(&mut s, &auth_info_frame_for(product::D2XP)).await;
+            let info = recv_frame(&mut s).await;
+            let server_token = { let mut r = info.reader(); r.u32().unwrap(); r.u32().unwrap() };
+            send_frame(&mut s, &auth_check_frame(6, key)).await;
+            recv_frame(&mut s).await;
+            let proof = bnetcc_crypto::logon_proof(5, server_token, &bnetcc_crypto::password_hash(password));
+            let mut lw = Writer::new();
+            lw.u32(5).u32(server_token).bytes(&proof).cstr(user.as_bytes());
+            send_frame(&mut s, &Frame::new(sid::LOGONRESPONSE2, lw.finish())).await;
+            recv_frame(&mut s).await.reader().u32().unwrap()
+        };
+        assert_eq!(attempt("Mistyper", "not-baal", 9402).await, logon_status::WRONG_PASSWORD);
+        assert_eq!(attempt("Nobodyhere", "baal", 9403).await, logon_status::NO_SUCH_ACCOUNT);
+        assert_eq!(attempt("mistyper", "BAAL", 9404).await, logon_status::SUCCESS, "names and passwords are case-insensitive");
     }
 
     #[tokio::test]
