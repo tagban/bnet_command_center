@@ -9,6 +9,7 @@ mod moderation;
 mod node;
 mod outbound;
 mod public_status;
+mod realm;
 mod session;
 mod stats_push;
 mod status;
@@ -199,6 +200,18 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
                 let url = cfg.discord.games_webhook_url.trim();
                 (!url.is_empty()).then(|| url.to_string())
             },
+            // The realm shares warnet mode's rule for the WarCraft III listeners: a chat-only
+            // server offers no game infrastructure at all.
+            d2_realm: (cfg.diablo2.realm && policy.mode != bnetcc_core::policy::ServerMode::Warnet)
+                .then(|| node::D2Realm {
+                    name: cfg.server.realm.clone(),
+                    description: cfg.diablo2.description.clone(),
+                    address: {
+                        let a = cfg.diablo2.address.trim();
+                        (!a.is_empty()).then(|| a.to_string())
+                    },
+                    max_characters: cfg.diablo2.max_characters as usize,
+                }),
             gateway_allowlist: cfg.limits.gateway_allowlist.clone(),
             version_policy,
             files_dir,

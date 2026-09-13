@@ -997,6 +997,11 @@ fn settings_page(admin: &Admin, config_path: &Path, flash: Option<(bool, &str)>)
         &wc3_logon,
         &[("nls", "NLS / SRP (default)"), ("legacy", "Legacy X-SHA-1 (StarCraft-hash loader)")],
     );
+    // Diablo II closed realm.
+    let d2_realm_ck = if cfg_bool(&doc, &["diablo2", "realm"], true) { "checked" } else { "" };
+    let d2_desc = html_escape(&cfg_string(&doc, &["diablo2", "description"], "Diablo II closed realm"));
+    let d2_addr = html_escape(&cfg_string(&doc, &["diablo2", "address"], ""));
+    let d2_max = cfg_int(&doc, &["diablo2", "max_characters"], 18);
     // Listeners.
     let bncs = html_escape(&cfg_string(&doc, &["listen", "bncs"], "0.0.0.0:6112"));
     let accept_shards = cfg_int(&doc, &["listen", "accept_shards"], 1);
@@ -1117,6 +1122,16 @@ fn settings_page(admin: &Admin, config_path: &Path, flash: Option<(bool, &str)>)
 <label for="w3">WarCraft III logon</label>
 <select id="w3" name="server_wc3_logon">{wc3_opts}</select>
 <p class="muted">NLS is what a normal WarCraft III client uses. <b>Legacy</b> advertises the X-SHA-1 logon for a StarCraft-hash loader — leave it on NLS unless you run one. See docs/WARCRAFT3.md §3.7.</p>
+
+<div class="hdr">Diablo II realm</div>
+<div class="row"><input id="d2r" name="d2_realm" type="checkbox" {d2_realm_ck}><label for="d2r" class="cb">Offer the closed realm (private characters on the Battle.net button)</label></div>
+<label for="d2d">Realm description (its name is the realm name above: <code>Name@realm</code>)</label>
+<input id="d2d" name="d2_description" type="text" value="{d2_desc}" maxlength="64">
+<label for="d2a">Realm address clients dial (empty = the address they reached this server on)</label>
+<input id="d2a" name="d2_address" type="text" value="{d2_addr}" placeholder="bnet.example.net or 203.0.113.4">
+<p class="muted">The realm shares the BNCS port — no extra port to forward. LAN players always get the LAN address; set this to your public address or hostname for players on the internet. Game creation needs a Diablo II game server, which is not built in yet; see docs/DIABLO2.md.</p>
+<label for="d2m">Characters per account (1–18)</label>
+<input id="d2m" name="d2_max_characters" type="number" min="1" max="18" value="{d2_max}">
 
 <div class="hdr">Network &amp; listeners</div>
 <div class="warn">These need a restart and can lock you out or move ports. Change them only when you know the address is reachable.</div>
@@ -1306,6 +1321,8 @@ fn do_settings_config(req: &Request, admin: &Admin, config_path: &Path) -> Respo
         ("server_wc3_logon", &["server", "wc3_logon"][..]),
         ("server_motd", &["server", "motd"][..]),
         ("discord_games_webhook", &["discord", "games_webhook_url"][..]),
+        ("d2_description", &["diablo2", "description"][..]),
+        ("d2_address", &["diablo2", "address"][..]),
         ("listen_bncs", &["listen", "bncs"][..]),
         ("listen_admin", &["listen", "admin"][..]),
         ("status_listen", &["status", "listen"][..]),
@@ -1352,6 +1369,7 @@ fn do_settings_config(req: &Request, admin: &Admin, config_path: &Path) -> Respo
         ("stats_interval", &["stats_push", "interval_secs"]),
         ("tracker_interval", &["tracker", "advertise_interval_secs"]),
         ("tracker_prune", &["tracker", "prune_after_secs"]),
+        ("d2_max_characters", &["diablo2", "max_characters"]),
     ];
     for &(field, path) in ints {
         if let Some(raw) = req.form.get(field) {
@@ -1413,6 +1431,7 @@ fn do_settings_config(req: &Request, admin: &Admin, config_path: &Path) -> Respo
         ("cd_key_uniqueness", &["limits", "cd_key_uniqueness"][..]),
         ("versions_restrict", &["versions", "restrict"][..]),
         ("offline_login", &["federation", "offline_login"][..]),
+        ("d2_realm", &["diablo2", "realm"][..]),
     ] {
         set_cfg(&mut doc, path, toml_edit::value(checkbox(&req.form, field)));
     }

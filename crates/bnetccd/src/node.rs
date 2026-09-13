@@ -309,6 +309,11 @@ pub struct Node {
     /// If set, post a one-line announcement to this Discord webhook when a client advertises
     /// a game. A separate webhook from the main status one; `None` disables it.
     pub games_announce_webhook: Option<String>,
+    /// The Diablo II closed realm, if offered. See `crate::realm`.
+    pub d2_realm: Option<D2Realm>,
+    /// Outstanding realm logons: the handle a client carries from `SID_LOGONREALMEX` to
+    /// `MCP_STARTUP`, keyed by the 64-bit id in the MCP chunk. See [`RealmTicket`].
+    realm_tickets: Mutex<HashMap<u64, RealmTicket>>,
     /// Per-category default channel size caps (`0` = unlimited).
     pub channel_caps: ChannelCaps,
     /// Configured advertisement banners. Empty means we never answer `SID_CHECKAD`,
@@ -368,6 +373,8 @@ pub struct NodeConfig {
     pub wc3_legacy_logon: bool,
     /// Optional separate Discord webhook for game announcements (`None` disables).
     pub games_announce_webhook: Option<String>,
+    /// The Diablo II closed realm, if offered.
+    pub d2_realm: Option<D2Realm>,
     /// Addresses exempt from the one-gateway-connection-per-IP rule.
     pub gateway_allowlist: Vec<IpAddr>,
     /// Client version restriction.
@@ -389,6 +396,36 @@ pub struct NodeConfig {
     pub udp_socket: Option<Arc<tokio::net::UdpSocket>>,
     /// Where to persist staff bans/mutes. `None` keeps them in memory only (tests).
     pub bans_path: Option<std::path::PathBuf>,
+}
+
+/// The Diablo II closed realm's settings (see `crate::config::Diablo2Config`).
+#[derive(Debug, Clone)]
+pub struct D2Realm {
+    /// Realm name, as the client shows it and as it leads a character's chat statstring.
+    pub name: String,
+    /// Description in the realm list.
+    pub description: String,
+    /// Host or address to hand clients for the realm connection; `None` hands each client
+    /// the local address its login connection arrived on.
+    pub address: Option<String>,
+    /// Characters per account.
+    pub max_characters: usize,
+}
+
+/// What `SID_LOGONREALMEX` hands a client to present on its realm connection.
+///
+/// We run both ends — the login server and the realm — so the ticket is simply a random
+/// 64-bit handle in the MCP chunk, looked up here; there is no cross-server cryptography to
+/// reproduce. It lives as long as the login connection that minted it (a client reconnects
+/// to the realm after every game, with the same data), and dies with it.
+#[derive(Debug, Clone)]
+pub struct RealmTicket {
+    /// The cookie the client echoes first in `MCP_STARTUP`.
+    pub cookie: u32,
+    /// Who logged on.
+    pub account: Account,
+    /// `D2DV` or `D2XP` — decides whether expansion characters are usable.
+    pub product: bnetcc_proto::FourCc,
 }
 
 /// Default per-category channel size caps. `0` means unlimited for that category. A
@@ -436,6 +473,8 @@ impl Node {
             realm: cfg.realm,
             wc3_legacy_logon: cfg.wc3_legacy_logon,
             games_announce_webhook: cfg.games_announce_webhook,
+            d2_realm: cfg.d2_realm,
+            realm_tickets: Mutex::new(HashMap::new()),
             channel_caps: cfg.channel_caps,
             ads: AdRotation::default(),
             files_dir: cfg.files_dir,
@@ -619,6 +658,65 @@ impl Node {
         // registered in each — they never collide as a display name. Storage enforces
         // uniqueness within each namespace.
         self.storage.create_account(name, credential).await
+    }
+
+    /// Mint a realm ticket for a logged-on account: `(ticket id, cookie)`.
+    pub fn mint_realm_ticket(&self, account: Account, product: bnetcc_proto::FourCc) -> (u64, u32) {
+        let mut tickets = self.realm_tickets.lock().expect("realm tickets lock");
+        let cookie: u32 = rand::random();
+        loop {
+            let id: u64 = rand::random();
+            // Zero reads as "no ticket" in logs and to a client that zero-fills; never mint it.
+            if id != 0 && !tickets.contains_key(&id) {
+                tickets.insert(id, RealmTicket { cookie, account, product });
+                return (id, cookie);
+            }
+        }
+    }
+
+    /// The ticket a realm connection presents, if `id` is live and `cookie` matches it.
+    /// Tickets are not consumed: the client presents the same one after every game.
+    #[must_use]
+    pub fn realm_ticket(&self, id: u64, cookie: u32) -> Option<RealmTicket> {
+        self.realm_tickets
+            .lock()
+            .expect("realm tickets lock")
+            .get(&id)
+            .filter(|t| t.cookie == cookie)
+            .cloned()
+    }
+
+    /// Revoke a ticket, when the login connection that minted it closes.
+    pub fn revoke_realm_ticket(&self, id: u64) {
+        self.realm_tickets.lock().expect("realm tickets lock").remove(&id);
+    }
+
+    /// An account's Diablo II realm characters, oldest first.
+    pub async fn characters(&self, account_id: AccountId) -> Result<Vec<bnetcc_storage::Character>, String> {
+        self.storage.characters(account_id).await
+    }
+
+    /// A realm character by name, realm-wide.
+    pub async fn character_by_name(&self, name: &str) -> Option<bnetcc_storage::Character> {
+        self.storage.character_by_name(name).await
+    }
+
+    /// Create a realm character.
+    pub async fn create_character(
+        &self,
+        character: bnetcc_storage::Character,
+    ) -> Result<(), crate::storage::CreateCharacterError> {
+        self.storage.create_character(character).await
+    }
+
+    /// Replace a character's mutable fields.
+    pub async fn update_character(&self, character: bnetcc_storage::Character) -> Result<bool, String> {
+        self.storage.update_character(character).await
+    }
+
+    /// Delete one of an account's characters.
+    pub async fn delete_character(&self, account_id: AccountId, name: &str) -> Result<bool, String> {
+        self.storage.delete_character(account_id, name).await
     }
 
     /// Try to claim a CD key for a session that has not logged in yet.
@@ -1241,6 +1339,12 @@ pub(crate) fn test_node_with(tweak: impl FnOnce(&mut NodeConfig)) -> Node {
         realm: "bncc".into(),
         wc3_legacy_logon: false,
         games_announce_webhook: None,
+        d2_realm: Some(D2Realm {
+            name: "bncc".into(),
+            description: "Test realm".into(),
+            address: None,
+            max_characters: 4,
+        }),
         gateway_allowlist: Vec::new(),
         version_policy: crate::config::VersionPolicy::default(),
         files_dir: None,

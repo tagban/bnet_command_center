@@ -159,6 +159,58 @@ pub mod msg {
     pub const CHARLIST2: u8 = 0x19;
 }
 
+/// `MCP_STARTUP` result codes.
+pub mod startup_result {
+    /// Accepted.
+    pub const OK: u32 = 0x00;
+    /// The realm could not identify the logon (unknown or stale `SID_LOGONREALMEX` data).
+    /// The client shows "realm unavailable".
+    pub const UNAVAILABLE: u32 = 0x0A;
+}
+
+/// `MCP_CHARCREATE` result codes.
+pub mod char_create_result {
+    /// Created.
+    pub const OK: u32 = 0x00;
+    /// The name is taken.
+    pub const NAME_TAKEN: u32 = 0x14;
+    /// The name, class or flags are not allowed.
+    pub const INVALID: u32 = 0x15;
+}
+
+/// `MCP_CHARLOGON` result codes. Anything but these proceeds into the realm.
+pub mod char_logon_result {
+    /// Selected.
+    pub const OK: u32 = 0x00;
+    /// No such character. Returns the client to character select with its MCP connection
+    /// intact.
+    pub const NOT_FOUND: u32 = 0x46;
+}
+
+/// `MCP_CHARDELETE` result codes.
+pub mod char_delete_result {
+    /// Deleted.
+    pub const OK: u32 = 0x00;
+    /// No such character on this account.
+    pub const NOT_FOUND: u32 = 0x49;
+}
+
+/// `MCP_CREATEGAME` result codes.
+pub mod create_game_result {
+    /// Created.
+    pub const OK: u32 = 0x00;
+    /// "Invalid Game Name".
+    pub const INVALID_NAME: u32 = 0x1E;
+    /// "Game Already Exists".
+    pub const NAME_TAKEN: u32 = 0x1F;
+    /// "Server Down" — no game server could take the game.
+    pub const SERVERS_DOWN: u32 = 0x20;
+}
+
+/// The token that ends an `MCP_GAMELIST` reply. Each game is its own `MCP_GAMELIST`
+/// packet; this one, with no name, tells the client the list is complete.
+pub const GAMELIST_END_TOKEN: u32 = 0xFFFF_FFFE;
+
 /// `MCP_JOINGAME` result codes.
 pub mod join_result {
     /// Success. The client now disconnects from the realm and dials the game server.

@@ -155,6 +155,17 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr, node: Arc<Node>, limits
                 debug!(%peer, ?reason, "game connection refused by admission control");
                 return;
             }
+            // A Diablo II realm connection opens with the same selector as a login; the next
+            // byte tells them apart. Only looked at when the realm is offered, so a server
+            // without one behaves exactly as before.
+            if node.d2_realm.is_some() && crate::realm::is_realm_connection(&stream).await {
+                let result = crate::realm::mcp_session(stream, peer, Arc::clone(&node), limits).await;
+                node.release(ClientClass::GamePending, ip);
+                if let Err(e) = result {
+                    debug!(%peer, error = %e, "realm session ended");
+                }
+                return;
+            }
             let (result, final_class) =
                 bncs_session(stream, peer, Arc::clone(&node), limits).await;
             node.release(final_class, ip);
@@ -405,7 +416,7 @@ async fn bnftp_session(
 
 /// A short hex preview of a frame body, for debug logging while reverse-engineering a
 /// client's wire format. Capped so a large frame does not flood the log.
-fn hex_preview(body: &[u8]) -> String {
+pub(crate) fn hex_preview(body: &[u8]) -> String {
     const MAX: usize = 64;
     let shown = &body[..body.len().min(MAX)];
     let mut s = String::with_capacity(shown.len() * 2 + 3);
@@ -513,6 +524,11 @@ struct Bncs {
     hosting_game: bool,
     /// An NLS logon in flight: set by `SID_AUTH_ACCOUNTLOGON`, consumed by the proof.
     srp: Option<SrpPending>,
+    /// The local address this connection arrived on — the realm address a LAN client is
+    /// handed by `SID_LOGONREALMEX`.
+    local: Option<SocketAddr>,
+    /// Diablo II realm tickets this connection minted, revoked when it closes.
+    realm_tickets: Vec<u64>,
 }
 
 /// The server-side state of one WarCraft III logon between the challenge (0x53) and the
@@ -536,6 +552,7 @@ async fn bncs_session(
     node: Arc<Node>,
     limits: SessionLimits,
 ) -> (std::io::Result<()>, ClientClass) {
+    let local = stream.local_addr().ok();
     let (mut rd, wr) = stream.into_split();
     let (tx, rx) = mpsc::channel::<Wire>(limits.outbound_queue);
     let writer = spawn_writer(wr, rx);
@@ -563,6 +580,8 @@ async fn bncs_session(
         kill: Arc::new(tokio::sync::Notify::new()),
         hosting_game: false,
         srp: None,
+        local,
+        realm_tickets: Vec::new(),
     };
 
     // Real Battle.net (and Atlas) send SID_PING (0x25) as soon as a game client connects,
@@ -707,9 +726,21 @@ impl Bncs {
                 "WC3 session ended"
             );
         }
+        if self.is_diablo2() {
+            info!(
+                peer = %self.peer,
+                product = ?self.product,
+                state = self.state.name(),
+                name = %self.display_name,
+                "D2 session ended"
+            );
+        }
         let now = now_ms();
         for key in self.claimed_keys.drain(..) {
             self.node.release_key(key, now);
+        }
+        for ticket in self.realm_tickets.drain(..) {
+            self.node.revoke_realm_ticket(ticket);
         }
         // A game must never outlive the connection hosting it.
         if let Some(account) = &self.account {
@@ -760,6 +791,19 @@ impl Bncs {
                 "WC3 frame in"
             );
         }
+        // Temporary Diablo II trace, as above: no real D2 client has logged in here yet, so
+        // the first closed-realm session shows its exact packet sequence in the log. Remove
+        // once a real client has made and selected a character (docs/DIABLO2.md).
+        if self.is_diablo2() {
+            info!(
+                peer = %self.peer,
+                id = %format!("{:#04x}", frame.id),
+                len = frame.body.len(),
+                state = self.state.name(),
+                body = %hex_preview(&frame.body),
+                "D2 frame in"
+            );
+        }
         let step = match frame.id {
             sid::AUTH_INFO => self.auth_info(frame),
             sid::AUTH_CHECK => self.auth_check(frame),
@@ -773,7 +817,10 @@ impl Bncs {
             sid::AUTH_ACCOUNTLOGONPROOF => self.auth_account_logon_proof(frame).await,
             sid::CREATEACCOUNT => self.create_account_legacy(frame).await,
             sid::CREATEACCOUNT2 => self.create_account2(frame).await,
-            sid::ENTERCHAT => self.enter_chat(frame),
+            sid::ENTERCHAT => self.enter_chat(frame).await,
+            // The Diablo II closed realm: list it, then log on to it (see `crate::realm`).
+            sid::QUERYREALMS2 => self.query_realms(),
+            sid::LOGONREALMEX => self.logon_realm(frame).await,
             sid::JOINCHANNEL => self.join_channel(frame),
             sid::LEAVECHAT => self.leave_chat(),
             sid::CHATCOMMAND => self.chat_command(frame).await,
@@ -826,7 +873,11 @@ impl Bncs {
             | sid::SYSTEMINFO
             | sid::DISPLAYAD => Step::Continue,
             other => {
-                debug!(peer = %self.peer, id = other, "unhandled packet");
+                if self.is_diablo2() {
+                    info!(peer = %self.peer, id = %format!("{other:#04x}"), "unhandled Diablo II packet");
+                } else {
+                    debug!(peer = %self.peer, id = other, "unhandled packet");
+                }
                 Step::Continue
             }
         };
@@ -841,6 +892,10 @@ impl Bncs {
             }
         }
         step
+    }
+
+    fn is_diablo2(&self) -> bool {
+        matches!(self.product, Some(p) if p == product::D2DV || p == product::D2XP)
     }
 
     fn send(&self, frame: &Frame) -> Step {
@@ -1646,10 +1701,164 @@ impl Bncs {
         self.send(&Frame::new(sid::CREATEACCOUNT, w.finish()))
     }
 
-    fn enter_chat(&mut self, _frame: &Frame) -> Step {
-        if self.account.is_none() {
-            return Step::Close;
+    /// `SID_QUERYREALMS2` (0x40): `u32 0, u32 count`, then per realm `u32 1, cstr name,
+    /// cstr description`. One realm, or none when it is not offered (and to non-Diablo II
+    /// clients, which have no use for one).
+    fn query_realms(&mut self) -> Step {
+        let d2 = matches!(self.product, Some(p) if p == product::D2DV || p == product::D2XP);
+        let mut w = Writer::with_capacity(64);
+        w.u32(0);
+        match self.node.d2_realm.as_ref().filter(|_| d2) {
+            Some(realm) => {
+                w.u32(1).u32(1).cstr(realm.name.as_bytes()).cstr(realm.description.as_bytes());
+            }
+            None => {
+                w.u32(0);
+            }
         }
+        self.send(&Frame::new(sid::QUERYREALMS2, w.finish()))
+    }
+
+    /// `SID_LOGONREALMEX` (0x3E): `u32 client token, u8[20] realm password hash, cstr realm`.
+    ///
+    /// Success is `u32 cookie, u32 status 0, u32[2] chunk1, u8[4] realm IP, u16 port (network
+    /// order) + u16 0, u32[12] chunk2, cstr unique name`; the client forwards everything but
+    /// the address into `MCP_STARTUP`. Failure is just `u32 cookie, u32 status` — the client
+    /// treats any reply of 8 bytes or fewer as one. The realm password hash is the stock
+    /// client's fixed `"password"` and proves nothing, so it is not checked.
+    async fn logon_realm(&mut self, frame: &Frame) -> Step {
+        /// "Realm unavailable".
+        const REALM_UNAVAILABLE: u32 = 0x8000_0001;
+        let mut r = frame.reader();
+        let parsed = (|| {
+            let token = r.u32()?;
+            r.bytes(20)?;
+            let title = r.cstr(64)?;
+            Ok::<_, bnetcc_proto::ProtoError>((token, String::from_utf8_lossy(title).into_owned()))
+        })();
+        let Ok((client_token, title)) = parsed else {
+            return Step::Close;
+        };
+        let refuse = |s: &Self, why: &str| {
+            info!(peer = %s.peer, realm = %title, why, "realm logon refused");
+            let mut w = Writer::with_capacity(8);
+            w.u32(client_token).u32(REALM_UNAVAILABLE);
+            s.send(&Frame::new(sid::LOGONREALMEX, w.finish()))
+        };
+        let (Some(account), Some(product)) = (self.account.clone(), self.product) else {
+            return refuse(self, "not logged in");
+        };
+        if product != product::D2DV && product != product::D2XP {
+            return refuse(self, "not a Diablo II client");
+        }
+        let Some(realm) = self.node.d2_realm.clone() else {
+            return refuse(self, "no realm is offered");
+        };
+        if !realm.name.eq_ignore_ascii_case(&title) {
+            return refuse(self, "unknown realm");
+        }
+        let Some(ip) = self.realm_address(&realm).await else {
+            return refuse(self, "no IPv4 address to hand the client");
+        };
+        let port = self.local.map_or(6112, |a| a.port());
+        let (ticket, cookie) = self.node.mint_realm_ticket(account.clone(), product);
+        self.realm_tickets.push(ticket);
+        info!(peer = %self.peer, account = %account.name, realm = %realm.name, %ip, port, "realm logon");
+
+        let mut w = Writer::with_capacity(96);
+        w.u32(cookie)
+            .u32(0)
+            .u32(ticket as u32)
+            .u32((ticket >> 32) as u32)
+            .bytes(&ip.octets())
+            .bytes(&port.to_be_bytes())
+            .u16(0)
+            .bytes(&[0u8; 48])
+            .cstr(account.name.as_bytes());
+        self.send(&Frame::new(sid::LOGONREALMEX, w.finish()))
+    }
+
+    /// The IPv4 address to send a client to for the realm. A client on this network gets the
+    /// address it reached us on — always reachable from where it is. Anyone else gets the
+    /// configured `diablo2.address` (resolved now, so a dynamic-DNS name stays current), or
+    /// that same local address if none is configured.
+    async fn realm_address(&self, realm: &crate::node::D2Realm) -> Option<std::net::Ipv4Addr> {
+        use std::net::IpAddr;
+        fn v4(ip: IpAddr) -> Option<std::net::Ipv4Addr> {
+            match ip {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+            }
+        }
+        let local = self.local.and_then(|a| v4(a.ip()));
+        let peer_is_local = v4(self.peer.ip())
+            .is_some_and(|ip| ip.is_private() || ip.is_loopback() || ip.is_link_local());
+        if peer_is_local || realm.address.is_none() {
+            return local;
+        }
+        let configured = realm.address.as_deref().unwrap_or_default();
+        if let Ok(ip) = configured.parse::<std::net::Ipv4Addr>() {
+            return Some(ip);
+        }
+        match tokio::net::lookup_host((configured, 0)).await {
+            Ok(addrs) => addrs.filter_map(|a| v4(a.ip())).next().or(local),
+            Err(e) => {
+                warn!(host = configured, error = %e, "could not resolve diablo2.address; using the local address");
+                local
+            }
+        }
+    }
+
+    /// A Diablo II client entering chat as a closed-realm character names it in its
+    /// `SID_ENTERCHAT` statstring (`Realm,Character`). Adopt it: the statstring becomes the
+    /// character's portrait, and the chat name `Character*Account` — the form Battle.net used
+    /// for realm characters, and the one bots and the client itself expect.
+    async fn adopt_realm_character(&mut self, frame: &Frame, account: &Account) {
+        let Some(product) = self.product.filter(|&p| p == product::D2DV || p == product::D2XP) else {
+            return;
+        };
+        let Some(realm) = self.node.d2_realm.clone() else {
+            return;
+        };
+        let mut r = frame.reader();
+        let Ok(stat) = r.cstr(USERNAME_MAX).and_then(|_| r.cstr(128)) else {
+            return;
+        };
+        let Some((realm_name, char_name)) = bnetcc_proto::d2::parse_enterchat_statstring(stat) else {
+            return; // an Open Battle.net character, or none
+        };
+        if !realm_name.eq_ignore_ascii_case(&realm.name) {
+            return;
+        }
+        let character = match self.node.character_by_name(char_name).await {
+            Some(c) if c.account == account.id => c,
+            _ => {
+                info!(peer = %self.peer, account = %account.name, character = char_name, "entering chat as a realm character this account does not own; ignored");
+                return;
+            }
+        };
+        self.statstring =
+            crate::realm::portrait(&character).chat_statstring(product, &realm.name, &character.name);
+        let chat_name = format!("{}*{}", character.name, account.name);
+        if base_name(&self.display_name).eq_ignore_ascii_case(&chat_name) {
+            return;
+        }
+        // A name is a channel identity, so change it outside any channel.
+        if let Some(key) = self.channel.take() {
+            self.leave_current(&key);
+        }
+        self.node.unregister_session(&self.display_name);
+        self.node.release_name(&self.display_name);
+        self.display_name = self.node.claim_name(&chat_name);
+        self.node.register_session(&self.display_name, self.peer.ip(), self.out.clone(), Arc::clone(&self.kill));
+        info!(peer = %self.peer, name = %self.display_name, "entered chat as a realm character");
+    }
+
+    async fn enter_chat(&mut self, frame: &Frame) -> Step {
+        let Some(account) = self.account.clone() else {
+            return Step::Close;
+        };
+        self.adopt_realm_character(frame, &account).await;
         // The unique display name (with any #N), so a duplicate login sees itself correctly.
         let mut w = Writer::with_capacity(64);
         w.cstr(self.display_name.as_bytes())
@@ -3542,5 +3751,265 @@ mod tests {
             bnetcc_proto::statstring::layout::DIABLO_DEFAULT,
             "the Diablo default statstring reaches other clients in the channel"
         );
+    }
+
+    // --- Diablo II closed realm -------------------------------------------------------
+
+    async fn mcp_send(s: &mut TcpStream, id: u8, body: Vec<u8>) {
+        let mut out = Vec::new();
+        bnetcc_proto::mcp::encode_frame(&bnetcc_proto::mcp::Frame::new(id, body), &mut out).unwrap();
+        s.write_all(&out).await.expect("write mcp");
+    }
+
+    async fn mcp_recv(s: &mut TcpStream) -> bnetcc_proto::mcp::Frame {
+        let mut header = [0u8; bnetcc_proto::mcp::HEADER_LEN];
+        s.read_exact(&mut header).await.expect("read mcp header");
+        let len = u16::from_le_bytes([header[0], header[1]]) as usize;
+        let mut body = vec![0u8; len - bnetcc_proto::mcp::HEADER_LEN];
+        s.read_exact(&mut body).await.expect("read mcp body");
+        bnetcc_proto::mcp::Frame::new(header[2], body)
+    }
+
+    /// Log a Diablo II client in over X-SHA-1, stopping before `SID_ENTERCHAT`.
+    async fn d2_login(addr: std::net::SocketAddr, p: FourCc, user: &str, key: u32) -> TcpStream {
+        const CLIENT_TOKEN: u32 = 0x0D2D_0D2D;
+        let mut s = connect(addr).await;
+        send_frame(&mut s, &auth_info_frame_for(p)).await;
+        let info = recv_frame(&mut s).await;
+        let mut ir = info.reader();
+        let _logon_type = ir.u32().unwrap();
+        let server_token = ir.u32().unwrap();
+        send_frame(&mut s, &auth_check_frame(6, key)).await;
+        assert_eq!(recv_frame(&mut s).await.reader().u32().unwrap(), auth_check_status::PASSED);
+        let h1 = bnetcc_crypto::password_hash("baal");
+        let mut cw = Writer::new();
+        cw.bytes(&h1).cstr(user.as_bytes());
+        send_frame(&mut s, &Frame::new(sid::CREATEACCOUNT2, cw.finish())).await;
+        assert_eq!(recv_frame(&mut s).await.reader().u32().unwrap(), 0x00, "account creation");
+        let proof = bnetcc_crypto::logon_proof(CLIENT_TOKEN, server_token, &h1);
+        let mut lw = Writer::new();
+        lw.u32(CLIENT_TOKEN).u32(server_token).bytes(&proof).cstr(user.as_bytes());
+        send_frame(&mut s, &Frame::new(sid::LOGONRESPONSE2, lw.finish())).await;
+        assert_eq!(recv_frame(&mut s).await.reader().u32().unwrap(), logon_status::SUCCESS);
+        s
+    }
+
+    /// Log on to the realm over BNCS and open the realm connection it points at, through
+    /// `MCP_STARTUP`. Returns the started realm connection.
+    async fn enter_realm(bncs: &mut TcpStream, user: &str) -> TcpStream {
+        let mut w = Writer::new();
+        w.u32(0x1234).bytes(&[0xAA; 20]).cstr(b"BNCC"); // realm names are case-insensitive
+        send_frame(bncs, &Frame::new(sid::LOGONREALMEX, w.finish())).await;
+        let reply = recv_frame(bncs).await;
+        assert_eq!(reply.id, sid::LOGONREALMEX);
+        assert!(reply.body.len() > 8, "a success is longer than the 8-byte failure form");
+        let mut r = reply.reader();
+        let cookie = r.u32().unwrap();
+        assert_eq!(r.u32().unwrap(), 0, "status");
+        let chunk1 = [r.u32().unwrap(), r.u32().unwrap()];
+        let ip: [u8; 4] = r.array().unwrap();
+        let port = u16::from_be_bytes(r.array().unwrap());
+        assert_eq!(r.u16().unwrap(), 0, "the port is a network-order u16 zero-extended to 32 bits");
+        let chunk2 = r.bytes(48).unwrap().to_vec();
+        assert_eq!(r.cstr(64).unwrap(), user.as_bytes(), "unique name");
+        assert_eq!(ip, [127, 0, 0, 1], "a local client is sent to the address it reached us on");
+        assert_eq!(port, bncs.peer_addr().unwrap().port(), "the realm rides the BNCS port");
+
+        let mut mcp = TcpStream::connect((std::net::Ipv4Addr::from(ip), port)).await.expect("connect realm");
+        mcp.write_all(&[0x01]).await.unwrap();
+        let mut sw = Writer::new();
+        sw.u32(cookie).u32(0).u32(chunk1[0]).u32(chunk1[1]).bytes(&chunk2).cstr(user.as_bytes());
+        mcp_send(&mut mcp, bnetcc_proto::mcp::msg::STARTUP, sw.finish()).await;
+        let started = mcp_recv(&mut mcp).await;
+        assert_eq!(started.id, bnetcc_proto::mcp::msg::STARTUP);
+        assert_eq!(started.reader().u32().unwrap(), 0, "startup accepted");
+        mcp
+    }
+
+    async fn create_char(mcp: &mut TcpStream, class: u32, status: u16, name: &str) -> u32 {
+        let mut w = Writer::new();
+        w.u32(class).u16(status).cstr(name.as_bytes());
+        mcp_send(mcp, bnetcc_proto::mcp::msg::CHARCREATE, w.finish()).await;
+        mcp_recv(mcp).await.reader().u32().unwrap()
+    }
+
+    /// `(total, [(name, portrait)])` from `MCP_CHARLIST2`.
+    async fn char_list(mcp: &mut TcpStream) -> (u32, Vec<(String, Vec<u8>)>) {
+        let mut w = Writer::new();
+        w.u32(8);
+        mcp_send(mcp, bnetcc_proto::mcp::msg::CHARLIST2, w.finish()).await;
+        let reply = mcp_recv(mcp).await;
+        assert_eq!(reply.id, bnetcc_proto::mcp::msg::CHARLIST2);
+        let mut r = reply.reader();
+        assert_eq!(r.u16().unwrap(), 8, "echoes the number requested");
+        let total = r.u32().unwrap();
+        let returned = r.u16().unwrap();
+        let mut chars = Vec::new();
+        for _ in 0..returned {
+            assert_eq!(r.u32().unwrap(), 0xFFFF_FFFF, "characters never expire here");
+            let name = String::from_utf8_lossy(r.cstr(64).unwrap()).into_owned();
+            chars.push((name, r.cstr(64).unwrap().to_vec()));
+        }
+        (total, chars)
+    }
+
+    async fn char_logon(mcp: &mut TcpStream, name: &str) -> u32 {
+        let mut w = Writer::new();
+        w.cstr(name.as_bytes());
+        mcp_send(mcp, bnetcc_proto::mcp::msg::CHARLOGON, w.finish()).await;
+        mcp_recv(mcp).await.reader().u32().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_diablo_two_client_makes_a_realm_character_and_chats_as_it() {
+        use bnetcc_proto::mcp::{create_game_result, msg, GAMELIST_END_TOKEN};
+        let addr = spawn_server().await;
+        let mut bncs = d2_login(addr, product::D2XP, "Tagban", 9001).await;
+
+        send_frame(&mut bncs, &Frame::new(sid::QUERYREALMS2, Vec::new())).await;
+        let realms = recv_frame(&mut bncs).await;
+        let mut rr = realms.reader();
+        assert_eq!((rr.u32().unwrap(), rr.u32().unwrap(), rr.u32().unwrap()), (0, 1, 1));
+        assert_eq!(rr.cstr(64).unwrap(), b"bncc");
+        assert_eq!(rr.cstr(64).unwrap(), b"Test realm");
+
+        let mut mcp = enter_realm(&mut bncs, "Tagban").await;
+        assert_eq!(char_list(&mut mcp).await, (0, Vec::new()), "a new account has no characters");
+
+        assert_eq!(create_char(&mut mcp, 1, 0x20, "Tyrael").await, 0x00, "expansion sorceress");
+        assert_eq!(create_char(&mut mcp, 3, 0x04, "Deckard").await, 0x00, "classic hardcore paladin");
+        assert_eq!(create_char(&mut mcp, 1, 0x20, "TYRAEL").await, 0x14, "names are unique");
+        assert_eq!(create_char(&mut mcp, 5, 0x00, "Classicdruid").await, 0x15, "druids need the expansion");
+        assert_eq!(create_char(&mut mcp, 1, 0x20, "Tyrael2").await, 0x15, "no digits in names");
+
+        let (total, chars) = char_list(&mut mcp).await;
+        assert_eq!(total, 2);
+        assert_eq!(chars[0].0, "Tyrael");
+        let portrait = &chars[0].1;
+        assert_eq!(portrait.len(), bnetcc_proto::d2::PORTRAIT_LEN);
+        assert_eq!(portrait[13], 2, "class + 1 (sorceress)");
+        assert_eq!(portrait[25], 1, "level");
+        assert_eq!(portrait[26], 0x80 | 0x20, "expansion bit");
+        assert_eq!(chars[1].1[26], 0x80 | 0x04, "hardcore bit");
+
+        assert_eq!(char_logon(&mut mcp, "Nobody").await, 0x46);
+        assert_eq!(char_logon(&mut mcp, "tyrael").await, 0x00);
+
+        // The lobby answers without a game server: an empty list, and a clear refusal.
+        let mut gl = Writer::new();
+        gl.u16(7).u32(0).cstr(b"");
+        mcp_send(&mut mcp, msg::GAMELIST, gl.finish()).await;
+        let list = mcp_recv(&mut mcp).await;
+        let mut lr = list.reader();
+        assert_eq!(lr.u16().unwrap(), 7, "request id echoed");
+        lr.u32().unwrap();
+        lr.u8().unwrap();
+        assert_eq!(lr.u32().unwrap(), GAMELIST_END_TOKEN);
+        let mut cg = Writer::new();
+        cg.u16(8).u32(0).u8(1).u8(0xFF).u8(8).cstr(b"baal run").cstr(b"").cstr(b"");
+        mcp_send(&mut mcp, msg::CREATEGAME, cg.finish()).await;
+        let created = mcp_recv(&mut mcp).await;
+        let mut cr = created.reader();
+        assert_eq!((cr.u16().unwrap(), cr.u16().unwrap(), cr.u16().unwrap()), (8, 0, 0));
+        assert_eq!(cr.u32().unwrap(), create_game_result::SERVERS_DOWN);
+        mcp_send(&mut mcp, msg::MOTD, Vec::new()).await;
+        let motd = mcp_recv(&mut mcp).await;
+        assert_eq!(&motd.body[..], b"\0motd\0");
+
+        // Back on the login connection, enter chat as the character.
+        let mut ew = Writer::new();
+        ew.cstr(b"Tyrael").cstr(b"bncc,Tyrael");
+        send_frame(&mut bncs, &Frame::new(sid::ENTERCHAT, ew.finish())).await;
+        let entered = recv_frame(&mut bncs).await;
+        assert_eq!(entered.id, sid::ENTERCHAT);
+        let mut er = entered.reader();
+        assert_eq!(er.cstr(64).unwrap(), b"Tyrael*Tagban", "realm characters chat as Character*Account");
+        let stat = er.cstr(128).unwrap();
+        assert!(stat.starts_with(b"PX2Dbncc,Tyrael,"), "statstring: {stat:02X?}");
+        assert_eq!(stat.len(), b"PX2Dbncc,Tyrael,".len() + bnetcc_proto::d2::PORTRAIT_LEN);
+        assert_eq!(er.cstr(64).unwrap(), b"Tyrael*Tagban");
+    }
+
+    #[tokio::test]
+    async fn realm_characters_belong_to_one_account() {
+        let addr = spawn_server().await;
+        let mut owner = d2_login(addr, product::D2XP, "Owner", 9101).await;
+        let mut owner_mcp = enter_realm(&mut owner, "Owner").await;
+        assert_eq!(create_char(&mut owner_mcp, 0, 0x20, "Akara").await, 0x00);
+
+        let mut other = d2_login(addr, product::D2XP, "Other", 9102).await;
+        let mut other_mcp = enter_realm(&mut other, "Other").await;
+        assert_eq!(char_list(&mut other_mcp).await.0, 0, "another account's characters are not listed");
+        assert_eq!(char_logon(&mut other_mcp, "Akara").await, 0x46, "or selectable");
+        assert_eq!(create_char(&mut other_mcp, 0, 0x20, "akara").await, 0x14, "or re-creatable");
+        let mut dw = Writer::new();
+        dw.u16(3).cstr(b"Akara");
+        mcp_send(&mut other_mcp, bnetcc_proto::mcp::msg::CHARDELETE, dw.finish()).await;
+        let refused = mcp_recv(&mut other_mcp).await;
+        assert_eq!(&refused.body[..], &[3, 0, 0x49, 0, 0, 0], "or deletable");
+
+        // Claiming someone else's character in chat changes nothing.
+        let mut ew = Writer::new();
+        ew.cstr(b"Akara").cstr(b"bncc,Akara");
+        send_frame(&mut other, &Frame::new(sid::ENTERCHAT, ew.finish())).await;
+        let entered = recv_frame(&mut other).await;
+        assert_eq!(entered.reader().cstr(64).unwrap(), b"Other");
+
+        // The owner deletes it, and the name is free again.
+        let mut dw = Writer::new();
+        dw.u16(4).cstr(b"akara");
+        mcp_send(&mut owner_mcp, bnetcc_proto::mcp::msg::CHARDELETE, dw.finish()).await;
+        assert_eq!(&mcp_recv(&mut owner_mcp).await.body[..], &[4, 0, 0, 0, 0, 0]);
+        assert_eq!(create_char(&mut other_mcp, 0, 0x20, "Akara").await, 0x00);
+    }
+
+    #[tokio::test]
+    async fn a_classic_client_sees_only_classic_characters() {
+        let addr = spawn_server().await;
+        let mut lod = d2_login(addr, product::D2XP, "Twoclients", 9201).await;
+        let mut lod_mcp = enter_realm(&mut lod, "Twoclients").await;
+        assert_eq!(create_char(&mut lod_mcp, 4, 0x20, "Lodbarb").await, 0x00);
+        assert_eq!(create_char(&mut lod_mcp, 4, 0x00, "Classicbarb").await, 0x00);
+
+        // The same account from a classic client: the account's second login is `#2`.
+        let mut classic = connect(addr).await;
+        send_frame(&mut classic, &auth_info_frame_for(product::D2DV)).await;
+        let info = recv_frame(&mut classic).await;
+        let server_token = { let mut r = info.reader(); r.u32().unwrap(); r.u32().unwrap() };
+        send_frame(&mut classic, &auth_check_frame(6, 9202)).await;
+        recv_frame(&mut classic).await;
+        let h1 = bnetcc_crypto::password_hash("baal");
+        let proof = bnetcc_crypto::logon_proof(1, server_token, &h1);
+        let mut lw = Writer::new();
+        lw.u32(1).u32(server_token).bytes(&proof).cstr(b"Twoclients");
+        send_frame(&mut classic, &Frame::new(sid::LOGONRESPONSE2, lw.finish())).await;
+        assert_eq!(recv_frame(&mut classic).await.reader().u32().unwrap(), logon_status::SUCCESS);
+        let mut classic_mcp = enter_realm(&mut classic, "Twoclients").await;
+
+        let (total, chars) = char_list(&mut classic_mcp).await;
+        assert_eq!((total, chars[0].0.as_str()), (1, "Classicbarb"));
+        assert_eq!(char_logon(&mut classic_mcp, "Lodbarb").await, 0x46);
+        assert_eq!(create_char(&mut classic_mcp, 4, 0x20, "Sneakylod").await, 0x15);
+    }
+
+    #[tokio::test]
+    async fn a_realm_connection_with_an_unknown_ticket_is_refused() {
+        let addr = spawn_server().await;
+        let mut mcp = TcpStream::connect(addr).await.unwrap();
+        mcp.write_all(&[0x01]).await.unwrap();
+        let mut w = Writer::new();
+        w.u32(1).u32(0).u32(0xDEAD).u32(0xBEEF).bytes(&[0; 48]).cstr(b"Forger");
+        mcp_send(&mut mcp, bnetcc_proto::mcp::msg::STARTUP, w.finish()).await;
+        assert_eq!(mcp_recv(&mut mcp).await.reader().u32().unwrap(), 0x0A);
+        let mut rest = Vec::new();
+        assert_eq!(mcp.read_to_end(&mut rest).await.unwrap(), 0, "and the connection is closed");
+    }
+
+    #[tokio::test]
+    async fn other_products_are_offered_no_realm() {
+        let addr = spawn_server().await;
+        let mut s = login(addr, "Starcrafter", "pw", 9301).await;
+        send_frame(&mut s, &Frame::new(sid::QUERYREALMS2, Vec::new())).await;
+        assert_eq!(&recv_frame(&mut s).await.body[..], &[0u8; 8]);
     }
 }

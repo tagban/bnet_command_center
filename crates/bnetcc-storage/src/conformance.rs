@@ -16,7 +16,7 @@
 //! wins) that otherwise only show up in production on one backend.
 
 use crate::attr::{AttrKey, AttrMap};
-use crate::model::{Ban, BanScope, Credential, NewAccount};
+use crate::model::{Ban, BanScope, Character, Credential, NewAccount};
 use crate::{Storage, StorageError};
 
 /// A `NewAccount` with sensible defaults, for tests.
@@ -48,6 +48,7 @@ pub fn run<S: Storage>(s: &mut S) {
     bans(s);
     counting(s);
     enumeration_and_deletion(s);
+    characters(s);
 }
 
 /// Account creation, lookup and credentials.
@@ -283,4 +284,76 @@ pub fn enumeration_and_deletion<S: Storage>(s: &mut S) {
     assert_ne!(reborn.id, a.id, "a deleted id is not reused");
     // Deleting an absent account is a no-op, not an error.
     s.delete_account(999_999).expect("idempotent delete");
+}
+
+fn character(account: bnetcc_core::AccountId, name: &str) -> Character {
+    Character {
+        account,
+        name: name.to_string(),
+        class: 1,
+        status: 0x20,
+        level: 1,
+        progression: 0,
+        created_at: 1_700_000_000,
+        last_played: 1_700_000_000,
+        save: None,
+    }
+}
+
+/// Diablo II realm characters: realm-wide unique names, per-account listing, update and
+/// deletion scoped to the owner, and removal with the account.
+///
+/// # Panics
+///
+/// On divergence.
+pub fn characters<S: Storage>(s: &mut S) {
+    let owner = s.create_account(account("CharOwner")).expect("create");
+    let other = s.create_account(account("CharOther")).expect("create");
+    assert!(s.characters(owner.id).expect("list").is_empty());
+
+    s.create_character(character(owner.id, "Tyrael")).expect("create char");
+    s.create_character(character(owner.id, "Deckard")).expect("create second char");
+    let listed = s.characters(owner.id).expect("list");
+    let names: Vec<&str> = listed.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["Tyrael", "Deckard"], "listed oldest first, case preserved");
+
+    // Names are unique across the whole realm, case-insensitively.
+    assert_eq!(
+        s.create_character(character(other.id, "TYRAEL")),
+        Err(StorageError::NameTaken),
+        "another account may not take a held name"
+    );
+    assert_eq!(s.create_character(character(owner.id, "tyrael")), Err(StorageError::NameTaken));
+    assert_eq!(
+        s.create_character(character(999_999, "Orphan")),
+        Err(StorageError::NoSuchAccount)
+    );
+
+    let found = s.character_by_name("tyRAEL").expect("lookup").expect("present");
+    assert_eq!(found.account, owner.id);
+    assert_eq!(found.name, "Tyrael");
+
+    // Update touches the mutable fields, and only for the owner.
+    let mut upgraded = found.clone();
+    upgraded.status = 0x24;
+    upgraded.level = 12;
+    upgraded.save = Some(vec![0x55, 0xAA, 0x96]);
+    assert!(s.update_character(&upgraded).expect("update"));
+    let reread = s.character_by_name("Tyrael").expect("lookup").expect("present");
+    assert_eq!((reread.status, reread.level), (0x24, 12));
+    assert_eq!(reread.save.as_deref(), Some(&[0x55, 0xAA, 0x96][..]));
+    let mut stolen = upgraded.clone();
+    stolen.account = other.id;
+    assert!(!s.update_character(&stolen).expect("update"), "a non-owner cannot update");
+
+    // Deletion is scoped to the owner and frees the name.
+    assert!(!s.delete_character(other.id, "Tyrael").expect("delete"), "not theirs to delete");
+    assert!(s.delete_character(owner.id, "TYRAEL").expect("delete"));
+    assert!(s.character_by_name("Tyrael").expect("lookup").is_none());
+    assert!(!s.delete_character(owner.id, "Tyrael").expect("delete"), "already gone");
+    s.create_character(character(other.id, "Tyrael")).expect("a freed name can be reused");
+
+    // Characters go with their account.
+    s.delete_account(owner.id).expect("delete account");
+    assert!(s.character_by_name("Deckard").expect("lookup").is_none());
 }

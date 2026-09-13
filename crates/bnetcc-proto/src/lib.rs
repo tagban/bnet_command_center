@@ -30,6 +30,7 @@ pub mod bnftp;
 pub mod bni;
 pub mod buf;
 pub mod chat;
+pub mod d2;
 pub mod error;
 pub mod line;
 pub mod mcp;

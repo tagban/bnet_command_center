@@ -44,7 +44,7 @@ use bnetcc_core::AccountId;
 
 pub use attr::{Acl, Actor, AttrKey, AttrMap, AttrSchema, Level};
 pub use memory::MemoryStorage;
-pub use model::{Account, Ban, BanScope, Credential, NewAccount};
+pub use model::{Account, Ban, BanScope, Character, Credential, NewAccount};
 pub use write_behind::{FlushPolicy, WriteBehind};
 
 /// A storage failure.
@@ -188,6 +188,44 @@ pub trait Storage: Send + 'static {
     ///
     /// Backend failure.
     fn delete_account(&mut self, id: AccountId) -> Result<()>;
+
+    /// Every Diablo II character owned by an account, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Backend failure.
+    fn characters(&mut self, account: AccountId) -> Result<Vec<Character>>;
+
+    /// A character by name, realm-wide and case-insensitively.
+    ///
+    /// # Errors
+    ///
+    /// Backend failure.
+    fn character_by_name(&mut self, name: &str) -> Result<Option<Character>>;
+
+    /// Create a character. **Write-through.**
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NameTaken`] if any account already holds the name,
+    /// [`StorageError::NoSuchAccount`] if the owner does not exist, or backend failure.
+    fn create_character(&mut self, character: Character) -> Result<()>;
+
+    /// Replace a stored character's mutable fields (class and name are its identity and do
+    /// not change). **Write-through.** Returns `false` if the owner holds no such character.
+    ///
+    /// # Errors
+    ///
+    /// Backend failure.
+    fn update_character(&mut self, character: &Character) -> Result<bool>;
+
+    /// Delete one of an account's characters. **Write-through.** Returns `false` if the
+    /// account holds no character of that name — including one held by another account.
+    ///
+    /// # Errors
+    ///
+    /// Backend failure.
+    fn delete_character(&mut self, account: AccountId, name: &str) -> Result<bool>;
 
     /// Flush anything buffered. Called on a timer and at shutdown.
     ///

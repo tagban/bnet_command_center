@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bnetcc_core::AccountId;
 use bnetcc_storage::attr::{Actor, AttrKey, AttrMap, AttrSchema};
-use bnetcc_storage::model::{Credential, NewAccount};
+use bnetcc_storage::model::{Character, Credential, NewAccount};
 use bnetcc_storage::{Storage, StorageError};
 use tokio::sync::oneshot;
 
@@ -89,7 +89,37 @@ pub enum CreateAccountError {
     Backend(String),
 }
 
+/// Why character creation was refused.
+#[derive(Debug, Clone)]
+pub enum CreateCharacterError {
+    /// Some account already holds the name.
+    NameTaken,
+    /// The backend failed, or the actor thread is gone. For logs.
+    Backend(String),
+}
+
 enum Command {
+    Characters {
+        account_id: AccountId,
+        resp: oneshot::Sender<Result<Vec<Character>, String>>,
+    },
+    CharacterByName {
+        name: String,
+        resp: oneshot::Sender<Option<Character>>,
+    },
+    CreateCharacter {
+        character: Character,
+        resp: oneshot::Sender<Result<(), CreateCharacterError>>,
+    },
+    UpdateCharacter {
+        character: Character,
+        resp: oneshot::Sender<Result<bool, String>>,
+    },
+    DeleteCharacter {
+        account_id: AccountId,
+        name: String,
+        resp: oneshot::Sender<Result<bool, String>>,
+    },
     AccountByName {
         name: String,
         resp: oneshot::Sender<Option<Account>>,
@@ -307,6 +337,54 @@ impl StorageHandle {
     pub fn record_login(&self, account_id: AccountId, when: u64) {
         let _ = self.0.send(Command::RecordLogin { account_id, when });
     }
+
+    /// An account's Diablo II realm characters, oldest first.
+    pub async fn characters(&self, account_id: AccountId) -> Result<Vec<Character>, String> {
+        let (resp, rx) = oneshot::channel();
+        if self.0.send(Command::Characters { account_id, resp }).is_err() {
+            return Err("storage actor is gone".into());
+        }
+        rx.await.unwrap_or_else(|_| Err("storage actor is gone".into()))
+    }
+
+    /// A realm character by name (realm-wide, case-insensitive). `None` on failure too.
+    pub async fn character_by_name(&self, name: &str) -> Option<Character> {
+        let (resp, rx) = oneshot::channel();
+        let name = name.to_string();
+        if self.0.send(Command::CharacterByName { name, resp }).is_err() {
+            return None;
+        }
+        rx.await.unwrap_or(None)
+    }
+
+    /// Create a realm character. Write-through.
+    pub async fn create_character(&self, character: Character) -> Result<(), CreateCharacterError> {
+        let (resp, rx) = oneshot::channel();
+        if self.0.send(Command::CreateCharacter { character, resp }).is_err() {
+            return Err(CreateCharacterError::Backend("storage actor is gone".into()));
+        }
+        rx.await
+            .unwrap_or_else(|_| Err(CreateCharacterError::Backend("storage actor is gone".into())))
+    }
+
+    /// Replace a character's mutable fields. `Ok(false)` if the owner holds no such character.
+    pub async fn update_character(&self, character: Character) -> Result<bool, String> {
+        let (resp, rx) = oneshot::channel();
+        if self.0.send(Command::UpdateCharacter { character, resp }).is_err() {
+            return Err("storage actor is gone".into());
+        }
+        rx.await.unwrap_or_else(|_| Err("storage actor is gone".into()))
+    }
+
+    /// Delete one of an account's characters. `Ok(false)` if it holds none of that name.
+    pub async fn delete_character(&self, account_id: AccountId, name: &str) -> Result<bool, String> {
+        let (resp, rx) = oneshot::channel();
+        let name = name.to_string();
+        if self.0.send(Command::DeleteCharacter { account_id, name, resp }).is_err() {
+            return Err("storage actor is gone".into());
+        }
+        rx.await.unwrap_or_else(|_| Err("storage actor is gone".into()))
+    }
 }
 
 /// Start the storage actor on a dedicated thread, which owns `backend` for the life of
@@ -318,6 +396,27 @@ pub fn spawn(mut backend: Box<dyn Storage + Send>) -> StorageHandle {
         .spawn(move || {
             while let Ok(cmd) = rx.recv() {
                 match cmd {
+                    Command::Characters { account_id, resp } => {
+                        let _ = resp.send(backend.characters(account_id).map_err(|e| e.to_string()));
+                    }
+                    Command::CharacterByName { name, resp } => {
+                        let _ = resp.send(backend.character_by_name(&name).ok().flatten());
+                    }
+                    Command::CreateCharacter { character, resp } => {
+                        let result = backend.create_character(character).map_err(|e| match e {
+                            StorageError::NameTaken => CreateCharacterError::NameTaken,
+                            other => CreateCharacterError::Backend(other.to_string()),
+                        });
+                        let _ = resp.send(result);
+                    }
+                    Command::UpdateCharacter { character, resp } => {
+                        let _ = resp.send(backend.update_character(&character).map_err(|e| e.to_string()));
+                    }
+                    Command::DeleteCharacter { account_id, name, resp } => {
+                        let _ = resp.send(
+                            backend.delete_character(account_id, &name).map_err(|e| e.to_string()),
+                        );
+                    }
                     Command::AccountByName { name, resp } => {
                         let found = backend
                             .account_by_name(&name)

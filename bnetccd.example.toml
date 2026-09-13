@@ -197,6 +197,18 @@ path = "bnetccd.db"
 # disables BNFTP serving (real classic clients then hang at "Checking versions").
 dir = ""
 
+[diablo2]
+# The Diablo II closed realm: the client's "Battle.net" button, with characters stored in this
+# server's database. It shares the BNCS port (no extra port to forward). Creating a game needs
+# a Diablo II game server, which is not built in yet — the lobby answers "Server Down". Never
+# offered in warnet mode. The realm's name is server.realm. See docs/DIABLO2.md.
+realm = true
+description = "Diablo II closed realm"
+# Host or IPv4 address clients dial for the realm. LAN clients always get the LAN address they
+# connected to; set this to your public address/hostname for players on the internet.
+address = ""
+max_characters = 18         # per account, 1..=18
+
 [admins]
 # Accounts treated as Battle.net Administrators (sysops). They carry the admin flag and
 # the Blizzard-representative tag (the staff icon) in every channel. Case-insensitive.

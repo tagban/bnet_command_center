@@ -106,3 +106,34 @@ impl Ban {
         }
     }
 }
+
+/// A Diablo II closed-realm character, owned by one account.
+///
+/// Character names are unique **realm-wide**, case-insensitively, not merely per account:
+/// a name is an identity in chat (`Name*Account`), in game lists, and to a game server's
+/// save handling, so two accounts may never hold the same one.
+///
+/// The fields are what the character-select screen and the chat portrait are drawn from.
+/// `save` is the game server's own `.d2s` blob once a game server has written one; the
+/// realm never interprets it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Character {
+    /// The owning account.
+    pub account: AccountId,
+    /// Name as created, preserving case.
+    pub name: String,
+    /// Class, `0` Amazon … `6` Assassin.
+    pub class: u8,
+    /// The `.d2s` status bits: `0x04` hardcore, `0x08` dead, `0x20` expansion, `0x40` ladder.
+    pub status: u8,
+    /// Character level, `1..=99`.
+    pub level: u8,
+    /// Difficulty/act progression (the title a character has earned).
+    pub progression: u8,
+    /// Creation time, seconds since the Unix epoch.
+    pub created_at: u64,
+    /// Last selected, seconds since the Unix epoch.
+    pub last_played: u64,
+    /// The game server's save, if one has been written. Opaque to the realm.
+    pub save: Option<Vec<u8>>,
+}

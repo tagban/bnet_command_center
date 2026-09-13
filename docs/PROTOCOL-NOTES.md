@@ -359,17 +359,23 @@ D2GS:  new TCP connection, port 4000 (hardcoded client-side, cannot be changed)
        → D2GS_STARTGAME (0x5C) → D2GS_ENTERGAMEENVIRONMENT (0x6A) → compressed
 ```
 
+✅ **Implemented** in `crates/bnetccd/src/realm.rs` (characters; games need a D2GS). Full
+write-up, layouts and test steps: `docs/DIABLO2.md`.
+
 ⚠️ `SID_LOGONREALMEX` rule: if the response is **longer than 8 bytes**, proceed; otherwise it
 is an error (`0x80000001` realm unavailable, `0x80000002` logon failed). The 16 `u32`s must be
-forwarded verbatim into `MCP_STARTUP`.
-🛑 The "new format" (D2 1.14d+) is documented only as `Unknown[16] / Unknown[40]`; the
-cryptographic construction is unknown. 🛑 `MCP_STARTUP` chunk semantics are only partially
-mapped and reportedly changed by Blizzard later.
+forwarded verbatim into `MCP_STARTUP`. The address is 4 IP bytes then the port as a
+**network-order `u16` + `u16 0`**.
+✅ The chunk contents are opaque to the client, so when login server and realm are one
+process they need no cryptography at all: ours carry a random ticket handle. (The "new
+format" crypto only matters when interoperating with someone else's realm.)
 
 PvPGN's split — bnetd :6112, D2CS :6113, D2DBS :6114, third-party D2GS :4000 — is one valid
-topology, not the only one. `jaenster/d2-dedicated-server` collapses BNCS and MCP onto 6112,
-which is closer to what real Battle.net did. **D2GS is closed-source, Windows-only, and its
-port is hardcoded, so you cannot run two per host.** Plan realms as containers/VMs.
+topology, not the only one. We, like `jaenster/d2-dedicated-server` (MIT), serve BNCS and MCP
+on 6112, telling them apart by the byte after the `0x01` selector — closer to what real
+Battle.net did. The D2GS port is hardcoded in the client, so one game server address per
+host. Blizzard's D2GS is closed-source and Windows-only, but jaenster's runs the game's own
+engine headlessly on Linux — see `docs/DIABLO2.md` §5.
 
 ---
 

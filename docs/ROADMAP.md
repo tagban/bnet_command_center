@@ -178,15 +178,15 @@ Realms run **inside `bnetccd`**, not as separate daemons — `docs/ARCHITECTURE.
 reasoning, including that PvPGN's `d2dbs` still uses `select()` capped at `FD_SETSIZE` and
 never received the fix `bnetd` got in 2003.
 
-- [ ] MCP gateway as an in-process module. **The framing codec is done**
-      (`bnetcc_proto::mcp`), including a test asserting that a BNCS frame fed to the MCP
-      decoder does not silently succeed. What remains is the session state machine and the
-      realm handlers.
-- [ ] Character store behind the `Storage` trait, called as a function rather than over a
-      socket. Replaces `d2cs` **and** `d2dbs`, and the custom `bnetd`↔`d2cs` binary protocol
-      goes away with them.
-- [ ] `GameHost` trait with an `External` implementation, so operators running the existing
-      closed-source D2GS can point at it while still supervising exactly one binary.
+- [x] MCP gateway as an in-process module (`crates/bnetccd/src/realm.rs`), on the BNCS port:
+      startup, character list/create/select/delete/upgrade, MOTD, and a lobby that answers
+      without a game server. Characters chat as `Character*Account`. See `docs/DIABLO2.md`.
+      **Awaiting its first real-client test.**
+- [x] Character store behind the `Storage` trait (`characters` table, schema v2), called as a
+      function rather than over a socket. Replaces `d2cs` **and** `d2dbs`.
+- [ ] `GameHost` trait with an `External` implementation. The candidate is now
+      `jaenster/d2-dedicated-server`'s MIT game server (the game's own engine, headless, Linux),
+      reached through its Redis contract — `docs/DIABLO2.md` §5.
 - [ ] Document the realm constraint precisely: **port 4000 is hardcoded in the client**, so
       one realm per IP address. Additional addresses are fine; additional processes on one
       address are not.

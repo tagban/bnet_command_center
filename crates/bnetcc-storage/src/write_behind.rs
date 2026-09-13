@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use bnetcc_core::AccountId;
 
 use crate::attr::{AttrKey, AttrMap};
-use crate::model::{Account, Ban, BanScope, Credential, NewAccount};
+use crate::model::{Account, Ban, BanScope, Character, Credential, NewAccount};
 use crate::{Result, Storage};
 
 /// When to flush buffered attribute writes.
@@ -273,6 +273,29 @@ impl<B: Storage> Storage for WriteBehind<B> {
         self.backend.delete_account(id)
     }
 
+    fn characters(&mut self, account: AccountId) -> Result<Vec<Character>> {
+        self.backend.characters(account)
+    }
+
+    fn character_by_name(&mut self, name: &str) -> Result<Option<Character>> {
+        self.backend.character_by_name(name)
+    }
+
+    /// Write-through: a character the player just made must survive a restart.
+    fn create_character(&mut self, character: Character) -> Result<()> {
+        self.backend.create_character(character)
+    }
+
+    /// Write-through.
+    fn update_character(&mut self, character: &Character) -> Result<bool> {
+        self.backend.update_character(character)
+    }
+
+    /// Write-through.
+    fn delete_character(&mut self, account: AccountId, name: &str) -> Result<bool> {
+        self.backend.delete_character(account, name)
+    }
+
     fn flush(&mut self) -> Result<()> {
         let now = self.last_flush_ms;
         self.flush_now(now)
@@ -513,6 +536,21 @@ mod tests {
         }
         fn delete_account(&mut self, id: AccountId) -> Result<()> {
             self.0.delete_account(id)
+        }
+        fn characters(&mut self, a: AccountId) -> Result<Vec<Character>> {
+            self.0.characters(a)
+        }
+        fn character_by_name(&mut self, n: &str) -> Result<Option<Character>> {
+            self.0.character_by_name(n)
+        }
+        fn create_character(&mut self, c: Character) -> Result<()> {
+            self.0.create_character(c)
+        }
+        fn update_character(&mut self, c: &Character) -> Result<bool> {
+            self.0.update_character(c)
+        }
+        fn delete_character(&mut self, a: AccountId, n: &str) -> Result<bool> {
+            self.0.delete_character(a, n)
         }
         fn flush(&mut self) -> Result<()> {
             self.0.flush()

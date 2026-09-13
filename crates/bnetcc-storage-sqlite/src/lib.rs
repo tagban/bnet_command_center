@@ -25,12 +25,12 @@ use std::path::Path;
 
 use bnetcc_core::AccountId;
 use bnetcc_storage::attr::{AttrKey, AttrMap};
-use bnetcc_storage::model::{Account, Ban, BanScope, Credential, NewAccount};
+use bnetcc_storage::model::{Account, Ban, BanScope, Character, Credential, NewAccount};
 use bnetcc_storage::{validate_account_name, Result, Storage, StorageError};
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// Current schema version. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Ordered migrations. Index `n` migrates from version `n` to `n + 1`.
 const MIGRATIONS: &[&str] = &[
@@ -61,6 +61,24 @@ const MIGRATIONS: &[&str] = &[
         expires_at INTEGER,
         PRIMARY KEY (account_id, scope)
     ) WITHOUT ROWID;
+    ",
+    // 1 -> 2: Diablo II realm characters. `name_lower` is UNIQUE across the table — a
+    // character name is a realm-wide identity, not a per-account one.
+    r"
+    CREATE TABLE characters (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        name        TEXT    NOT NULL,
+        name_lower  TEXT    NOT NULL UNIQUE,
+        class       INTEGER NOT NULL,
+        status      INTEGER NOT NULL,
+        level       INTEGER NOT NULL,
+        progression INTEGER NOT NULL,
+        created_at  INTEGER NOT NULL,
+        last_played INTEGER NOT NULL,
+        save        BLOB
+    );
+    CREATE INDEX characters_by_account ON characters(account_id, id);
     ",
 ];
 
@@ -189,6 +207,25 @@ impl SqliteStorage {
                 ("srp", salt.to_vec(), Some(verifier.to_vec()))
             }
         }
+    }
+
+    fn row_to_character(row: &rusqlite::Row<'_>) -> rusqlite::Result<Character> {
+        // Stored as INTEGER; a value outside u8 can only come from a hand-edited database,
+        // and clamping it is kinder than failing the whole character list.
+        let byte = |col: &str| -> rusqlite::Result<u8> {
+            Ok(row.get::<_, i64>(col)?.clamp(0, 255) as u8)
+        };
+        Ok(Character {
+            account: row.get::<_, i64>("account_id")? as AccountId,
+            name: row.get("name")?,
+            class: byte("class")?,
+            status: byte("status")?,
+            level: byte("level")?,
+            progression: byte("progression")?,
+            created_at: row.get::<_, i64>("created_at")? as u64,
+            last_played: row.get::<_, i64>("last_played")? as u64,
+            save: row.get("save")?,
+        })
     }
 
     const fn scope_str(s: BanScope) -> &'static str {
@@ -430,6 +467,93 @@ impl Storage for SqliteStorage {
             .execute(params![id as i64])
             .map_err(map_err)?;
         Ok(())
+    }
+
+    fn characters(&mut self, account: AccountId) -> Result<Vec<Character>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT * FROM characters WHERE account_id = ?1 ORDER BY id")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(params![account as i64], Self::row_to_character)
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    fn character_by_name(&mut self, name: &str) -> Result<Option<Character>> {
+        self.conn
+            .prepare_cached("SELECT * FROM characters WHERE name_lower = ?1")
+            .map_err(map_err)?
+            .query_row(params![name.to_ascii_lowercase()], Self::row_to_character)
+            .optional()
+            .map_err(map_err)
+    }
+
+    fn create_character(&mut self, c: Character) -> Result<()> {
+        // The UNIQUE index decides a name race, not a check-then-insert.
+        let result = self
+            .conn
+            .prepare_cached(
+                "INSERT OR IGNORE INTO characters
+                     (account_id, name, name_lower, class, status, level, progression,
+                      created_at, last_played, save)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )
+            .map_err(map_err)?
+            .execute(params![
+                c.account as i64,
+                c.name,
+                c.name.to_ascii_lowercase(),
+                c.class,
+                c.status,
+                c.level,
+                c.progression,
+                c.created_at as i64,
+                c.last_played as i64,
+                c.save,
+            ]);
+        match result {
+            Ok(0) => Err(StorageError::NameTaken),
+            Ok(_) => Ok(()),
+            Err(e) if is_foreign_key_violation(&e) => Err(StorageError::NoSuchAccount),
+            Err(e) => Err(map_err(e)),
+        }
+    }
+
+    fn update_character(&mut self, c: &Character) -> Result<bool> {
+        let n = self
+            .conn
+            .prepare_cached(
+                "UPDATE characters
+                    SET status = ?1, level = ?2, progression = ?3, last_played = ?4, save = ?5
+                  WHERE account_id = ?6 AND name_lower = ?7",
+            )
+            .map_err(map_err)?
+            .execute(params![
+                c.status,
+                c.level,
+                c.progression,
+                c.last_played as i64,
+                c.save,
+                c.account as i64,
+                c.name.to_ascii_lowercase(),
+            ])
+            .map_err(map_err)?;
+        Ok(n > 0)
+    }
+
+    fn delete_character(&mut self, account: AccountId, name: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .prepare_cached("DELETE FROM characters WHERE account_id = ?1 AND name_lower = ?2")
+            .map_err(map_err)?
+            .execute(params![account as i64, name.to_ascii_lowercase()])
+            .map_err(map_err)?;
+        Ok(n > 0)
     }
 
     fn flush(&mut self) -> Result<()> {

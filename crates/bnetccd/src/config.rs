@@ -45,6 +45,39 @@ pub struct Config {
     pub stats_push: StatsPushConfig,
     /// Optional PvPGN-compatible server tracking (advertise us / host a list).
     pub tracker: TrackerConfig,
+    /// The Diablo II closed realm (private characters).
+    pub diablo2: Diablo2Config,
+}
+
+/// The Diablo II closed realm: the "Battle.net" button's character select, with characters
+/// stored on this server. It rides the BNCS port — the realm connection is told apart from a
+/// login by the byte after the protocol selector — so it needs no extra forwarded port.
+/// Game creation needs a Diablo II game server, which is not part of this yet: the realm
+/// answers "server down" to create/join. See `docs/DIABLO2.md`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Diablo2Config {
+    /// Offer the realm. Never offered in warnet mode.
+    pub realm: bool,
+    /// The realm's description in `SID_QUERYREALMS2`. Its *name* is `server.realm`.
+    pub description: String,
+    /// Host or IPv4 address a client dials for the realm. Empty (the default) hands each
+    /// client the address it reached this server on, which is right on a LAN; set your
+    /// public address or hostname when players connect from the internet through NAT.
+    pub address: String,
+    /// Characters per account, `1..=18`.
+    pub max_characters: u32,
+}
+
+impl Default for Diablo2Config {
+    fn default() -> Self {
+        Self {
+            realm: true,
+            description: "Diablo II closed realm".into(),
+            address: String::new(),
+            max_characters: 18,
+        }
+    }
 }
 
 /// PvPGN-compatible server tracking (see `crate::tracker`). Both halves optional.
@@ -742,6 +775,9 @@ impl Config {
         }
         if self.federation.enabled && self.federation.hub.is_empty() {
             return Err("federation.enabled is true but federation.hub is empty".into());
+        }
+        if !(1..=18).contains(&self.diablo2.max_characters) {
+            return Err("diablo2.max_characters must be between 1 and 18".into());
         }
         Ok(())
     }

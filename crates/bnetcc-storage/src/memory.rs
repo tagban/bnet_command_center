@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use bnetcc_core::AccountId;
 
 use crate::attr::{AttrKey, AttrMap};
-use crate::model::{Account, Ban, BanScope, Credential, NewAccount};
+use crate::model::{Account, Ban, BanScope, Character, Credential, NewAccount};
 use crate::{validate_account_name, Result, Storage, StorageError};
 
 /// An in-memory [`Storage`] implementation.
@@ -27,6 +27,8 @@ pub struct MemoryStorage {
     by_name: HashMap<String, AccountId>,
     attrs: HashMap<AccountId, AttrMap>,
     bans: HashMap<(AccountId, BanScope), Ban>,
+    /// Characters in creation order; names are unique realm-wide.
+    characters: Vec<Character>,
     next_id: AccountId,
 }
 
@@ -143,7 +145,52 @@ impl Storage for MemoryStorage {
         }
         self.attrs.remove(&id);
         self.bans.retain(|(acct, _), _| *acct != id);
+        self.characters.retain(|c| c.account != id);
         Ok(())
+    }
+
+    fn characters(&mut self, account: AccountId) -> Result<Vec<Character>> {
+        Ok(self.characters.iter().filter(|c| c.account == account).cloned().collect())
+    }
+
+    fn character_by_name(&mut self, name: &str) -> Result<Option<Character>> {
+        Ok(self
+            .characters
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .cloned())
+    }
+
+    fn create_character(&mut self, character: Character) -> Result<()> {
+        if !self.accounts.contains_key(&character.account) {
+            return Err(StorageError::NoSuchAccount);
+        }
+        if self.characters.iter().any(|c| c.name.eq_ignore_ascii_case(&character.name)) {
+            return Err(StorageError::NameTaken);
+        }
+        self.characters.push(character);
+        Ok(())
+    }
+
+    fn update_character(&mut self, character: &Character) -> Result<bool> {
+        let Some(slot) = self.characters.iter_mut().find(|c| {
+            c.account == character.account && c.name.eq_ignore_ascii_case(&character.name)
+        }) else {
+            return Ok(false);
+        };
+        slot.status = character.status;
+        slot.level = character.level;
+        slot.progression = character.progression;
+        slot.last_played = character.last_played;
+        slot.save.clone_from(&character.save);
+        Ok(true)
+    }
+
+    fn delete_character(&mut self, account: AccountId, name: &str) -> Result<bool> {
+        let before = self.characters.len();
+        self.characters
+            .retain(|c| !(c.account == account && c.name.eq_ignore_ascii_case(name)));
+        Ok(self.characters.len() != before)
     }
 
     fn flush(&mut self) -> Result<()> {
