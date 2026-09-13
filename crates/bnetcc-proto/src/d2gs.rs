@@ -61,8 +61,14 @@ pub mod sc {
     pub const REMOVE_UNIT: u8 = 0x0A;
     /// Which unit is the client's own player (6 bytes).
     pub const OWN_UNIT: u8 = 0x0B;
+    /// What an NPC has to say about quests, before its dialog opens (40 bytes).
+    pub const NPC_QUEST_MESSAGES: u8 = 0x27;
     /// Quest flags: the player's own (type 6) or an NPC's quest dialog update (103 bytes).
     pub const QUEST_FLAGS: u8 = 0x28;
+    /// Open the waypoint menu (21 bytes).
+    pub const WAYPOINT_MENU: u8 = 0x63;
+    /// Open or close a panel (2 bytes).
+    pub const UI_ACTION: u8 = 0x77;
     /// The game's quest flags (97 bytes).
     pub const GAME_QUEST_FLAGS: u8 = 0x29;
     /// Whether each quest is available in this game (38 bytes).
@@ -514,6 +520,50 @@ pub fn player_quest_flags(flags: &[u8; QUEST_FLAG_BYTES]) -> Vec<u8> {
     w.finish()
 }
 
+/// `0x27`: `[unit type u8][guid u32][count u8][u8][8 × (message u16, flag u8, u8)]` — the quest
+/// messages an NPC offers, sent first when a player talks to it (`0x00572C10`, list from
+/// `0x00661480`). An NPC with nothing quest-related to say: a count and entries all zero.
+#[must_use]
+pub fn npc_no_quest_messages(unit_type: u8, guid: u32) -> Vec<u8> {
+    let mut w = Writer::with_capacity(40);
+    w.u8(sc::NPC_QUEST_MESSAGES).u8(unit_type).u32(guid).bytes(&[0; 34]);
+    w.finish()
+}
+
+/// `0x28` type 1: `[1][npc guid u32][u8 0][flags 96]` — the player's quest flags, last of the
+/// packets that open an NPC's dialog (`0x00572C10` → `0x0053D670`); the client looks the NPC
+/// up by guid and opens its menu (`0x004B6DD0`).
+#[must_use]
+pub fn npc_dialog_quest_flags(npc_guid: u32, flags: &[u8; QUEST_FLAG_BYTES]) -> Vec<u8> {
+    let mut w = Writer::with_capacity(7 + QUEST_FLAG_BYTES);
+    w.u8(sc::QUEST_FLAGS).u8(1).u32(npc_guid).u8(0).bytes(flags);
+    w.finish()
+}
+
+/// Bytes of a player's waypoint flags after their version word (`0x006610B0` copies 16).
+pub const WAYPOINT_FLAG_BYTES: usize = 14;
+
+/// `0x63`: `[waypoint guid u32][version u16 0x0102][flags 14]` — the waypoint menu, with the
+/// waypoints the player has; `Levels.txt` `Waypoint` n is bit n of the flags, least significant
+/// first (`0x00660EC0`, table `0x00746424`). Sent by the waypoint's `OperateFn` 23
+/// (`0x00584E30`) once it is active.
+#[must_use]
+pub fn waypoint_menu(guid: u32, flags: &[u8; WAYPOINT_FLAG_BYTES]) -> Vec<u8> {
+    let mut w = Writer::with_capacity(21);
+    w.u8(sc::WAYPOINT_MENU).u32(guid).u16(0x0102).bytes(flags);
+    w.finish()
+}
+
+/// `0x77`: `[action u8]` — open or close a panel; `0x10` opens the stash (`OperateFn` 32,
+/// `0x00564CD0`).
+#[must_use]
+pub fn ui_action(action: u8) -> Vec<u8> {
+    vec![sc::UI_ACTION, action]
+}
+
+/// `0x77` action: open the stash.
+pub const UI_OPEN_STASH: u8 = 0x10;
+
 /// `0x29`: `[flags 96]` — the game's quest flags (`0x00544520`, client `0x004B2620`).
 #[must_use]
 pub fn game_quest_flags(flags: &[u8; QUEST_FLAG_BYTES]) -> Vec<u8> {
@@ -890,6 +940,13 @@ mod tests {
         assert_eq!(&player_quest_flags(&[0; QUEST_FLAG_BYTES])[..7], &[0x28, 6, 0, 0, 0, 0, 0]);
         assert_eq!(player_quest_flags(&[0; QUEST_FLAG_BYTES]).len(), 103);
         assert_eq!(game_quest_flags(&[0; QUEST_FLAG_BYTES]).len(), 97);
+        assert_eq!(npc_no_quest_messages(1, 5).len(), 40);
+        assert_eq!(&npc_dialog_quest_flags(5, &[0; QUEST_FLAG_BYTES])[..7], &[0x28, 1, 5, 0, 0, 0, 0]);
+        let mut known = [0u8; WAYPOINT_FLAG_BYTES];
+        known[0] = 1;
+        let menu = waypoint_menu(3, &known);
+        assert_eq!((menu.len(), &menu[5..8]), (21, &[0x02, 0x01, 0x01][..]), "version 0x0102, then bit 0: the camp");
+        assert_eq!(ui_action(UI_OPEN_STASH), vec![0x77, 0x10]);
         assert_eq!(pong().len(), 33);
         assert_eq!(join_failed_packet(join_failed::WRONG_VERSION), vec![0xB4, 0x10, 0, 0, 0]);
     }

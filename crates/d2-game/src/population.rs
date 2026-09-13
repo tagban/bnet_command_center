@@ -188,6 +188,15 @@ impl Population {
         self.rooms.get(room)?.as_deref()
     }
 
+    /// A spawned unit by engine unit type and guid.
+    #[must_use]
+    pub fn find(&self, kind: u8, guid: u32) -> Option<&Spawned> {
+        self.rooms.iter().flatten().flatten().find(|u| match u {
+            Spawned::Object { guid: g, .. } => kind == unit_type::OBJECT && *g == guid,
+            Spawned::Monster { guid: g, .. } => kind == unit_type::MONSTER && *g == guid,
+        })
+    }
+
     /// Populate `room` of `level` unless it already is (`0x005559A0`), and return its units.
     pub fn activate(&mut self, data: &GameData, level: &PresetLevel, room: usize) -> Activated<'_> {
         let mut not_ported = Vec::new();
@@ -328,6 +337,8 @@ mod tests {
         assert_eq!((variants[1], variants[6]), (1, 2));
         assert!(components.iter().zip(variants).all(|(&c, &v)| c < v.max(1)), "each pick within its variants");
 
+        assert!(matches!(pop.find(unit_type::MONSTER, 2), Some(Spawned::Monster { x: 514, .. })));
+        assert!(pop.find(unit_type::OBJECT, 9).is_none() && pop.find(unit_type::PLAYER, 1).is_none());
         let again = pop.activate(&data, &level, 0);
         assert_eq!((again.units.to_vec(), again.not_ported.len()), (units, 0), "populated once");
         let second = pop.activate(&data, &level, 1);

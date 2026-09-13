@@ -334,7 +334,8 @@ mod tests {
         }
         assert!(data.next_level_experience(0, 1).unwrap() > 0);
         let town = data.levels().get(1).expect("Rogue Encampment");
-        assert_eq!((town.act, town.drlg_type), (0, levels::DrlgType::Preset));
+        assert_eq!((town.act, town.drlg_type, town.waypoint), (0, levels::DrlgType::Preset, Some(0)));
+        assert_eq!(data.levels().get(2).unwrap().waypoint, None, "Blood Moor has none");
         assert_eq!(data.lvl_prests().for_level(1).unwrap().files.len(), 4, "TownN1/E1/S1/W1");
         assert!(matches!(data.mon_presets().get(0, 2), Some(presets::PresetMonster::Class { name, .. }) if name == "akara"));
         let chicken = data.monsters().get(149).expect("chicken");
@@ -343,6 +344,9 @@ mod tests {
         assert_eq!((rogue.critter, rogue.components[6]), (false, 2), "a town rogue carries one of two bows");
         let torch = data.objects().get(37).expect("objects.txt row 37");
         assert_eq!(torch.init_fn, 8);
+        assert_eq!(data.objects().get(267).unwrap().operate_fn, 32, "the stash");
+        assert!(data.monsters().get(148).unwrap().interact, "Akara talks");
+        assert!(!data.monsters().get(152).unwrap().interact, "town rogues do not");
         assert!(data.read_file("data\\global\\tiles\\Act1\\Town\\TownN1.ds1").unwrap().is_some());
     }
 }

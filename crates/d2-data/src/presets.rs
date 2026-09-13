@@ -169,6 +169,8 @@ pub struct ObjectClass {
     pub name: String,
     /// `InitFn`: the engine's per-class spawn routine (table `0x00731BC0`, record `+0x1B1`).
     pub init_fn: u8,
+    /// `OperateFn`: what operating it does (table `0x00732D18`, record `+0x1B3`).
+    pub operate_fn: u8,
     /// `PreOperate`: spawn some already operated (record `+0x13D`).
     pub pre_operate: bool,
     /// `SubClass` bits (record `+0x167`), e.g. 0x04 portals (`SendUnitToClient` adds `0x60`),
@@ -185,6 +187,7 @@ impl Objects {
             .map(|r| ObjectClass {
                 name: r.get("description - not loaded").or_else(|| r.get("Name")).unwrap_or_default().to_string(),
                 init_fn: r.int("InitFn").and_then(|v| u8::try_from(v).ok()).unwrap_or(0),
+                operate_fn: r.int("OperateFn").and_then(|v| u8::try_from(v).ok()).unwrap_or(0),
                 pre_operate: r.int("PreOperate").unwrap_or(0) != 0,
                 sub_class: r.int("SubClass").and_then(|v| u8::try_from(v).ok()).unwrap_or(0),
             })

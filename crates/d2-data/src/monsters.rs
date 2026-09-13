@@ -26,6 +26,11 @@ pub struct MonsterClass {
     pub critter: bool,
     /// Variants per component, as the engine counts them: the entries in each variant column.
     pub components: [u8; 16],
+    /// `MonStats.txt` `interact` (flag bit 9, record `+0xD` bit 1): a player can talk to it
+    /// (`0x00572C10` refuses otherwise).
+    pub interact: bool,
+    /// `MonStats.txt` `npc` (flag bit 8).
+    pub npc: bool,
 }
 
 /// Monster classes by id (`hcIdx`).
@@ -68,7 +73,8 @@ impl Monsters {
                 let class = i32::try_from(row.int("hcIdx")?).ok()?;
                 let id = row.get("Id")?.to_string();
                 let &(critter, components) = display.get(&row.get("MonStatsEx")?.to_ascii_lowercase())?;
-                Some((class, MonsterClass { id, critter, components }))
+                let flag = |c: &str| row.int(c).unwrap_or(0) != 0;
+                Some((class, MonsterClass { id, critter, components, interact: flag("interact"), npc: flag("npc") }))
             })
             .collect();
         Ok(Self { by_class })
@@ -87,7 +93,7 @@ mod tests {
 
     #[test]
     fn classes_join_their_display_row_and_count_variants() {
-        let monstats = Table::parse(b"Id\thcIdx\tMonStatsEx\r\nguard\t7\tguardex\r\nhen\t8\thenex\r\nlost\t9\tnowhere\r\n");
+        let monstats = Table::parse(b"Id\thcIdx\tMonStatsEx\tnpc\tinteract\r\nguard\t7\tguardex\t1\t1\r\nhen\t8\thenex\t\t\r\nlost\t9\tnowhere\t\t\r\n");
         let mut ms2 = String::from("Id\tcritter");
         for c in COMPONENT_COLUMNS {
             ms2.push('\t');
@@ -96,7 +102,8 @@ mod tests {
         ms2.push_str("\r\nGUARDEX\t\t\tlit\t\t\t\t\tsbw,lbw\r\nhenex\t1\t\tlit\r\n");
         let m = Monsters::from_tables(&monstats, &Table::parse(ms2.as_bytes())).unwrap();
         let guard = m.get(7).unwrap();
-        assert_eq!((guard.id.as_str(), guard.critter), ("guard", false));
+        assert_eq!((guard.id.as_str(), guard.critter, guard.interact, guard.npc), ("guard", false, true, true));
+        assert!(!m.get(8).unwrap().interact);
         assert_eq!(guard.components[..8], [0, 1, 0, 0, 0, 0, 2, 0], "TR one variant, LH two");
         assert!(m.get(8).unwrap().critter);
         assert!(m.get(9).is_none(), "no display row, no class");

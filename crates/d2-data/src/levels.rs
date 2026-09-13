@@ -36,6 +36,9 @@ pub struct LevelDef {
     pub drlg_type: DrlgType,
     /// `LevelType`: the `LvlTypes.txt` row naming its tile set.
     pub level_type: i32,
+    /// `Waypoint`: the level's bit in a player's waypoint flags (record `+0xE4`), `None` for
+    /// a level without a waypoint (255).
+    pub waypoint: Option<u8>,
 }
 
 /// All levels, by id.
@@ -77,6 +80,7 @@ impl Levels {
                     _ => DrlgType::None,
                 },
                 level_type: int("LevelType"),
+                waypoint: row.int("Waypoint").and_then(|w| u8::try_from(w).ok()).filter(|&w| w != 255),
             };
             let at = id as usize;
             if by_id.len() <= at {

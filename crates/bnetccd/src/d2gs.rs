@@ -369,13 +369,51 @@ impl GameServer {
     /// Where a unit of the game's population stands.
     fn unit_position(&self, game_id: u16, kind: u32, guid: u32) -> Option<(u16, u16)> {
         let g = self.lock();
-        let game = g.by_id.get(&game_id)?;
-        let (town, population) = (game.town.as_ref()?, game.population.as_ref()?);
-        (0..town.rooms.len()).filter_map(|room| population.units(room)).flatten().find_map(|u| match *u {
-            Spawned::Object { guid: g, x, y, .. } if kind == u32::from(unit_type::OBJECT) && g == guid => Some((x, y)),
-            Spawned::Monster { guid: g, x, y, .. } if kind == u32::from(unit_type::MONSTER) && g == guid => Some((x, y)),
-            _ => None,
-        })
+        let population = g.by_id.get(&game_id)?.population.as_ref()?;
+        match *population.find(u8::try_from(kind).ok()?, guid)? {
+            Spawned::Object { x, y, .. } | Spawned::Monster { x, y, .. } => Some((x, y)),
+        }
+    }
+
+    /// What the engine answers `0x13` with (`0x00548B00`), for the units the test knows:
+    /// - an NPC `MonStats.txt` lets players talk to: its dialog (`0x00572C10`: `27 29 28`), with
+    ///   no quest messages and a new character's clear flags;
+    /// - the stash (`OperateFn` 32, class 267): `77 10` (`0x00564CD0`);
+    /// - an active waypoint (`OperateFn` 23): the player learns its level's waypoint, then the
+    ///   menu `63` (`0x00584E30`).
+    ///
+    /// Range, busy and collision checks are not ported: the client walks up before it asks.
+    fn interact(&self, game_id: u16, kind: u32, guid: u32, waypoints: &mut [u8; d2gs::WAYPOINT_FLAG_BYTES]) -> Vec<Vec<u8>> {
+        let (Some(rules), Ok(kind)) = (&self.rules, u8::try_from(kind)) else { return Vec::new() };
+        let g = self.lock();
+        let Some(game) = g.by_id.get(&game_id) else { return Vec::new() };
+        let Some(unit) = game.population.as_ref().and_then(|p| p.find(kind, guid)) else { return Vec::new() };
+        match *unit {
+            Spawned::Monster { class, mode, .. } => {
+                let talks = rules.monsters().get(i32::from(class)).is_some_and(|m| m.interact);
+                if !talks || matches!(mode, 0 | 12) {
+                    return Vec::new();
+                }
+                vec![
+                    d2gs::npc_no_quest_messages(unit_type::MONSTER, guid),
+                    d2gs::game_quest_flags(&[0; d2gs::QUEST_FLAG_BYTES]),
+                    d2gs::npc_dialog_quest_flags(guid, &[0; d2gs::QUEST_FLAG_BYTES]),
+                ]
+            }
+            Spawned::Object { class, mode, .. } => match rules.objects().get(i32::from(class)).map(|o| o.operate_fn) {
+                Some(32) if class == 267 => vec![d2gs::ui_action(d2gs::UI_OPEN_STASH)],
+                Some(23) if matches!(mode, 1 | 2) => {
+                    let level = game.town.as_ref().map_or(i32::from(TOWN_AREA), |t| t.level_id);
+                    if let Some(bit) = rules.levels().get(level).and_then(|l| l.waypoint) {
+                        if let Some(byte) = waypoints.get_mut(usize::from(bit / 8)) {
+                            *byte |= 1 << (bit % 8);
+                        }
+                    }
+                    vec![d2gs::waypoint_menu(guid, waypoints)]
+                }
+                _ => Vec::new(),
+            },
+        }
     }
 
     /// What a client is sent when its player's near rooms change from `from` to `to`, in the
@@ -546,6 +584,8 @@ async fn run(
     let mut chunk = [0u8; 2048];
     let mut outbox = Outbox::default();
     let mut walker: Option<Walker> = None;
+    // The player's waypoint flags; a new character's are clear until it touches one.
+    let mut waypoints = [0u8; d2gs::WAYPOINT_FLAG_BYTES];
     let mut frame = tokio::time::interval(SERVER_FRAME);
     frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_step = Instant::now();
@@ -628,6 +668,16 @@ async fn run(
                             last_step = Instant::now();
                         }
                         w.go(f64::from(u16_at(1)), f64::from(u16_at(3)), speed * server.speed_scale);
+                    }
+                }
+                (Stage::InGame, cs::INTERACT) => {
+                    let Some(p) = player.as_ref() else { continue };
+                    let replies = server.interact(p.game_id, u32_at(1), u32_at(5), &mut waypoints);
+                    if !replies.is_empty() {
+                        for packet in &replies {
+                            outbox.push(packet);
+                        }
+                        flush(stream, peer, tables, &mut outbox).await?;
                     }
                 }
                 (Stage::InGame, cs::UPDATE_POSITION) => {
@@ -847,6 +897,8 @@ pub(crate) mod tests {
         client[usize::from(cs::RUN_TO_LOCATION)] = 5;
         client[usize::from(cs::WALK_TO_UNIT)] = 9;
         client[usize::from(cs::RUN_TO_UNIT)] = 9;
+        client[usize::from(cs::INTERACT)] = 9;
+        client[usize::from(cs::UPDATE_POSITION)] = 5;
         EngineTables::new(&lengths, client, [0i32; SERVER_OPCODES]).unwrap()
     }
 
@@ -989,19 +1041,33 @@ pub(crate) mod tests {
     }
 
     /// A made-up town in a row of four rooms: the second holds a torch (object 1, InitFn 8), the
-    /// waypoint players start on (object 3) and an NPC (monster 10, two helmets to pick from); a
-    /// crate stands in the fourth room, two rooms away.
+    /// waypoint players start on (object 3), the stash (267) and an NPC who talks (monster 10,
+    /// two helmets to pick from); a crate stands in the fourth room, two rooms away.
     fn test_town() -> (GameData, PresetLevel) {
+        use d2_data::levels::Levels;
         use d2_data::monsters::{Monsters, COMPONENT_COLUMNS};
         use d2_data::presets::{MonPresets, Objects, PresetMonster};
         use d2_drlg::preset::{PlacedUnit, UnitClass};
         use d2_drlg::Coords;
         use d2_formats::excel::Table;
         let mut rules = test_rules();
-        let objects = Table::parse(
-            b"Name\tInitFn\tPreOperate\tSubClass\r\nnone\t0\t0\t0\r\ntorch\t8\t0\t0\r\ncrate\t0\t0\t0\r\nwaypoint\t17\t0\t64\r\n",
-        );
-        let monstats = Table::parse(b"Id\thcIdx\tMonStatsEx\r\nguard\t10\tguard\r\n");
+        // Rows 0..=267: a torch (1), a crate (2), the waypoint (3) and, at the engine's class
+        // id, the stash (267).
+        let mut objects = String::from("Name\tInitFn\tPreOperate\tSubClass\tOperateFn\r\n");
+        for class in 0..=267 {
+            objects += match class {
+                1 => "torch\t8\t0\t0\t13\r\n",
+                2 => "crate\t0\t0\t0\t0\r\n",
+                3 => "waypoint\t17\t0\t64\t23\r\n",
+                267 => "bank\t0\t0\t0\t32\r\n",
+                _ => "none\t0\t0\t0\t0\r\n",
+            };
+        }
+        let objects = Table::parse(objects.as_bytes());
+        let levels = "Id\tAct\tSizeX\tSizeY\tSizeX(N)\tSizeY(N)\tSizeX(H)\tSizeY(H)\tOffsetX\tOffsetY\tDepend\tDrlgType\tLevelType\tWaypoint\r\n\
+                      1\t0\t32\t8\t32\t8\t32\t8\t0\t0\t0\t2\t1\t0\r\n";
+        rules.set_levels(Levels::from_table(&Table::parse(levels.as_bytes())).unwrap());
+        let monstats = Table::parse(b"Id\thcIdx\tMonStatsEx\tnpc\tinteract\r\nguard\t10\tguard\t1\t1\r\n");
         let mut ms2 = String::from("Id\tcritter");
         for c in COMPONENT_COLUMNS {
             ms2 += &format!("\t{c}");
@@ -1022,6 +1088,7 @@ pub(crate) mod tests {
                 at(UnitClass::Object(1), 5812, 4444),
                 at(UnitClass::Object(2), 5890, 4444),
                 at(UnitClass::Object(3), 5805, 4447),
+                at(UnitClass::Object(267), 5825, 4460),
             ],
         };
         (rules, town)
@@ -1049,6 +1116,9 @@ pub(crate) mod tests {
                 0x28 => 103,
                 0x29 => 97,
                 0x8F => 33,
+                0x27 => 40,
+                0x63 => 21,
+                0x77 => 2,
                 other => panic!("unexpected opcode {other:#04x}"),
             };
             out.push(rest[..size].to_vec());
@@ -1102,7 +1172,7 @@ pub(crate) mod tests {
         }
         assert_eq!(
             seen,
-            vec![d2gs::load_room(1176, 888, 1), d2gs::assign_object(3, 2, 5890, 4444, 0, 0), d2gs::unload_room(1152, 888, 1)]
+            vec![d2gs::load_room(1176, 888, 1), d2gs::assign_object(4, 2, 5890, 4444, 0, 0), d2gs::unload_room(1152, 888, 1)]
         );
 
         // Back to the first room: it and its neighbours come back; the fourth, two rooms off,
@@ -1116,7 +1186,52 @@ pub(crate) mod tests {
             let frame = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut c, huffman)).await.expect("rooms follow the run back");
             seen.extend(split_packets(&frame));
         }
-        assert_eq!(seen, vec![d2gs::load_room(1152, 888, 1), d2gs::remove_unit(2, 3), d2gs::unload_room(1176, 888, 1)]);
+        assert_eq!(seen, vec![d2gs::load_room(1152, 888, 1), d2gs::remove_unit(2, 4), d2gs::unload_room(1176, 888, 1)]);
+    }
+
+    /// Talking to the NPC opens its dialog, operating the stash opens it, and the waypoint opens
+    /// its menu with the camp's waypoint learnt; a crate nobody can use gets no answer.
+    #[tokio::test]
+    async fn clicking_an_npc_the_stash_or_the_waypoint_gets_the_engines_answer() {
+        let (rules, town) = test_town();
+        let gs = Arc::new(GameServer::new(test_tables(), Some(rules)).with_town(town));
+        let id = gs.create("probe", "", 0).unwrap();
+        let (_, hash) = gs.stage_join("probe", "", character("TestBan", 4, 0)).unwrap();
+        let addr = spawn(Arc::clone(&gs)).await;
+        let huffman = &gs.tables.huffman;
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.read_exact(&mut [0u8; 2]).await.unwrap();
+        c.write_all(&logon_packet(id, hash, 4, 0x0E, "TestBan")).await.unwrap();
+        read_frame(&mut c, huffman).await;
+        read_frame(&mut c, huffman).await;
+        c.write_all(&[cs::ENTER_GAME]).await.unwrap();
+        let mut joined = Vec::new();
+        while joined.last() != Some(&0x04) {
+            joined.extend(read_frame(&mut c, huffman).await);
+        }
+        let interact = |kind: u32, guid: u32| {
+            let mut p = vec![cs::INTERACT];
+            p.extend_from_slice(&kind.to_le_bytes());
+            p.extend_from_slice(&guid.to_le_bytes());
+            p
+        };
+        // The guard is monster 1; objects: torch 1, waypoint 2, stash 3.
+        c.write_all(&interact(1, 1)).await.unwrap();
+        assert_eq!(
+            split_packets(&read_frame(&mut c, huffman).await),
+            vec![
+                d2gs::npc_no_quest_messages(1, 1),
+                d2gs::game_quest_flags(&[0; d2gs::QUEST_FLAG_BYTES]),
+                d2gs::npc_dialog_quest_flags(1, &[0; d2gs::QUEST_FLAG_BYTES]),
+            ]
+        );
+        c.write_all(&interact(2, 3)).await.unwrap();
+        assert_eq!(read_frame(&mut c, huffman).await, d2gs::ui_action(0x10));
+        c.write_all(&interact(2, 1)).await.unwrap(); // the torch: no answer
+        c.write_all(&interact(2, 2)).await.unwrap();
+        let mut camp = [0u8; d2gs::WAYPOINT_FLAG_BYTES];
+        camp[0] = 1;
+        assert_eq!(read_frame(&mut c, huffman).await, d2gs::waypoint_menu(2, &camp));
     }
 
     #[tokio::test]
@@ -1142,7 +1257,7 @@ pub(crate) mod tests {
         let tail: Vec<u8> = ops.iter().map(|(op, _)| *op).skip_while(|&op| op != 0x53).collect();
         assert_eq!(
             tail,
-            vec![0x53, 0x07, 0x07, 0x07, 0x51, 0x51, 0xAC, 0xAA, 0x6D, 0x07, 0x15, 0x7E, 0x04],
+            vec![0x53, 0x07, 0x07, 0x07, 0x51, 0x51, 0x51, 0xAC, 0xAA, 0x6D, 0x07, 0x15, 0x7E, 0x04],
             "spawn room, then its three near rooms — units after their own room — then placement"
         );
         let body = |op: u8| ops.iter().find(|(o, _)| *o == op).map(|(_, b)| b.clone()).unwrap();
