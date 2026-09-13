@@ -107,8 +107,9 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
 1. Select a character and **Create Game** (Normal). *Expect:* the client loads into the Rogue
    Encampment, beside the campfire. *Before:* "Server Down". (Verified 2026-09-13.)
 2. *Expect nothing else to work.* The server sends the join up to "load complete" and then
-   only answers pings: no life/mana, no NPCs, and clicks go nowhere (they are logged). Leave
-   with Esc → Save and Exit, or close the client.
+   only answers pings: no life/mana, no NPCs or lit campfire, and the character walks only
+   on its own screen (the walk requests are logged). Past the town edge is black: nothing
+   tells the client to load those rooms. Esc → Save and Exit returns to chat (verified).
 3. Send the log from the moment you clicked Create Game.
 
 What it shows, in order:

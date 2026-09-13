@@ -69,7 +69,8 @@ second process, no control link; `characters.save` already holds the `.d2s`.
   decompilation is a weaker position than a true two-team clean room — the MIT licence covers
   jaenster's work, it cannot license Blizzard's. Precedents exist on both sides (DevilutionX, a
   decompilation-derived Diablo I, is long-lived and public; bnetd was sued). `docs/LEGAL.md` §2 is
-  the relevant section. Record the decision there before merging ported code.
+  the relevant section. **Decided 2026-09-13 (tagban): go ahead** — recorded in `docs/LEGAL.md`
+  §2, "Decision: the Diablo II game server is built from decompilation".
 - **Attribution**: each ported file carries jaenster's MIT notice and names its libd2 source.
 
 ## 5. Milestones

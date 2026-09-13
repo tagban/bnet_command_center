@@ -67,6 +67,24 @@ Things that reduce (not eliminate) exposure and are worth doing anyway:
   artwork, fonts, or the Battle.net logo. Describe it as compatible with a protocol, not as
   "Battle.net".
 
+### Decision: the Diablo II game server is built from decompilation (2026-09-13)
+
+**Made by tagban (project owner), 2026-09-13**, as `docs/D2GS-RUST.md` §4 asked before any
+ported code lands. The Diablo II game server is written from decompiling the retail 1.14d
+`Game.exe` in Ghidra and from porting `jaenster/libd2` (MIT), which is itself
+decompilation-derived. tagban's reasoning: a working server needs it, and this version of the
+game is no longer supported.
+
+This records the choice. It does not change the exposure described above. What the project
+still keeps to:
+
+- **No Blizzard bytes in the repository.** Engine tables, excel data and MPQ contents are
+  read at run time from the operator's own install (`diablo2.data_dir`). `scripts/d2re/`
+  reads them out of a local `Game.exe` and commits nothing it reads.
+- **Reimplementation, not copied code.** Ported functions are written fresh in Rust and cite
+  the 1.14d address they reproduce, so each can be checked against the binary.
+- **Attribution.** Files ported from libd2 carry its MIT notice and name their libd2 source.
+
 ---
 
 ## 3. WarCraft III will need a patched client, and you cannot fix that
