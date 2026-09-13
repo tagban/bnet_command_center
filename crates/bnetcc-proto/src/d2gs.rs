@@ -14,7 +14,8 @@
 //! Everything here was read from the retail 1.14d `Game.exe` — see
 //! `docs/D2GS-114D-WIRE.md`, which cites the engine address behind each rule. The engine's
 //! own tables (Huffman code lengths, packet sizes) are **not** in this repository: they are
-//! read from the operator's `Game.exe` at run time by [`EngineTables::from_game_exe`].
+//! read from the operator's `Game.exe` at run time (`d2_data::engine`) and handed to
+//! [`EngineTables::new`].
 
 use crate::buf::Writer;
 use crate::error::{ProtoError, Result};
@@ -122,15 +123,6 @@ pub struct EngineTables {
     pub server_sizes: [i32; SERVER_OPCODES],
 }
 
-/// Where the tables live in `Game.exe` 1.14.3.71.
-mod image {
-    pub const HUFFMAN_CODE_LENGTHS: u32 = 0x0070_76C0;
-    pub const CLIENT_SIZES: u32 = 0x0073_0DC0;
-    pub const SERVER_SIZES: u32 = 0x0073_0AE8;
-    /// `VS_FIXEDFILEINFO` 1.14.3.71: `dwFileVersionMS`, `dwFileVersionLS`.
-    pub const FILE_VERSION: (u32, u32) = (0x0001_000E, 0x0003_0047);
-}
-
 impl EngineTables {
     /// Assemble tables, checking the code lengths form a usable code.
     ///
@@ -144,112 +136,6 @@ impl EngineTables {
     ) -> Result<Self> {
         Ok(Self { huffman: Huffman::new(code_lengths)?, client_sizes, server_sizes })
     }
-
-    /// Read the tables out of a retail 1.14d `Game.exe` image (the whole file).
-    ///
-    /// Refuses any other build: the addresses are 1.14.3.71's. As a second guard, a few
-    /// sizes every client relies on are checked after reading.
-    ///
-    /// # Errors
-    ///
-    /// [`ProtoError::InvalidValue`] naming what did not match.
-    pub fn from_game_exe(file: &[u8]) -> Result<Self> {
-        let invalid = |field: &'static str, value: String| ProtoError::InvalidValue { field, value };
-        let pe = Pe::parse(file).ok_or_else(|| invalid("Game.exe", "not a PE image".into()))?;
-        match fixed_file_version(file) {
-            Some(v) if v == image::FILE_VERSION => {}
-            Some((ms, ls)) => {
-                return Err(invalid(
-                    "Game.exe version",
-                    format!("{}.{}.{}.{} (need 1.14.3.71)", ms >> 16, ms & 0xFFFF, ls >> 16, ls & 0xFFFF),
-                ))
-            }
-            None => return Err(invalid("Game.exe version", "no version resource".into())),
-        }
-
-        let lengths: [u8; 256] = pe
-            .bytes(image::HUFFMAN_CODE_LENGTHS, 256)
-            .and_then(|b| b.try_into().ok())
-            .ok_or_else(|| invalid("Game.exe", "Huffman table out of range".into()))?;
-        let mut client_sizes = [0i32; CLIENT_OPCODES];
-        pe.i32s(image::CLIENT_SIZES, &mut client_sizes)
-            .ok_or_else(|| invalid("Game.exe", "client size table out of range".into()))?;
-        let mut server_sizes = [0i32; SERVER_OPCODES];
-        pe.i32s(image::SERVER_SIZES, &mut server_sizes)
-            .ok_or_else(|| invalid("Game.exe", "server size table out of range".into()))?;
-
-        let expected = [
-            (client_sizes[usize::from(cs::GAME_LOGON)], 37),
-            (client_sizes[usize::from(cs::ENTER_GAME)], 1),
-            (client_sizes[usize::from(cs::PING)], 13),
-            (server_sizes[usize::from(sc::GAME_FLAGS)], 8),
-            (server_sizes[usize::from(sc::LOAD_ACT)], 12),
-            (server_sizes[usize::from(sc::ASSIGN_PLAYER)], 26),
-        ];
-        if expected.iter().any(|(got, want)| got != want) {
-            return Err(invalid("Game.exe", "packet size tables do not match 1.14d".into()));
-        }
-        Self::new(&lengths, client_sizes, server_sizes)
-    }
-}
-
-/// Just enough of a PE32 image to read initialised data by virtual address.
-struct Pe<'a> {
-    file: &'a [u8],
-    base: u32,
-    /// `(virtual address, raw size, raw offset)` per section.
-    sections: Vec<(u32, u32, u32)>,
-}
-
-impl<'a> Pe<'a> {
-    fn parse(file: &'a [u8]) -> Option<Self> {
-        let u16_at = |o: usize| file.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
-        let u32_at = |o: usize| file.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-        if file.get(..2)? != b"MZ" {
-            return None;
-        }
-        let pe = u32_at(0x3C)? as usize;
-        if file.get(pe..pe + 4)? != b"PE\0\0" {
-            return None;
-        }
-        let count = u16_at(pe + 6)? as usize;
-        let optional = u16_at(pe + 20)? as usize;
-        let base = u32_at(pe + 24 + 28)?;
-        let first = pe + 24 + optional;
-        let sections = (0..count)
-            .map(|i| {
-                let s = first + 40 * i;
-                Some((u32_at(s + 12)?, u32_at(s + 16)?, u32_at(s + 20)?))
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(Self { file, base, sections })
-    }
-
-    fn bytes(&self, va: u32, len: usize) -> Option<&'a [u8]> {
-        let rva = va.checked_sub(self.base)?;
-        self.sections.iter().find_map(|&(start, raw_size, raw_offset)| {
-            let within = rva.checked_sub(start)?;
-            (within as usize + len <= raw_size as usize)
-                .then(|| self.file.get(raw_offset as usize + within as usize..)?.get(..len))
-                .flatten()
-        })
-    }
-
-    fn i32s(&self, va: u32, out: &mut [i32]) -> Option<()> {
-        let bytes = self.bytes(va, out.len() * 4)?;
-        for (v, b) in out.iter_mut().zip(bytes.chunks_exact(4)) {
-            *v = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-        }
-        Some(())
-    }
-}
-
-/// `dwFileVersionMS`/`LS` from the image's `VS_FIXEDFILEINFO`, found by its signature.
-fn fixed_file_version(file: &[u8]) -> Option<(u32, u32)> {
-    const SIGNATURE: [u8; 4] = 0xFEEF_04BD_u32.to_le_bytes();
-    let at = file.windows(4).position(|w| w == SIGNATURE)?;
-    let b = file.get(at + 8..at + 16)?;
-    Some((u32::from_le_bytes([b[0], b[1], b[2], b[3]]), u32::from_le_bytes([b[4], b[5], b[6], b[7]])))
 }
 
 // --- Huffman ---------------------------------------------------------------------------
@@ -861,21 +747,5 @@ mod tests {
         assert_eq!((bits_at(&p, 8, 15), bits_at(&p, 23, 15), bits_at(&p, 38, 15)), (55, 15, 89));
         let p = life_and_position(1, 2, 3, 5810, 4450, -1, 2);
         assert_eq!((bits_at(&p, 53, 16), bits_at(&p, 69, 16), bits_at(&p, 85, 8), bits_at(&p, 93, 8)), (5810, 4450, 0xFF, 2));
-    }
-
-    /// With the operator's real `Game.exe` (set `BNETCC_D2_GAME_EXE`), the tables load and the
-    /// codec reproduces a frame captured off a live 1.14d server — plaintext GameFlags + 0x00
-    /// in, `7a 09 a5 f0` out. The capture is from jaenster/libd2 (MIT).
-    #[test]
-    fn with_a_real_game_exe_the_codec_matches_a_live_server() {
-        let Ok(path) = std::env::var("BNETCC_D2_GAME_EXE") else {
-            return;
-        };
-        let file = std::fs::read(path).expect("read Game.exe");
-        let tables = EngineTables::from_game_exe(&file).expect("1.14d tables");
-        let plain = [0x01, 0x00, 0x04, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00];
-        let mut out = Vec::new();
-        encode_frame(&tables.huffman, &plain, &mut out).unwrap();
-        assert_eq!(out, vec![0x05, 0x7A, 0x09, 0xA5, 0xF0]);
     }
 }

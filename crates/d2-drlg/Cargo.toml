@@ -8,8 +8,6 @@ description = "Diablo II level generation: the world a game seed produces, as th
 
 [dependencies]
 d2-data = { path = "../d2-data" }
-
-[dev-dependencies]
 d2-formats = { path = "../d2-formats" }
 
 [lints.rust]

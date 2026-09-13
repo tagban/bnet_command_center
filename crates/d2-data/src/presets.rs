@@ -1,0 +1,181 @@
+//! What the map files' preset units mean: `LvlPrest.txt` (which DS1 a preset level uses),
+//! `MonPreset.txt` with `MonStats.txt` / `SuperUniques.txt` / `MonPlace.txt` (what a preset
+//! monster id places), and `objects.txt` names.
+
+use std::collections::HashMap;
+
+use d2_formats::excel::Table;
+
+use crate::Error;
+
+/// One `LvlPrest.txt` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LvlPrest {
+    /// `Def`.
+    pub def: i32,
+    /// `LevelId` (0 for rows used only by mazes and sub-levels).
+    pub level_id: i32,
+    /// `Populate`: whether rooms spawn their populate objects.
+    pub populate: bool,
+    /// `File1`..`File6`, relative to `data\global\tiles`, blanks and `0` dropped.
+    pub files: Vec<String>,
+}
+
+/// `LvlPrest.txt`.
+#[derive(Debug, Clone, Default)]
+pub struct LvlPrests {
+    rows: Vec<LvlPrest>,
+}
+
+impl LvlPrests {
+    /// Parse the table.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadTable`] if `Def`, `LevelId` or `File1` is missing.
+    pub fn from_table(t: &Table) -> Result<Self, Error> {
+        for column in ["Def", "LevelId", "File1"] {
+            if t.column(column).is_none() {
+                return Err(Error::BadTable { table: "lvlprest.txt", problem: format!("no {column} column") });
+            }
+        }
+        let rows = t
+            .rows()
+            .map(|row| LvlPrest {
+                def: row.int("Def").unwrap_or(0) as i32,
+                level_id: row.int("LevelId").unwrap_or(0) as i32,
+                populate: row.int("Populate").unwrap_or(0) != 0,
+                files: (1..=6)
+                    .filter_map(|i| row.get(&format!("File{i}")))
+                    .filter(|f| *f != "0")
+                    .map(str::to_string)
+                    .collect(),
+            })
+            .collect();
+        Ok(Self { rows })
+    }
+
+    /// The preset row for a level.
+    #[must_use]
+    pub fn for_level(&self, level_id: i32) -> Option<&LvlPrest> {
+        self.rows.iter().find(|r| r.level_id == level_id && level_id != 0)
+    }
+}
+
+/// What a preset monster id places.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PresetMonster {
+    /// A `MonStats.txt` class (`hcIdx`) — an NPC or a monster.
+    Class {
+        /// The class id.
+        class: i32,
+        /// The `MonPreset.txt` `Place` name.
+        name: String,
+    },
+    /// A `SuperUniques.txt` row.
+    SuperUnique {
+        /// Its row.
+        index: i32,
+        /// The `Place` name.
+        name: String,
+    },
+    /// A `MonPlace.txt` placement rule (a spawn group, not a monster).
+    Placement {
+        /// Its row.
+        index: i32,
+        /// The `Place` name.
+        name: String,
+    },
+    /// A name no table knows.
+    Unknown(String),
+}
+
+/// `MonPreset.txt` resolved against `MonStats`, `SuperUniques` and `MonPlace`, as
+/// `DATATBLS_LinkerMonsterPreset` (`0x006597E0`) resolves it at load.
+#[derive(Debug, Clone, Default)]
+pub struct MonPresets {
+    /// Per act (0..=4), in `MonPreset.txt` order: the block a DS1 monster id indexes.
+    per_act: [Vec<PresetMonster>; 5],
+}
+
+impl MonPresets {
+    /// Resolve `MonPreset.txt`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadTable`] if a needed column is missing.
+    pub fn from_tables(monpreset: &Table, monstats: &Table, superuniques: &Table, monplace: &Table) -> Result<Self, Error> {
+        let need = |t: &Table, table: &'static str, column: &str| {
+            t.column(column).map(|_| ()).ok_or_else(|| Error::BadTable { table, problem: format!("no {column} column") })
+        };
+        need(monpreset, "monpreset.txt", "Place")?;
+        need(monstats, "monstats.txt", "Id")?;
+        need(monstats, "monstats.txt", "hcIdx")?;
+        need(superuniques, "superuniques.txt", "Superunique")?;
+        need(monplace, "monplace.txt", "code")?;
+
+        let index = |t: &Table, column: &str| -> HashMap<String, i32> {
+            let mut m = HashMap::new();
+            for (i, row) in t.rows().enumerate() {
+                if let Some(name) = row.get(column) {
+                    m.entry(name.to_ascii_lowercase()).or_insert(i as i32);
+                }
+            }
+            m
+        };
+        let classes: HashMap<String, i32> = monstats
+            .rows()
+            .filter_map(|r| Some((r.get("Id")?.to_ascii_lowercase(), r.int("hcIdx")? as i32)))
+            .collect();
+        let supers = index(superuniques, "Superunique");
+        let places = index(monplace, "code");
+
+        let mut per_act: [Vec<PresetMonster>; 5] = Default::default();
+        for row in monpreset.rows() {
+            let (Some(act), Some(place)) = (row.int("Act"), row.get("Place")) else { continue };
+            let Some(block) = usize::try_from(act - 1).ok().and_then(|a| per_act.get_mut(a)) else { continue };
+            let key = place.to_ascii_lowercase();
+            let name = place.to_string();
+            block.push(if let Some(&index) = supers.get(&key) {
+                PresetMonster::SuperUnique { index, name }
+            } else if let Some(&class) = classes.get(&key) {
+                PresetMonster::Class { class, name }
+            } else if let Some(&index) = places.get(&key) {
+                PresetMonster::Placement { index, name }
+            } else {
+                PresetMonster::Unknown(name)
+            });
+        }
+        Ok(Self { per_act })
+    }
+
+    /// What DS1 monster id `ds1_id` places in `act` (0-based).
+    #[must_use]
+    pub fn get(&self, act: u8, ds1_id: i32) -> Option<&PresetMonster> {
+        self.per_act.get(usize::from(act))?.get(usize::try_from(ds1_id).ok()?)
+    }
+}
+
+/// `objects.txt`: names by class id.
+#[derive(Debug, Clone, Default)]
+pub struct Objects {
+    names: Vec<String>,
+}
+
+impl Objects {
+    /// Parse the table.
+    #[must_use]
+    pub fn from_table(t: &Table) -> Self {
+        let names = t
+            .rows()
+            .map(|r| r.get("description - not loaded").or_else(|| r.get("Name")).unwrap_or_default().to_string())
+            .collect();
+        Self { names }
+    }
+
+    /// An object class's description, for logs.
+    #[must_use]
+    pub fn name(&self, class: i32) -> Option<&str> {
+        self.names.get(usize::try_from(class).ok()?).map(String::as_str)
+    }
+}

@@ -11,6 +11,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod ds1;
 pub mod excel;
 pub mod mpq;
+pub mod pe;
 pub mod pkware;

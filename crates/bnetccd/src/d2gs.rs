@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use bnetcc_proto::d2::status;
 use bnetcc_proto::d2gs::{self, cs, join_failed, ClientPacketLen, EngineTables, GameLogon, Outbox};
 use bnetcc_storage::Character;
+use d2_data::engine::EngineData;
 use d2_data::{stat, GameData};
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -121,7 +122,9 @@ impl GameServer {
     pub async fn start(data_dir: &str, ip: std::net::IpAddr) -> Option<Arc<Self>> {
         let path = Path::new(data_dir).join("Game.exe");
         let tables = match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|file| {
-            EngineTables::from_game_exe(&file).map_err(|e| e.to_string())
+            let engine = EngineData::from_game_exe(&file).map_err(|e| e.to_string())?;
+            EngineTables::new(&engine.huffman_code_lengths, engine.client_packet_sizes, engine.server_packet_sizes)
+                .map_err(|e| e.to_string())
         }) {
             Ok(t) => t,
             Err(e) => {
@@ -561,6 +564,21 @@ pub(crate) mod tests {
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(serve(listener, server));
         addr
+    }
+
+    /// With the operator's `Game.exe` (`BNETCC_D2_GAME_EXE`), the wire tables it yields reproduce
+    /// a frame captured off a live 1.14d server: plaintext GameFlags + 0x00 in, `05 7a 09 a5 f0`
+    /// on the wire. The capture is from jaenster/libd2 (MIT).
+    #[test]
+    fn with_a_real_game_exe_the_codec_matches_a_live_server() {
+        let Ok(path) = std::env::var("BNETCC_D2_GAME_EXE") else {
+            return;
+        };
+        let engine = EngineData::from_game_exe(&std::fs::read(path).unwrap()).expect("1.14d tables");
+        let tables = EngineTables::new(&engine.huffman_code_lengths, engine.client_packet_sizes, engine.server_packet_sizes).unwrap();
+        let mut out = Vec::new();
+        d2gs::encode_frame(&tables.huffman, &[0x01, 0x00, 0x04, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00], &mut out).unwrap();
+        assert_eq!(out, vec![0x05, 0x7A, 0x09, 0xA5, 0xF0]);
     }
 
     #[test]

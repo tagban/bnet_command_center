@@ -13,6 +13,7 @@
 #![warn(missing_docs)]
 
 pub mod act;
+pub mod preset;
 pub mod rng;
 
 /// A rectangle in tiles: origin and size.

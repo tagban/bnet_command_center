@@ -9,14 +9,18 @@
 
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 
 use d2_formats::excel::Table;
 use d2_formats::mpq::{self, ArchiveSet, DATA_ARCHIVES};
 
+pub mod engine;
 pub mod levels;
+pub mod presets;
 pub mod stat;
 
 use levels::Levels;
+use presets::{LvlPrests, MonPresets, Objects};
 
 /// Classes in `charstats.txt` order, which is the engine's class id.
 pub const CLASSES: [&str; 7] = ["Amazon", "Sorceress", "Necromancer", "Paladin", "Barbarian", "Druid", "Assassin"];
@@ -80,6 +84,11 @@ pub struct GameData {
     /// `experience.txt` by level (row `"0"` first), one column per class.
     experience: Vec<[u32; 7]>,
     levels: Levels,
+    lvl_prests: LvlPrests,
+    mon_presets: MonPresets,
+    objects: Objects,
+    /// The install's archives, kept open for map files; `None` when built from tables.
+    archives: Option<Arc<ArchiveSet>>,
 }
 
 impl GameData {
@@ -98,7 +107,47 @@ impl GameData {
         };
         let mut data = Self::from_tables(&read("charstats.txt")?, &read("experience.txt")?)?;
         data.levels = Levels::from_table(&read("levels.txt")?)?;
+        data.lvl_prests = LvlPrests::from_table(&read("lvlprest.txt")?)?;
+        data.mon_presets = MonPresets::from_tables(
+            &read("monpreset.txt")?,
+            &read("monstats.txt")?,
+            &read("superuniques.txt")?,
+            &read("monplace.txt")?,
+        )?;
+        data.objects = Objects::from_table(&read("objects.txt")?);
+        data.archives = Some(Arc::new(archives));
         Ok(data)
+    }
+
+    /// Read a file from the install, e.g. `data\global\tiles\Act1\Town\TownN1.ds1`.
+    /// `Ok(None)` if there is no such file or no install was loaded.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Mpq`] if the file is there but cannot be read.
+    pub fn read_file(&self, member: &str) -> Result<Option<Vec<u8>>, Error> {
+        match &self.archives {
+            Some(a) => Ok(a.read(member)?),
+            None => Ok(None),
+        }
+    }
+
+    /// `LvlPrest.txt`.
+    #[must_use]
+    pub fn lvl_prests(&self) -> &LvlPrests {
+        &self.lvl_prests
+    }
+
+    /// `MonPreset.txt`, resolved.
+    #[must_use]
+    pub fn mon_presets(&self) -> &MonPresets {
+        &self.mon_presets
+    }
+
+    /// `objects.txt`.
+    #[must_use]
+    pub fn objects(&self) -> &Objects {
+        &self.objects
     }
 
     /// Build from already-parsed tables.
@@ -149,7 +198,15 @@ impl GameData {
         if levels.len() < 2 {
             return Err(bad("experience.txt", "fewer than two levels".into()));
         }
-        Ok(Self { classes, experience: levels, levels: Levels::default() })
+        Ok(Self {
+            classes,
+            experience: levels,
+            levels: Levels::default(),
+            lvl_prests: LvlPrests::default(),
+            mon_presets: MonPresets::default(),
+            objects: Objects::default(),
+            archives: None,
+        })
     }
 
     /// `Levels.txt` (empty when built with [`GameData::from_tables`]).
@@ -263,5 +320,8 @@ mod tests {
         assert!(data.next_level_experience(0, 1).unwrap() > 0);
         let town = data.levels().get(1).expect("Rogue Encampment");
         assert_eq!((town.act, town.drlg_type), (0, levels::DrlgType::Preset));
+        assert_eq!(data.lvl_prests().for_level(1).unwrap().files.len(), 4, "TownN1/E1/S1/W1");
+        assert!(matches!(data.mon_presets().get(0, 2), Some(presets::PresetMonster::Class { name, .. }) if name == "akara"));
+        assert!(data.read_file("data\\global\\tiles\\Act1\\Town\\TownN1.ds1").unwrap().is_some());
     }
 }
