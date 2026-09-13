@@ -17,7 +17,7 @@
 //! this does not include; the lobby answers "server down" / "game does not exist", which the
 //! client shows as ordinary messages. Characters, selection and chat all work without it.
 //! With `diablo2.game_server_probe` on, games can be created and joined against the
-//! handshake test in [`crate::d2gs`] — the client reaches the loading screen and no further.
+//! handshake test in [`crate::d2gs`] — the client reaches the Rogue Encampment and no further.
 //!
 //! Wire layouts are from BNETDocs, cross-checked against the MIT-licensed
 //! `jaenster/d2-dedicated-server` realm (a retail 1.14d client renders its replies) — see

@@ -186,6 +186,13 @@ the client's own player unit (`0x7A6A70`), still null. That pointer is only ever
 `0x0B` handler (`0x0045CC50`), which looks up an **existing** unit by guid — hence the engine
 order in row 4: `0x59` first, then `0x0B`, and only then `0x03 0x53`. The test now sends that.
 
+Second run, same day, with `59 0B 23 23 03 53 07 15 7E` / `04`: **the client is in the game** — in
+the Rogue Encampment, standing where §5's spawn put it, and stays connected (a `0x6D` ping every
+5 s, answered with `0x8F`). Clicking the ground sends `0x01` WalkToLocation to subtiles a few
+steps from the spawn (`01 ad16 5f11` = 5805, 4447), which confirms map seed, spawn and room.
+Missing, as expected with nothing sent after `04`: life/mana/stamina (no stat packets), and no
+response to actions (walking needs the server to answer).
+
 ## 6. Server packet builders (opcode → function)
 
 `scripts/d2re/server_send_builders.py <Game.exe>` finds every call to the queue function

@@ -72,7 +72,7 @@ pub struct Diablo2Config {
     pub data_dir: String,
     /// **Experimental test.** Let clients create and join games against the game-server
     /// handshake test on port 4000 (`crate::d2gs`): a joining client gets Blizzard's join
-    /// sequence and stops at the loading screen — there is no world yet. Needs `data_dir`.
+    /// sequence and stands in the Rogue Encampment with no stats, NPCs or actions. Needs `data_dir`.
     pub game_server_probe: bool,
 }
 

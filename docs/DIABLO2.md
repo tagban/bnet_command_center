@@ -104,11 +104,11 @@ game_server_probe = true
 Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is not (wrong
 `Game.exe`, port 4000 taken). Internet players also need TCP 4000 forwarded; LAN clients don't.
 
-1. Select a character and **Create Game** (Normal). *Expect:* the client leaves the lobby for
-   the loading screen. *Before:* "Server Down".
-2. *Expect it to stop there.* The server sends the join up to "load complete" and nothing
-   after — no town, no NPCs. Close the client (Task Manager if the loading screen will not
-   let go).
+1. Select a character and **Create Game** (Normal). *Expect:* the client loads into the Rogue
+   Encampment, beside the campfire. *Before:* "Server Down". (Verified 2026-09-13.)
+2. *Expect nothing else to work.* The server sends the join up to "load complete" and then
+   only answers pings: no life/mana, no NPCs, and clicks go nowhere (they are logged). Leave
+   with Esc → Save and Exit, or close the client.
 3. Send the log from the moment you clicked Create Game.
 
 What it shows, in order:

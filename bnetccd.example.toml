@@ -212,7 +212,7 @@ max_characters = 18         # per account, 1..=18
 data_dir = ""
 # EXPERIMENTAL test, off by default: let clients create and join games against the game-server
 # handshake test on TCP port 4000 (forward it for internet players). A joining client gets
-# Blizzard's join sequence and stops at the loading screen — there is no world yet. Needs
+# Blizzard's join sequence and stands in the Rogue Encampment — no stats, NPCs or actions. Needs
 # data_dir. Every game packet is logged. See docs/D2GS-114D-WIRE.md.
 game_server_probe = false
 

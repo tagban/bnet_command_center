@@ -137,7 +137,7 @@ impl GameServer {
         warn!(
             %addr,
             "Diablo II game server HANDSHAKE TEST is on: games can be created and joined, but \
-             clients stop at the loading screen (diablo2.game_server_probe)"
+             clients only stand in town: no stats, NPCs or actions (diablo2.game_server_probe)"
         );
         tokio::spawn(serve(listener, Arc::clone(&server)));
         Some(server)
