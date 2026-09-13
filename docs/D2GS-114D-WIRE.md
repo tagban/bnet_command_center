@@ -375,6 +375,54 @@ change sends exactly the packets above — except that a room is dropped only on
 away (gap under 14), because the straight-line player can run ahead of the client's. Blood Moor's
 monsters, objects and warps are not generated.
 
+### Talking, the stash and the waypoint (2026-09-13)
+
+`0x13` `[type u32][guid u32]` (handler `0x54AA90`, type ≤ 5) goes to `0x548B00`:
+
+- **NPC** (type 1): within range (`0x641530` < `0x33`), an NPC with `MonStats` `npc` and
+  `interact` (record `+0xD` bits 0 and 1) stops its path; at a distance of 6 or less, unless the
+  player is busy, `0x573020` → `0x572C10`. That checks the NPC is alive and `interact` (flag 9),
+  adds the player to the NPC's list, sends Kashya-style hireling lists for classes 150/198/515/
+  252 (`0x576770`), marks the player as interacting (`0x554120`, type 1), runs the quests' NPC
+  callbacks into a message list (`0x543D10`), then sends **`0x27`** (40) `[1][npc guid][count
+  u8][u8][8 × (message u16, flag u8, u8)]` (`0x661480`), **`0x29`** game quest flags, and
+  **`0x28`** `[1][npc guid][0][player quest flags 96]`. The client's type-1 `0x28` handler
+  (`0x4B6DD0`) finds the NPC and opens its menu (or plays a queued quest message). Closing sends
+  C→S `0x30` `[type][guid]` (`0x54B9F0` → `0x572F20`), answered with nothing. The menu's actions
+  come as C→S `0x38` `[action u32][npc guid u32][u32]` (`0x579D60`): 1 trade (for the shop NPC
+  classes), 2 gamble/repair, 3 hire, others quest-specific — shops need item generation.
+- **Object** (type 2): mode ≤ 7, in range and not blocked (`0x623660`, `0x622B50` mask `0x804`)
+  → `0x584540` → `0x584420` → `OperateFn` table `0x732D18`.
+  - Stash, `OperateFn` 32 (`0x564CD0`): class 267 with both units in town → interacting type 2
+    and **`0x77 10`**, then items are re-sorted (`0x55FA40`). Closing is C→S `0x4F`
+    `[button u16 0x12][u16][u16]` (`0x54C7C0` → `0x568060` → `0x564D50`): the interaction ends,
+    nothing sent. Buttons 0x13/0x14 move gold.
+  - Waypoint, `OperateFn` 23 (`0x584E30`): its level's `Levels.txt` `Waypoint` bit is set in the
+    player's flags (`0x660E00`, `0x660EC0`: word `1 + n/16`, bit `n % 16`, table `0x746424`); an
+    inactive waypoint (mode 0) turns to mode 1; an active one (mode 1 or 2) with the player not
+    busy sends **`0x63`** (21) `[waypoint guid][u16 0x0102][flags 14]` (`0x6610B0`) and marks the
+    player interacting. Choosing a destination is C→S `0x49` `[guid][level]`.
+
+The handshake test answers the NPC case (no quest messages, clear flags), the stash and the
+waypoint (a new character's flags, the camp's bit set on use) without the range, busy and
+collision checks; it does not answer `0x38` or `0x49`.
+
+### The act clock (2026-09-13)
+
+A new act's environment (`0x61BE40`, `.\ENVIRONMENT\Env.cpp`) starts in period 2 at tick 0 with
+128 ticks a degree (`0x7443E4` speeds 128, 4, 8) — exactly what the handshake test's first `0x53`
+said. Every frame (`0x52D870` → `0x52D7B0`) each act's clock steps (`0x61C040` → `0x61BEE0`): one
+tick, plus 15 in Act IV, or one more at night (phase 2) and eight more on top in Act III; wrap at
+360°; move to the next period once past its angle, snapping the ticks to it. `0x61C040` reports a
+change when the period or phase changed or the degree moved more than 16 from the last report,
+and `0x52D7B0` then sends `0x53` `[period u32][ticks u32][eclipse u8]` (`0x61C330`) to every
+client in that act in join state 4. Act I: day for 160°, dusk at about 13.6 minutes; the bonfire
+lights then (§5, *The bonfire is on a clock*). Period 1's successor, period 2 at 0°, is always
+behind the ticks, so period 1 lasts a single frame and the day restarts at 340°.
+
+The handshake test keeps one clock per game (Act I), steps it by elapsed server frames, and
+sends `0x53` on each report; eclipses are not ported.
+
 ## 6. Server packet builders (opcode → function)
 
 `scripts/d2re/server_send_builders.py <Game.exe>` finds every call to the queue function
@@ -394,8 +442,8 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
 
 - Walk the player-state helpers under `SendUnitToClient` to the exact packet list for one's own
   player (stats, skills, items, states).
-- NPC and object interaction: C→S `0x02`/`0x13`/`0x59` (above) and what the server answers.
-- The act clock: the server's starting period and the `0x53` updates as it advances.
+- Shops: `0x38` trade/gamble/repair and the store's items; hirelings; NPC quest messages.
+- Waypoint travel (`0x49`), which needs warps and other acts.
 - Movement: paths and collision (`0x64DEA0`, libd2 `path.zig`/`collision.zig`) in place of
   straight lines; cross-level near rooms by visibility slots (`0x66C220`); the wilderness
   generator proper, for Blood Moor's monsters, objects and warps; NPC AI walking their DS1

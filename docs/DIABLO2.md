@@ -111,18 +111,21 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
 2. *Expect, around the waypoint* (the 3×3 rooms around it, when `data_dir` holds the MPQs):
    the NPCs and objects nearby standing still — in the camp tagban tested, Warriv, Kashya, Akara,
    Charsi, Gheed and five rogue guards — the torches lit, the bonfire, the stash and the
-   waypoint (active, blue). What is near depends on the layout. The bonfire burns
-   low: the client lights it only at dusk and night, and test games stay at midday. Clicking
-   an NPC or the stash does nothing. Chickens wander as before — the client spawns those
-   itself. (Verified 2026-09-13.)
+   waypoint (active, blue). What is near depends on the layout. Chickens wander as before —
+   the client spawns those itself. (Verified 2026-09-13.)
+   *Expect to talk and use things:* clicking Akara, Kashya, Charsi, Gheed or Warriv opens their
+   menu (Talk has nothing to say yet; Trade, Hire and the rest do nothing), clicking the stash
+   opens it (empty), clicking the waypoint opens its menu with the Rogue Encampment ticked
+   (travel does nothing). *Expect the day to pass:* the bonfire burns low by day and lights up
+   at dusk, about 14 minutes after the game was created.
 3. *Expect walking to load the world:* the server follows your character, so NPCs and
    objects further from the waypoint appear as you approach, and walking out of the camp
    shows Blood Moor's ground as you go (`player entered a level level=2` in the log). Blood
    Moor is empty — no monsters, shrines or the Den of Evil entrance yet — and walking through
    a fence can make the server think you are somewhere you are not (it has no collision).
 4. *Expect nothing else to work:* life/mana/stamina show (level-1 values from
-   `charstats.txt`), NPCs never walk, clicking does nothing. Esc → Save and Exit returns to
-   chat (verified).
+   `charstats.txt`), NPCs never walk, there is no combat, no shop and no travel. Esc → Save
+   and Exit returns to chat (verified).
 5. Send the log from the moment you clicked Create Game.
 
 What it shows, in order:
