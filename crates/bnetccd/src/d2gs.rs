@@ -26,6 +26,7 @@ use d2_data::engine::EngineData;
 use d2_data::{stat, GameData};
 use d2_drlg::act::Act;
 use d2_drlg::preset::PresetLevel;
+use d2_drlg::world::{RoomId, World};
 use d2_game::population::{unit_type, waypoint_spawn, Population, Spawned};
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -64,6 +65,18 @@ const FALLBACK_SPAWN_ROOM: (u16, u16) = (1152, 880);
 /// Guid of the joining player's unit.
 const PLAYER_GUID: u32 = 1;
 
+/// Walking speed in subtiles a second: `CharStats.txt` `WalkVelocity` 6 as the engine's
+/// `dwVelocity` (`6 << 8`), which moves `velocity / 16` of a subtile a frame (libd2
+/// `world/src/motion.zig`, from `0x0064FE40`) at 25 frames a second.
+const WALK_SPEED: f64 = 6.0 * 25.0 / 16.0;
+/// Running speed, from `RunVelocity` 9 the same way.
+const RUN_SPEED: f64 = 9.0 * 25.0 / 16.0;
+/// A room leaves a client's view only once it is this many tiles from the player's room — one
+/// room further than the engine's near gap (6). The server walks straight lines without
+/// collision, so it can run ahead of the client's player; dropping a room the client still
+/// stands in would free it under its player.
+const KEEP_GAP: i32 = 6 + 8;
+
 /// The test game server: its engine tables, the game rules, and the games the realm has created.
 #[derive(Debug)]
 pub struct GameServer {
@@ -73,6 +86,8 @@ pub struct GameServer {
     /// Where each game's Rogue Encampment comes from; without one a player stands in an empty
     /// town.
     towns: Towns,
+    /// Multiplies walking and running speed — for tests.
+    speed_scale: f64,
     games: Mutex<Games>,
 }
 
@@ -107,6 +122,8 @@ struct Game {
     map_seed: u32,
     /// The Rogue Encampment for [`Game::map_seed`].
     town: Option<PresetLevel>,
+    /// The act's walkable levels and their rooms: what a player's near rooms are drawn from.
+    world: Option<World>,
     /// Where joining players are placed.
     spawn: (u16, u16),
     /// The town's objects and NPCs, spawned room by room as players come near.
@@ -137,7 +154,7 @@ impl GameServer {
     /// A game server with no games.
     #[must_use]
     pub fn new(tables: EngineTables, rules: Option<GameData>) -> Self {
-        Self { tables, rules, towns: Towns::None, games: Mutex::new(Games::default()) }
+        Self { tables, rules, towns: Towns::None, speed_scale: 1.0, games: Mutex::new(Games::default()) }
     }
 
     /// Build each new game's town from its own map seed with these engine tables (the rules
@@ -156,29 +173,41 @@ impl GameServer {
         self
     }
 
-    /// A new game's map seed and town: a random seed, as the engine draws one per game, and the
-    /// camp it produces; [`FALLBACK_MAP_SEED`] if that town cannot be built.
-    fn new_town(&self, difficulty: u8) -> (u32, Option<PresetLevel>) {
+    /// Scale walking and running speed — for tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_speed_scale(mut self, scale: f64) -> Self {
+        self.speed_scale = scale;
+        self
+    }
+
+    /// A new game's map seed, town and walkable world: a random seed, as the engine draws one
+    /// per game, and the act it produces; [`FALLBACK_MAP_SEED`] if that town cannot be built.
+    fn new_map(&self, difficulty: u8) -> (u32, Option<PresetLevel>, Option<World>) {
         let (Towns::FromInstall(engine), Some(data)) = (&self.towns, &self.rules) else {
             #[cfg(test)]
-            let fixed = match &self.towns {
-                Towns::Fixed(town) => Some(town.clone()),
-                _ => None,
-            };
-            #[cfg(not(test))]
-            let fixed = None;
-            return (FALLBACK_MAP_SEED, fixed);
+            if let Towns::Fixed(town) = &self.towns {
+                let level = d2_drlg::world::WorldLevel { id: town.level_id, area: town.area, rooms: town.rooms.clone() };
+                return (FALLBACK_MAP_SEED, Some(town.clone()), Some(World::from_levels(vec![level])));
+            }
+            return (FALLBACK_MAP_SEED, None, None);
         };
         let build = |seed: u32| {
             let act = Act::build(data.levels(), 0, difficulty, seed);
-            PresetLevel::build(data, engine, &act, i32::from(TOWN_AREA))
+            PresetLevel::build(data, engine, &act, i32::from(TOWN_AREA)).map(|town| {
+                let world = World::build(data.levels(), &act, Some(&town));
+                (town, world)
+            })
         };
         let seed: u32 = rand::thread_rng().gen();
         match build(seed) {
-            Ok(town) => (seed, Some(town)),
+            Ok((town, world)) => (seed, Some(town), Some(world)),
             Err(e) => {
                 warn!(map_seed = %format!("{seed:#010x}"), error = %e, "town not built for this seed; using the fallback seed");
-                (FALLBACK_MAP_SEED, build(FALLBACK_MAP_SEED).ok())
+                match build(FALLBACK_MAP_SEED) {
+                    Ok((town, world)) => (FALLBACK_MAP_SEED, Some(town), Some(world)),
+                    Err(_) => (FALLBACK_MAP_SEED, None, None),
+                }
             }
         }
     }
@@ -238,7 +267,7 @@ impl GameServer {
     /// [`CreateError`].
     pub fn create(&self, name: &str, password: &str, difficulty: u8) -> Result<u16, CreateError> {
         let difficulty = difficulty.min(2);
-        let (map_seed, town) = self.new_town(difficulty);
+        let (map_seed, town, world) = self.new_map(difficulty);
         let spawn = town
             .as_ref()
             .zip(self.rules.as_ref())
@@ -268,10 +297,13 @@ impl GameServer {
                 population: town.as_ref().map(|t| Population::new(rand::thread_rng().gen(), t.rooms.len())),
                 spawn,
                 town,
+                world,
             },
         );
-        let map = g.by_id[&id].town.as_ref().map_or("none", |t| t.map.as_str());
-        info!(game = %name, id, difficulty, map_seed = %format!("{map_seed:#010x}"), %map, ?spawn, "test game created");
+        let game = &g.by_id[&id];
+        let map = game.town.as_ref().map_or("none", |t| t.map.as_str());
+        let levels: Vec<i32> = game.world.as_ref().map(|w| w.levels().iter().map(|l| l.id).collect()).unwrap_or_default();
+        info!(game = %name, id, difficulty, map_seed = %format!("{map_seed:#010x}"), %map, ?spawn, ?levels, "test game created");
         Ok(id)
     }
 
@@ -315,24 +347,60 @@ impl GameServer {
         })
     }
 
-    /// The rooms a player placed at `(x, y)` is sent (`PlacePlayerInAct`): `0x07` for its own
-    /// room, then for each room near it (`0x00537B50`) its `0x07` followed by the packets
-    /// `SendUnitToClient` sends for its units — populating rooms nobody has been near yet.
-    fn rooms_around(&self, game_id: u16, x: u16, y: u16) -> Vec<Vec<u8>> {
-        let fallback = vec![d2gs::load_room(FALLBACK_SPAWN_ROOM.0, FALLBACK_SPAWN_ROOM.1, TOWN_AREA as u8)];
-        let Some(rules) = &self.rules else { return fallback };
+    /// The room holding `(x, y)` and the rooms near it, if the game has a world and the spot is
+    /// in one of its rooms.
+    fn near(&self, game_id: u16, x: f64, y: f64) -> Option<(RoomId, Vec<RoomId>)> {
+        let g = self.lock();
+        let world = g.by_id.get(&game_id)?.world.as_ref()?;
+        let room = world.room_at(x as i32, y as i32)?;
+        Some((room, world.rooms_near(room)))
+    }
+
+    /// The view a client keeps after its player enters `room` with `near` around it: the near
+    /// rooms, and those of `old` still within [`KEEP_GAP`] of `room`.
+    fn kept_view(&self, game_id: u16, room: RoomId, near: &[RoomId], old: &[RoomId]) -> Vec<RoomId> {
+        let g = self.lock();
+        let Some(world) = g.by_id.get(&game_id).and_then(|game| game.world.as_ref()) else { return near.to_vec() };
+        let mut view = near.to_vec();
+        view.extend(old.iter().filter(|r| !near.contains(r) && world.rooms_within(room, **r, KEEP_GAP)));
+        view
+    }
+
+    /// Where a unit of the game's population stands.
+    fn unit_position(&self, game_id: u16, kind: u32, guid: u32) -> Option<(u16, u16)> {
+        let g = self.lock();
+        let game = g.by_id.get(&game_id)?;
+        let (town, population) = (game.town.as_ref()?, game.population.as_ref()?);
+        (0..town.rooms.len()).filter_map(|room| population.units(room)).flatten().find_map(|u| match *u {
+            Spawned::Object { guid: g, x, y, .. } if kind == u32::from(unit_type::OBJECT) && g == guid => Some((x, y)),
+            Spawned::Monster { guid: g, x, y, .. } if kind == u32::from(unit_type::MONSTER) && g == guid => Some((x, y)),
+            _ => None,
+        })
+    }
+
+    /// What a client is sent when its player's near rooms change from `from` to `to`, in the
+    /// engine's order (`0x00537B50`): each room that came near as its `0x07` and the packets
+    /// `SendUnitToClient` sends for its units (`0x0053A8E0`) — populating rooms nobody has been
+    /// near yet — then each room left behind as a `0x0A` per unit and its `0x08`
+    /// (`0x0053A9B0`).
+    fn view_change(&self, game_id: u16, from: &[RoomId], to: &[RoomId]) -> Vec<Vec<u8>> {
         let mut g = self.lock();
-        let Some(game) = g.by_id.get_mut(&game_id) else { return fallback };
-        let (Some(town), Some(population)) = (&game.town, &mut game.population) else { return fallback };
-        let Some(room) = town.room_index_at(x.into(), y.into()) else { return fallback };
-        let own = town.rooms[room];
-        let mut packets = vec![d2gs::load_room(own.x as u16, own.y as u16, town.level_id as u8)];
-        for near in town.rooms_near(room) {
-            let r = town.rooms[near];
-            packets.push(d2gs::load_room(r.x as u16, r.y as u16, town.level_id as u8));
-            let activated = population.activate(rules, town, near);
+        let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
+        let Some(world) = &game.world else { return Vec::new() };
+        let mut packets = Vec::new();
+        let town_level = game.town.as_ref().map(|t| t.level_id);
+        for &id in to.iter().filter(|id| !from.contains(id)) {
+            let Some(room) = world.room(id) else { continue };
+            packets.push(d2gs::load_room(room.x as u16, room.y as u16, id.level as u8));
+            let (Some(rules), Some(town), Some(population)) = (&self.rules, &game.town, &mut game.population) else {
+                continue;
+            };
+            if Some(id.level) != town_level {
+                continue;
+            }
+            let activated = population.activate(rules, town, id.index);
             for skipped in &activated.not_ported {
-                debug!(game_id, room = ?r, unit = %skipped, "map unit not spawned: not ported");
+                debug!(game_id, ?room, unit = %skipped, "map unit not spawned: not ported");
             }
             for unit in activated.units {
                 match *unit {
@@ -346,6 +414,19 @@ impl GameServer {
                     }
                 }
             }
+        }
+        for &id in from.iter().filter(|id| !to.contains(id)) {
+            let Some(room) = world.room(id) else { continue };
+            if Some(id.level) == town_level {
+                for unit in game.population.as_ref().and_then(|p| p.units(id.index)).unwrap_or(&[]) {
+                    let kind = match unit {
+                        Spawned::Object { .. } => unit_type::OBJECT,
+                        Spawned::Monster { .. } => unit_type::MONSTER,
+                    };
+                    packets.push(d2gs::remove_unit(kind, unit.guid()));
+                }
+            }
+            packets.push(d2gs::unload_room(room.x as u16, room.y as u16, id.level as u8));
         }
         packets
     }
@@ -397,6 +478,45 @@ struct Player {
     spawn: (u16, u16),
 }
 
+/// Where the server has a client's player: moved toward the spot it last walked or ran to,
+/// in a straight line (collision is not ported), and the rooms the client holds.
+#[derive(Debug, Clone, PartialEq)]
+struct Walker {
+    x: f64,
+    y: f64,
+    target: Option<(f64, f64)>,
+    /// Subtiles a second.
+    speed: f64,
+    room: Option<RoomId>,
+    view: Vec<RoomId>,
+}
+
+impl Walker {
+    fn moving(&self) -> bool {
+        self.target.is_some()
+    }
+
+    /// Head for `(x, y)`.
+    fn go(&mut self, x: f64, y: f64, speed: f64) {
+        self.target = Some((x, y));
+        self.speed = speed;
+    }
+
+    /// Advance by `dt`; stop on arrival.
+    fn step(&mut self, dt: Duration) {
+        let Some((tx, ty)) = self.target else { return };
+        let (dx, dy) = (tx - self.x, ty - self.y);
+        let left = dx.hypot(dy);
+        let travel = self.speed * dt.as_secs_f64();
+        if travel >= left {
+            (self.x, self.y, self.target) = (tx, ty, None);
+        } else {
+            self.x += dx / left * travel;
+            self.y += dy / left * travel;
+        }
+    }
+}
+
 /// One client on the game port.
 async fn session(mut stream: TcpStream, peer: SocketAddr, server: &GameServer) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
@@ -425,10 +545,40 @@ async fn run(
     let mut inbox: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 2048];
     let mut outbox = Outbox::default();
+    let mut walker: Option<Walker> = None;
+    let mut frame = tokio::time::interval(SERVER_FRAME);
+    frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_step = Instant::now();
 
     loop {
         let limit = if stage == Stage::AwaitLogon { LOGON_TIMEOUT } else { IN_GAME_TIMEOUT };
-        let n = match tokio::time::timeout(limit, stream.read(&mut chunk)).await {
+        let moving = walker.as_ref().is_some_and(Walker::moving);
+        let read = tokio::select! {
+            r = tokio::time::timeout(limit, stream.read(&mut chunk)) => Some(r),
+            _ = frame.tick(), if moving => None,
+        };
+        let Some(read) = read else {
+            // A server frame while the player moves: advance it and follow it with rooms.
+            let (Some(w), Some(p)) = (walker.as_mut(), player.as_ref()) else { continue };
+            let now = Instant::now();
+            w.step(now.duration_since(last_step).min(SERVER_FRAME * 5));
+            last_step = now;
+            if let Some((room, near)) = server.near(p.game_id, w.x, w.y) {
+                if w.room != Some(room) {
+                    if w.room.map(|r| r.level) != Some(room.level) {
+                        info!(%peer, level = room.level, x = w.x as i32, y = w.y as i32, "player entered a level");
+                    }
+                    let view = server.kept_view(p.game_id, room, &near, &w.view);
+                    for packet in server.view_change(p.game_id, &w.view, &view) {
+                        outbox.push(&packet);
+                    }
+                    (w.room, w.view) = (Some(room), view);
+                    flush(stream, peer, tables, &mut outbox).await?;
+                }
+            }
+            continue;
+        };
+        let n = match read {
             Ok(r) => r?,
             Err(_) => {
                 info!(%peer, ?stage, "game connection timed out");
@@ -451,6 +601,8 @@ async fn run(
             };
             let packet: Vec<u8> = inbox.drain(..len).collect();
             info!(%peer, ?stage, op = %format!("{:#04x}", packet[0]), len, body = %hex_preview(&packet), "D2GS packet in");
+            let u16_at = |at: usize| packet.get(at..at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+            let u32_at = |at: usize| packet.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
 
             match (stage, packet[0]) {
                 (Stage::AwaitLogon, cs::GAME_LOGON) => {
@@ -466,8 +618,38 @@ async fn run(
                 }
                 (Stage::AwaitEnterGame, cs::ENTER_GAME) => {
                     let p = player.as_ref().expect("logged on");
-                    enter_game(stream, peer, server, p, &mut outbox).await?;
+                    walker = Some(enter_game(stream, peer, server, p, &mut outbox).await?);
                     stage = Stage::InGame;
+                }
+                (Stage::InGame, op @ (cs::WALK_TO_LOCATION | cs::RUN_TO_LOCATION)) => {
+                    if let Some(w) = walker.as_mut() {
+                        let speed = if op == cs::RUN_TO_LOCATION { RUN_SPEED } else { WALK_SPEED };
+                        if !w.moving() {
+                            last_step = Instant::now();
+                        }
+                        w.go(f64::from(u16_at(1)), f64::from(u16_at(3)), speed * server.speed_scale);
+                    }
+                }
+                (Stage::InGame, cs::UPDATE_POSITION) => {
+                    // The client's own idea of where its player is (engine `0x0054CD50` re-syncs to
+                    // it): take it, and let the next frame follow it with rooms.
+                    if let Some(w) = walker.as_mut() {
+                        (w.x, w.y) = (f64::from(u16_at(1)), f64::from(u16_at(3)));
+                        if !w.moving() {
+                            w.target = Some((w.x, w.y));
+                            last_step = Instant::now();
+                        }
+                    }
+                }
+                (Stage::InGame, op @ (cs::WALK_TO_UNIT | cs::RUN_TO_UNIT)) => {
+                    let (Some(w), Some(p)) = (walker.as_mut(), player.as_ref()) else { continue };
+                    if let Some((x, y)) = server.unit_position(p.game_id, u32_at(1), u32_at(5)) {
+                        let speed = if op == cs::RUN_TO_UNIT { RUN_SPEED } else { WALK_SPEED };
+                        if !w.moving() {
+                            last_step = Instant::now();
+                        }
+                        w.go(f64::from(x), f64::from(y), speed * server.speed_scale);
+                    }
                 }
                 (_, cs::PING) => {
                     outbox.push(&d2gs::pong());
@@ -551,14 +733,14 @@ async fn logon(
 /// sends its stats (`0x1D`–`0x1F`), both selected skills and its life/mana (`0x95`); then the act
 /// (`03 53`); then `PlacePlayerInAct` loads the spawn room (`07`), enters the player into it —
 /// every near room's `07` and units — and places the player (`15 7E`). `04` follows a frame
-/// later.
+/// later. Returns where the player stands and the rooms its client holds.
 async fn enter_game(
     stream: &mut TcpStream,
     peer: SocketAddr,
     server: &GameServer,
     p: &Player,
     outbox: &mut Outbox,
-) -> std::io::Result<()> {
+) -> std::io::Result<Walker> {
     let tables = &server.tables;
     let (x, y) = p.spawn;
     // Unplaced: at (0, 0) the client creates the unit without looking for a room.
@@ -586,7 +768,18 @@ async fn enter_game(
     // Period 2 starts at angle 0: the start of the day. The client's 0x53 handler reads its
     // own player unit, which is why 0x0B has to be in first.
     outbox.push(&d2gs::act_environment(2, 0, false));
-    let rooms = server.rooms_around(p.game_id, x, y);
+    let mut walker = Walker { x: f64::from(x), y: f64::from(y), target: None, speed: 0.0, room: None, view: Vec::new() };
+    let rooms = match server.near(p.game_id, walker.x, walker.y) {
+        Some((room, near)) => {
+            let own = server.lock().by_id.get(&p.game_id).and_then(|g| g.world.as_ref()?.room(room));
+            let mut packets: Vec<Vec<u8>> =
+                own.map(|r| d2gs::load_room(r.x as u16, r.y as u16, room.level as u8)).into_iter().collect();
+            packets.extend(server.view_change(p.game_id, &[], &near));
+            (walker.room, walker.view) = (Some(room), near);
+            packets
+        }
+        None => vec![d2gs::load_room(FALLBACK_SPAWN_ROOM.0, FALLBACK_SPAWN_ROOM.1, TOWN_AREA as u8)],
+    };
     for packet in &rooms {
         outbox.push(packet);
     }
@@ -601,9 +794,9 @@ async fn enter_game(
         character = %p.character.name,
         difficulty = p.difficulty,
         room_packets = rooms.len(),
-        "join sequence sent; from here the test only logs what the client does"
+        "join sequence sent; from here the server follows the player's walking and logs the rest"
     );
-    Ok(())
+    Ok(walker)
 }
 
 /// Compress and send everything queued, logging the plaintext.
@@ -650,6 +843,10 @@ pub(crate) mod tests {
         client[usize::from(cs::ENTER_GAME)] = 1;
         client[usize::from(cs::PING)] = 13;
         client[usize::from(cs::LEAVE_GAME)] = 1;
+        client[usize::from(cs::WALK_TO_LOCATION)] = 5;
+        client[usize::from(cs::RUN_TO_LOCATION)] = 5;
+        client[usize::from(cs::WALK_TO_UNIT)] = 9;
+        client[usize::from(cs::RUN_TO_UNIT)] = 9;
         EngineTables::new(&lengths, client, [0i32; SERVER_OPCODES]).unwrap()
     }
 
@@ -759,28 +956,8 @@ pub(crate) mod tests {
         assert_eq!(read_frame(&mut c, huffman).await, vec![0x02]);
 
         c.write_all(&[cs::ENTER_GAME]).await.unwrap();
-        let entered = read_frame(&mut c, huffman).await;
-        let mut packets = Vec::new();
-        let mut rest = entered.as_slice();
-        while let Some(&op) = rest.first() {
-            let size = match op {
-                0x59 => 26,
-                0x0B | 0x07 | 0x1F => 6,
-                0x1D => 3,
-                0x1E => 4,
-                0x23 | 0x95 => 13,
-                0x03 => 12,
-                0x53 => 10,
-                0x15 => 11,
-                0x7E => 5,
-                0x5E => 38,
-                0x28 => 103,
-                0x29 => 97,
-                other => panic!("unexpected opcode {other:#04x}"),
-            };
-            packets.push(&rest[..size]);
-            rest = &rest[size..];
-        }
+        let entered = split_packets(&read_frame(&mut c, huffman).await);
+        let packets: Vec<&[u8]> = entered.iter().map(Vec::as_slice).collect();
         let ops: Vec<u8> = packets.iter().map(|p| p[0]).filter(|op| !(0x1D..=0x1F).contains(op)).collect();
         assert_eq!(
             ops,
@@ -837,7 +1014,7 @@ pub(crate) mod tests {
         let at = |class, x, y| PlacedUnit { class, x, y, path: Vec::new() };
         let town = PresetLevel {
             level_id: 1,
-            area: room(1152, 888),
+            area: Coords { x: 1152, y: 888, w: 32, h: 8 },
             map: String::new(),
             rooms: vec![room(1152, 888), room(1160, 888), room(1168, 888), room(1176, 888)],
             units: vec![
@@ -848,6 +1025,98 @@ pub(crate) mod tests {
             ],
         };
         (rules, town)
+    }
+
+    /// Split a run of server packets by the sizes the join and the room stream use.
+    fn split_packets(mut rest: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Some(&op) = rest.first() {
+            let size = match op {
+                0x59 => 26,
+                0x0B | 0x07 | 0x08 | 0x0A | 0x1F => 6,
+                0x04 => 1,
+                0x1D => 3,
+                0x1E => 4,
+                0x23 | 0x95 => 13,
+                0x03 => 12,
+                0x53 | 0x6D => 10,
+                0x15 => 11,
+                0x7E => 5,
+                0x51 => 14,
+                0xAA => usize::from(rest[6]),
+                0xAC => usize::from(rest[12]),
+                0x5E => 38,
+                0x28 => 103,
+                0x29 => 97,
+                0x8F => 33,
+                other => panic!("unexpected opcode {other:#04x}"),
+            };
+            out.push(rest[..size].to_vec());
+            rest = &rest[size..];
+        }
+        out
+    }
+
+    #[test]
+    fn a_walker_heads_straight_for_its_spot_and_stops_there() {
+        let mut w = Walker { x: 0.0, y: 0.0, target: None, speed: 0.0, room: None, view: Vec::new() };
+        w.go(30.0, 40.0, 10.0);
+        w.step(Duration::from_secs(1));
+        assert!((w.x - 6.0).abs() < 1e-9 && (w.y - 8.0).abs() < 1e-9, "10 subtiles along the line: {w:?}");
+        assert!(w.moving());
+        w.step(Duration::from_secs(10));
+        assert_eq!((w.x, w.y, w.moving()), (30.0, 40.0, false), "arrives, not overshoots");
+        assert!((RUN_SPEED - 14.0625).abs() < 1e-9 && (WALK_SPEED - 9.375).abs() < 1e-9);
+    }
+
+    /// Running east through the made-up town: entering the third room loads the fourth (with
+    /// its crate); entering the fourth drops the first, now two rooms away — the second, one
+    /// room away and full of units, stays.
+    #[tokio::test]
+    async fn running_across_rooms_loads_what_comes_near_and_drops_what_is_left_behind() {
+        let (rules, town) = test_town();
+        let gs = Arc::new(GameServer::new(test_tables(), Some(rules)).with_town(town).with_speed_scale(20.0));
+        let id = gs.create("probe", "", 0).unwrap();
+        let (_, hash) = gs.stage_join("probe", "", character("TestBan", 4, 0)).unwrap();
+        let addr = spawn(Arc::clone(&gs)).await;
+        let huffman = &gs.tables.huffman;
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.read_exact(&mut [0u8; 2]).await.unwrap();
+        c.write_all(&logon_packet(id, hash, 4, 0x0E, "TestBan")).await.unwrap();
+        read_frame(&mut c, huffman).await;
+        read_frame(&mut c, huffman).await;
+        c.write_all(&[cs::ENTER_GAME]).await.unwrap();
+        let mut joined = Vec::new();
+        while joined.last() != Some(&0x04) {
+            joined.extend(read_frame(&mut c, huffman).await);
+        }
+
+        let mut run = vec![cs::RUN_TO_LOCATION];
+        run.extend_from_slice(&5900u16.to_le_bytes());
+        run.extend_from_slice(&4450u16.to_le_bytes());
+        c.write_all(&run).await.unwrap();
+        let mut seen = Vec::new();
+        while !seen.contains(&d2gs::unload_room(1152, 888, 1)) {
+            let frame = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut c, huffman)).await.expect("rooms follow the run");
+            seen.extend(split_packets(&frame));
+        }
+        assert_eq!(
+            seen,
+            vec![d2gs::load_room(1176, 888, 1), d2gs::assign_object(3, 2, 5890, 4444, 0, 0), d2gs::unload_room(1152, 888, 1)]
+        );
+
+        // Back to the first room: it and its neighbours come back; the fourth, two rooms off,
+        // goes with its crate.
+        let mut back = vec![cs::RUN_TO_LOCATION];
+        back.extend_from_slice(&5760u16.to_le_bytes());
+        back.extend_from_slice(&4450u16.to_le_bytes());
+        c.write_all(&back).await.unwrap();
+        let mut seen = Vec::new();
+        while !seen.contains(&d2gs::unload_room(1176, 888, 1)) {
+            let frame = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut c, huffman)).await.expect("rooms follow the run back");
+            seen.extend(split_packets(&frame));
+        }
+        assert_eq!(seen, vec![d2gs::load_room(1152, 888, 1), d2gs::remove_unit(2, 3), d2gs::unload_room(1176, 888, 1)]);
     }
 
     #[tokio::test]
@@ -869,31 +1138,7 @@ pub(crate) mod tests {
         while plain.last() != Some(&0x04) || plain.len() < 2 {
             plain.extend(read_frame(&mut c, huffman).await);
         }
-        let mut ops = Vec::new();
-        let mut rest = plain.as_slice();
-        while let Some(&op) = rest.first() {
-            let size = match op {
-                0x59 => 26,
-                0x0B | 0x07 | 0x1F => 6,
-                0x04 => 1,
-                0x1D => 3,
-                0x1E => 4,
-                0x23 | 0x95 => 13,
-                0x03 => 12,
-                0x53 | 0x6D => 10,
-                0x15 => 11,
-                0x7E => 5,
-                0x51 => 14,
-                0xAA => usize::from(rest[6]),
-                0xAC => usize::from(rest[12]),
-                0x5E => 38,
-                0x28 => 103,
-                0x29 => 97,
-                other => panic!("unexpected opcode {other:#04x}"),
-            };
-            ops.push((op, rest[..size].to_vec()));
-            rest = &rest[size..];
-        }
+        let ops: Vec<(u8, Vec<u8>)> = split_packets(&plain).into_iter().map(|p| (p[0], p)).collect();
         let tail: Vec<u8> = ops.iter().map(|(op, _)| *op).skip_while(|&op| op != 0x53).collect();
         assert_eq!(
             tail,
@@ -931,6 +1176,58 @@ pub(crate) mod tests {
             maps.insert(town.map.clone());
         }
         assert!(maps.len() > 1, "32 games, one camp: {maps:?}");
+    }
+
+    /// With the operator's install: walking from the waypoint to the middle of Blood Moor, the
+    /// server loads Blood Moor's rooms along the way, and every room it drops it had loaded.
+    #[test]
+    fn with_a_real_install_walking_out_of_camp_loads_blood_moor() {
+        let Ok(dir) = std::env::var("BNETCC_D2_DATA_DIR") else {
+            return;
+        };
+        let engine = EngineData::from_game_exe(&std::fs::read(Path::new(&dir).join("Game.exe")).unwrap()).unwrap();
+        let gs = GameServer::new(test_tables(), Some(GameData::load(&dir).unwrap())).with_engine(engine);
+        for i in 0..8 {
+            let id = gs.create(&format!("walk {i}"), "", 0).unwrap();
+            let (spawn, moor) = {
+                let g = gs.lock();
+                let game = &g.by_id[&id];
+                let moor = game.world.as_ref().unwrap().levels().iter().find(|l| l.id == 2).unwrap().area;
+                (game.spawn, moor)
+            };
+            let (tx, ty) = (f64::from((moor.x + moor.w / 2) * 5), f64::from((moor.y + moor.h / 2) * 5));
+            let mut w = Walker { x: f64::from(spawn.0), y: f64::from(spawn.1), target: None, speed: 0.0, room: None, view: Vec::new() };
+            let (room, near) = gs.near(id, w.x, w.y).unwrap();
+            let mut loaded: Vec<Vec<u8>> = gs.view_change(id, &[], &near).into_iter().filter(|p| p[0] == 0x07).collect();
+            (w.room, w.view) = (Some(room), near);
+            w.go(tx, ty, RUN_SPEED);
+            let mut moor_rooms = 0;
+            while w.moving() {
+                w.step(SERVER_FRAME);
+                let Some((room, near)) = gs.near(id, w.x, w.y) else { continue };
+                if w.room == Some(room) {
+                    continue;
+                }
+                let view = gs.kept_view(id, room, &near, &w.view);
+                for p in gs.view_change(id, &w.view, &view) {
+                    match p[0] {
+                        0x07 => {
+                            moor_rooms += usize::from(p[5] == 2);
+                            loaded.push(p);
+                        }
+                        0x08 => {
+                            let mut as_load = p.clone();
+                            as_load[0] = 0x07;
+                            assert!(loaded.contains(&as_load), "dropped a room never loaded: {p:02x?}");
+                            loaded.retain(|l| *l != as_load);
+                        }
+                        _ => {}
+                    }
+                }
+                (w.room, w.view) = (Some(room), view);
+            }
+            assert!(moor_rooms > 10, "game {i}: only {moor_rooms} Blood Moor rooms loaded on the way");
+        }
     }
 
     #[tokio::test]

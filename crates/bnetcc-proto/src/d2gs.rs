@@ -55,6 +55,10 @@ pub mod sc {
     pub const GAME_EXIT: u8 = 0x06;
     /// Load a room on the client (6 bytes).
     pub const LOAD_ROOM: u8 = 0x07;
+    /// Release a room the client loaded (6 bytes).
+    pub const UNLOAD_ROOM: u8 = 0x08;
+    /// Forget a unit (6 bytes).
+    pub const REMOVE_UNIT: u8 = 0x0A;
     /// Which unit is the client's own player (6 bytes).
     pub const OWN_UNIT: u8 = 0x0B;
     /// Quest flags: the player's own (type 6) or an NPC's quest dialog update (103 bytes).
@@ -98,8 +102,21 @@ pub mod sc {
     pub const JOIN_FAILED: u8 = 0xB4;
 }
 
-/// Client-to-server opcodes used by the join.
+/// Client-to-server opcodes handled so far.
 pub mod cs {
+    /// Walk to a spot: `[x u16][y u16]` (5 bytes; engine handler `0x005497E0`).
+    pub const WALK_TO_LOCATION: u8 = 0x01;
+    /// Walk to a unit: `[type u32][guid u32]` (9 bytes).
+    pub const WALK_TO_UNIT: u8 = 0x02;
+    /// Run to a spot: `[x u16][y u16]` (5 bytes; engine handler `0x005498D0`).
+    pub const RUN_TO_LOCATION: u8 = 0x03;
+    /// Run to a unit: `[type u32][guid u32]` (9 bytes).
+    pub const RUN_TO_UNIT: u8 = 0x04;
+    /// Interact with a unit: `[type u32][guid u32]` (9 bytes).
+    pub const INTERACT: u8 = 0x13;
+    /// Where the client has its player: `[x u16][y u16]` (5 bytes; engine handler
+    /// `0x0054CD50` re-syncs the server's unit to it).
+    pub const UPDATE_POSITION: u8 = 0x5F;
     /// Leave the game.
     pub const LEAVE_GAME: u8 = 0x69;
     /// Log on to a game (37 bytes).
@@ -524,6 +541,25 @@ pub fn load_room(tile_x: u16, tile_y: u16, level: u8) -> Vec<u8> {
     w.finish()
 }
 
+/// `0x08`: `[room tile x u16][room tile y u16][level u8]` — the client releases a room it was
+/// told to load (builder `0x0053BC90`, sent by `0x0053A9B0` when a room drops out of the
+/// player's near rooms, after its units' `0x0A`).
+#[must_use]
+pub fn unload_room(tile_x: u16, tile_y: u16, level: u8) -> Vec<u8> {
+    let mut w = Writer::with_capacity(6);
+    w.u8(sc::UNLOAD_ROOM).u16(tile_x).u16(tile_y).u8(level);
+    w.finish()
+}
+
+/// `0x0A`: `[unit type u8][guid u32]` — the client forgets a unit (`0x00571600` →
+/// `0x0053BDA0`; never sent for missiles).
+#[must_use]
+pub fn remove_unit(unit_type: u8, guid: u32) -> Vec<u8> {
+    let mut w = Writer::with_capacity(6);
+    w.u8(sc::REMOVE_UNIT).u8(unit_type).u32(guid);
+    w.finish()
+}
+
 /// `0x23`: `[unit type u8][guid u32][right-hand u8][skill u16][item guid u32]` (builder
 /// `0x0053C590`); item guid `0xFFFFFFFF` when no item grants the skill.
 #[must_use]
@@ -843,6 +879,8 @@ mod tests {
         assert_eq!(reassign_player(0, 1, 2, 3, 1).len(), 11);
         assert_eq!(own_unit(0, 1), vec![0x0B, 0, 1, 0, 0, 0]);
         assert_eq!(load_room(1160, 888, 1), vec![0x07, 0x88, 0x04, 0x78, 0x03, 1]);
+        assert_eq!(unload_room(1160, 888, 1), vec![0x08, 0x88, 0x04, 0x78, 0x03, 1]);
+        assert_eq!(remove_unit(1, 5), vec![0x0A, 1, 5, 0, 0, 0]);
         assert_eq!(select_skill(0, 1, true, 0, u32::MAX).len(), 13);
         assert_eq!(set_stat(12, 1), vec![0x1D, 12, 1]);
         assert_eq!(set_stat(7, 55 << 8), vec![0x1E, 7, 0x00, 0x37]);

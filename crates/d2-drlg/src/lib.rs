@@ -15,6 +15,7 @@
 pub mod act;
 pub mod preset;
 pub mod rng;
+pub mod world;
 
 /// A rectangle in tiles: origin and size.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

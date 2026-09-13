@@ -598,6 +598,15 @@ impl Act {
         Some(Coords { x: def.offset.0 + base.x, y: def.offset.1 + base.y, w, h })
     }
 
+    /// The levels the act's placement walk laid out, in id order: the towns and the wilderness
+    /// trunks a player crosses on foot (not the levels reached through warps).
+    #[must_use]
+    pub fn placed_levels(&self) -> Vec<i32> {
+        let mut ids: Vec<i32> = self.placed.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// The Rogue Encampment's map variant: its own placement direction, 0..=3 for
     /// `TownN1`/`E1`/`S1`/`W1` (`DRLGLEVEL_ParseLevelData` pass 2, `0x006772C0`).
     #[must_use]
