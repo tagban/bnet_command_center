@@ -21,6 +21,12 @@ pub struct LvlPrest {
     pub size: (i32, i32),
     /// `Files`: how many map files the preset rotates through.
     pub file_count: i32,
+    /// `Scan`: the map is read for warps when the piece is built.
+    pub scan: bool,
+    /// `Pops`: pop-out regions (roofs) the map marks.
+    pub pops: i32,
+    /// `File1`..`File6` as written, blanks included, so a file index points at its column.
+    pub file_slots: Vec<String>,
     /// `File1`..`File6`, relative to `data\global\tiles`, blanks and `0` dropped.
     pub files: Vec<String>,
 }
@@ -51,6 +57,9 @@ impl LvlPrests {
                 populate: row.int("Populate").unwrap_or(0) != 0,
                 size: (row.int("SizeX").unwrap_or(0) as i32, row.int("SizeY").unwrap_or(0) as i32),
                 file_count: row.int("Files").unwrap_or(0) as i32,
+                scan: row.int("Scan").unwrap_or(0) != 0,
+                pops: row.int("Pops").unwrap_or(0) as i32,
+                file_slots: (1..=6).map(|i| row.get(&format!("File{i}")).unwrap_or_default().to_string()).collect(),
                 files: (1..=6)
                     .filter_map(|i| row.get(&format!("File{i}")))
                     .filter(|f| *f != "0")
@@ -71,6 +80,21 @@ impl LvlPrests {
     #[must_use]
     pub fn by_def(&self, def: i32) -> Option<&LvlPrest> {
         self.rows.iter().find(|r| r.def == def)
+    }
+}
+
+impl LvlPrest {
+    /// The map file a piece built with file index `pick` reads: that column, or the first
+    /// non-empty one when it is empty or `0` (`DRLGPRESET_AllocDrlgFile`'s caller).
+    #[must_use]
+    pub fn file_for(&self, pick: i32) -> Option<&str> {
+        let usable = |f: &&String| !f.is_empty() && f.as_str() != "0";
+        usize::try_from(pick)
+            .ok()
+            .and_then(|i| self.file_slots.get(i))
+            .filter(usable)
+            .or_else(|| self.file_slots.iter().find(usable))
+            .map(String::as_str)
     }
 }
 
@@ -108,6 +132,8 @@ pub enum PresetMonster {
 pub struct MonPresets {
     /// Per act (0..=4), in `MonPreset.txt` order: the block a DS1 monster id indexes.
     per_act: [Vec<PresetMonster>; 5],
+    /// `MonStats.txt` rows, where the engine's class ids for super uniques and placements start.
+    monstats_rows: i32,
 }
 
 impl MonPresets {
@@ -158,13 +184,33 @@ impl MonPresets {
                 PresetMonster::Unknown(name)
             });
         }
-        Ok(Self { per_act })
+        Ok(Self { per_act, monstats_rows: monstats.rows().count() as i32 })
     }
 
     /// What DS1 monster id `ds1_id` places in `act` (0-based).
     #[must_use]
     pub fn get(&self, act: u8, ds1_id: i32) -> Option<&PresetMonster> {
         self.per_act.get(usize::from(act))?.get(usize::try_from(ds1_id).ok()?)
+    }
+
+    /// The class id the engine gives a DS1 monster unit (`ParsePresetsOfDrlgFile`): the
+    /// `MonStats` row, or a super unique's or placement's row past the `MonStats` rows; the raw
+    /// id when the act's block has no such entry.
+    #[must_use]
+    pub fn engine_class(&self, act: i32, ds1_id: i32) -> i32 {
+        let Some(block) = usize::try_from(act).ok().and_then(|a| self.per_act.get(a)) else { return ds1_id };
+        match usize::try_from(ds1_id).ok().and_then(|i| block.get(i)) {
+            None => ds1_id,
+            Some(PresetMonster::Class { class, .. }) => *class,
+            Some(PresetMonster::SuperUnique { index, .. } | PresetMonster::Placement { index, .. }) => index + self.monstats_rows,
+            Some(PresetMonster::Unknown(_)) => self.monstats_rows,
+        }
+    }
+
+    /// `MonStats.txt` rows.
+    #[must_use]
+    pub fn monstats_rows(&self) -> i32 {
+        self.monstats_rows
     }
 }
 

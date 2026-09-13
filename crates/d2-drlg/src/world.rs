@@ -134,7 +134,7 @@ impl World {
             ids.append(&mut extra);
         }
         let mut world = Self::default();
-        let outdoors = if act.act == 0 { Some(Act1Outdoors::new(data, &engine.outdoor, act, act.game_seed)) } else { None };
+        let outdoors = if act.act == 0 { Some(Act1Outdoors::new(data, engine, act, act.game_seed)) } else { None };
         for id in ids {
             let Some(def) = levels.get(id) else { continue };
             if !matches!(def.drlg_type, DrlgType::Preset | DrlgType::Wilderness) {

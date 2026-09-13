@@ -29,11 +29,11 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use d2_data::engine::OutdoorTables;
+use d2_data::engine::{EngineData, OutdoorTables};
 use d2_data::levels::{DrlgType, Levels};
 use d2_data::lvlsub::LvlSub;
 use d2_data::GameData;
-use d2_formats::ds1::{Ds1, SubstGroup};
+use d2_formats::ds1::{Ds1, SubstGroup, UnitKind};
 
 use crate::act::Act;
 use crate::preset::ROOM_TILES;
@@ -149,6 +149,14 @@ pub struct OutdoorRoom {
     pub outdoor: i32,
     /// Its cell's link flags (the anchor's for a piece).
     pub link: i32,
+    /// `nSeed`: the room's own RNG seed, from which its tiles and units are rolled.
+    pub seed: u32,
+    /// `nSubThemePicked`: which rows of the level's terrain group a plain room uses
+    /// (`DRLGROOMEX_RollLevelSubstitutionMask`), one bit per row.
+    pub sub_picks: u32,
+    /// `sSeed`'s low word once the room is made (after the terrain rolls); its init starts
+    /// again from [`OutdoorRoom::seed`].
+    pub seed_after: u32,
 }
 
 impl OutdoorLevel {
@@ -176,6 +184,7 @@ impl OutdoorLevel {
 /// substitution maps.
 pub struct Act1Outdoors<'a> {
     data: &'a GameData,
+    engine: &'a EngineData,
     tables: &'a OutdoorTables,
     act: &'a Act,
     start_seed: u32,
@@ -191,7 +200,7 @@ impl<'a> Act1Outdoors<'a> {
     /// # Errors
     ///
     /// [`Error`] if a substitution map cannot be read.
-    pub fn new(data: &'a GameData, tables: &'a OutdoorTables, act: &'a Act, game_seed: u32) -> Result<Self, Error> {
+    pub fn new(data: &'a GameData, engine: &'a EngineData, act: &'a Act, game_seed: u32) -> Result<Self, Error> {
         let levels = data.levels();
         // DRLGLEVEL_ParseLevelData (0x006774xx): each list node gets an open edge (warp -1) to its
         // predecessor, both ways, through DRLGACT_AllocWarpsInfo (0x006428A0) and
@@ -224,7 +233,7 @@ impl<'a> Act1Outdoors<'a> {
             }
             borders.push(rows);
         }
-        Ok(Self { data, tables, act, start_seed: rng::act_start_seed(game_seed), warps, borders })
+        Ok(Self { data, engine, tables: &engine.outdoor, act, start_seed: rng::act_start_seed(game_seed), warps, borders })
     }
 
     /// Generate a wilderness level's cells and rooms.
@@ -556,6 +565,7 @@ struct Generator<'a, 'b> {
     /// `aExitPoints1`..`4`: each exit, its snapped start, its snapped target, its target.
     exits: [[ExitPoint; 6]; 4],
     exit_count: usize,
+    last_room_seed: u32,
 }
 
 /// A road end (`D2DrlgExitPointStrc`): world tiles and a side (0..=3; 4 for none or the middle).
@@ -586,6 +596,7 @@ impl<'a, 'b> Generator<'a, 'b> {
             trackers: Vec::new(),
             exits: [[ExitPoint::default(); 6]; 4],
             exit_count: 0,
+            last_room_seed: 0,
         }
     }
 
@@ -1624,24 +1635,25 @@ impl<'a, 'b> Generator<'a, 'b> {
         Ok(None)
     }
 
-    /// `DRLGOUTDOOR_CreateOutdoorRoomExGrid` (`0x006750F0`): the rooms. Rooms join the level's
-    /// list at its head, so the list runs from the last room made.
-    fn finish(self) -> Result<OutdoorLevel, Error> {
+    /// `DRLGOUTDOOR_CreateOutdoorRoomExGrid` (`0x006750F0`): the rooms, each taking its seed
+    /// from the level's (`DRLGROOM_AllocRoomEx`, `0x0066B3F0`). A piece's anchor cell draws a
+    /// map file (then replaced by the one its cell holds), reads the map's units if the piece is
+    /// scanned (`DRLGPRESET_BuildPresetArea`), and cuts the piece into 8×8 rooms from its corner
+    /// (`DRLGPRESET_BuildArea`). Rooms join the level's list at its head, so the list runs from
+    /// the last room made.
+    fn finish(mut self) -> Result<OutdoorLevel, Error> {
         let mut rooms = Vec::new();
         for y in 0..self.height {
             for x in 0..self.width {
                 let (outdoor, link) = (self.outdoor.get(x, y), self.link.get(x, y));
                 let (tx, ty) = (self.area.x + x * ROOM_TILES, self.area.y + y * ROOM_TILES);
-                let room = |dx: i32, dy: i32, preset, file| OutdoorRoom {
-                    area: Coords { x: tx + dx * ROOM_TILES, y: ty + dy * ROOM_TILES, w: ROOM_TILES, h: ROOM_TILES },
-                    preset,
-                    file,
-                    outdoor,
-                    link,
-                };
                 if outdoor & PRESET == 0 {
                     if outdoor & BLANK == 0 {
-                        rooms.push(room(0, 0, 0, 0));
+                        let mut state = self.room_seed();
+                        let area = Coords { x: tx, y: ty, w: ROOM_TILES, h: ROOM_TILES };
+                        let sub_picks = self.sub_picks(&mut state);
+                        let (seed, seed_after) = (self.last_room_seed, state.low);
+                        rooms.push(OutdoorRoom { area, preset: 0, file: 0, outdoor, link, seed, sub_picks, seed_after });
                     }
                     continue;
                 }
@@ -1649,10 +1661,21 @@ impl<'a, 'b> Generator<'a, 'b> {
                 if preset == 0 {
                     continue;
                 }
-                let (w, h) = self.preset_size(preset)?;
-                for py in 0..h {
-                    for px in 0..w {
-                        rooms.push(room(px, py, preset, (outdoor >> 16) & 0xF));
+                let ctx = self.ctx;
+                let row = ctx.data.lvl_prests().by_def(preset).ok_or(Error::NoPreset(preset))?;
+                if row.file_count >= 1 {
+                    self.seed.step();
+                }
+                let file = (outdoor >> 16) & 0xF;
+                if row.scan || row.pops != 0 {
+                    self.piece_units(row.file_for(file))?;
+                }
+                let (w, h) = row.size;
+                for py in (0..h.max(0)).step_by(ROOM_TILES as usize) {
+                    for px in (0..w.max(0)).step_by(ROOM_TILES as usize) {
+                        let seed = self.room_seed().low;
+                        let area = Coords { x: tx + px, y: ty + py, w: ROOM_TILES.min(w - px), h: ROOM_TILES.min(h - py) };
+                        rooms.push(OutdoorRoom { area, preset, file, outdoor, link, seed, sub_picks: 0, seed_after: seed });
                     }
                 }
             }
@@ -1669,6 +1692,69 @@ impl<'a, 'b> Generator<'a, 'b> {
             link: self.link.cells(),
             rooms,
         })
+    }
+
+    /// `DRLGROOMEX_RollLevelSubstitutionMask` (`Drlg.cpp:2422`): a percent roll per row of the
+    /// level's terrain group, on the room's seed (which the room's init later resets).
+    fn sub_picks(&self, room: &mut Seed) -> u32 {
+        let Some(def) = self.ctx.data.levels().get(self.id) else { return 0 };
+        if def.sub_type == -1 || def.sub_theme == -1 {
+            return 0;
+        }
+        let mut picks = 0;
+        for (i, row) in self.ctx.data.lvl_subs().group(def.sub_type).iter().enumerate() {
+            let prob = usize::try_from(def.sub_theme).ok().and_then(|t| row.prob.get(t)).copied().unwrap_or(0);
+            if ((room.roll() % 100) as i32) < prob {
+                picks |= 1u32.wrapping_shl(i as u32 & 0x1F);
+            }
+        }
+        picks
+    }
+
+    /// `DRLGROOM_AllocRoomEx`: a room's seed state is the level's low word stepped once from
+    /// `{low, 0x29A}`; `nSeed` is its low word.
+    fn room_seed(&mut self) -> Seed {
+        self.seed.step();
+        let mut room = Seed::new(self.seed.low, 0x29A);
+        room.step();
+        self.last_room_seed = room.low;
+        room
+    }
+
+    /// The level-seed draws of `DRLGPRESET_AddPresetUnitToDrlgMap` (`0x006675F0`) for a scanned
+    /// piece's map: some units — certain monsters and placements, and a few objects — are kept
+    /// only on a roll. The engine walks the units newest first.
+    fn piece_units(&mut self, file: Option<&str>) -> Result<(), Error> {
+        let Some(file) = file else { return Ok(()) };
+        let member = format!("data\\global\\tiles\\{}", file.replace('/', "\\"));
+        let bytes = self.ctx.data.read_file(&member).map_err(Error::Data)?.ok_or(Error::MissingMap(member))?;
+        let map = Ds1::parse(&bytes).map_err(Error::Ds1)?;
+        let monsters = self.ctx.data.mon_presets();
+        let monstats = monsters.monstats_rows();
+        for unit in map.units.iter().rev() {
+            let rolls = match unit.kind {
+                UnitKind::Monster => {
+                    let class = monsters.engine_class(map.act, unit.id);
+                    if class < 0 {
+                        continue;
+                    }
+                    if class < monstats {
+                        matches!(class, 0xCC | 0xCD | 0x173 | 0x174)
+                    } else {
+                        matches!(class - monstats, 0x21..=0x23)
+                    }
+                }
+                UnitKind::Object => {
+                    let act = u8::try_from(map.act).unwrap_or(0);
+                    matches!(self.ctx.engine.preset_object_class(act, unit.id), Some(0xC4 | 0x105 | 0x245))
+                }
+                UnitKind::Other(_) => continue,
+            };
+            if rolls {
+                self.seed.step();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1780,7 +1866,7 @@ mod tests {
 
     fn generate(data: &GameData, engine: &EngineData, seed: u32, difficulty: u8) -> HashMap<i32, Result<OutdoorLevel, String>> {
         let act = Act::build(data.levels(), 0, difficulty, seed);
-        let outdoors = Act1Outdoors::new(data, &engine.outdoor, &act, seed).expect("substitution maps");
+        let outdoors = Act1Outdoors::new(data, engine, &act, seed).expect("substitution maps");
         ACT1_WILDERNESS.iter().map(|&id| (id, outdoors.generate(id).map_err(|e| e.to_string()))).collect()
     }
 
@@ -1835,14 +1921,16 @@ mod tests {
                     let (x, y) = (field("\"x\":").unwrap(), field("\"y\":").unwrap());
                     let ours = level.rooms.iter().find(|o| (o.area.x, o.area.y) == (x, y)).unwrap();
                     // A piece's room flags carry more than its link bits.
+                    let picks = field("\"subThemePicked\":").map_or(0, |p| p as u32);
+                    let seed = number(&r, "\"seed\":", 0).unwrap().0 as u32;
                     let (expected, got) = if field("\"nPresetType\":") == Some(2) {
-                        ((field("\"def\":").unwrap(), 0), (ours.preset, 0))
+                        ((field("\"def\":").unwrap(), 0, seed, 0), (ours.preset, 0, ours.seed, 0))
                     } else {
-                        ((0, field("\"flags\":").unwrap() & 0x3_FFFF), (ours.preset, ours.link & 0x3_FFFF))
+                        ((0, field("\"flags\":").unwrap() & 0x3_FFFF, seed, picks), (ours.preset, ours.link & 0x3_FFFF, ours.seed_after, ours.sub_picks))
                     };
                     rooms_checked += 1;
                     if got != expected {
-                        wrong.push(format!("seed {seed} level {id} room ({x}, {y}): (piece, link) {got:x?}, recorded {expected:x?}"));
+                        wrong.push(format!("seed {seed} level {id} room ({x}, {y}): (piece, link, seed, terrain picks) {got:x?}, recorded {expected:x?}"));
                     }
                 }
             }

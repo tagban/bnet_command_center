@@ -44,6 +44,14 @@ pub struct LevelDef {
     /// `Warp0`..`Warp7`: the `LvlWarp.txt` id reaching each `Vis` level, -1 for none (an open
     /// edge rather than a door).
     pub warp: [i32; 8],
+    /// `SubType`: the `LvlSub.txt` group of terrain pieces its outdoor rooms roll, -1 for none.
+    pub sub_type: i32,
+    /// `SubTheme`: which probability column of that group, -1 for none.
+    pub sub_theme: i32,
+    /// `SubWaypoint`: the `LvlSub.txt` group its waypoint comes from, -1 for none.
+    pub sub_waypoint: i32,
+    /// `SubShrine`: the `LvlSub.txt` group its shrines come from, -1 for none.
+    pub sub_shrine: i32,
 }
 
 /// All levels, by id.
@@ -88,6 +96,10 @@ impl Levels {
                 waypoint: row.int("Waypoint").and_then(|w| u8::try_from(w).ok()).filter(|&w| w != 255),
                 vis: std::array::from_fn(|i| int(&format!("Vis{i}"))),
                 warp: std::array::from_fn(|i| row.int(&format!("Warp{i}")).map_or(-1, |w| w as i32)),
+                sub_type: row.int("SubType").map_or(-1, |v| v as i32),
+                sub_theme: row.int("SubTheme").map_or(-1, |v| v as i32),
+                sub_waypoint: row.int("SubWaypoint").map_or(-1, |v| v as i32),
+                sub_shrine: row.int("SubShrine").map_or(-1, |v| v as i32),
             };
             let at = id as usize;
             if by_id.len() <= at {

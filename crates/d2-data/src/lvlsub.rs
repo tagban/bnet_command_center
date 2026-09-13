@@ -17,6 +17,16 @@ pub struct LvlSub {
     pub bord_type: i32,
     /// `GridSize`: level cells per map tile.
     pub grid_size: i32,
+    /// `CheckAll`: try every position rather than a roll's worth.
+    pub check_all: bool,
+    /// `Dt1Mask`: tile files the piece needs.
+    pub dt1_mask: i32,
+    /// `Prob0`..`Prob4`: percent chance per sub theme that a room uses this row.
+    pub prob: [i32; 5],
+    /// `Trials0`..`Trials4`: placement tries per sub theme, -1 for every position.
+    pub trials: [i32; 5],
+    /// `Max0`..`Max4`: placements per sub theme.
+    pub max: [i32; 5],
 }
 
 /// `LvlSub.txt`, in file order.
@@ -44,6 +54,11 @@ impl LvlSubs {
                 file: row.get("File").unwrap_or_default().to_string(),
                 bord_type: row.int("BordType").unwrap_or(0) as i32,
                 grid_size: row.int("GridSize").unwrap_or(0) as i32,
+                check_all: row.int("CheckAll").unwrap_or(0) != 0,
+                dt1_mask: row.int("Dt1Mask").unwrap_or(0) as i32,
+                prob: std::array::from_fn(|i| row.int(&format!("Prob{i}")).unwrap_or(0) as i32),
+                trials: std::array::from_fn(|i| row.int(&format!("Trials{i}")).unwrap_or(0) as i32),
+                max: std::array::from_fn(|i| row.int(&format!("Max{i}")).unwrap_or(0) as i32),
             })
             .collect();
         Ok(Self { rows })
