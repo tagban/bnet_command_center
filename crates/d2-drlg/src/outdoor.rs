@@ -1,4 +1,5 @@
-//! Act I wilderness levels: which 8×8-tile cells the engine makes rooms, and which it leaves void.
+//! Act I wilderness levels: which 8×8-tile cells the engine makes rooms, which it leaves void, and
+//! what it places on them.
 //!
 //! A wilderness level is a grid of cells (`DRLGOUTDOOR_GenerateLevel`, `0x00675360`). The act
 //! generator first walks the level's outline — its rectangle, split where it meets a
@@ -16,8 +17,8 @@
 //! Rooms are listed without the per-room RNG of their creation (the room seeds and the preset
 //! file draws of `DRLGPRESET_BuildArea`), which does not change which rooms there are.
 //!
-//! The RNG is the level's own seed (`{act start + level id, 0x29A}`); every draw up to the stop
-//! is reproduced in order, as are the engine's reads past a grid row's end (the grid is one
+//! The RNG is the level's own seed (`{act start + level id, 0x29A}`); every placement draw is
+//! reproduced in order, as are the engine's reads past a grid row's end (the grid is one
 //! allocation, so they land in the next row).
 //!
 //! Ported from libd2 `packages/drlg/src/drlg/outdoors/{Outdoors,ActInit,Border,OutPlace,OutRoom,

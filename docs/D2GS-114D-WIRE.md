@@ -377,21 +377,25 @@ the corners outside a level's border (`SetBlankBorderGridCells`, `0x675670`) and
 the cliff and corner shapes stamped from `LvlSub.txt` maps (`DRLGOUTDOOR_ApplySubTileToGrid`,
 `0x66F520`) — 2–13 cells a level, on the edge and, in Black Marsh and Tamoe Highland, inside.
 A `0x07` into one would crash the client, so the test generates them: `d2_drlg::outdoor` ports
-the Act I outdoor generator (libd2 `outdoors/ActInit.zig`, `Border.zig`, `OutPlace.zig`,
-`OutRoom.zig`, `OutSub.zig`, `TileSub.zig`, `DrlgVer.zig`) up to the last substitution border —
-after it the generator only places pieces on free cells (`TestOutdoorLevelPreset` refuses blank
-ones) or ORs flags, so the room set is final and the road pathfinder is not needed. The outline
-comes from the level's rectangle split where a neighbour touches it: the placement lists wire each
+the Act I outdoor placement (libd2 `outdoors/ActInit.zig`, `Border.zig`, `OutPlace.zig`,
+`OutRoom.zig`, `OutSub.zig`, `TileSub.zig`, `DrlgVer.zig`): borders, substitution borders, the
+exits and their roads (a depth-first search bounded by a growing cost, `0x6817D0`), the waypoint,
+shrines and set pieces. Everything that blanks a cell happens by the last substitution border;
+what comes after only places pieces on free cells (`TestOutdoorLevelPreset` refuses blank ones)
+or ORs flags. The outline comes from the level's rectangle split where a neighbour touches it: the placement lists wire each
 node to its predecessor as an open edge (`DRLGACT_SetWarpConnection`, warp -1), and
 `DRLGLEVEL_AllocDrlgLevelFromLevelIdToLevelId` (`0x677680`) turns those `Vis` slots into orths;
 a preset neighbour (the camp, the Monastery Gate) gets no border pieces along its edge. The road
 flags come from the placement's own directions (`0x677180` reads `aCurrentDir[n]` and `[n + 1]`),
-and the lookup tables from `Game.exe` (`0x6F05D8`, `0x6F0620`, `0x6F0FC0`, `0x6F0FE8`,
-`0x6F1258`, `0x6F2680`). Against libd2's recordings of the engine the rooms match exactly — 21
+and the lookup tables from `Game.exe` (`d2_data::engine::OutdoorTables`, addresses there). Against libd2's recordings of the engine the rooms match exactly — 21
 Normal levels (`deep_seed_*.jsonl`) and 35 Hell levels (`coll_seed*_all.jsonl.gz`) room by room,
 and the room count of all seven Act I wilderness levels for 200 seeds on Normal and Hell
-(`coll_crc_masked_200_*.jsonl.gz`, 2,800 levels). It moves the player in a
-straight line at the engine's speeds (no collision, no path), re-syncs on `0x5F`, and on a room
+(`coll_crc_masked_200_*.jsonl.gz`, 2,800 levels); every piece id and every plain room's link
+flags (neighbours, shrine styles, waypoint — drawn after the roads) match in the 21 Normal levels.
+The rooms' own seeds and the pieces' file draws at room creation (`DRLGPRESET_BuildArea`) are not
+ported yet.
+
+The test moves the player in a straight line at the engine's speeds (no collision, no path), re-syncs on `0x5F`, and on a room
 change sends exactly the packets above — except that a room is dropped only once it is two rooms
 away (gap under 14), because the straight-line player can run ahead of the client's. Blood Moor's
 monsters, objects and warps are not generated.
@@ -466,10 +470,9 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
 - Shops: `0x38` trade/gamble/repair and the store's items; hirelings; NPC quest messages.
 - Waypoint travel (`0x49`), which needs warps and other acts.
 - Movement: paths and collision (`0x64DEA0`, libd2 `path.zig`/`collision.zig`) in place of
-  straight lines; cross-level near rooms by visibility slots (`0x66C220`); the rest of the
-  wilderness generator (exits and roads with the pathfinder `0x6817D0`, waypoints, shrines, set
-  pieces), then Blood Moor's monsters, objects and warps; NPC AI walking their DS1 paths
-  (`0x666120`).
+  straight lines; cross-level near rooms by visibility slots (`0x66C220`); wilderness room
+  creation (room seeds, piece files) and room init, for the waypoint, shrine and set-piece objects,
+  then Blood Moor's monsters and warps; NPC AI walking their DS1 paths (`0x666120`).
 - The byte at `0x68`+20 and the `0x6A`/`0x6C`/`0x6E` handlers.
 - A packet capture from the real engine (`docs/D2GS-RUST.md` §2 oracle) would confirm the dump
   faster than reading it; §4 and §6 say where to look in that capture.
