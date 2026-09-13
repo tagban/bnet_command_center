@@ -105,17 +105,20 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
 `Game.exe`, port 4000 taken). Internet players also need TCP 4000 forwarded; LAN clients don't.
 
 1. Select a character and **Create Game** (Normal). *Expect:* the client loads into the Rogue
-   Encampment, beside the campfire. *Before:* "Server Down". (Verified 2026-09-13.)
-2. *Expect, around the campfire* (the 3×3 rooms around the spawn, when `data_dir` holds the
-   MPQs): Warriv beside you, Kashya, Akara, Charsi, Gheed and five rogue guards standing still;
-   the torches lit, the bonfire, the stash and the waypoint (active, blue). The bonfire burns
+   Encampment, standing on the waypoint. *Before:* "Server Down". (Verified 2026-09-13.)
+   Each game has its own map seed, so the camp's layout — and the side its exit is on —
+   changes from game to game (with the MPQs; without them every game is the same camp).
+2. *Expect, around the waypoint* (the 3×3 rooms around it, when `data_dir` holds the MPQs):
+   the NPCs and objects nearby standing still — in the camp tagban tested, Warriv, Kashya, Akara,
+   Charsi, Gheed and five rogue guards — the torches lit, the bonfire, the stash and the
+   waypoint (active, blue). What is near depends on the layout. The bonfire burns
    low: the client lights it only at dusk and night, and test games stay at midday. Clicking
    an NPC or the stash does nothing. Chickens wander as before — the client spawns those
    itself. (Verified 2026-09-13.)
 3. *Expect nothing else to work.* After "load complete" the server only answers pings:
    life/mana/stamina show (level-1 values from `charstats.txt`), NPCs never walk, the
    character walks only on its own screen (the walk requests are logged), and anything two
-   rooms or more from the spawn — the cows, NPCs out of sight — is never sent. Past the town
+   rooms or more from the waypoint is never sent. Past the town
    edge is black; the first build that sent town units halted the client there ("failed at
    (96)", missing quest data), fixed since. Esc → Save and Exit returns to chat (verified).
 4. Send the log from the moment you clicked Create Game.
@@ -124,6 +127,7 @@ What it shows, in order:
 
 ```
 game created game=… id=…                       realm accepted MCP_CREATEGAME
+test game created … map_seed=… map=… spawn=…   the camp this game got
 sending client to the game server id=… ip=…    MCP_JOINGAME
 game connection; sending AF 01                 client reached port 4000
 D2GS packet in op=0x68 …  /  GAMELOGON …       the client's logon, every field

@@ -171,6 +171,9 @@ pub struct ObjectClass {
     pub init_fn: u8,
     /// `PreOperate`: spawn some already operated (record `+0x13D`).
     pub pre_operate: bool,
+    /// `SubClass` bits (record `+0x167`), e.g. 0x04 portals (`SendUnitToClient` adds `0x60`),
+    /// 0x40 waypoints (the town spawn search looks for one).
+    pub sub_class: u8,
 }
 
 impl Objects {
@@ -183,6 +186,7 @@ impl Objects {
                 name: r.get("description - not loaded").or_else(|| r.get("Name")).unwrap_or_default().to_string(),
                 init_fn: r.int("InitFn").and_then(|v| u8::try_from(v).ok()).unwrap_or(0),
                 pre_operate: r.int("PreOperate").unwrap_or(0) != 0,
+                sub_class: r.int("SubClass").and_then(|v| u8::try_from(v).ok()).unwrap_or(0),
             })
             .collect();
         Self { rows }

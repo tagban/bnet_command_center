@@ -113,6 +113,28 @@ pub fn object_mode(init_fn: u8, pre_operate: bool, level_id: i32) -> Option<u8> 
     }
 }
 
+/// `objects.txt` `SubClass` bit of waypoints.
+pub const SUBCLASS_WAYPOINT: u8 = 0x40;
+
+/// Where a player entering a preset level without a warp is put, in world subtiles: on the
+/// level's waypoint — the first room flagged as holding one, its first preset object whose
+/// class is a waypoint (`0x0066AD80`), at that tile's subtile (3, 3) (`0x0061B060`). The engine
+/// then takes the nearest spot free for the player (`0x0064E7B0`, collision mask `0x1C09`);
+/// that search is not ported, and a waypoint has no collision of its own. `None` if the level
+/// has no waypoint, where the engine falls back to other rooms (`0x0066B1F0`), not ported.
+#[must_use]
+pub fn waypoint_spawn(data: &GameData, level: &PresetLevel) -> Option<(u16, u16)> {
+    level.units.iter().find_map(|u| match u.class {
+        UnitClass::Object(class)
+            if class <= 0x23C && data.objects().get(class).is_some_and(|o| o.sub_class & SUBCLASS_WAYPOINT != 0) =>
+        {
+            let at = |v: i32| u16::try_from(v.div_euclid(5) * 5 + 3).ok();
+            Some((at(u.x)?, at(u.y)?))
+        }
+        _ => None,
+    })
+}
+
 /// Pick each graphics component from the unit's seed (`0x005739D0`): uniform over the class's
 /// variants, the seed untouched for a component with none.
 #[must_use]
@@ -359,6 +381,18 @@ mod tests {
             assert!(monsters.contains(&npc), "{npc} in {monsters:?}");
         }
         assert!(!monsters.contains(&149), "chickens are the client's");
+        assert_eq!(waypoint_spawn(&data, &level), Some((5798, 4413)), "on the waypoint at (5799, 4414)");
+
+        // Every game seed gives one of the four camps, each with a waypoint to start on.
+        let mut maps = std::collections::BTreeSet::new();
+        for seed in (0..400u32).map(|i| i.wrapping_mul(0x9E37_79B9) ^ 0x5A5A) {
+            let act = d2_drlg::act::Act::build(data.levels(), 0, 0, seed);
+            let town = PresetLevel::build(&data, &engine, &act, 1).unwrap_or_else(|e| panic!("seed {seed:#x}: {e}"));
+            let (x, y) = waypoint_spawn(&data, &town).unwrap_or_else(|| panic!("seed {seed:#x}: no waypoint"));
+            assert!(town.room_index_at(x.into(), y.into()).is_some(), "seed {seed:#x}: spawn outside the town");
+            maps.insert(town.map);
+        }
+        assert_eq!(maps.len(), 4, "{maps:?}");
     }
 
     #[test]

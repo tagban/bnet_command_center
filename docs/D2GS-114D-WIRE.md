@@ -174,14 +174,14 @@ so a client test can overturn it:
   sent; both `0x23`s say skill 0 (Attack) with item guid `0xFFFFFFFF`.
 - `0x07`'s fields are read as the room's tile rectangle (`+0x10`, `+0x14` of the struct
   `0x619730` fills) — the usual D2 coords layout, not traced further.
-- Map seed `0x12345678` with the spawn beside the Rogue Encampment campfire, from libd2's
-  object dump for that seed; walkability of that exact subtile is not checked.
+- Each game draws a random map seed (the engine's `game+0x7C`); without the install's maps it
+  uses `0x12345678`. Players start on the town waypoint (§5, *Where a new player starts*); the
+  engine's final free-spot search around it is not ported.
 - `0x5B` rosters are not sent. Room units go out with the join, right after each near room's
   `0x07`, as they would for a room another player had already populated; the engine's first
   population of a fresh game may send them a frame later instead.
-- The near-room order compares the room fields `0x66BBC0` reads as x/y/w/h (not traced).
-- Warriv's map spot (5806, 4450) is 4 subtiles from our spawn; the engine would pick a free
-  spot (`0x61B060`), which is not ported.
+- The near-room order compares room fields `+0x34`…`+0x40`, the ones the spawn search reads as
+  a room's tile x, y, width and height (`0x66B2B0`).
 
 ### First client test (2026-09-13)
 
@@ -314,6 +314,23 @@ of the period table `0x7443F0` (six rows `angle, phase, colour`: 320/3, 340/3, 0
 frame (`0x61BEE0`, towns faster). We send period 2 and never advance it: day, embers. The
 server's own starting period is not yet read.
 
+### Where a new player starts (2026-09-13)
+
+tagban noticed the camp's exit was always in the same place: every test game had used map seed
+`0x12345678`, while the camp's layout (TownN1/E1/S1/W1) follows the seed. Seeds are now drawn per
+game, which needed the engine's spawn instead of a spot picked for that one seed.
+`PlacePlayerInAct` (`0x5394A0`, no warp given) calls `0x61B060` with the act's town:
+`0x66B2B0` loads the level and — with `+0x90` of `0x61E470`'s struct clear (meaning unread;
+taken as clear on a fresh join) — asks `0x66AD80`
+for the first room flagged as holding a waypoint (`+0x28 & 0x30000`) and, in it, the first
+preset object with class ≤ `0x23C` whose `objects.txt` SubClass has bit `0x40` (waypoint); the
+player's tile is that object's (preset x ÷ 5 + room tile x). Without one it tries `0x66B1F0`,
+`0x642630` and `0x66AE70` (not read). The tile becomes
+subtiles × 5 + 3, and `0x64E7B0` (`0x64DEA0`, radius `0x32`, collision mask `0x1C09`) moves the
+player to the nearest free spot for its size. A waypoint has no collision (`HasCollision*` 0), so
+on a fresh game that is the waypoint's own tile. Over 400 seeds every camp builds, all four maps
+appear, and each has its waypoint inside the town.
+
 ## 6. Server packet builders (opcode → function)
 
 `scripts/d2re/server_send_builders.py <Game.exe>` finds every call to the queue function
@@ -337,7 +354,8 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
 - The act clock: the server's starting period and the `0x53` updates as it advances.
 - Movement: the C→S walk/run packets, the player's path, and `0x537B50` on a room change —
   `0x07` + units for new near rooms, `0x53A9B0` (unit removals via `0x571600`, then `0x08`) for
-  old ones; the spawn search `0x61B060`; NPC AI walking their DS1 paths (`0x666120`).
+  old ones; the free-spot search `0x64DEA0` (needs collision); NPC AI walking their DS1 paths
+  (`0x666120`).
 - The byte at `0x68`+20 and the `0x6A`/`0x6C`/`0x6E` handlers.
 - A packet capture from the real engine (`docs/D2GS-RUST.md` §2 oracle) would confirm the dump
   faster than reading it; §4 and §6 say where to look in that capture.

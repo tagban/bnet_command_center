@@ -26,7 +26,7 @@ use d2_data::engine::EngineData;
 use d2_data::{stat, GameData};
 use d2_drlg::act::Act;
 use d2_drlg::preset::PresetLevel;
-use d2_game::population::{unit_type, Population, Spawned};
+use d2_game::population::{unit_type, waypoint_spawn, Population, Spawned};
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -50,18 +50,17 @@ const IN_GAME_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// `sUpdateClients` sending `04`.
 const SERVER_FRAME: Duration = Duration::from_millis(40);
 
-/// Every test game uses this map seed. `jaenster/libd2`'s engine dumps for it place the
-/// Rogue Encampment's objects (Normal) at world subtiles around (5800, 4450): stash
-/// (5806, 4444), campfire (5799, 4457), waypoint (5799, 4414).
-const MAP_SEED: u32 = 0x1234_5678;
 /// The Rogue Encampment.
 const TOWN_AREA: u16 = 1;
-/// Spawn point: beside the campfire and stash for [`MAP_SEED`]. Walkability unverified —
-/// the real engine picks this from the generated town, which we do not have yet.
-const SPAWN: (u16, u16) = (5810, 4450);
-/// Top-left tile of the 8×8-tile room holding [`SPAWN`]: the same dump puts the stash, 4
-/// subtiles away, in the room at tile (1160, 888).
-const SPAWN_ROOM: (u16, u16) = (1160, 888);
+/// Map seed for a game whose town cannot be built (no MPQs, or a build error). Each game
+/// otherwise gets its own random seed, as the engine's `game+0x7C`, and with it one of the
+/// four camps. `jaenster/libd2`'s engine dump for this seed puts its waypoint at (5799, 4414).
+const FALLBACK_MAP_SEED: u32 = 0x1234_5678;
+/// Spawn for [`FALLBACK_MAP_SEED`]: the waypoint's tile at subtile (3, 3)
+/// (`d2_game::population::waypoint_spawn`).
+const FALLBACK_SPAWN: (u16, u16) = (5798, 4413);
+/// Top-left tile of the room holding [`FALLBACK_SPAWN`].
+const FALLBACK_SPAWN_ROOM: (u16, u16) = (1152, 880);
 /// Guid of the joining player's unit.
 const PLAYER_GUID: u32 = 1;
 
@@ -71,9 +70,20 @@ pub struct GameServer {
     tables: EngineTables,
     /// `charstats.txt` and friends from the install; without them a player joins with no stats.
     rules: Option<GameData>,
-    /// The Rogue Encampment for [`MAP_SEED`]; without it a player stands in an empty town.
-    town: Option<PresetLevel>,
+    /// Where each game's Rogue Encampment comes from; without one a player stands in an empty
+    /// town.
+    towns: Towns,
     games: Mutex<Games>,
+}
+
+#[derive(Debug)]
+enum Towns {
+    None,
+    /// Built per game from its map seed, with the engine's preset object table.
+    FromInstall(Box<EngineData>),
+    /// The same town for every game, for tests.
+    #[cfg(test)]
+    Fixed(PresetLevel),
 }
 
 #[derive(Debug, Default)]
@@ -93,6 +103,12 @@ struct Game {
     staged: Vec<Character>,
     /// Characters connected to this game.
     connected: Vec<String>,
+    /// `game+0x7C`: the seed the client lays the act out from (`0x03`).
+    map_seed: u32,
+    /// The Rogue Encampment for [`Game::map_seed`].
+    town: Option<PresetLevel>,
+    /// Where joining players are placed.
+    spawn: (u16, u16),
     /// The town's objects and NPCs, spawned room by room as players come near.
     population: Option<Population>,
 }
@@ -121,14 +137,50 @@ impl GameServer {
     /// A game server with no games.
     #[must_use]
     pub fn new(tables: EngineTables, rules: Option<GameData>) -> Self {
-        Self { tables, rules, town: None, games: Mutex::new(Games::default()) }
+        Self { tables, rules, towns: Towns::None, games: Mutex::new(Games::default()) }
     }
 
-    /// Give new games this town to populate (it must be built from these rules).
+    /// Build each new game's town from its own map seed with these engine tables (the rules
+    /// must hold the install's maps).
+    #[must_use]
+    pub fn with_engine(mut self, engine: EngineData) -> Self {
+        self.towns = Towns::FromInstall(Box::new(engine));
+        self
+    }
+
+    /// Give every new game this town (it must be built from these rules) — for tests.
+    #[cfg(test)]
     #[must_use]
     pub fn with_town(mut self, town: PresetLevel) -> Self {
-        self.town = Some(town);
+        self.towns = Towns::Fixed(town);
         self
+    }
+
+    /// A new game's map seed and town: a random seed, as the engine draws one per game, and the
+    /// camp it produces; [`FALLBACK_MAP_SEED`] if that town cannot be built.
+    fn new_town(&self, difficulty: u8) -> (u32, Option<PresetLevel>) {
+        let (Towns::FromInstall(engine), Some(data)) = (&self.towns, &self.rules) else {
+            #[cfg(test)]
+            let fixed = match &self.towns {
+                Towns::Fixed(town) => Some(town.clone()),
+                _ => None,
+            };
+            #[cfg(not(test))]
+            let fixed = None;
+            return (FALLBACK_MAP_SEED, fixed);
+        };
+        let build = |seed: u32| {
+            let act = Act::build(data.levels(), 0, difficulty, seed);
+            PresetLevel::build(data, engine, &act, i32::from(TOWN_AREA))
+        };
+        let seed: u32 = rand::thread_rng().gen();
+        match build(seed) {
+            Ok(town) => (seed, Some(town)),
+            Err(e) => {
+                warn!(map_seed = %format!("{seed:#010x}"), error = %e, "town not built for this seed; using the fallback seed");
+                (FALLBACK_MAP_SEED, build(FALLBACK_MAP_SEED).ok())
+            }
+        }
     }
 
     /// Load `Game.exe` and the game rules from `data_dir`, bind the game port on `ip`, and start
@@ -164,18 +216,7 @@ impl GameServer {
                 None
             }
         };
-        let town = rules.as_ref().and_then(|data| {
-            let act = Act::build(data.levels(), 0, 0, MAP_SEED);
-            PresetLevel::build(data, &engine, &act, i32::from(TOWN_AREA))
-                .map_err(|e| warn!(error = %e, "town not built: players will stand in an empty town"))
-                .ok()
-        });
-        let mut server = Self::new(tables, rules);
-        if let Some(town) = town {
-            info!(map = %town.map, rooms = town.rooms.len(), units = town.units.len(), "Rogue Encampment built");
-            server = server.with_town(town);
-        }
-        let server = Arc::new(server);
+        let server = Arc::new(Self::new(tables, rules).with_engine(engine));
         warn!(
             %addr,
             "Diablo II game server HANDSHAKE TEST is on: games can be created and joined; clients \
@@ -196,6 +237,13 @@ impl GameServer {
     ///
     /// [`CreateError`].
     pub fn create(&self, name: &str, password: &str, difficulty: u8) -> Result<u16, CreateError> {
+        let difficulty = difficulty.min(2);
+        let (map_seed, town) = self.new_town(difficulty);
+        let spawn = town
+            .as_ref()
+            .zip(self.rules.as_ref())
+            .and_then(|(town, rules)| waypoint_spawn(rules, town))
+            .unwrap_or(FALLBACK_SPAWN);
         let mut g = self.lock();
         g.by_id.retain(|_, game| !game.connected.is_empty() || game.created.elapsed() < UNJOINED_GAME_TTL);
         if g.by_id.values().any(|game| game.name.eq_ignore_ascii_case(name)) {
@@ -212,14 +260,18 @@ impl GameServer {
                 name: name.to_string(),
                 password: password.to_string(),
                 hash: rand::thread_rng().gen(),
-                difficulty: difficulty.min(2),
+                difficulty,
                 created: Instant::now(),
                 staged: Vec::new(),
                 connected: Vec::new(),
-                population: self.town.as_ref().map(|t| Population::new(rand::thread_rng().gen(), t.rooms.len())),
+                map_seed,
+                population: town.as_ref().map(|t| Population::new(rand::thread_rng().gen(), t.rooms.len())),
+                spawn,
+                town,
             },
         );
-        info!(game = %name, id, difficulty, "test game created");
+        let map = g.by_id[&id].town.as_ref().map_or("none", |t| t.map.as_str());
+        info!(game = %name, id, difficulty, map_seed = %format!("{map_seed:#010x}"), %map, ?spawn, "test game created");
         Ok(id)
     }
 
@@ -248,26 +300,33 @@ impl GameServer {
     }
 
     /// Match a `GAMELOGON` to a staged join, moving the character into the game.
-    fn claim(&self, logon: &GameLogon) -> Option<(Character, u8)> {
+    fn claim(&self, logon: &GameLogon) -> Option<Player> {
         let mut g = self.lock();
         let game = g.by_id.get_mut(&logon.game_id).filter(|game| game.hash == logon.game_hash)?;
         let at = game.staged.iter().position(|c| c.name.eq_ignore_ascii_case(&logon.name))?;
         let character = game.staged.remove(at);
         game.connected.push(character.name.clone());
-        Some((character, game.difficulty))
+        Some(Player {
+            game_id: logon.game_id,
+            character,
+            difficulty: game.difficulty,
+            map_seed: game.map_seed,
+            spawn: game.spawn,
+        })
     }
 
-    /// The rooms a player at `(x, y)` is sent on entering (the spawn room's near rooms,
-    /// `0x00537B50`), each as its `0x07` followed by the packets `SendUnitToClient` sends for
-    /// its units — populating rooms nobody has been near yet.
+    /// The rooms a player placed at `(x, y)` is sent (`PlacePlayerInAct`): `0x07` for its own
+    /// room, then for each room near it (`0x00537B50`) its `0x07` followed by the packets
+    /// `SendUnitToClient` sends for its units — populating rooms nobody has been near yet.
     fn rooms_around(&self, game_id: u16, x: u16, y: u16) -> Vec<Vec<u8>> {
-        let (Some(town), Some(rules)) = (&self.town, &self.rules) else { return Vec::new() };
-        let Some(room) = town.room_index_at(x.into(), y.into()) else { return Vec::new() };
+        let fallback = vec![d2gs::load_room(FALLBACK_SPAWN_ROOM.0, FALLBACK_SPAWN_ROOM.1, TOWN_AREA as u8)];
+        let Some(rules) = &self.rules else { return fallback };
         let mut g = self.lock();
-        let Some(population) = g.by_id.get_mut(&game_id).and_then(|game| game.population.as_mut()) else {
-            return Vec::new();
-        };
-        let mut packets = Vec::new();
+        let Some(game) = g.by_id.get_mut(&game_id) else { return fallback };
+        let (Some(town), Some(population)) = (&game.town, &mut game.population) else { return fallback };
+        let Some(room) = town.room_index_at(x.into(), y.into()) else { return fallback };
+        let own = town.rooms[room];
+        let mut packets = vec![d2gs::load_room(own.x as u16, own.y as u16, town.level_id as u8)];
         for near in town.rooms_near(room) {
             let r = town.rooms[near];
             packets.push(d2gs::load_room(r.x as u16, r.y as u16, town.level_id as u8));
@@ -334,6 +393,8 @@ struct Player {
     game_id: u16,
     character: Character,
     difficulty: u8,
+    map_seed: u32,
+    spawn: (u16, u16),
 }
 
 /// One client on the game port.
@@ -459,12 +520,13 @@ async fn logon(
         flush(stream, peer, tables, outbox).await?;
         return Ok(None);
     }
-    let Some((character, difficulty)) = server.claim(&logon) else {
+    let Some(joined) = server.claim(&logon) else {
         info!(%peer, name = %logon.name, "GAMELOGON matches no staged join; refusing");
         outbox.push(&refuse(join_failed::GENERIC));
         flush(stream, peer, tables, outbox).await?;
         return Ok(None);
     };
+    let (character, difficulty) = (&joined.character, joined.difficulty);
     if logon.class != character.class {
         warn!(%peer, sent = logon.class, stored = character.class, "GAMELOGON class differs from the character's");
     }
@@ -480,7 +542,7 @@ async fn logon(
     // database answers. Ours is already loaded.
     outbox.push(&[d2gs::sc::LOAD_SUCCESS]);
     flush(stream, peer, tables, outbox).await?;
-    Ok(Some(Player { game_id: logon.game_id, character, difficulty }))
+    Ok(Some(joined))
 }
 
 /// `ENTERGAME`, in the engine's order (`HandleSrvJoinAct`): `ClientAddPlayerToGame` creates
@@ -498,7 +560,7 @@ async fn enter_game(
     outbox: &mut Outbox,
 ) -> std::io::Result<()> {
     let tables = &server.tables;
-    let (x, y) = SPAWN;
+    let (x, y) = p.spawn;
     // Unplaced: at (0, 0) the client creates the unit without looking for a room.
     outbox.push(&d2gs::assign_player(PLAYER_GUID, p.character.class, &p.character.name, 0, 0));
     // A fresh game's quests (every quest object starts available) and a new character's flags,
@@ -520,11 +582,10 @@ async fn enter_game(
         let whole = |id: u8| stats.iter().find(|&&(s, _)| s == id).map_or(0, |&(_, v)| (v >> 8) as u16);
         outbox.push(&d2gs::life_and_position(whole(stat::HITPOINTS), whole(stat::MANA), whole(stat::STAMINA), 0, 0, 0, 0));
     }
-    outbox.push(&d2gs::load_act(0, MAP_SEED, TOWN_AREA, 0));
+    outbox.push(&d2gs::load_act(0, p.map_seed, TOWN_AREA, 0));
     // Period 2 starts at angle 0: the start of the day. The client's 0x53 handler reads its
     // own player unit, which is why 0x0B has to be in first.
     outbox.push(&d2gs::act_environment(2, 0, false));
-    outbox.push(&d2gs::load_room(SPAWN_ROOM.0, SPAWN_ROOM.1, TOWN_AREA as u8));
     let rooms = server.rooms_around(p.game_id, x, y);
     for packet in &rooms {
         outbox.push(packet);
@@ -670,8 +731,9 @@ pub(crate) mod tests {
         let mut logon = GameLogon::parse(&logon_packet(id, hash ^ 1, 1, 0x0E, "Tyrael")).unwrap();
         assert!(gs.claim(&logon).is_none(), "the hash must match");
         logon.game_hash = hash;
-        let (c, difficulty) = gs.claim(&logon).expect("staged");
-        assert_eq!((c.name.as_str(), difficulty), ("Tyrael", 2));
+        let joined = gs.claim(&logon).expect("staged");
+        assert_eq!((joined.character.name.as_str(), joined.difficulty), ("Tyrael", 2));
+        assert_eq!((joined.map_seed, joined.spawn), (FALLBACK_MAP_SEED, FALLBACK_SPAWN), "no install: the fallback camp");
         assert!(gs.claim(&logon).is_none(), "a staged join is used once");
 
         gs.leave(id, "tyrael");
@@ -733,7 +795,9 @@ pub(crate) mod tests {
         assert_eq!(&packets[0][6..13], b"TestBan", "the character's name in 0x59");
         assert_eq!(&packets[0][22..26], &[0, 0, 0, 0], "0x59 before placement: no position");
         assert_eq!(packets[4], &[0x0B, 0, 1, 0, 0, 0], "then: that unit is yours");
-        assert_eq!(&packets[5 + 15 + 3][2..6], &MAP_SEED.to_le_bytes(), "0x03 carries the seed");
+        assert_eq!(&packets[5 + 15 + 3][2..6], &FALLBACK_MAP_SEED.to_le_bytes(), "0x03 carries the seed");
+        assert_eq!(packets[5 + 15 + 5], d2gs::load_room(1152, 880, 1), "no town: the fallback seed's spawn room");
+        assert_eq!(&packets[5 + 15 + 6][6..10], &[0xA6, 0x16, 0x3D, 0x11], "placed on its waypoint (5798, 4413)");
         assert_eq!(read_frame(&mut c, huffman).await, vec![0x04]);
 
         let mut ping = vec![0u8; 13];
@@ -747,9 +811,9 @@ pub(crate) mod tests {
         assert_eq!(read_frame(&mut c, huffman).await, vec![0xB0]);
     }
 
-    /// A made-up town in a row of four rooms: the spawn room (the second) holds a torch (object
-    /// 1, InitFn 8) and an NPC (monster 10, two helmets to pick from); a crate stands in the
-    /// fourth room, two rooms away from the spawn.
+    /// A made-up town in a row of four rooms: the second holds a torch (object 1, InitFn 8), the
+    /// waypoint players start on (object 3) and an NPC (monster 10, two helmets to pick from); a
+    /// crate stands in the fourth room, two rooms away.
     fn test_town() -> (GameData, PresetLevel) {
         use d2_data::monsters::{Monsters, COMPONENT_COLUMNS};
         use d2_data::presets::{MonPresets, Objects, PresetMonster};
@@ -757,7 +821,9 @@ pub(crate) mod tests {
         use d2_drlg::Coords;
         use d2_formats::excel::Table;
         let mut rules = test_rules();
-        let objects = Table::parse(b"Name\tInitFn\tPreOperate\r\nnone\t0\t0\r\ntorch\t8\t0\r\ncrate\t0\t0\r\n");
+        let objects = Table::parse(
+            b"Name\tInitFn\tPreOperate\tSubClass\r\nnone\t0\t0\t0\r\ntorch\t8\t0\t0\r\ncrate\t0\t0\t0\r\nwaypoint\t17\t0\t64\r\n",
+        );
         let monstats = Table::parse(b"Id\thcIdx\tMonStatsEx\r\nguard\t10\tguard\r\n");
         let mut ms2 = String::from("Id\tcritter");
         for c in COMPONENT_COLUMNS {
@@ -778,6 +844,7 @@ pub(crate) mod tests {
                 at(UnitClass::Monster(PresetMonster::Class { class: 10, name: "guard".into() }), 5815, 4455),
                 at(UnitClass::Object(1), 5812, 4444),
                 at(UnitClass::Object(2), 5890, 4444),
+                at(UnitClass::Object(3), 5805, 4447),
             ],
         };
         (rules, town)
@@ -830,10 +897,11 @@ pub(crate) mod tests {
         let tail: Vec<u8> = ops.iter().map(|(op, _)| *op).skip_while(|&op| op != 0x53).collect();
         assert_eq!(
             tail,
-            vec![0x53, 0x07, 0x07, 0x07, 0x51, 0xAC, 0xAA, 0x6D, 0x07, 0x15, 0x7E, 0x04],
+            vec![0x53, 0x07, 0x07, 0x07, 0x51, 0x51, 0xAC, 0xAA, 0x6D, 0x07, 0x15, 0x7E, 0x04],
             "spawn room, then its three near rooms — units after their own room — then placement"
         );
         let body = |op: u8| ops.iter().find(|(o, _)| *o == op).map(|(_, b)| b.clone()).unwrap();
+        assert_eq!(body(0x15), d2gs::reassign_player(0, 1, 5808, 4448, 1), "placed on the waypoint's tile");
         assert_eq!(body(0x51), d2gs::assign_object(1, 1, 5812, 4444, 2, 0), "the torch, lit");
         let npc = body(0xAC);
         assert_eq!((&npc[1..5], &npc[5..7], npc[11]), (&1u32.to_le_bytes()[..], &10u16.to_le_bytes()[..], 0x80));
@@ -841,6 +909,28 @@ pub(crate) mod tests {
         let rooms: Vec<Vec<u8>> = ops.iter().filter(|(op, _)| *op == 0x07).map(|(_, b)| b.clone()).collect();
         assert_eq!(rooms[0], d2gs::load_room(1160, 888, 1), "PlacePlayerInAct's own 07 first");
         assert!(!rooms.contains(&d2gs::load_room(1176, 888, 1)), "two rooms away is not near");
+    }
+
+    /// With the operator's install (`BNETCC_D2_DATA_DIR`, holding `Game.exe` and the MPQs): each
+    /// game draws its own map seed, the camps vary, and players start on each camp's waypoint.
+    #[test]
+    fn with_a_real_install_each_game_gets_its_own_camp() {
+        let Ok(dir) = std::env::var("BNETCC_D2_DATA_DIR") else {
+            return;
+        };
+        let engine = EngineData::from_game_exe(&std::fs::read(Path::new(&dir).join("Game.exe")).unwrap()).unwrap();
+        let gs = GameServer::new(test_tables(), Some(GameData::load(&dir).unwrap())).with_engine(engine);
+        let mut maps = std::collections::BTreeSet::new();
+        for i in 0..32 {
+            let id = gs.create(&format!("camp {i}"), "", 0).unwrap();
+            let g = gs.lock();
+            let game = &g.by_id[&id];
+            let town = game.town.as_ref().expect("built");
+            assert_ne!(game.map_seed, FALLBACK_MAP_SEED);
+            assert!(town.room_index_at(game.spawn.0.into(), game.spawn.1.into()).is_some(), "{:?}", game.spawn);
+            maps.insert(town.map.clone());
+        }
+        assert!(maps.len() > 1, "32 games, one camp: {maps:?}");
     }
 
     #[tokio::test]
