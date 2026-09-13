@@ -161,6 +161,21 @@ These are captured so they are not lost; each needs real design work, not just a
       `Name@<realm>` accounts, per-product game listing with lookup-by-name, and empty
       `SID_FRIENDSLIST`/`SID_NEWS_INFO` replies. See `docs/WARCRAFT3.md`. Still to confirm
       against a real patched client.
+- [ ] **Ladder system for every game — next up (requested 2026-09-13).** A formal ladder
+      per product, not a leaderboard bolted on later:
+      - **Eligibility, as classic Battle.net had it:** StarCraft/Brood War and Warcraft II need
+        **10 normal-game wins** before a player may join the ladder (then opt in). Confirm the
+        per-product rule and what the client shows when refused before hard-coding it.
+      - **Results** already record (`SID_GAMERESULT` 0x2C → `Record\<product>\0\…`); ladder
+        games record separately (`Record\<product>\1\…`), with a rating formula chosen
+        with tagban, plus disconnect handling and plausibility checks (both players must agree).
+      - **In-client ladder views** (SC/W2 ladder screens, `SID_READUSERDATA` ladder keys) and
+        a web ladder page; statstrings carry the record so bots can show stat icons.
+      - **WarCraft III matchmaking** ("Play Game"): today it fails with "problem receiving
+        required matchmaking data" because `SID_WARCRAFTGENERAL` 0x44 is unanswered (`07`
+        tournament, `02` ladder map/type records). Then `WID_GAMESEARCH` and the W3 route
+        listener (TCP 6200) for automated matches and results. `docs/WARCRAFT3.md` §1, §4.4, §5.
+      - **Diablo II** realm ladder characters (`status & 0x40`) and `MCP_REQUESTLADDERDATA`.
 - [ ] WarCraft III: clans (`0x70`–`0x82`), `SID_WARCRAFTGENERAL`, W3 route listener, and an
       **MPQ reader** for `icons-WAR3.bni` — which is an MPQ of `.blp` images, not a BNI.
       Document that WC3 needs a patched client because of the 128-byte RSA server
