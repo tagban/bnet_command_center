@@ -75,6 +75,24 @@ sent = XSHA1(clientToken ‖ serverToken ‖ h1)      // 4 + 4 + 20 = 28 bytes, 
 Account creation (`SID_CREATEACCOUNT2`, `0x3D`) hashes the lowercased password **once**, not
 twice. Usernames longer than 15 characters are truncated.
 
+⚠️ **The lowercasing is the client's job, and the server cannot undo a client that skips it.**
+The password never crosses the wire — only `h1` (creation) or the salted proof (logon) — so a
+server has nothing left to fold. Blizzard's clients fold (BNETDocs, `SID_LOGONRESPONSE` 0x29:
+*"Passwords should be converted to lowercase before hashing"*); WarCraft III's NLS folds to
+**upper** case instead (BNETDocs "NLS/SRP Protocol"). Seen 2026-09-13: a real D2 LoD 1.14d
+client's `h1` for `Mixed!case` matched `XSHA1("mixed!case")`, while a bot sent a proof for the
+same password that matched nothing — an account created by such a bot is unreachable from
+real clients (and vice versa) until its password is reset.
+
+**Suspected cause, unconfirmed: hashing services.** Bots often outsource the hash to BNLS
+(`BNLS_HASHDATA` `0x0B`, "hash passwords using OLS") or JBLS. If the service hashes the bytes
+it is given verbatim, the caller must lowercase first, and a bot that assumes the service
+does it produces exactly the failure above. BNETDocs' BNLS guide does not say which side
+folds. **When we build our own BNLS/JBLS-compatible server:** decide and document it — folding
+`HASHDATA` input server-side makes naive bots interoperate with real clients, at the cost of
+diverging from a service that hashes verbatim (test both against an existing bot before
+choosing), and fold NLS logon names/passwords to upper case for WarCraft III.
+
 Status codes: `0x00` success · `0x01` no such account · `0x02` wrong password ·
 `0x03` account corrupted (D2 only) · `0x06` account closed (+ reason string). An unknown
 status makes the client show a default error and disconnect.
