@@ -25,9 +25,11 @@ use d2_data::engine::EngineData;
 use d2_data::levels::DrlgType;
 use d2_data::GameData;
 
+use d2_formats::ds1::UnitKind;
+
 use crate::act::Act;
 use crate::outdoor::Act1Outdoors;
-use crate::preset::{PresetLevel, ROOM_TILES, SUBTILES};
+use crate::preset::{PlacedUnit, PresetLevel, UnitClass, ROOM_TILES, SUBTILES};
 use crate::Coords;
 
 /// A room: its level and its index in that level's rooms.
@@ -48,6 +50,8 @@ pub struct WorldLevel {
     pub area: Coords,
     /// Its rooms in tiles.
     pub rooms: Vec<Coords>,
+    /// The units its map and its rooms' init place, in world subtiles.
+    pub units: Vec<PlacedUnit>,
 }
 
 /// The walkable levels of an act.
@@ -144,10 +148,28 @@ impl World {
             if area.w <= 0 || area.h <= 0 || world.levels.iter().any(|l| overlaps(l.area, area)) {
                 continue;
             }
-            let rooms = match (town, def.drlg_type, &outdoors) {
-                (Some(t), _, _) if t.level_id == id => t.rooms.clone(),
+            let (rooms, units) = match (town, def.drlg_type, &outdoors) {
+                (Some(t), _, _) if t.level_id == id => (t.rooms.clone(), t.units.clone()),
                 (_, DrlgType::Wilderness, Some(Ok(outdoors))) => match outdoors.generate(id) {
-                    Ok(level) => level.rooms.iter().map(|r| r.area).collect(),
+                    Ok(level) => {
+                        let mut units = Vec::new();
+                        for room in &level.rooms {
+                            match outdoors.room_units(&level, room) {
+                                Ok(placed) => units.extend(placed.into_iter().map(|u| PlacedUnit {
+                                    class: match u.kind {
+                                        UnitKind::Object => UnitClass::Object(u.class),
+                                        UnitKind::Monster => UnitClass::Other { kind: 1, id: u.class },
+                                        UnitKind::Other(kind) => UnitClass::Other { kind, id: u.class },
+                                    },
+                                    x: u.x,
+                                    y: u.y,
+                                    path: Vec::new(),
+                                })),
+                                Err(e) => world.unbuilt.push((id, format!("room {:?}: {e}", room.area))),
+                            }
+                        }
+                        (level.rooms.iter().map(|r| r.area).collect(), units)
+                    }
                     Err(e) => {
                         world.unbuilt.push((id, e.to_string()));
                         continue;
@@ -161,14 +183,15 @@ impl World {
                     world.unbuilt.push((id, format!("act {} wilderness is not ported", act.act + 1)));
                     continue;
                 }
-                _ => grid_rooms(area, def.drlg_type),
+                _ => (grid_rooms(area, def.drlg_type), Vec::new()),
             };
-            world.levels.push(WorldLevel { id, area, rooms });
+            world.levels.push(WorldLevel { id, area, rooms, units });
         }
         world
     }
 
-    /// Levels [`World::build`] left out because they could not be generated, with the reason.
+    /// What [`World::build`] could not generate — levels it left out, or rooms whose units it
+    /// could not place — with the reason.
     #[must_use]
     pub fn unbuilt(&self) -> &[(i32, String)] {
         &self.unbuilt
@@ -194,6 +217,17 @@ impl World {
 
     fn level(&self, id: i32) -> Option<&WorldLevel> {
         self.levels.iter().find(|l| l.id == id)
+    }
+
+    /// The units standing in a room, in the order its level lists them.
+    pub fn units_in(&self, id: RoomId) -> impl Iterator<Item = &PlacedUnit> {
+        let level = self.level(id.level);
+        level.into_iter().flat_map(move |l| {
+            l.units.iter().filter(move |u| {
+                let (tx, ty) = (u.x.div_euclid(SUBTILES), u.y.div_euclid(SUBTILES));
+                l.rooms.iter().position(|c| tx >= c.x && tx < c.x + c.w && ty >= c.y && ty < c.y + c.h) == Some(id.index)
+            })
+        })
     }
 
     /// The room holding a world subtile position.
@@ -254,8 +288,8 @@ mod tests {
         let town = Coords { x: 100, y: 100, w: 16, h: 8 };
         let moor = Coords { x: 96, y: 108, w: 24, h: 16 };
         World::from_levels(vec![
-            WorldLevel { id: 1, area: town, rooms: grid_rooms(town, DrlgType::Preset) },
-            WorldLevel { id: 2, area: moor, rooms: grid_rooms(moor, DrlgType::Wilderness) },
+            WorldLevel { id: 1, area: town, rooms: grid_rooms(town, DrlgType::Preset), units: Vec::new() },
+            WorldLevel { id: 2, area: moor, rooms: grid_rooms(moor, DrlgType::Wilderness), units: Vec::new() },
         ])
     }
 

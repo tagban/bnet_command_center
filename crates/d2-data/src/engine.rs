@@ -57,6 +57,9 @@ mod address {
     pub const OUTDOOR_JITTER_Y: u32 = 0x006F_2830;
     /// The road search's direction cycles and step deltas, signed bytes (`0x006817D0`).
     pub const OUTDOOR_PATH_DELTAS: u32 = 0x006F_2840;
+    /// `gaWallNeighborOrientTable`: a road edge cell's tile orientation by its eight
+    /// neighbours (`DRLGOUTROOM_ComputeWallOrientations`, `0x00680B10`).
+    pub const OUTDOOR_EDGE_ORIENTATIONS: u32 = 0x006F_2700;
     /// `VS_FIXEDFILEINFO` 1.14.3.71.
     pub const FILE_VERSION: (u32, u32) = (0x0001_000E, 0x0003_0047);
 }
@@ -110,6 +113,9 @@ pub struct OutdoorTables {
     pub jitter: [(i32, i32); 4],
     /// Four 4-entry direction cycles, then y deltas and x deltas by direction.
     pub path_deltas: [i32; 24],
+    /// A road edge cell's tile orientation (0 none) by the mask of its set neighbours: bit 7 NE,
+    /// 6 E, 5 SE, 4 N, 3 S, 2 NW, 1 W, 0 SW.
+    pub edge_orientations: [u8; 256],
 }
 
 /// One period of an act's day.
@@ -232,6 +238,7 @@ impl OutdoorTables {
             spiral: std::array::from_fn(|i| (sx[i], sy[i])),
             jitter: std::array::from_fn(|i| (jx[i], jy[i])),
             path_deltas: std::array::from_fn(|i| deltas[i]),
+            edge_orientations: image.bytes(address::OUTDOOR_EDGE_ORIENTATIONS, 256)?.try_into().ok()?,
         })
     }
 }

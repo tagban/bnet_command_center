@@ -64,6 +64,13 @@ impl LvlSubs {
         Ok(Self { rows })
     }
 
+    /// The rows from group `sub_type`'s first to the end of the table: a room's picks index rows
+    /// from there by bit (`SubTypeWpShrine`, `0x006707A0`).
+    #[must_use]
+    pub fn from_group(&self, sub_type: i32) -> &[LvlSub] {
+        self.rows.iter().position(|r| r.sub_type == sub_type).map_or(&[], |start| &self.rows[start..])
+    }
+
     /// The consecutive rows of group `sub_type`, from its first row
     /// (`TXT_LvlSub_GetLineFromSubType` and the walk `TILESUB_AddSecondaryBorder` makes, `0x00670750`).
     #[must_use]

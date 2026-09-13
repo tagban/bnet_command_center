@@ -59,6 +59,8 @@ pub mod sc {
     pub const UNLOAD_ROOM: u8 = 0x08;
     /// Forget a unit (6 bytes).
     pub const REMOVE_UNIT: u8 = 0x0A;
+    /// An object's mode changed (12 bytes).
+    pub const OBJECT_STATE: u8 = 0x0E;
     /// Which unit is the client's own player (6 bytes).
     pub const OWN_UNIT: u8 = 0x0B;
     /// What an NPC has to say about quests, before its dialog opens (40 bytes).
@@ -687,6 +689,16 @@ pub fn assign_object(guid: u32, class: u16, x: u16, y: u16, mode: u8, interactio
     w.finish()
 }
 
+/// `0x0E`: `[unit type u8 = 2][guid u32][3][selectable u8][mode u32]`, an object's new mode
+/// (`0x0053B470`, from `OBJECT_SendStateToClient` `0x00581A20` when the object is flagged for
+/// update); `selectable` is the unit's flag bit 1.
+#[must_use]
+pub fn object_state(guid: u32, selectable: bool, mode: u32) -> Vec<u8> {
+    let mut w = Writer::with_capacity(12);
+    w.u8(sc::OBJECT_STATE).u8(2).u32(guid).u8(3).u8(selectable.into()).u32(mode);
+    w.finish()
+}
+
 /// Bits a graphics component's value takes in `0xAC`: one below three variants, else enough for
 /// `variants - 1` (`0x0053E2E0`, and the client's `0x0045F190` reads it the same way).
 #[must_use]
@@ -959,6 +971,7 @@ mod tests {
     #[test]
     fn units_are_packed_as_the_engine_builds_them() {
         assert_eq!(assign_object(3, 267, 5806, 4444, 0, 0), vec![0x51, 2, 3, 0, 0, 0, 0x0B, 0x01, 0xAE, 0x16, 0x5C, 0x11, 0, 0]);
+        assert_eq!(object_state(5, true, 1), vec![0x0E, 2, 5, 0, 0, 0, 3, 1, 1, 0, 0, 0]);
         assert_eq!(no_unit_states(1, 9), vec![0xAA, 1, 9, 0, 0, 0, 8, 0xFF]);
         assert_eq!(monster_standing(9, 1, 2, 0x80), vec![0x6D, 9, 0, 0, 0, 1, 0, 2, 0, 0x80]);
         assert_eq!((component_bits(0), component_bits(2), component_bits(3), component_bits(4), component_bits(5)), (1, 1, 2, 2, 3));

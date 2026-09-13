@@ -206,7 +206,7 @@ impl GameServer {
         let (Towns::FromInstall(engine), Some(data)) = (&self.towns, &self.rules) else {
             #[cfg(test)]
             if let Towns::Fixed(town) = &self.towns {
-                let level = d2_drlg::world::WorldLevel { id: town.level_id, area: town.area, rooms: town.rooms.clone() };
+                let level = d2_drlg::world::WorldLevel { id: town.level_id, area: town.area, rooms: town.rooms.clone(), units: town.units.clone() };
                 return (FALLBACK_MAP_SEED, Some(town.clone()), Some(World::from_levels(vec![level])));
             }
             return (FALLBACK_MAP_SEED, None, None);
@@ -316,7 +316,7 @@ impl GameServer {
                 staged: Vec::new(),
                 connected: Vec::new(),
                 map_seed,
-                population: town.as_ref().map(|t| Population::new(rand::thread_rng().gen(), t.rooms.len())),
+                population: world.is_some().then(|| Population::new(rand::thread_rng().gen())),
                 spawn,
                 town,
                 world,
@@ -395,7 +395,7 @@ impl GameServer {
     fn unit_position(&self, game_id: u16, kind: u32, guid: u32) -> Option<(u16, u16)> {
         let g = self.lock();
         let population = g.by_id.get(&game_id)?.population.as_ref()?;
-        match *population.find(u8::try_from(kind).ok()?, guid)? {
+        match *population.find(u8::try_from(kind).ok()?, guid)?.1 {
             Spawned::Object { x, y, .. } | Spawned::Monster { x, y, .. } => Some((x, y)),
         }
     }
@@ -404,15 +404,16 @@ impl GameServer {
     /// - an NPC `MonStats.txt` lets players talk to: its dialog (`0x00572C10`: `27 29 28`), with
     ///   no quest messages and a new character's clear flags;
     /// - the stash (`OperateFn` 32, class 267): `77 10` (`0x00564CD0`);
-    /// - an active waypoint (`OperateFn` 23): the player learns its level's waypoint, then the
-    ///   menu `63` (`0x00584E30`).
+    /// - a waypoint (`OperateFn` 23, `0x00584E30`): the player learns its level's waypoint; an
+    ///   inactive one turns active (`0E`, mode 1), an active one opens the menu (`63`).
     ///
     /// Range, busy and collision checks are not ported: the client walks up before it asks.
     fn interact(&self, game_id: u16, kind: u32, guid: u32, waypoints: &mut [u8; d2gs::WAYPOINT_FLAG_BYTES]) -> Vec<Vec<u8>> {
         let (Some(rules), Ok(kind)) = (&self.rules, u8::try_from(kind)) else { return Vec::new() };
-        let g = self.lock();
-        let Some(game) = g.by_id.get(&game_id) else { return Vec::new() };
-        let Some(unit) = game.population.as_ref().and_then(|p| p.find(kind, guid)) else { return Vec::new() };
+        let mut g = self.lock();
+        let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
+        let Some(population) = game.population.as_mut() else { return Vec::new() };
+        let Some((room, unit)) = population.find(kind, guid) else { return Vec::new() };
         match *unit {
             Spawned::Monster { class, mode, .. } => {
                 let talks = rules.monsters().get(i32::from(class)).is_some_and(|m| m.interact);
@@ -427,14 +428,20 @@ impl GameServer {
             }
             Spawned::Object { class, mode, .. } => match rules.objects().get(i32::from(class)).map(|o| o.operate_fn) {
                 Some(32) if class == 267 => vec![d2gs::ui_action(d2gs::UI_OPEN_STASH)],
-                Some(23) if matches!(mode, 1 | 2) => {
-                    let level = game.town.as_ref().map_or(i32::from(TOWN_AREA), |t| t.level_id);
-                    if let Some(bit) = rules.levels().get(level).and_then(|l| l.waypoint) {
+                Some(23) => {
+                    if let Some(bit) = rules.levels().get(room.level).and_then(|l| l.waypoint) {
                         if let Some(byte) = waypoints.get_mut(usize::from(bit / 8)) {
                             *byte |= 1 << (bit % 8);
                         }
                     }
-                    vec![d2gs::waypoint_menu(guid, waypoints)]
+                    match mode {
+                        0 => {
+                            population.set_object_mode(guid, 1);
+                            vec![d2gs::object_state(guid, true, 1)]
+                        }
+                        1 | 2 => vec![d2gs::waypoint_menu(guid, waypoints)],
+                        _ => Vec::new(),
+                    }
                 }
                 _ => Vec::new(),
             },
@@ -451,17 +458,13 @@ impl GameServer {
         let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
         let Some(world) = &game.world else { return Vec::new() };
         let mut packets = Vec::new();
-        let town_level = game.town.as_ref().map(|t| t.level_id);
         for &id in to.iter().filter(|id| !from.contains(id)) {
             let Some(room) = world.room(id) else { continue };
             packets.push(d2gs::load_room(room.x as u16, room.y as u16, id.level as u8));
-            let (Some(rules), Some(town), Some(population)) = (&self.rules, &game.town, &mut game.population) else {
+            let (Some(rules), Some(population)) = (&self.rules, &mut game.population) else {
                 continue;
             };
-            if Some(id.level) != town_level {
-                continue;
-            }
-            let activated = population.activate(rules, town, id.index);
+            let activated = population.activate(rules, id.level, id, world.units_in(id));
             for skipped in &activated.not_ported {
                 debug!(game_id, ?room, unit = %skipped, "map unit not spawned: not ported");
             }
@@ -480,14 +483,12 @@ impl GameServer {
         }
         for &id in from.iter().filter(|id| !to.contains(id)) {
             let Some(room) = world.room(id) else { continue };
-            if Some(id.level) == town_level {
-                for unit in game.population.as_ref().and_then(|p| p.units(id.index)).unwrap_or(&[]) {
-                    let kind = match unit {
-                        Spawned::Object { .. } => unit_type::OBJECT,
-                        Spawned::Monster { .. } => unit_type::MONSTER,
-                    };
-                    packets.push(d2gs::remove_unit(kind, unit.guid()));
-                }
+            for unit in game.population.as_ref().and_then(|p| p.units(id)).unwrap_or(&[]) {
+                let kind = match unit {
+                    Spawned::Object { .. } => unit_type::OBJECT,
+                    Spawned::Monster { .. } => unit_type::MONSTER,
+                };
+                packets.push(d2gs::remove_unit(kind, unit.guid()));
             }
             packets.push(d2gs::unload_room(room.x as u16, room.y as u16, id.level as u8));
         }
@@ -1125,7 +1126,8 @@ pub(crate) mod tests {
         }
         let objects = Table::parse(objects.as_bytes());
         let levels = "Id\tAct\tSizeX\tSizeY\tSizeX(N)\tSizeY(N)\tSizeX(H)\tSizeY(H)\tOffsetX\tOffsetY\tDepend\tDrlgType\tLevelType\tWaypoint\r\n\
-                      1\t0\t32\t8\t32\t8\t32\t8\t0\t0\t0\t2\t1\t0\r\n";
+                      1\t0\t32\t8\t32\t8\t32\t8\t0\t0\t0\t2\t1\t0\r\n\
+                      3\t0\t8\t8\t8\t8\t8\t8\t0\t0\t0\t3\t2\t1\r\n";
         rules.set_levels(Levels::from_table(&Table::parse(levels.as_bytes())).unwrap());
         let monstats = Table::parse(b"Id\thcIdx\tMonStatsEx\tnpc\tinteract\r\nguard\t10\tguard\t1\t1\r\n");
         let mut ms2 = String::from("Id\tcritter");
@@ -1292,6 +1294,36 @@ pub(crate) mod tests {
         let mut camp = [0u8; d2gs::WAYPOINT_FLAG_BYTES];
         camp[0] = 1;
         assert_eq!(read_frame(&mut c, huffman).await, d2gs::waypoint_menu(2, &camp));
+    }
+
+    /// A waypoint out in the wilderness starts inactive: the first click learns it and turns it
+    /// on (`0E`, mode 1), the next opens the menu with its level ticked.
+    #[test]
+    fn a_wild_waypoint_turns_on_before_it_opens_its_menu() {
+        use d2_drlg::preset::{PlacedUnit, UnitClass};
+        use d2_drlg::world::WorldLevel;
+        use d2_drlg::Coords;
+        let (rules, town) = test_town();
+        let gs = GameServer::new(test_tables(), Some(rules)).with_town(town);
+        let id = gs.create("probe", "", 0).unwrap();
+        let plains = Coords { x: 1152, y: 896, w: 8, h: 8 };
+        {
+            let mut g = gs.lock();
+            let game = g.by_id.get_mut(&id).unwrap();
+            let mut levels = game.world.take().unwrap().levels().to_vec();
+            let waypoint = PlacedUnit { class: UnitClass::Object(3), x: 5779, y: 4499, path: Vec::new() };
+            levels.push(WorldLevel { id: 3, area: plains, rooms: vec![plains], units: vec![waypoint] });
+            game.world = Some(World::from_levels(levels));
+        }
+        let room = RoomId { level: 3, index: 0 };
+        let packets = gs.view_change(id, &[], &[room]);
+        assert_eq!(packets, vec![d2gs::load_room(1152, 896, 3), d2gs::assign_object(1, 3, 5779, 4499, 0, 0)], "inactive");
+        let mut learned = [0u8; d2gs::WAYPOINT_FLAG_BYTES];
+        learned[0] = 1;
+        assert_eq!(gs.interact(id, 2, 1, &mut learned), vec![d2gs::object_state(1, true, 1)]);
+        assert_eq!(learned[0], 0b11, "the camp's and Cold Plains' bits");
+        assert_eq!(gs.interact(id, 2, 1, &mut learned), vec![d2gs::waypoint_menu(1, &learned)]);
+        assert_eq!(gs.view_change(id, &[room], &[]), vec![d2gs::remove_unit(2, 1), d2gs::unload_room(1152, 896, 3)]);
     }
 
     /// The act's clock runs from the game's creation: a joined client is told its time of day

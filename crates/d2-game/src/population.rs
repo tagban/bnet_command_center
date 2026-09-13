@@ -1,4 +1,4 @@
-//! Filling a preset level's rooms with their units.
+//! Filling a world's rooms with their units.
 //!
 //! The engine populates a room the first time a player comes near it (`0x0052D0F0`, bit 0 of
 //! the room's `+0x34` flags): `0x005559A0` walks the room's preset units twice — everything that
@@ -11,8 +11,11 @@
 
 use d2_data::presets::PresetMonster;
 use d2_data::GameData;
-use d2_drlg::preset::{PresetLevel, UnitClass};
+use std::collections::HashMap;
+
+use d2_drlg::preset::{PlacedUnit, PresetLevel, UnitClass};
 use d2_drlg::rng::Seed;
+use d2_drlg::world::RoomId;
 
 /// Engine unit types (`unit+0x00`).
 pub mod unit_type {
@@ -159,14 +162,15 @@ pub struct Population {
     seed: Seed,
     /// `game+0x90`, by unit type.
     last_guid: [u32; 6],
-    rooms: Vec<Option<Vec<Spawned>>>,
+    /// The rooms populated so far.
+    rooms: HashMap<RoomId, Vec<Spawned>>,
 }
 
 impl Population {
-    /// An empty population for a level of `rooms` rooms, with the game's random seed.
+    /// An empty population with the game's random seed.
     #[must_use]
-    pub fn new(game_seed: u32, rooms: usize) -> Self {
-        Self { seed: Seed::new(game_seed, 0x29A), last_guid: [0; 6], rooms: vec![None; rooms] }
+    pub fn new(game_seed: u32) -> Self {
+        Self { seed: Seed::new(game_seed, 0x29A), last_guid: [0; 6], rooms: HashMap::new() }
     }
 
     /// Take the next guid for a unit type (`0x00552EE0`, which skips 0 on wrapping).
@@ -184,38 +188,59 @@ impl Population {
 
     /// The units of a room already populated.
     #[must_use]
-    pub fn units(&self, room: usize) -> Option<&[Spawned]> {
-        self.rooms.get(room)?.as_deref()
+    pub fn units(&self, room: RoomId) -> Option<&[Spawned]> {
+        self.rooms.get(&room).map(Vec::as_slice)
     }
 
-    /// A spawned unit by engine unit type and guid.
+    /// A spawned unit by engine unit type and guid, with the room it was spawned in.
     #[must_use]
-    pub fn find(&self, kind: u8, guid: u32) -> Option<&Spawned> {
-        self.rooms.iter().flatten().flatten().find(|u| match u {
-            Spawned::Object { guid: g, .. } => kind == unit_type::OBJECT && *g == guid,
-            Spawned::Monster { guid: g, .. } => kind == unit_type::MONSTER && *g == guid,
+    pub fn find(&self, kind: u8, guid: u32) -> Option<(RoomId, &Spawned)> {
+        self.rooms.iter().find_map(|(room, units)| {
+            units
+                .iter()
+                .find(|u| match u {
+                    Spawned::Object { guid: g, .. } => kind == unit_type::OBJECT && *g == guid,
+                    Spawned::Monster { guid: g, .. } => kind == unit_type::MONSTER && *g == guid,
+                })
+                .map(|u| (*room, u))
         })
     }
 
-    /// Populate `room` of `level` unless it already is (`0x005559A0`), and return its units.
-    pub fn activate(&mut self, data: &GameData, level: &PresetLevel, room: usize) -> Activated<'_> {
+    /// Change a spawned object's mode (`0x00624690`); `true` if it changed.
+    pub fn set_object_mode(&mut self, object: u32, to: u8) -> bool {
+        for unit in self.rooms.values_mut().flatten() {
+            if let Spawned::Object { guid, mode, .. } = unit {
+                if *guid == object {
+                    let changed = *mode != to;
+                    *mode = to;
+                    return changed;
+                }
+            }
+        }
+        false
+    }
+
+    /// Populate `room` of level `level_id` from the units standing in it, unless it already is
+    /// (`0x005559A0`), and return its units.
+    pub fn activate<'u>(&mut self, data: &GameData, level_id: i32, room: RoomId, placed: impl IntoIterator<Item = &'u PlacedUnit>) -> Activated<'_> {
         let mut not_ported = Vec::new();
-        if matches!(self.rooms.get(room), Some(None)) {
+        if !self.rooms.contains_key(&room) {
+            let placed: Vec<&PlacedUnit> = placed.into_iter().collect();
             let mut units = Vec::new();
             let position = |x: i32, y: i32| (u16::try_from(x).unwrap_or(0), u16::try_from(y).unwrap_or(0));
             // Pass 1: everything but monsters.
-            for unit in level.units_in(room) {
+            for &unit in &placed {
                 let (x, y) = position(unit.x, unit.y);
                 match &unit.class {
                     UnitClass::Monster(_) => {}
-                    _ if UBER_LEVELS.contains(&level.level_id) => not_ported.push(format!("{:?} in an Uber level", unit.class)),
+                    _ if UBER_LEVELS.contains(&level_id) => not_ported.push(format!("{:?} in an Uber level", unit.class)),
                     UnitClass::Object(0x23D) => {}
                     &UnitClass::Object(class) if class > 0x23D => {
                         not_ported.push(format!("object {class} at ({x}, {y}): special spawn 0x0054F490"));
                     }
                     &UnitClass::Object(class) => {
                         let def = data.objects().get(class);
-                        match def.and_then(|d| object_mode(d.init_fn, d.pre_operate, level.level_id)) {
+                        match def.and_then(|d| object_mode(d.init_fn, d.pre_operate, level_id)) {
                             Some(mode) => {
                                 let (guid, _) = self.allocate(unit_type::OBJECT);
                                 units.push(Spawned::Object { guid, class: class as u16, x, y, mode, interaction: 0 });
@@ -231,7 +256,7 @@ impl Population {
                 }
             }
             // Pass 2: monsters (0x0054E600 → 0x0054E490).
-            for unit in level.units_in(room) {
+            for &unit in &placed {
                 let UnitClass::Monster(preset) = &unit.class else { continue };
                 let (x, y) = position(unit.x, unit.y);
                 match preset {
@@ -255,9 +280,9 @@ impl Population {
                     other => not_ported.push(format!("{other:?} at ({x}, {y})")),
                 }
             }
-            self.rooms[room] = Some(units);
+            self.rooms.insert(room, units);
         }
-        Activated { units: self.rooms.get(room).and_then(Option::as_deref).unwrap_or(&[]), not_ported }
+        Activated { units: self.rooms.get(&room).map_or(&[], Vec::as_slice), not_ported }
     }
 }
 
@@ -323,9 +348,10 @@ mod tests {
     #[test]
     fn objects_spawn_before_monsters_with_their_init_modes_and_critters_stay_with_the_client() {
         let (data, level) = (rules(), town());
-        let mut pop = Population::new(0x1234, level.rooms.len());
-        assert!(pop.units(0).is_none());
-        let first = pop.activate(&data, &level, 0);
+        let room = |index| RoomId { level: 1, index };
+        let mut pop = Population::new(0x1234);
+        assert!(pop.units(room(0)).is_none());
+        let first = pop.activate(&data, 1, room(0), level.units_in(0));
         assert_eq!(first.not_ported.len(), 1, "{:?}", first.not_ported);
         let units = first.units.to_vec();
         assert_eq!(units.len(), 4, "torch, waypoint, two guards; no hen");
@@ -337,13 +363,15 @@ mod tests {
         assert_eq!((variants[1], variants[6]), (1, 2));
         assert!(components.iter().zip(variants).all(|(&c, &v)| c < v.max(1)), "each pick within its variants");
 
-        assert!(matches!(pop.find(unit_type::MONSTER, 2), Some(Spawned::Monster { x: 514, .. })));
+        assert!(matches!(pop.find(unit_type::MONSTER, 2), Some((r, Spawned::Monster { x: 514, .. })) if r == room(0)));
         assert!(pop.find(unit_type::OBJECT, 9).is_none() && pop.find(unit_type::PLAYER, 1).is_none());
-        let again = pop.activate(&data, &level, 0);
+        let again = pop.activate(&data, 1, room(0), level.units_in(0));
         assert_eq!((again.units.to_vec(), again.not_ported.len()), (units, 0), "populated once");
-        let second = pop.activate(&data, &level, 1);
+        let second = pop.activate(&data, 1, room(1), level.units_in(1));
         assert!(matches!(second.units, [Spawned::Object { guid: 3, class: 3, mode: 0, .. }]), "guids carry on across rooms");
-        assert!(pop.activate(&data, &level, 7).units.is_empty());
+        assert!(pop.set_object_mode(3, 1) && !pop.set_object_mode(3, 1) && !pop.set_object_mode(99, 1));
+        assert!(matches!(pop.units(room(1)), Some([Spawned::Object { mode: 1, .. }])));
+        assert!(pop.activate(&data, 1, room(7), level.units_in(7)).units.is_empty());
     }
 
     #[test]
@@ -373,11 +401,11 @@ mod tests {
         let act = d2_drlg::act::Act::build(data.levels(), 0, 0, 0x1234_5678);
         let level = PresetLevel::build(&data, &engine, &act, 1).unwrap();
         let room = level.room_index_at(5810, 4450).unwrap();
-        let mut pop = Population::new(1, level.rooms.len());
+        let mut pop = Population::new(1);
         let mut objects = Vec::new();
         let mut monsters = Vec::new();
         for near in level.rooms_near(room) {
-            let a = pop.activate(&data, &level, near);
+            let a = pop.activate(&data, 1, RoomId { level: 1, index: near }, level.units_in(near));
             assert!(a.not_ported.is_empty(), "{:?}", a.not_ported);
             for u in a.units {
                 match *u {
@@ -414,7 +442,7 @@ mod tests {
         assert_eq!(object_mode(17, false, 3), Some(0), "a waypoint in the wild starts inactive");
         assert_eq!(object_mode(0, true, 1), None);
         assert_eq!(object_mode(23, false, 1), None);
-        let mut pop = Population::new(0, 0);
+        let mut pop = Population::new(0);
         pop.last_guid[2] = u32::MAX;
         assert_eq!(pop.next_guid(unit_type::OBJECT), 1, "0 is skipped on wrapping");
     }

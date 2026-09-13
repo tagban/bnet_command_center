@@ -5,6 +5,7 @@ use d2_data::engine::EngineData;
 use d2_data::GameData;
 use d2_drlg::act::Act;
 use d2_drlg::preset::PresetLevel;
+use d2_drlg::world::RoomId;
 use d2_game::population::{Population, Spawned};
 
 fn main() {
@@ -24,10 +25,10 @@ fn main() {
         std::process::exit(1);
     };
     println!("{} area {:?}; ({x}, {y}) in room {:?}", level.map, level.area, level.rooms[room]);
-    let mut pop = Population::new(1, level.rooms.len());
+    let mut pop = Population::new(1);
     for near in level.rooms_near(room) {
         println!("room {:?}", level.rooms[near]);
-        let a = pop.activate(&data, &level, near);
+        let a = pop.activate(&data, level.level_id, RoomId { level: level.level_id, index: near }, level.units_in(near));
         for u in a.units {
             match *u {
                 Spawned::Object { guid, class, x, y, mode, .. } => {
