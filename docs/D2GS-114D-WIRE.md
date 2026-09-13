@@ -111,7 +111,7 @@ Client join state lives at `client+4` (set by `0x5386D0`).
 | 2b | realm game | `[JOIN 2]` host `+0x08`: fetch character, wait | — | 1 |
 | 2b′ | open game | — | `0x02` | 1 |
 | 3 | host delivers the character | SrvRecvDatabaseCharacter `0x5306E0`, `[JOIN 3]` | `0x02` | 1 |
-| 4 | C→S `0x6B` ENTERGAME (1) | SrvJoinAct `0x530190` → `ClientAddPlayerToGame` `0x539760`: load the character (new-character path `0x532590` calls `SendUnitToClient`), check expansion/hardcore against the game (failure → `0xB4` with its code) | `0x59` for the player, **unplaced (0, 0)**; `0x0B` `[type][guid]` "this unit is yours" (`0x537930`); `0x5F`; every stat as `0x1D`/`0x1E`/`0x1F` `[stat][value]` (stat-list walk with callback `0x548520` → `0x53BE40`); `0x7B` hotkeys; `0x23` selected skill ×2 (right, left); life/mana `0x548760` → `0x95` (first time, unplaced) | 1 |
+| 4 | C→S `0x6B` ENTERGAME (1) | SrvJoinAct `0x530190` → `ClientAddPlayerToGame` `0x539760`: load the character (new-character path `0x532590` calls `SendUnitToClient`, then the player's quest setup `0x546270`), check expansion/hardcore against the game (failure → `0xB4` with its code) | `0x59` for the player, **unplaced (0, 0)**; `0x5E` quest states, `0x28` type 6 player quest flags, `0x29` game quest flags (§5, *Quests at join*); `0x0B` `[type][guid]` "this unit is yours" (`0x537930`); `0x5F`; every stat as `0x1D`/`0x1E`/`0x1F` `[stat][value]` (stat-list walk with callback `0x548520` → `0x53BE40`); `0x7B` hotkeys; `0x23` selected skill ×2 (right, left); life/mana `0x548760` → `0x95` (first time, unplaced) | 1 |
 | 4a | | `0x52C210`: build the act if needed (`0x53AC70`, seed `game+0x7C`, difficulty `game+0x6D`) | `0x03` LoadAct (12), then `0x53` (10) | 2 |
 | 4b | | place the player `0x5394A0` | `0x07` `[room tile x u16][room tile y u16][level u8]` for the spawn room; then `0x5381F0` → `0x537B50` enters the player into that room: for each room "near" it (§5, *Town units*) `0x53A8E0` sends `0x07` and every unit already in the room (`SendUnitToClient`); `0x15` ReassignPlayer (11) `[type][guid][x][y][1]`, `0x7E` (5) | 3 |
 | 5 | next server frame | sUpdateClients `0x52D440` for state 3, `[JOIN 6] SCMD_STARTACT` | `0x04`; item/equipment pass `0x55DF00`; `0x5B` roster records both ways with every player already in the game (plus `0x8E` per entry of that player's unit`+0x60` list), then the joiner's own (`0x52C410`, confirmed in disassembly); `0x55B620`; host `+0x14`; broadcast `0x5A 02 04 …` "joined our world" (`0x54AA40`) | 4 |
@@ -284,6 +284,36 @@ neighbourhood. For seed `0x12345678` that is 24 objects (lit torches, the bonfir
 the waypoint) and Warriv, Kashya, Akara, Charsi, Gheed and five rogues; the cows two rooms east
 are not sent. `crates/d2-game/examples/town_units.rs` prints the list for any seed and spot.
 
+### Second client test: town units, and a crash leaving town (2026-09-13)
+
+With the town units in: tagban walked around the camp and saw the NPCs, torches, stash and
+waypoint; the bonfire looked like smouldering embers. Clicking Warriv sent `02 01000000 05000000`
+(walk to monster 5), `59 01000000 05000000 ae16 0000 6211 0000` and `13 01000000 05000000`
+(interact); clicking the stash `02`/`13` with object 16 — exactly the guids §5 *Town units*
+gives Warriv and the stash, so the unit ids line up with the client's. Nothing answers those
+yet. Walking south out of the camp (player at about (5833, 4543), past the town's last row
+4520) the client halted: "Unrecoverable internal error … failed at (96)", `0x4B92FE`.
+
+**Quests at join.** That halt is `0x4B92E0` asserting its quest table is loaded: the area
+change check `0x4DCAA0` → `0x4CC270` (per level group, `0x72A2C4`) → `0x4A4180` reads it. The
+table is filled only by `0x5E` (38, client `0x45E570` → `0x4B92B0`: 37 bytes, then the loaded
+flag). The server sends it from `0x546270`, which every new or loaded player goes through inside
+`ClientAddPlayerToGame`'s load, right after the player's `0x59` and before `0x0B`:
+- `0x5E` `[state × 37]` — each quest object's `+9` (quests allocated with 1 by `0x545D80`);
+- `0x28` `[6][u32 0][u8 0][flags 96]` — the player's quest flags for the game's difficulty
+  (`0x53D670`; the client `0x4B6DD0` copies type 6, other types are NPC quest dialog updates);
+- `0x29` `[flags 96]` — the game's quest flags (`0x544520`, client `0x4B2620`);
+- `0x89 00` only when quest 1's object is active past state 3 (`0x590810`), never at a fresh start.
+The handshake test now sends `5E` (all 1) `28` `29` (all clear) in that place.
+
+**The bonfire is on a clock.** `objects.txt` 39 (RogueBonfire) is the one object with ClientFn
+14 (`0x4BDCC0` → `0x4BC5E0`): every 500 ms the client itself puts it in mode 1, lit, while the
+act's light phase is 1–3, and back to mode 0, embers, in phase 0. The phase is the second column
+of the period table `0x7443F0` (six rows `angle, phase, colour`: 320/3, 340/3, 0/0, 160/1,
+180/1, 200/2), picked by `0x53`'s period (`0x61C240`); the engine advances period and ticks each
+frame (`0x61BEE0`, towns faster). We send period 2 and never advance it: day, embers. The
+server's own starting period is not yet read.
+
 ## 6. Server packet builders (opcode → function)
 
 `scripts/d2re/server_send_builders.py <Game.exe>` finds every call to the queue function
@@ -303,6 +333,8 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
 
 - Walk the player-state helpers under `SendUnitToClient` to the exact packet list for one's own
   player (stats, skills, items, states).
+- NPC and object interaction: C→S `0x02`/`0x13`/`0x59` (above) and what the server answers.
+- The act clock: the server's starting period and the `0x53` updates as it advances.
 - Movement: the C→S walk/run packets, the player's path, and `0x537B50` on a room change —
   `0x07` + units for new near rooms, `0x53A9B0` (unit removals via `0x571600`, then `0x08`) for
   old ones; the spawn search `0x61B060`; NPC AI walking their DS1 paths (`0x666120`).

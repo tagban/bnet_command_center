@@ -57,6 +57,12 @@ pub mod sc {
     pub const LOAD_ROOM: u8 = 0x07;
     /// Which unit is the client's own player (6 bytes).
     pub const OWN_UNIT: u8 = 0x0B;
+    /// Quest flags: the player's own (type 6) or an NPC's quest dialog update (103 bytes).
+    pub const QUEST_FLAGS: u8 = 0x28;
+    /// The game's quest flags (97 bytes).
+    pub const GAME_QUEST_FLAGS: u8 = 0x29;
+    /// Whether each quest is available in this game (38 bytes).
+    pub const QUEST_STATES: u8 = 0x5E;
     /// A unit's selected skill on one mouse button (13 bytes).
     pub const SELECT_SKILL: u8 = 0x23;
     /// One of the player's own stats, value in a byte (3 bytes).
@@ -466,6 +472,39 @@ pub fn act_environment(period: u32, ticks: u32, eclipse: bool) -> Vec<u8> {
     w.finish()
 }
 
+/// Quests the engine tracks (`0x00731888`) — one byte each in `0x5E`.
+pub const QUESTS: usize = 37;
+/// Bytes of quest flags per difficulty, as a `.d2s` and the game keep them.
+pub const QUEST_FLAG_BYTES: usize = 96;
+
+/// `0x5E`: one byte per quest, the quest object's `+9` (`0x00546270`; 1 for every quest when
+/// the game allocates them, `0x00545D80`). The client copies it into its quest table and marks
+/// the table loaded (`0x004B92B0`); entering a new area reads it and halts the client if it never
+/// came (`0x004B92E0`, "failed at (96)").
+#[must_use]
+pub fn quest_states(states: &[u8; QUESTS]) -> Vec<u8> {
+    let mut w = Writer::with_capacity(1 + QUESTS);
+    w.u8(sc::QUEST_STATES).bytes(states);
+    w.finish()
+}
+
+/// `0x28` type 6: `[6][u32 0][u8 0][flags 96]` — the player's quest flags for the game's
+/// difficulty (builder `0x0053D670`, client `0x004B6DD0` copies them).
+#[must_use]
+pub fn player_quest_flags(flags: &[u8; QUEST_FLAG_BYTES]) -> Vec<u8> {
+    let mut w = Writer::with_capacity(7 + QUEST_FLAG_BYTES);
+    w.u8(sc::QUEST_FLAGS).u8(6).u32(0).u8(0).bytes(flags);
+    w.finish()
+}
+
+/// `0x29`: `[flags 96]` — the game's quest flags (`0x00544520`, client `0x004B2620`).
+#[must_use]
+pub fn game_quest_flags(flags: &[u8; QUEST_FLAG_BYTES]) -> Vec<u8> {
+    let mut w = Writer::with_capacity(1 + QUEST_FLAG_BYTES);
+    w.u8(sc::GAME_QUEST_FLAGS).bytes(flags);
+    w.finish()
+}
+
 /// `0x0B`: `[unit type u8][guid u32]` (builder `0x00537930`). The client makes the unit it
 /// already knows by that guid its own player (handler `0x0045CC50`), so the unit's `0x59` must
 /// come first — and nothing that reads the player, such as `0x53`, may come before this.
@@ -809,6 +848,10 @@ mod tests {
         assert_eq!(set_stat(7, 55 << 8), vec![0x1E, 7, 0x00, 0x37]);
         assert_eq!(set_stat(13, 0xFFFF), vec![0x1F, 13, 0xFF, 0xFF, 0, 0], "0xFFFF itself needs the dword");
         assert_eq!(player_placed().len(), 5);
+        assert_eq!(quest_states(&[1; QUESTS]).len(), 38);
+        assert_eq!(&player_quest_flags(&[0; QUEST_FLAG_BYTES])[..7], &[0x28, 6, 0, 0, 0, 0, 0]);
+        assert_eq!(player_quest_flags(&[0; QUEST_FLAG_BYTES]).len(), 103);
+        assert_eq!(game_quest_flags(&[0; QUEST_FLAG_BYTES]).len(), 97);
         assert_eq!(pong().len(), 33);
         assert_eq!(join_failed_packet(join_failed::WRONG_VERSION), vec![0xB4, 0x10, 0, 0, 0]);
     }

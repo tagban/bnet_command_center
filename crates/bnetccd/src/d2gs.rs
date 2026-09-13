@@ -2,7 +2,7 @@
 //!
 //! Nothing is simulated. A client that joins a game is taken through the join exactly as
 //! the 1.14d engine runs it (`docs/D2GS-114D-WIRE.md` §4): `AF 01`, then on `GAMELOGON`
-//! `01 00` and `02`, then on `ENTERGAME` `59 0B`, the player's stats, `23 23 95 03 53 07`, the
+//! `01 00` and `02`, then on `ENTERGAME` `59 5E 28 29 0B`, the player's stats, `23 23 95 03 53 07`, the
 //! rooms around the spawn with their objects and NPCs (`07`, `51`, `AC AA 6D`), `15 7E` and, a
 //! server frame later, `04`.
 //! After that nothing is sent but ping replies; every packet the client sends is logged.
@@ -484,7 +484,8 @@ async fn logon(
 }
 
 /// `ENTERGAME`, in the engine's order (`HandleSrvJoinAct`): `ClientAddPlayerToGame` creates
-/// the player — its `0x59`, before it has a position — names it the client's own with `0x0B`,
+/// the player — its `0x59`, before it has a position, then the quest setup a new player gets
+/// (`0x00546270`: `5E 28 29`) — names it the client's own with `0x0B`,
 /// sends its stats (`0x1D`–`0x1F`), both selected skills and its life/mana (`0x95`); then the act
 /// (`03 53`); then `PlacePlayerInAct` loads the spawn room (`07`), enters the player into it —
 /// every near room's `07` and units — and places the player (`15 7E`). `04` follows a frame
@@ -500,6 +501,11 @@ async fn enter_game(
     let (x, y) = SPAWN;
     // Unplaced: at (0, 0) the client creates the unit without looking for a room.
     outbox.push(&d2gs::assign_player(PLAYER_GUID, p.character.class, &p.character.name, 0, 0));
+    // A fresh game's quests (every quest object starts available) and a new character's flags,
+    // all clear: the client halts on entering a new area without them.
+    outbox.push(&d2gs::quest_states(&[1; d2gs::QUESTS]));
+    outbox.push(&d2gs::player_quest_flags(&[0; d2gs::QUEST_FLAG_BYTES]));
+    outbox.push(&d2gs::game_quest_flags(&[0; d2gs::QUEST_FLAG_BYTES]));
     outbox.push(&d2gs::own_unit(0, PLAYER_GUID));
     // Its stats, one packet each (ClientAddPlayerToGame walks the stat list through 0x548520),
     // as a new character: no .d2s is loaded yet.
@@ -705,21 +711,29 @@ pub(crate) mod tests {
                 0x53 => 10,
                 0x15 => 11,
                 0x7E => 5,
+                0x5E => 38,
+                0x28 => 103,
+                0x29 => 97,
                 other => panic!("unexpected opcode {other:#04x}"),
             };
             packets.push(&rest[..size]);
             rest = &rest[size..];
         }
         let ops: Vec<u8> = packets.iter().map(|p| p[0]).filter(|op| !(0x1D..=0x1F).contains(op)).collect();
-        assert_eq!(ops, vec![0x59, 0x0B, 0x23, 0x23, 0x95, 0x03, 0x53, 0x07, 0x15, 0x7E], "the engine's order, one frame");
-        let stats: Vec<&[u8]> = packets[2..].iter().copied().take_while(|p| (0x1D..=0x1F).contains(&p[0])).collect();
+        assert_eq!(
+            ops,
+            vec![0x59, 0x5E, 0x28, 0x29, 0x0B, 0x23, 0x23, 0x95, 0x03, 0x53, 0x07, 0x15, 0x7E],
+            "the engine's order, one frame"
+        );
+        assert_eq!(packets[1], d2gs::quest_states(&[1; d2gs::QUESTS]), "every quest available");
+        let stats: Vec<&[u8]> = packets[5..].iter().copied().take_while(|p| (0x1D..=0x1F).contains(&p[0])).collect();
         assert_eq!(stats.len(), 15, "every stat a new character starts with, right after 0x0B");
         assert!(stats.contains(&&[0x1E, stat::MAXHP, 0x00, 50][..]), "max life (20 vit + 30) << 8");
         assert!(stats.contains(&&[0x1D, stat::LEVEL, 1][..]));
         assert_eq!(&packets[0][6..13], b"TestBan", "the character's name in 0x59");
         assert_eq!(&packets[0][22..26], &[0, 0, 0, 0], "0x59 before placement: no position");
-        assert_eq!(packets[1], &[0x0B, 0, 1, 0, 0, 0], "then: that unit is yours");
-        assert_eq!(&packets[2 + 15 + 3][2..6], &MAP_SEED.to_le_bytes(), "0x03 carries the seed");
+        assert_eq!(packets[4], &[0x0B, 0, 1, 0, 0, 0], "then: that unit is yours");
+        assert_eq!(&packets[5 + 15 + 3][2..6], &MAP_SEED.to_le_bytes(), "0x03 carries the seed");
         assert_eq!(read_frame(&mut c, huffman).await, vec![0x04]);
 
         let mut ping = vec![0u8; 13];
@@ -805,6 +819,9 @@ pub(crate) mod tests {
                 0x51 => 14,
                 0xAA => usize::from(rest[6]),
                 0xAC => usize::from(rest[12]),
+                0x5E => 38,
+                0x28 => 103,
+                0x29 => 97,
                 other => panic!("unexpected opcode {other:#04x}"),
             };
             ops.push((op, rest[..size].to_vec()));
