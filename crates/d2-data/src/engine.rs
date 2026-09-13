@@ -41,6 +41,22 @@ mod address {
     /// Left/right variants of the vertical border pieces by preset id
     /// (`DRLGOUTROOM_SpawnVerticalBorderPresets`, `0x0067FE90`).
     pub const OUTDOOR_VERTICAL_BORDERS: u32 = 0x006F_2680;
+    /// The eight neighbour offsets tried around a road cell, `y` then `x`, signed bytes
+    /// (`SpawnRandomOutdoorDS1`, `0x006745E0`).
+    pub const OUTDOOR_NEIGHBOURS_Y: u32 = 0x006F_060C;
+    pub const OUTDOOR_NEIGHBOURS_X: u32 = 0x006F_0614;
+    /// Link grid flag per shrine style (`SpawnAct12Shrines`, `0x00674E40`).
+    pub const OUTDOOR_SHRINE_STYLES: u32 = 0x006F_061C;
+    /// `DRLGPATH_GetPathDirection`'s table, three ints per 5×5 direction cell.
+    pub const OUTDOOR_PATH_DIRECTIONS: u32 = 0x006F_1518;
+    /// Road target search offsets, `y` then `x` (`DRLGOUTROOM_ComputeExitTargetPositions`, `0x00681000`).
+    pub const OUTDOOR_SPIRAL_Y: u32 = 0x006F_2800;
+    pub const OUTDOOR_SPIRAL_X: u32 = 0x006F_2810;
+    /// Road vertex jitter directions, `x` then `y` (`DRLGOUTROOM_BuildVertexPathsWithJitter`, `0x00681240`).
+    pub const OUTDOOR_JITTER_X: u32 = 0x006F_2820;
+    pub const OUTDOOR_JITTER_Y: u32 = 0x006F_2830;
+    /// The road search's direction cycles and step deltas, signed bytes (`0x006817D0`).
+    pub const OUTDOOR_PATH_DELTAS: u32 = 0x006F_2840;
     /// `VS_FIXEDFILEINFO` 1.14.3.71.
     pub const FILE_VERSION: (u32, u32) = (0x0001_000E, 0x0003_0047);
 }
@@ -82,6 +98,18 @@ pub struct OutdoorTables {
     pub road_flags: [[i32; 6]; 15],
     /// Vertical border piece variants by preset id: `[left, right]`.
     pub vertical_borders: [[i32; 2]; 16],
+    /// The eight `(x, y)` neighbours tried around a road cell.
+    pub neighbours: [(i32, i32); 8],
+    /// Link grid flag per shrine style.
+    pub shrine_styles: [i32; 4],
+    /// Direction (0..=7) toward a target by 5×5 direction cell.
+    pub path_directions: [i32; 25],
+    /// Road target search offsets `(x, y)` by step.
+    pub spiral: [(i32, i32); 4],
+    /// Road vertex jitter `(x, y)` by step.
+    pub jitter: [(i32, i32); 4],
+    /// Four 4-entry direction cycles, then y deltas and x deltas by direction.
+    pub path_deltas: [i32; 24],
 }
 
 /// One period of an act's day.
@@ -149,7 +177,9 @@ impl EngineData {
         let outdoor_ok = outdoor.road_presets[1] == [0, 4, 0x16C, 0x31F]
             && outdoor.road_directions.iter().all(|d| (-1..=3).contains(d))
             && outdoor.corners.iter().all(|c| (-1..=12).contains(c))
-            && outdoor.road_flags.iter().all(|r| r[5] > 0 && r[5] & (r[5] - 1) == 0);
+            && outdoor.road_flags.iter().all(|r| r[5] > 0 && r[5] & (r[5] - 1) == 0)
+            && outdoor.path_directions.iter().all(|d| (0..8).contains(d))
+            && outdoor.path_deltas[16..].iter().all(|d| (-1..=1).contains(d));
         if !sizes_ok || !presets_ok || !clock_ok || !outdoor_ok {
             return Err(bad("tables do not look like 1.14d's".into()));
         }
@@ -183,6 +213,12 @@ impl OutdoorTables {
         let presets: [i32; 52] = ints(image, address::OUTDOOR_ROAD_PRESETS)?;
         let flags: [i32; 90] = ints(image, address::OUTDOOR_ROAD_FLAGS)?;
         let vertical: [i32; 32] = ints(image, address::OUTDOOR_VERTICAL_BORDERS)?;
+        let signed = |at: u32, n: usize| image.bytes(at, n).map(|b| b.iter().map(|&v| i32::from(v as i8)).collect::<Vec<i32>>());
+        let (ny, nx) = (signed(address::OUTDOOR_NEIGHBOURS_Y, 8)?, signed(address::OUTDOOR_NEIGHBOURS_X, 8)?);
+        let directions: [i32; 75] = ints(image, address::OUTDOOR_PATH_DIRECTIONS)?;
+        let (sy, sx): ([i32; 4], [i32; 4]) = (ints(image, address::OUTDOOR_SPIRAL_Y)?, ints(image, address::OUTDOOR_SPIRAL_X)?);
+        let (jx, jy): ([i32; 4], [i32; 4]) = (ints(image, address::OUTDOOR_JITTER_X)?, ints(image, address::OUTDOOR_JITTER_Y)?);
+        let deltas = signed(address::OUTDOOR_PATH_DELTAS, 24)?;
         Some(Self {
             link_offsets: std::array::from_fn(|i| (links[i * 2], links[i * 2 + 1])),
             road_presets: std::array::from_fn(|r| std::array::from_fn(|c| presets[r * 4 + c])),
@@ -190,6 +226,12 @@ impl OutdoorTables {
             corners: ints(image, address::OUTDOOR_CORNERS)?,
             road_flags: std::array::from_fn(|r| std::array::from_fn(|c| flags[r * 6 + c])),
             vertical_borders: std::array::from_fn(|i| [vertical[i * 2], vertical[i * 2 + 1]]),
+            neighbours: std::array::from_fn(|i| (nx[i], ny[i])),
+            shrine_styles: ints(image, address::OUTDOOR_SHRINE_STYLES)?,
+            path_directions: std::array::from_fn(|i| directions[i * 3]),
+            spiral: std::array::from_fn(|i| (sx[i], sy[i])),
+            jitter: std::array::from_fn(|i| (jx[i], jy[i])),
+            path_deltas: std::array::from_fn(|i| deltas[i]),
         })
     }
 }
@@ -211,6 +253,9 @@ mod tests {
         assert_eq!(engine.day_periods[2], DayPeriod { angle: 0, phase: 0 }, "a new act's period: day, at angle 0");
         assert_eq!(engine.outdoor.road_flags[0], [0, 2, 3, 1, 0, 4], "a river flag, not for Blood Moor or Cold Plains");
         assert_eq!(engine.outdoor.corners[40], -1, "no corner without a turn");
+        assert_eq!(engine.outdoor.shrine_styles, [0x1000, 0x2000, 0x4000, 0x8000]);
+        assert_eq!(engine.outdoor.neighbours[0], (-1, 0));
+        assert_eq!(&engine.outdoor.path_deltas[16..], &[0, 1, 0, -1, 1, 0, -1, 0], "y then x steps by direction");
         if let Ok(libd2) = std::env::var("LIBD2_DIR") {
             let bin = std::fs::read(std::path::Path::new(&libd2).join("packages/drlg/src/excel/PresetObjectTable.bin")).unwrap();
             let theirs: Vec<i32> = bin.chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();

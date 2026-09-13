@@ -10,11 +10,11 @@
 //! (`DRLGOUTDOOR_CreateOutdoorRoomExGrid`, `0x006750F0`): a plain cell is one room, a preset
 //! piece's anchor cell becomes the piece cut into 8×8 rooms, and a blank cell is nothing.
 //!
-//! Everything that can blank a cell happens by the last substitution border, and what the Act I
-//! generator does after it — exits and roads, the waypoint, shrines, set pieces — only places
-//! pieces on cells already free (`TestOutdoorLevelPreset` refuses blank ones) or ORs flags that
-//! do not change the room set. So the port stops there and knows every room, without the road
-//! pathfinder. The one set piece stamped without that test, Burial Grounds' graveyard, is kept.
+//! After the borders come the exits — a road searched cell by cell from each level transition
+//! toward the middle (`DRLGOUTROOM_LinkOutdoorRoomExits`, `0x00681420`) — then the waypoint,
+//! shrines and the level's set pieces (`DRLGOUTROOM_SpawnAct1LevelPresets`, `0x00680580`).
+//! Rooms are listed without the per-room RNG of their creation (the room seeds and the preset
+//! file draws of `DRLGPRESET_BuildArea`), which does not change which rooms there are.
 //!
 //! The RNG is the level's own seed (`{act start + level id, 0x29A}`); every draw up to the stop
 //! is reproduced in order, as are the engine's reads past a grid row's end (the grid is one
@@ -54,11 +54,25 @@ const FILE_INDEX: i32 = 0xF_0000;
 
 /// The substitution borders' preset base: `LvlPrest.txt` 4..=15, the Act I wild borders.
 const ACT1_BORDER_BASE: i32 = 4;
-/// Level ids the Act I outdoor generator handles.
-const MOO_MOO_FARM: i32 = 39;
-const BLOOD_MOOR: i32 = 2;
-const BURIAL_GROUNDS: i32 = 17;
+/// Outdoor cell flag: on a road.
+const ROAD: i32 = 0x80;
+/// Outdoor cell flag: the waypoint's cell.
+const WAYPOINT: i32 = 0x800;
+/// Outdoor cell flag: a shrine's cell.
+const SHRINE: i32 = 0x1000;
+/// Level ids the Act I outdoor generator singles out.
 const ROGUE_ENCAMPMENT: i32 = 1;
+const BLOOD_MOOR: i32 = 2;
+const COLD_PLAINS: i32 = 3;
+const STONY_FIELD: i32 = 4;
+const DARK_WOOD: i32 = 5;
+const BLACK_MARSH: i32 = 6;
+const TAMOE_HIGHLAND: i32 = 7;
+const BURIAL_GROUNDS: i32 = 17;
+const MONASTERY_GATE: i32 = 26;
+const MOO_MOO_FARM: i32 = 39;
+/// Nodes in the road search's pool.
+const PATH_NODES: usize = 900;
 /// The levels Act I links edge to edge: `DRLGACTMISC_AllocDrlgLevelForAct` builds the
 /// neighbours of every wilderness level in this id range.
 const ACT1_LINKED: std::ops::RangeInclusive<i32> = 1..=17;
@@ -115,8 +129,25 @@ pub struct OutdoorLevel {
     pub outdoor: Vec<i32>,
     /// Preset id per cell (on a piece's anchor cell), row by row.
     pub presets: Vec<i32>,
+    /// Link flags per cell, row by row: visibility toward neighbours, shrine styles, waypoint.
+    pub link: Vec<i32>,
     /// Its rooms, in the level's room list order.
-    pub rooms: Vec<Coords>,
+    pub rooms: Vec<OutdoorRoom>,
+}
+
+/// A wilderness room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutdoorRoom {
+    /// Its rectangle in tiles.
+    pub area: Coords,
+    /// The preset piece it is part of (`LvlPrest.txt` `Def`), 0 for a plain cell.
+    pub preset: i32,
+    /// The piece's file index.
+    pub file: i32,
+    /// Its cell's outdoor flags (of the piece's anchor cell for a piece).
+    pub outdoor: i32,
+    /// Its cell's link flags (the anchor's for a piece).
+    pub link: i32,
 }
 
 impl OutdoorLevel {
@@ -207,12 +238,12 @@ impl<'a> Act1Outdoors<'a> {
             .filter(|d| d.act == 0 && d.drlg_type == DrlgType::Wilderness && d.level_type == 2)
             .ok_or(Error::NotAct1Wilderness(id))?;
         let area = self.act.coords(levels, def.id).ok_or(Error::NotAct1Wilderness(id))?;
-        let mut g = Generator::new(self, id, area);
-        (g.vertices, g.head) = outline(area, &self.orths(levels, id, area));
+        let mut g = Generator::new(self, id, area, self.orths(levels, id, area));
+        (g.vertices, g.head) = outline(area, &g.orths);
 
         // InitAct1OutdoorLevel (0x006807F0)
         g.road_flags();
-        if !matches!(id, BLOOD_MOOR | 3 | BURIAL_GROUNDS) {
+        if !matches!(id, BLOOD_MOOR | COLD_PLAINS | BURIAL_GROUNDS) {
             g.mark_border_junctions();
         }
         g.outline_flags();
@@ -224,16 +255,20 @@ impl<'a> Act1Outdoors<'a> {
             g.secondary_border(2)?;
             g.spawn_town_transitions_and_caves()?;
             g.secondary_border(3)?;
+            g.link_exits()?;
         }
         if id == MOO_MOO_FARM {
             for group in 0..=3 {
                 g.secondary_border(group)?;
             }
         }
-        if id == BURIAL_GROUNDS {
-            // DRLGOUTROOM_SpawnAct1LevelPresets (0x00680580): the graveyard, stamped untested.
-            g.spawn(1, 1, 0x6C, -1, false)?;
+        if (3..7).contains(&id) {
+            g.spawn_waypoint();
         }
+        if (2..8).contains(&id) {
+            g.spawn_shrines(5);
+        }
+        g.spawn_level_presets()?;
         g.finish()
     }
 
@@ -255,7 +290,7 @@ impl<'a> Act1Outdoors<'a> {
             let Some(other) = self.act.coords(levels, vis[i]) else { continue };
             let Some(direction) = direction_between(area, other) else { continue };
             let preset = levels.get(vis[i]).is_some_and(|d| d.drlg_type == DrlgType::Preset);
-            let orth = Orth { direction, preset, area: other };
+            let orth = Orth { level: vis[i], direction, preset, area: other };
             // The insertion walk never compares the head once the list has two entries.
             match orths.len() {
                 0 => orths.push(orth),
@@ -299,6 +334,7 @@ fn direction_between(a: Coords, b: Coords) -> Option<i32> {
 /// A neighbouring level across an open edge (`D2DrlgOrthStrc`).
 #[derive(Debug, Clone, Copy)]
 struct Orth {
+    level: i32,
     direction: i32,
     preset: bool,
     area: Coords,
@@ -467,6 +503,30 @@ fn outline(area: Coords, orths: &[Orth]) -> (Vec<Vertex>, usize) {
     (vertices, head)
 }
 
+/// `DRLGGRID_SetEdgeGridFlags` (`0x0067C760`) with OR, endpoints included: the cells from
+/// vertex `e` to the next vertex `n`.
+fn edge_cells(grid: &mut Grid, e: Vertex, n: Vertex, flag: i32) {
+    if e.x == n.x {
+        if e.y == n.y {
+            grid.or(e.x, e.y, flag);
+            return;
+        }
+        let (mut y, end) = if n.y <= e.y { (n.y + 1, e.y) } else { (e.y + 1, n.y) };
+        while y != end {
+            grid.or(e.x, y, flag);
+            y += 1;
+        }
+    } else {
+        let (mut x, end) = if e.x < n.x { (e.x + 1, n.x) } else { (n.x + 1, e.x) };
+        while x != end {
+            grid.or(x, e.y, flag);
+            x += 1;
+        }
+    }
+    grid.or(e.x, e.y, flag);
+    grid.or(n.x, n.y, flag);
+}
+
 /// `DRLGOUTDOOR_AllocPresetFileTracker`'s node: a preset's rotating file index.
 struct FileTracker {
     def: i32,
@@ -486,13 +546,27 @@ struct Generator<'a, 'b> {
     presets: Grid,
     /// `sGridOutdoor`.
     outdoor: Grid,
+    /// `sGridLink`.
+    link: Grid,
+    orths: Vec<Orth>,
     vertices: Vec<Vertex>,
     head: usize,
     trackers: Vec<FileTracker>,
+    /// `aExitPoints1`..`4`: each exit, its snapped start, its snapped target, its target.
+    exits: [[ExitPoint; 6]; 4],
+    exit_count: usize,
+}
+
+/// A road end (`D2DrlgExitPointStrc`): world tiles and a side (0..=3; 4 for none or the middle).
+#[derive(Debug, Clone, Copy, Default)]
+struct ExitPoint {
+    x: i32,
+    y: i32,
+    kind: u8,
 }
 
 impl<'a, 'b> Generator<'a, 'b> {
-    fn new(ctx: &'b Act1Outdoors<'a>, id: i32, area: Coords) -> Self {
+    fn new(ctx: &'b Act1Outdoors<'a>, id: i32, area: Coords, orths: Vec<Orth>) -> Self {
         let (width, height) = (area.w / ROOM_TILES, area.h / ROOM_TILES);
         Self {
             ctx,
@@ -504,10 +578,25 @@ impl<'a, 'b> Generator<'a, 'b> {
             seed: rng::level_seed(ctx.start_seed, id),
             presets: Grid::new(width, height),
             outdoor: Grid::new(width, height),
+            link: Grid::new(width, height),
+            orths,
             vertices: Vec::new(),
             head: 0,
             trackers: Vec::new(),
+            exits: [[ExitPoint::default(); 6]; 4],
+            exit_count: 0,
         }
+    }
+
+    /// The level's `Vis` slots as the act wired them (`DRLGROOM_GetVisArrayFromLevelId`).
+    fn vis(&self) -> [i32; 8] {
+        self.ctx.warps.get(&self.id).map_or_else(|| self.ctx.data.levels().get(self.id).map_or([0; 8], |d| d.vis), |w| w.0)
+    }
+
+    /// `DRLGOUTDOOR_GetAdjacentLevelVisMask` (`Outdoors.cpp:360`): the link bit of a level this
+    /// one sees.
+    fn vis_mask(&self, level: i32) -> i32 {
+        self.vis().iter().position(|&v| v == level).map_or(0, |i| 1 << ((i + 4) & 0x1F))
     }
 
     /// `ACT1_fpLevelDataFn2_A` (`0x00677180`).
@@ -589,40 +678,39 @@ impl<'a, 'b> Generator<'a, 'b> {
         out
     }
 
-    /// The outdoor half of `SetOutGridLinkFlags` (`0x00675770`): each open edge's cells get its
-    /// direction code. (The link grid's visibility bits do not bear on rooms.)
+    /// `SetOutGridLinkFlags` (`0x00675770`): each open edge's cells get the neighbour's link bit
+    /// and the edge's direction code.
     fn outline_flags(&mut self) {
         for i in self.ring() {
             let e = self.vertices[i];
             if e.flags & 1 != 0 {
-                self.edge_cells(i, e.direction * 2 + 1);
+                let n = self.vertices[e.next];
+                let vis = self.link_vis_flag(e);
+                edge_cells(&mut self.link, e, n, vis);
+                edge_cells(&mut self.outdoor, e, n, e.direction * 2 + 1);
             }
         }
     }
 
-    /// `DRLGGRID_SetEdgeGridFlags` (`0x0067C760`) with OR, endpoints included.
-    fn edge_cells(&mut self, i: usize, flag: i32) {
-        let e = self.vertices[i];
-        let n = self.vertices[e.next];
-        if e.x == n.x {
-            if e.y == n.y {
-                self.outdoor.or(e.x, e.y, flag);
-                return;
-            }
-            let (mut y, end) = if n.y <= e.y { (n.y + 1, e.y) } else { (e.y + 1, n.y) };
-            while y != end {
-                self.outdoor.or(e.x, y, flag);
-                y += 1;
-            }
+    /// `GetOutLinkVisFlag` (`Outdoors.cpp:380`): the link bit of the neighbour an open edge's
+    /// vertex looks into.
+    fn link_vis_flag(&self, v: Vertex) -> i32 {
+        let (right, bottom) = (self.width - 1, self.height - 1);
+        let edge = if v.x == 0 {
+            i32::from(v.y == 0)
+        } else if v.y == 0 {
+            i32::from(v.x == right) + 1
+        } else if v.x == right {
+            i32::from(v.y == bottom) + 2
+        } else if v.y == bottom {
+            3
         } else {
-            let (mut x, end) = if e.x < n.x { (e.x + 1, n.x) } else { (n.x + 1, e.x) };
-            while x != end {
-                self.outdoor.or(x, e.y, flag);
-                x += 1;
-            }
-        }
-        self.outdoor.or(e.x, e.y, flag);
-        self.outdoor.or(n.x, n.y, flag);
+            return 0;
+        };
+        let (ox, oy) = self.ctx.tables.link_offsets[edge as usize];
+        let (px, py) = (ox + v.x * 8 + self.area.x, oy + v.y * 8 + self.area.y);
+        let inside = |c: Coords| px >= c.x && py >= c.y && px < c.x + c.w && py < c.y + c.h;
+        self.orths.iter().find(|o| o.direction == edge && inside(o.area)).map_or(0, |o| self.vis_mask(o.level))
     }
 
     fn preset_size(&self, preset: i32) -> Result<(i32, i32), Error> {
@@ -1084,12 +1172,13 @@ impl<'a, 'b> Generator<'a, 'b> {
         Ok(true)
     }
 
-    /// `SpawnOutdoorLevelPreset` (`Outdoors.cpp:730`): the first free interior cell in a shuffle.
-    fn spawn_anywhere(&mut self, preset: i32, file: i32, offset: i32, sides: i32) -> Result<bool, Error> {
+    /// The interior cells (the grid less its outer ring), 0-based from `(1, 1)`, in the order the
+    /// engine's shuffle leaves them: two draws a swap, as many swaps as cells.
+    fn shuffled_interior(&mut self) -> Vec<(i32, i32)> {
         let across = self.width - 2;
         let total = (self.height - 2).wrapping_mul(across);
         if total <= 0 {
-            return Ok(false);
+            return Vec::new();
         }
         let mut cells: Vec<(i32, i32)> = (0..total).map(|i| (i % across, i / across)).collect();
         for _ in 0..total {
@@ -1097,7 +1186,12 @@ impl<'a, 'b> Generator<'a, 'b> {
             let b = self.seed.pick(total as u32) as usize;
             cells.swap(a, b);
         }
-        for (x, y) in cells {
+        cells
+    }
+
+    /// `SpawnOutdoorLevelPreset` (`Outdoors.cpp:730`): the first free interior cell in a shuffle.
+    fn spawn_anywhere(&mut self, preset: i32, file: i32, offset: i32, sides: i32) -> Result<bool, Error> {
+        for (x, y) in self.shuffled_interior() {
             if self.fits(x + 1, y + 1, preset, offset, sides)? {
                 self.spawn(x + 1, y + 1, preset, file, false)?;
                 return Ok(true);
@@ -1106,17 +1200,447 @@ impl<'a, 'b> Generator<'a, 'b> {
         Ok(false)
     }
 
+    /// `SpawnRandomOutdoorDS1` (`0x006745E0`): beside a road cell if a neighbour fits, else
+    /// anywhere.
+    fn spawn_near_road(&mut self, preset: i32, file: i32) -> Result<(), Error> {
+        let cells = self.shuffled_interior();
+        if cells.is_empty() {
+            return Ok(());
+        }
+        for (x, y) in cells {
+            let (gx, gy) = (x + 1, y + 1);
+            if self.outdoor.get(gx, gy) & ROAD == 0 {
+                continue;
+            }
+            for (dx, dy) in self.ctx.tables.neighbours {
+                if self.fits(gx + dx, gy + dy, preset, 0, 0xF)? {
+                    return self.spawn(gx + dx, gy + dy, preset, file, false);
+                }
+            }
+        }
+        self.spawn_anywhere(preset, file, 0, 0xF).map(|_| ())
+    }
+
+    /// `DRLGOUTROOM_SpawnRandomOutdoorDecorations` (`0x006804E0`): one or two of a piece by the
+    /// roads, sometimes a camp too.
+    fn decorations(&mut self, preset: i32, allow_camp: bool) -> Result<(), Error> {
+        self.seed.step();
+        if self.seed.low & 3 == 0 {
+            self.spawn_near_road(preset, -1)?;
+            self.spawn_near_road(preset, -1)?;
+        } else {
+            self.spawn_near_road(preset, -1)?;
+            if allow_camp {
+                self.seed.step();
+                if self.seed.low & 1 != 0 {
+                    self.spawn_near_road(0x31, -1)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `DRLGOUTROOM_SpawnAct1LevelPresets` (`0x00680580`): each level's set pieces.
+    fn spawn_level_presets(&mut self) -> Result<(), Error> {
+        let anywhere = |g: &mut Self, preset| g.spawn_anywhere(preset, -1, 0, 0xF).map(|_| ());
+        match self.id {
+            BLOOD_MOOR => {
+                self.spawn_near_road(0x2E, -1)?;
+                self.decorations(0x2F, false)?;
+            }
+            COLD_PLAINS => {
+                self.decorations(0x30, true)?;
+                anywhere(self, 0x2C)?;
+            }
+            STONY_FIELD => {
+                self.spawn_near_road(0xA0, -1)?;
+                self.spawn_near_road(0x2D, -1)?;
+                anywhere(self, 0xA2)?;
+                self.decorations(0x2F, true)?;
+                self.decorations(0x2A, false)?;
+                return anywhere(self, 0x1F);
+            }
+            DARK_WOOD => {
+                for preset in [0xA1, 0x29, 0x28] {
+                    anywhere(self, preset)?;
+                }
+                self.decorations(0x30, true)?;
+                self.decorations(0x2B, false)?;
+            }
+            BLACK_MARSH => {
+                for preset in [0xA3, 0x26, 0x27] {
+                    anywhere(self, preset)?;
+                }
+                self.decorations(0x2F, true)?;
+                self.decorations(0x2A, false)?;
+            }
+            TAMOE_HIGHLAND => {
+                self.decorations(0x30, true)?;
+                self.decorations(0x2B, false)?;
+                return anywhere(self, 0x1F);
+            }
+            BURIAL_GROUNDS => return self.spawn(1, 1, 0x6C, -1, false),
+            MOO_MOO_FARM => {
+                for preset in [0x32, 0x2E, 0x1F, 0x26, 0x27] {
+                    anywhere(self, preset)?;
+                }
+            }
+            _ => {}
+        }
+        anywhere(self, 0x1D)?;
+        anywhere(self, 0x1E)
+    }
+
+    /// `SpawnAct12Waypoint` (`0x006752A0`): Cold Plains' faces Blood Moor; elsewhere the first
+    /// free interior cell in a shuffle.
+    fn spawn_waypoint(&mut self) {
+        if self.id == COLD_PLAINS {
+            let at = self.vis().iter().position(|&v| v == BLOOD_MOOR).unwrap_or(8);
+            let mask = 1i32 << ((at + 4) & 0x1F);
+            for y in 0..self.height {
+                for x in 0..self.width {
+                    if self.link.get(x, y) & mask != 0 && self.outdoor.get(x, y) & RESERVED != 0 {
+                        let (mut wx, mut wy) = (x, y);
+                        if wx == 0 {
+                            wx = 1;
+                        }
+                        if wy == 0 {
+                            wy = 1;
+                        }
+                        if wx == self.width - 1 {
+                            wx -= 1;
+                        }
+                        if wy == self.height - 1 {
+                            wy -= 1;
+                        }
+                        self.link.or(wx, wy, 0x2_0000);
+                        self.outdoor.or(wx, wy, WAYPOINT);
+                        return;
+                    }
+                }
+            }
+        }
+        for (x, y) in self.shuffled_interior() {
+            if self.outdoor.get(x + 1, y + 1) & OCCUPIED == 0 {
+                self.link.or(x + 1, y + 1, 0x1_0000);
+                self.outdoor.or(x + 1, y + 1, WAYPOINT);
+                return;
+            }
+        }
+    }
+
+    /// `SpawnAct12Shrines` (`0x00674E40`): up to `count` shrines on free interior cells, their
+    /// styles taken in turn from a random one.
+    fn spawn_shrines(&mut self, count: i32) {
+        let mut style = (self.seed.roll() & 3) as usize;
+        let mut left = count;
+        for (x, y) in self.shuffled_interior() {
+            if left < 1 {
+                return;
+            }
+            if self.outdoor.get(x + 1, y + 1) & OCCUPIED == 0 {
+                self.link.or(x + 1, y + 1, self.ctx.tables.shrine_styles[style]);
+                self.outdoor.or(x + 1, y + 1, SHRINE);
+                style = (style + 1) & 3;
+                left -= 1;
+            }
+        }
+    }
+
+    /// `DRLGOUTROOM_LinkOutdoorRoomExits` (`0x00681420`): a road from each level transition
+    /// toward the middle, marked on the cells it crosses.
+    fn link_exits(&mut self) -> Result<(), Error> {
+        self.build_exit_points();
+        self.exit_targets();
+        for i in 0..self.exit_count {
+            if let Some(path) = self.find_path(i)? {
+                for &(x, y) in &path {
+                    if x >= 0 && x < self.width && y >= 0 && y < self.height {
+                        self.outdoor.or(x, y, ROAD);
+                    }
+                }
+                // DRLGOUTROOM_BuildVertexPathsWithJitter (0x00681240): one draw, then two for each
+                // vertex between the path's second and its last. The jittered positions only
+                // shape the road's tiles.
+                self.seed.step();
+                for _ in 0..path.len().saturating_sub(2) {
+                    self.seed.step();
+                    self.seed.step();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `DRLGOUTROOM_SnapVertexToGrid` (`0x00680CC0`): an exit's cell edge on its side.
+    fn snap(&self, p: ExitPoint) -> (i32, i32) {
+        let (mut x, mut y) = (p.x - self.area.x, p.y - self.area.y);
+        match p.kind {
+            0 => x = x / 8 * 8 + 11,
+            1 => y = y / 8 * 8 + 11,
+            2 => x = x / 8 * 8 - 5,
+            3 => y = y / 8 * 8 - 5,
+            _ => {}
+        }
+        (x + self.area.x, y + self.area.y)
+    }
+
+    /// `DRLGOUTROOM_BuildExitPointArray` (`0x00680D70`): the camp's and the Monastery Gate's
+    /// openings, then the road pieces on the grid.
+    fn build_exit_points(&mut self) {
+        self.exit_count = 0;
+        for i in 0..self.orths.len() {
+            let orth = self.orths[i];
+            if self.exit_count >= 6 {
+                continue;
+            }
+            let (ax, ay) = (orth.area.x, orth.area.y);
+            self.exits[0][self.exit_count] = match orth.level {
+                ROGUE_ENCAMPMENT => {
+                    let (dx, dy) = match orth.direction {
+                        0 => (0x3B, 0x13),
+                        1 => (0x1D, 0x23),
+                        2 => (4, 0x16),
+                        _ => (0x1D, 3),
+                    };
+                    ExitPoint { x: ax + dx, y: ay + dy, kind: orth.direction as u8 }
+                }
+                MONASTERY_GATE => ExitPoint { x: ax + 0x1B, y: ay + 0xD, kind: 1 },
+                _ => continue,
+            };
+            self.exit_count += 1;
+        }
+        for gx in 0..self.width {
+            for gy in 0..self.height {
+                if self.exit_count >= 6 {
+                    break;
+                }
+                let flow = (self.outdoor.get(gx, gy) >> 16) & 0xF;
+                let kind = match self.presets.get(gx, gy) {
+                    4 if flow == 3 => 3,
+                    5 if flow == 3 => 0,
+                    6 if flow == 3 => 1,
+                    7 if flow == 3 => 2,
+                    0x18 => 1,
+                    0x19 => 0,
+                    0x1C if flow == 1 && gx == self.width - 2 => 2,
+                    0x33 | 0x34 => u8::from(flow != 0),
+                    _ => 4,
+                };
+                self.exits[0][self.exit_count] = ExitPoint { x: self.area.x + gx * 8 + 3, y: self.area.y + gy * 8 + 3, kind };
+                if kind != 4 {
+                    self.exit_count += 1;
+                }
+            }
+        }
+        for i in 0..self.exit_count {
+            (self.exits[1][i].x, self.exits[1][i].y) = self.snap(self.exits[0][i]);
+        }
+    }
+
+    /// `DRLGOUTROOM_ComputeExitTargetPositions` (`0x00681000`): where each road heads — across
+    /// the river's crossing when the level has one, else a free cell near the exits' middle.
+    fn exit_targets(&mut self) {
+        let (wx, wy) = (self.area.x, self.area.y);
+        let crossing = if self.flags & 0x10 != 0 {
+            let x = self.width / 2 - 1;
+            (1..self.width - 1)
+                .find(|&y| self.presets.get(x, y) == 0x1C && (self.outdoor.get(x, y) >> 16) & 0xF == 1)
+                .map(|y| (x, y))
+        } else {
+            None
+        };
+        if let Some((cx, cy)) = crossing {
+            let (bx, by) = (wx + 3 + cx * 8, wy + 3 + cy * 8);
+            for i in 0..self.exit_count {
+                let right = self.exits[0][i].x > bx;
+                self.exits[3][i] = ExitPoint { x: if right { bx + 8 } else { bx }, y: by, kind: if right { 0 } else { 2 } };
+            }
+        } else if self.exit_count > 0 {
+            let (cx, cy) = if self.exit_count == 1 {
+                (self.width / 2, self.height / 2)
+            } else {
+                let n = self.exit_count as i32 * 8;
+                let sx: i32 = self.exits[0][..self.exit_count].iter().map(|e| e.x - wx).sum();
+                let sy: i32 = self.exits[0][..self.exit_count].iter().map(|e| e.y - wy).sum();
+                (sx / n, sy / n)
+            };
+            let (mut fx, mut fy) = (0, 0);
+            'search: for radius in 0..8 {
+                for (ox, oy) in self.ctx.tables.spiral {
+                    (fx, fy) = (ox * radius + cx, oy * radius + cy);
+                    if fx >= 0 && fx < self.width && fy >= 0 && fy < self.height && self.outdoor.get(fx, fy) & OCCUPIED == 0 {
+                        break 'search;
+                    }
+                }
+            }
+            let target = ExitPoint { x: wx + fx * 8 + 3, y: wy + fy * 8 + 3, kind: 4 };
+            for i in 0..self.exit_count {
+                self.exits[3][i] = target;
+            }
+        }
+        for i in 0..self.exit_count {
+            (self.exits[2][i].x, self.exits[2][i].y) = self.snap(self.exits[3][i]);
+        }
+    }
+
+    fn path_delta(&self, i: i32) -> Result<i32, Error> {
+        usize::try_from(i).ok().and_then(|i| self.ctx.tables.path_deltas.get(i)).copied().ok_or(Error::Halt("the road search ran off its direction table"))
+    }
+
+    /// `DRLGPATH_GetPathDirection`: the direction (0..=7) from one cell toward another.
+    fn path_direction(&self, from: (i32, i32), to: (i32, i32)) -> i32 {
+        self.ctx.tables.path_directions[direction_index(to.0 - from.0, to.1 - from.1) as usize]
+    }
+
+    /// `DRLGOUTROOM_FindPathBetweenExits` (`0x006817D0`): a depth-first road search from an
+    /// exit's cell to its target's, bounded by a cost that grows by 5 each try. The cells from
+    /// the target back to the start, or `None`.
+    fn find_path(&self, i: usize) -> Result<Option<Vec<(i32, i32)>>, Error> {
+        let cell = |p: ExitPoint| ((p.x - self.area.x) / 8, (p.y - self.area.y) / 8);
+        let (start, target) = (cell(self.exits[1][i]), cell(self.exits[2][i]));
+        let (adx, ady) = ((start.0 - target.0).abs(), (start.1 - target.1).abs());
+        if adx + ady <= 1 {
+            return Ok(Some(vec![start, target]));
+        }
+        let h = adx.min(ady) + adx.max(ady) * 2;
+        let direction = (self.path_direction(start, target) / 2) & 3;
+        let mut bound = h / 2 + h;
+        let limit = bound + 0x23;
+        let mut pool = vec![[0i32; 10]; PATH_NODES];
+        loop {
+            // Node: [f, h, g, x, y, tries, cycle index, direction, parent + 1, child + 1].
+            pool[0] = [h, h, 0, start.0, start.1, -1, 0, direction, 0, 0];
+            let mut used = 1;
+            let found = self.path_search(&mut pool, &mut used, target, bound)?;
+            bound += 5;
+            if used > PATH_NODES - 1 {
+                return Ok(None);
+            }
+            if let Some(mut node) = found {
+                let mut path = Vec::new();
+                loop {
+                    path.push((pool[node][3], pool[node][4]));
+                    if pool[node][8] == 0 {
+                        return Ok(Some(path));
+                    }
+                    node = (pool[node][8] - 1) as usize;
+                }
+            }
+            if bound >= limit {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// `DRLGOUTROOM_PathSearchStep`: expand from the root until the target or exhaustion.
+    fn path_search(&self, pool: &mut [[i32; 10]], used: &mut usize, target: (i32, i32), bound: i32) -> Result<Option<usize>, Error> {
+        let mut idx = 0;
+        loop {
+            let node = pool[idx];
+            if (node[3], node[4]) == target {
+                return Ok(Some(idx));
+            }
+            let nx = self.path_delta(node[7] + 0x14)? + node[3];
+            let ny = self.path_delta(node[7] + 0x10)? + node[4];
+            if self.path_step_ok(pool, (nx, ny), idx, target) {
+                let step = if node[3] == nx || node[4] == ny { 2 } else { 3 };
+                let (a, b) = ((nx - target.0).abs(), (ny - target.1).abs());
+                let h = a.min(b) + a.max(b) * 2;
+                let f = h + node[2] + step;
+                if f <= bound {
+                    if pool[idx][9] == 0 {
+                        let slot = *used;
+                        if slot == PATH_NODES {
+                            return Ok(None);
+                        }
+                        pool[slot] = [0; 10];
+                        *used += 1;
+                        pool[idx][9] = slot as i32 + 1;
+                        pool[slot][8] = idx as i32 + 1;
+                    }
+                    let child = (pool[idx][9] - 1) as usize;
+                    let parent = (pool[child][8] - 1) as usize;
+                    let half = self.path_direction((nx, ny), target) / 2;
+                    let cycle = (pool[parent][7] - half) & 3;
+                    let turn = self.path_delta(cycle * 4)?;
+                    let c = &mut pool[child];
+                    (c[1], c[0], c[2], c[5]) = (h, f, node[2] + step, 0);
+                    (c[6], c[7], c[3], c[4]) = (cycle * 4, (turn + half) & 3, nx, ny);
+                    idx = child;
+                    continue;
+                }
+            }
+            match self.path_advance(pool, idx)? {
+                Some(next) => idx = next,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// `DRLGOUTROOM_ValidatePathStep`: the target, or an in-grid cell off any piece and off the
+    /// path so far.
+    fn path_step_ok(&self, pool: &[[i32; 10]], (x, y): (i32, i32), mut idx: usize, target: (i32, i32)) -> bool {
+        if (x, y) == target {
+            return true;
+        }
+        if x < 0 || x >= self.width || y < 0 || y >= self.height || self.outdoor.get(x, y) & PRESET != 0 {
+            return false;
+        }
+        loop {
+            if (pool[idx][3], pool[idx][4]) == (x, y) {
+                return false;
+            }
+            if pool[idx][8] == 0 {
+                return true;
+            }
+            idx = (pool[idx][8] - 1) as usize;
+        }
+    }
+
+    /// `DRLGOUTROOM_AdvancePathDirection`: the node's next direction, or back up the path when its
+    /// three are spent.
+    fn path_advance(&self, pool: &mut [[i32; 10]], mut idx: usize) -> Result<Option<usize>, Error> {
+        if pool[idx][5] < 4 {
+            pool[idx][6] += 1;
+            let turn = self.path_delta(pool[idx][6])?;
+            pool[idx][7] = (turn + pool[idx][7]) & 3;
+        }
+        pool[idx][5] += 1;
+        if pool[idx][5] != 3 {
+            return Ok(Some(idx));
+        }
+        while idx != 0 {
+            idx = (pool[idx][8] - 1) as usize;
+            pool[idx][6] += 1;
+            let turn = self.path_delta(pool[idx][6])?;
+            pool[idx][5] += 1;
+            pool[idx][7] = (turn + pool[idx][7]) & 3;
+            if pool[idx][5] != 3 {
+                return Ok(Some(idx));
+            }
+        }
+        Ok(None)
+    }
+
     /// `DRLGOUTDOOR_CreateOutdoorRoomExGrid` (`0x006750F0`): the rooms. Rooms join the level's
     /// list at its head, so the list runs from the last room made.
     fn finish(self) -> Result<OutdoorLevel, Error> {
         let mut rooms = Vec::new();
         for y in 0..self.height {
             for x in 0..self.width {
-                let flags = self.outdoor.get(x, y);
+                let (outdoor, link) = (self.outdoor.get(x, y), self.link.get(x, y));
                 let (tx, ty) = (self.area.x + x * ROOM_TILES, self.area.y + y * ROOM_TILES);
-                if flags & PRESET == 0 {
-                    if flags & BLANK == 0 {
-                        rooms.push(Coords { x: tx, y: ty, w: ROOM_TILES, h: ROOM_TILES });
+                let room = |dx: i32, dy: i32, preset, file| OutdoorRoom {
+                    area: Coords { x: tx + dx * ROOM_TILES, y: ty + dy * ROOM_TILES, w: ROOM_TILES, h: ROOM_TILES },
+                    preset,
+                    file,
+                    outdoor,
+                    link,
+                };
+                if outdoor & PRESET == 0 {
+                    if outdoor & BLANK == 0 {
+                        rooms.push(room(0, 0, 0, 0));
                     }
                     continue;
                 }
@@ -1127,7 +1651,7 @@ impl<'a, 'b> Generator<'a, 'b> {
                 let (w, h) = self.preset_size(preset)?;
                 for py in 0..h {
                     for px in 0..w {
-                        rooms.push(Coords { x: tx + px * ROOM_TILES, y: ty + py * ROOM_TILES, w: ROOM_TILES, h: ROOM_TILES });
+                        rooms.push(room(px, py, preset, (outdoor >> 16) & 0xF));
                     }
                 }
             }
@@ -1141,9 +1665,31 @@ impl<'a, 'b> Generator<'a, 'b> {
             flags: self.flags,
             outdoor: self.outdoor.cells(),
             presets: self.presets.cells(),
+            link: self.link.cells(),
             rooms,
         })
     }
+}
+
+/// `DRLGPATH_GetDirectionIndex`: a direction's cell (0..=24) in a 5×5 grid centred on 12.
+fn direction_index(dx: i32, dy: i32) -> i32 {
+    let (mut dx, mut dy) = (dx, dy);
+    let (ax, ay) = (dx.abs(), dy.abs());
+    if ax < ay * 2 {
+        if ax * 2 <= ay {
+            if dx < 0 {
+                dx = -1;
+            } else {
+                dx &= 1;
+            }
+        }
+    } else if dy < 0 {
+        dy = -1;
+    } else {
+        dy &= 1;
+    }
+    dx = dx.clamp(-2, 2);
+    dx * 5 + 12 + dy.clamp(-2, 2)
 }
 
 #[cfg(test)]
@@ -1173,9 +1719,9 @@ mod tests {
         assert_eq!(direction_between(me, Coords { x: 180, y: 150, w: 40, h: 40 }), Some(2), "right");
         assert_eq!(direction_between(me, Coords { x: 90, y: 180, w: 40, h: 40 }), Some(3), "bottom");
         assert_eq!(direction_between(me, Coords { x: 300, y: 300, w: 40, h: 40 }), None);
-        let left = |y| Orth { direction: 0, preset: false, area: Coords { x: 60, y, w: 40, h: 40 } };
+        let left = |y| Orth { level: 3, direction: 0, preset: false, area: Coords { x: 60, y, w: 40, h: 40 } };
         assert!(left(90).goes_before(&left(130)), "down the left side from the top");
-        let top = |x| Orth { direction: 1, preset: false, area: Coords { x, y: 60, w: 40, h: 40 } };
+        let top = |x| Orth { level: 1, direction: 1, preset: false, area: Coords { x, y: 60, w: 40, h: 40 } };
         assert!(top(140).goes_before(&top(100)), "along the top from the right");
         assert!(left(130).goes_before(&top(100)), "by side first");
     }
@@ -1185,8 +1731,8 @@ mod tests {
         // Blood Moor-like: 56x96 tiles with a 56x40 town above its right part, and a level on
         // its left covering the lower half.
         let me = Coords { x: 1000, y: 1000, w: 56, h: 96 };
-        let town = Orth { direction: 1, preset: true, area: Coords { x: 1008, y: 960, w: 56, h: 40 } };
-        let west = Orth { direction: 0, preset: false, area: Coords { x: 920, y: 1048, w: 80, h: 80 } };
+        let town = Orth { level: 1, direction: 1, preset: true, area: Coords { x: 1008, y: 960, w: 56, h: 40 } };
+        let west = Orth { level: 3, direction: 0, preset: false, area: Coords { x: 920, y: 1048, w: 80, h: 80 } };
         let (vertices, head) = outline(me, &[west, town]);
         let mut ring = Vec::new();
         let mut p = head;
@@ -1244,7 +1790,7 @@ mod tests {
             Ok(level) => level,
             Err(e) => return Some(e.clone()),
         };
-        let mut got: Vec<(i32, i32)> = level.rooms.iter().map(|r| (r.x, r.y)).collect();
+        let mut got: Vec<(i32, i32)> = level.rooms.iter().map(|r| (r.area.x, r.area.y)).collect();
         got.sort_unstable();
         recorded.sort_unstable();
         (got != recorded).then(|| {
@@ -1254,34 +1800,57 @@ mod tests {
         })
     }
 
-    /// The rooms of every Act I wilderness level for the seeds libd2 recorded room by room.
+    /// The rooms of every Act I wilderness level for the seeds libd2 recorded room by room: where
+    /// they are, each piece's id, and each plain cell's link flags — neighbours, shrine styles and
+    /// the waypoint, which come after the roads and so check the road search's draws. (The
+    /// recordings keep neither the pieces' files nor the outdoor flags.)
     #[test]
     fn with_libd2_recordings_the_rooms_match_the_engine() {
         let Some((data, engine, golden)) = install() else { return };
-        let (mut checked, mut wrong) = (0, Vec::new());
+        let (mut checked, mut rooms_checked, mut wrong) = (0, 0, Vec::new());
         for (file, seed) in [("deep_seed_1.jsonl", 1u32), ("deep_seed_2.jsonl", 2), ("deep_seed_305419896.jsonl", 305_419_896)] {
             let ours = generate(&data, &engine, seed, 0);
             for line in read_golden(&golden.join(file)).lines().filter(|l| l.contains("\"evt\":\"drlg_level\"")) {
                 let Some((id, _)) = number(line, "\"levelId\":", 0) else { continue };
                 let Some(level) = ours.get(&(id as i32)) else { continue };
                 let rooms_at = line.find("\"rooms\":").expect("rooms");
-                let mut recorded = Vec::new();
-                let mut at = rooms_at;
-                while let Some((x, next)) = number(line, "{\"x\":", at) {
-                    let (y, next) = number(line, "\"y\":", next).unwrap();
-                    recorded.push((x as i32, y as i32));
-                    at = next;
-                }
+                let records: Vec<&str> = line[rooms_at..].split("{\"x\":").skip(1).collect();
+                let recorded: Vec<(i32, i32)> = records
+                    .iter()
+                    .map(|r| {
+                        let r = format!("{{\"x\":{r}");
+                        (number(&r, "\"x\":", 0).unwrap().0 as i32, number(&r, "\"y\":", 0).unwrap().0 as i32)
+                    })
+                    .collect();
                 checked += 1;
                 if let Some(problem) = compare(level, recorded) {
                     wrong.push(format!("seed {seed} level {id}: {problem}"));
+                    continue;
+                }
+                let level = level.as_ref().unwrap();
+                for r in records {
+                    let r = format!("{{\"x\":{r}");
+                    let field = |key| number(&r, key, 0).map(|(v, _)| v as i32);
+                    let (x, y) = (field("\"x\":").unwrap(), field("\"y\":").unwrap());
+                    let ours = level.rooms.iter().find(|o| (o.area.x, o.area.y) == (x, y)).unwrap();
+                    // A piece's room flags carry more than its link bits.
+                    let (expected, got) = if field("\"nPresetType\":") == Some(2) {
+                        ((field("\"def\":").unwrap(), 0), (ours.preset, 0))
+                    } else {
+                        ((0, field("\"flags\":").unwrap() & 0x3_FFFF), (ours.preset, ours.link & 0x3_FFFF))
+                    };
+                    rooms_checked += 1;
+                    if got != expected {
+                        wrong.push(format!("seed {seed} level {id} room ({x}, {y}): (piece, link) {got:x?}, recorded {expected:x?}"));
+                    }
                 }
             }
         }
-        eprintln!("{checked} levels compared");
+        eprintln!("{checked} levels, {rooms_checked} rooms compared");
         assert!(checked >= 21, "only {checked} levels compared");
-        assert!(wrong.is_empty(), "{} of {checked} differ:\n{}", wrong.len(), wrong.join("\n"));
+        assert!(wrong.is_empty(), "{} differ:\n{}", wrong.len(), wrong[..wrong.len().min(60)].join("\n"));
     }
+
     /// Every recorded room of the Act I wilderness for the seeds libd2 recorded on Hell, where
     /// the rooms are listed one line each.
     #[test]

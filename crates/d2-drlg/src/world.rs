@@ -147,7 +147,7 @@ impl World {
             let rooms = match (town, def.drlg_type, &outdoors) {
                 (Some(t), _, _) if t.level_id == id => t.rooms.clone(),
                 (_, DrlgType::Wilderness, Some(Ok(outdoors))) => match outdoors.generate(id) {
-                    Ok(level) => level.rooms,
+                    Ok(level) => level.rooms.iter().map(|r| r.area).collect(),
                     Err(e) => {
                         world.unbuilt.push((id, e.to_string()));
                         continue;
