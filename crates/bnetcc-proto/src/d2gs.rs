@@ -52,6 +52,12 @@ pub mod sc {
     pub const UNLOAD_COMPLETE: u8 = 0x05;
     /// Game exit.
     pub const GAME_EXIT: u8 = 0x06;
+    /// Load a room on the client (6 bytes).
+    pub const LOAD_ROOM: u8 = 0x07;
+    /// Which unit is the client's own player (6 bytes).
+    pub const OWN_UNIT: u8 = 0x0B;
+    /// A unit's selected skill on one mouse button (13 bytes).
+    pub const SELECT_SKILL: u8 = 0x23;
     /// Place a unit (11 bytes).
     pub const REASSIGN_PLAYER: u8 = 0x15;
     /// The act's time of day (10 bytes).
@@ -557,6 +563,34 @@ pub fn act_environment(period: u32, ticks: u32, eclipse: bool) -> Vec<u8> {
     w.finish()
 }
 
+/// `0x0B`: `[unit type u8][guid u32]` (builder `0x00537930`). The client makes the unit it
+/// already knows by that guid its own player (handler `0x0045CC50`), so the unit's `0x59` must
+/// come first — and nothing that reads the player, such as `0x53`, may come before this.
+#[must_use]
+pub fn own_unit(unit_type: u8, guid: u32) -> Vec<u8> {
+    let mut w = Writer::with_capacity(6);
+    w.u8(sc::OWN_UNIT).u8(unit_type).u32(guid);
+    w.finish()
+}
+
+/// `0x07`: `[room tile x u16][room tile y u16][level u8]` — load the room whose top-left tile
+/// is `(x, y)` (builder `0x0053BC50`, sent by `PlacePlayerInAct` for the spawn room).
+#[must_use]
+pub fn load_room(tile_x: u16, tile_y: u16, level: u8) -> Vec<u8> {
+    let mut w = Writer::with_capacity(6);
+    w.u8(sc::LOAD_ROOM).u16(tile_x).u16(tile_y).u8(level);
+    w.finish()
+}
+
+/// `0x23`: `[unit type u8][guid u32][right-hand u8][skill u16][item guid u32]` (builder
+/// `0x0053C590`); item guid `0xFFFFFFFF` when no item grants the skill.
+#[must_use]
+pub fn select_skill(unit_type: u8, guid: u32, right_hand: bool, skill: u16, item_guid: u32) -> Vec<u8> {
+    let mut w = Writer::with_capacity(13);
+    w.u8(sc::SELECT_SKILL).u8(unit_type).u32(guid).u8(right_hand.into()).u16(skill).u32(item_guid);
+    w.finish()
+}
+
 /// `0x59`: `[guid u32][class u8][name 16][x u16][y u16]` (builder `0x0053E8F0`).
 #[must_use]
 pub fn assign_player(guid: u32, class: u8, name: &str, x: u16, y: u16) -> Vec<u8> {
@@ -742,6 +776,9 @@ mod tests {
         assert_eq!(act_environment(2, 0, false).len(), 10);
         assert_eq!(assign_player(1, 4, "AVeryLongNameIndeed", 1, 2).len(), 26);
         assert_eq!(reassign_player(0, 1, 2, 3, 1).len(), 11);
+        assert_eq!(own_unit(0, 1), vec![0x0B, 0, 1, 0, 0, 0]);
+        assert_eq!(load_room(1160, 888, 1), vec![0x07, 0x88, 0x04, 0x78, 0x03, 1]);
+        assert_eq!(select_skill(0, 1, true, 0, u32::MAX).len(), 13);
         assert_eq!(player_placed().len(), 5);
         assert_eq!(pong().len(), 33);
         assert_eq!(join_failed_packet(join_failed::WRONG_VERSION), vec![0xB4, 0x10, 0, 0, 0]);

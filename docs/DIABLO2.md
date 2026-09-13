@@ -121,7 +121,7 @@ D2GS packet in op=0x68 …  /  GAMELOGON …       the client's logon, every fie
 D2GS packets out packets=01… 00                GameFlags + loading
 D2GS packets out packets=02                    load success
 D2GS packet in op=0x6b                         ENTERGAME: the client accepted our compression
-D2GS packets out packets=03… 53… 59… 15… 7e…   act, player, placement
+D2GS packets out packets=59… 0b… 23… 23… 03… 53… 07… 15… 7e…   player, act, room, placement
 D2GS packets out packets=04                    load complete
 D2GS packet in op=…                            whatever the client asks for next
 ```

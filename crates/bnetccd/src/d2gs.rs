@@ -2,7 +2,8 @@
 //!
 //! No world is simulated. A client that joins a game is taken through the join exactly as
 //! the 1.14d engine runs it (`docs/D2GS-114D-WIRE.md` §4): `AF 01`, then on `GAMELOGON`
-//! `01 00` and `02`, then on `ENTERGAME` `03 53 59 15 7E` and, a server frame later, `04`.
+//! `01 00` and `02`, then on `ENTERGAME` `59 0B 23 23 03 53 07 15 7E` and, a server frame
+//! later, `04`.
 //! After that nothing is sent but ping replies; every packet the client sends is logged.
 //! The point is to learn, against a real client, whether our compression and join sequence
 //! are accepted and what the client asks for next — not to play.
@@ -52,6 +53,9 @@ const TOWN_AREA: u16 = 1;
 /// Spawn point: beside the campfire and stash for [`MAP_SEED`]. Walkability unverified —
 /// the real engine picks this from the generated town, which we do not have yet.
 const SPAWN: (u16, u16) = (5810, 4450);
+/// Top-left tile of the 8×8-tile room holding [`SPAWN`]: the same dump puts the stash, 4
+/// subtiles away, in the room at tile (1160, 888).
+const SPAWN_ROOM: (u16, u16) = (1160, 888);
 /// Guid of the joining player's unit.
 const PLAYER_GUID: u32 = 1;
 
@@ -401,7 +405,10 @@ async fn logon(
     Ok(Some(Player { game_id: logon.game_id, character, difficulty }))
 }
 
-/// `ENTERGAME`: the act, the player, and a frame later `04`.
+/// `ENTERGAME`, in the engine's order (`HandleSrvJoinAct`): `ClientAddPlayerToGame` creates
+/// the player — its `0x59`, before it has a position — and names it the client's own with
+/// `0x0B` plus both selected skills; then the act (`03 53`); then `PlacePlayerInAct` loads
+/// the spawn room and places the player (`07 15 7E`). `04` follows a frame later.
 async fn enter_game(
     stream: &mut TcpStream,
     peer: SocketAddr,
@@ -411,10 +418,16 @@ async fn enter_game(
 ) -> std::io::Result<()> {
     let tables = &server.tables;
     let (x, y) = SPAWN;
+    // Unplaced: at (0, 0) the client creates the unit without looking for a room.
+    outbox.push(&d2gs::assign_player(PLAYER_GUID, p.character.class, &p.character.name, 0, 0));
+    outbox.push(&d2gs::own_unit(0, PLAYER_GUID));
+    outbox.push(&d2gs::select_skill(0, PLAYER_GUID, true, 0, u32::MAX));
+    outbox.push(&d2gs::select_skill(0, PLAYER_GUID, false, 0, u32::MAX));
     outbox.push(&d2gs::load_act(0, MAP_SEED, TOWN_AREA, 0));
-    // Period 2 starts at angle 0: the start of the day.
+    // Period 2 starts at angle 0: the start of the day. The client's 0x53 handler reads its
+    // own player unit, which is why 0x0B has to be in first.
     outbox.push(&d2gs::act_environment(2, 0, false));
-    outbox.push(&d2gs::assign_player(PLAYER_GUID, p.character.class, &p.character.name, x, y));
+    outbox.push(&d2gs::load_room(SPAWN_ROOM.0, SPAWN_ROOM.1, TOWN_AREA as u8));
     outbox.push(&d2gs::reassign_player(0, PLAYER_GUID, x, y, 1));
     outbox.push(&d2gs::player_placed());
     flush(stream, peer, tables, outbox).await?;
@@ -553,12 +566,29 @@ pub(crate) mod tests {
         assert_eq!(read_frame(&mut c, huffman).await, vec![0x02]);
 
         c.write_all(&[cs::ENTER_GAME]).await.unwrap();
-        let act = read_frame(&mut c, huffman).await;
-        let ops: Vec<u8> = [0, 12, 22, 48, 59].iter().map(|&i| act[i]).collect();
-        assert_eq!(ops, vec![0x03, 0x53, 0x59, 0x15, 0x7E], "03 53 59 15 7E in one frame");
-        assert_eq!(act.len(), 12 + 10 + 26 + 11 + 5);
-        assert_eq!(&act[2..6], &MAP_SEED.to_le_bytes());
-        assert_eq!(&act[28..35], b"TestBan", "the character's name in 0x59");
+        let entered = read_frame(&mut c, huffman).await;
+        let mut packets = Vec::new();
+        let mut rest = entered.as_slice();
+        while let Some(&op) = rest.first() {
+            let size = match op {
+                0x59 => 26,
+                0x0B | 0x07 => 6,
+                0x23 => 13,
+                0x03 => 12,
+                0x53 => 10,
+                0x15 => 11,
+                0x7E => 5,
+                other => panic!("unexpected opcode {other:#04x}"),
+            };
+            packets.push(&rest[..size]);
+            rest = &rest[size..];
+        }
+        let ops: Vec<u8> = packets.iter().map(|p| p[0]).collect();
+        assert_eq!(ops, vec![0x59, 0x0B, 0x23, 0x23, 0x03, 0x53, 0x07, 0x15, 0x7E], "the engine's order, one frame");
+        assert_eq!(&packets[0][6..13], b"TestBan", "the character's name in 0x59");
+        assert_eq!(&packets[0][22..26], &[0, 0, 0, 0], "0x59 before placement: no position");
+        assert_eq!(packets[1], &[0x0B, 0, 1, 0, 0, 0], "then: that unit is yours");
+        assert_eq!(&packets[4][2..6], &MAP_SEED.to_le_bytes());
         assert_eq!(read_frame(&mut c, huffman).await, vec![0x04]);
 
         let mut ping = vec![0u8; 13];

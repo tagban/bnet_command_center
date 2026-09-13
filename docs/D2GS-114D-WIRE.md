@@ -111,8 +111,9 @@ Client join state lives at `client+4` (set by `0x5386D0`).
 | 2b | realm game | `[JOIN 2]` host `+0x08`: fetch character, wait | — | 1 |
 | 2b′ | open game | — | `0x02` | 1 |
 | 3 | host delivers the character | SrvRecvDatabaseCharacter `0x5306E0`, `[JOIN 3]` | `0x02` | 1 |
-| 4 | C→S `0x6B` ENTERGAME (1) | SrvJoinAct `0x530190` → `0x52C210`: build the act if needed (`0x53AC70`, seed `game+0x7C`, difficulty `game+0x6D`) | `0x03` LoadAct (12), then `0x53` (10) | 2 |
-| 4a | | place the player `0x5394A0` | `0x15` ReassignPlayer (11) `[type][guid][x][y][1]`, then `0x7E` (5) | 3 |
+| 4 | C→S `0x6B` ENTERGAME (1) | SrvJoinAct `0x530190` → `ClientAddPlayerToGame` `0x539760`: load the character (new-character path `0x532590` calls `SendUnitToClient`), check expansion/hardcore against the game (failure → `0xB4` with its code) | `0x59` for the player, **unplaced (0, 0)**; `0x0B` `[type][guid]` "this unit is yours" (`0x537930`); `0x5F`; `0x7B` hotkeys; `0x23` selected skill ×2 (right, left) | 1 |
+| 4a | | `0x52C210`: build the act if needed (`0x53AC70`, seed `game+0x7C`, difficulty `game+0x6D`) | `0x03` LoadAct (12), then `0x53` (10) | 2 |
+| 4b | | place the player `0x5394A0` | `0x07` `[room tile x u16][room tile y u16][level u8]` for the spawn room, `0x15` ReassignPlayer (11) `[type][guid][x][y][1]`, `0x7E` (5) | 3 |
 | 5 | next server frame | sUpdateClients `0x52D440` for state 3, `[JOIN 6] SCMD_STARTACT` | `0x04`; item/equipment pass `0x55DF00`; `0x5B` roster records both ways with every player already in the game (plus `0x8E` per entry of that player's unit`+0x60` list), then the joiner's own (`0x52C410`, confirmed in disassembly); `0x55B620`; host `+0x14`; broadcast `0x5A 02 04 …` "joined our world" (`0x54AA40`) | 4 |
 
 Units the client sees — itself included — arrive through **`SendUnitToClient 0x571F90`**,
@@ -153,8 +154,9 @@ Packet layouts confirmed at the builder:
 1. Framing/compression: port `util/frame.zig` + `util/huffman.zig`; send `AF 01`; nothing after
    it until `0x68`; batch queued packets per flush up to 0x200 per compressed frame.
 2. Join state machine: the table in §4 is the spec — `01 00` on logon, `02` once the character
-   is loaded, `03 53 15 7E` on `0x6B`, `04` + rosters on the following frame, and units via
-   the room-activation path (`0x59` for the player itself).
+   is loaded, `59 0B 23 23 03 53 07 15 7E` on `0x6B` (player before act: the client's `0x53`
+   handler dereferences its own player), `04` + rosters on the following frame, other units
+   via the room-activation path.
 3. Reject logons whose version field is not `0x0E`, as the engine does, with `0xB4`.
 4. libd2's `gameserver.zig` skips `0x53` and uses raw mode; treat it as a reference, not the spec.
 
@@ -165,11 +167,24 @@ so a client test can overturn it:
 - `0x03`'s last field is sent as `0` (the client stores it beside the seed; meaning unread).
 - `0x53` is `(period 2, ticks 0, no eclipse)` — period 2 starts at angle 0 in the engine's
   period table `0x7443F0`; the client aborts on a period above 5.
-- `0x59` for the player itself is sent just before `0x15`. In the engine it comes from
-  `SendUnitToClient`, and its order relative to `0x15` is not yet read.
+- `0x5F` (`[u32]` = player data `+0x2C`, meaning unread) and the `0x7B` hotkeys are not
+  sent; both `0x23`s say skill 0 (Attack) with item guid `0xFFFFFFFF`.
+- `0x07`'s fields are read as the room's tile rectangle (`+0x10`, `+0x14` of the struct
+  `0x619730` fills) — the usual D2 coords layout, not traced further.
 - Map seed `0x12345678` with the spawn beside the Rogue Encampment campfire, from libd2's
   object dump for that seed; walkability of that exact subtile is not checked.
 - `0x5B` rosters and the post-`04` room stream are not sent.
+
+### First client test (2026-09-13)
+
+tagban's retail 1.14d client, LAN, against the handshake test sending `03 53 59 15 7E` / `04`:
+create → join → port 4000 → `GAMELOGON` (id, hash, version `0x0E` all right) → decoded our
+compressed `01 00` and `02` → pinged → **`ENTERGAME`**. So framing, compression and the logon
+half are confirmed against a real client. It then crashed 0.4 s later:
+`ACCESS_VIOLATION` at `0x0045E31C` — the `0x53` handler's `CMP ECX,[EAX+0x1C]` with `EAX` =
+the client's own player unit (`0x7A6A70`), still null. That pointer is only ever set by the
+`0x0B` handler (`0x0045CC50`), which looks up an **existing** unit by guid — hence the engine
+order in row 4: `0x59` first, then `0x0B`, and only then `0x03 0x53`. The test now sends that.
 
 ## 6. Server packet builders (opcode → function)
 
