@@ -117,7 +117,7 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
    *Expect to talk and use things:* clicking Akara, Kashya, Charsi, Gheed or Warriv opens their
    menu (Talk has nothing to say yet; Trade, Hire and the rest do nothing), clicking the stash
    opens it (empty), clicking the waypoint opens its menu with the Rogue Encampment ticked
-   (travel does nothing). *Expect the day to pass:* the bonfire burns low by day and lights up
+   (see step 3 for travel). *Expect the day to pass:* the bonfire burns low by day and lights up
    at dusk, about 14 minutes after the game was created.
 3. *Expect walking to load the world:* the server follows your character, so NPCs and
    objects further from the waypoint appear as you approach, and walking out of the camp
@@ -125,13 +125,14 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
    Cold Plains, Stony Field, Dark Wood, Black Marsh and Tamoe Highland, cliffs and borders
    included up to the black beyond them. Cold Plains, Stony Field, Dark Wood and Black Marsh
    have their waypoint standing on its pad (the big pads with two lit torches), dark: clicking
-   it turns it on, and clicking again opens the menu with that area ticked (travel does
-   nothing yet). Otherwise the areas are empty — no monsters, shrines or other objects, and
-   cave entrances do not lead anywhere. Walking through a fence can make
-   the server think you are somewhere you are not (it has no collision).
+   it turns it on, and clicking again opens the menu with that area ticked. Choosing another
+   area you have ticked takes you to its waypoint (`waypoint travel level=…` in the log).
+   Otherwise the areas are empty — no monsters, shrines or other objects, and cave entrances
+   do not lead anywhere. Walking through a fence can make the server think you are somewhere
+   you are not (it has no collision).
 4. *Expect nothing else to work:* life/mana/stamina show (level-1 values from
-   `charstats.txt`), NPCs never walk, there is no combat, no shop and no travel. Esc → Save
-   and Exit returns to chat (verified).
+   `charstats.txt`), NPCs never walk, there is no combat, no shop and no travel to other
+   acts. Esc → Save and Exit returns to chat (verified).
 5. Send the log from the moment you clicked Create Game.
 
 What it shows, in order:

@@ -471,7 +471,19 @@ test does the same.
 
 The handshake test answers the NPC case (no quest messages, clear flags), the stash and the
 waypoint (a new character's flags, the camp's bit set on use) without the range, busy and
-collision checks; it does not answer `0x38` or `0x49`.
+collision checks; it does not answer `0x38`.
+
+**Waypoint travel** (2026-09-13). C→S `0x49` (9) `[waypoint guid u32][level u16][u16]` (handler
+`0x54C5D0`) is refused within ten seconds of a tick `0x55B6C0` keeps and when `0x549570` rejects
+the level; otherwise `0x584F60` checks the unit is a waypoint (`OperateFn` 23), ends the
+interaction (`0x554190`), and for another level the player has learned (`0x660E00`/`0x660E50`)
+warps (`0x53AEC0`, warp type `0xD` for towns and a few special levels, else 0). Another act goes
+through the act change (`0x537340`, `0x53ACC0`); the same act finds the level's waypoint tile at
+subtile (3, 3) and the nearest free spot (`0x61B060`) and moves the unit there (`0x554EA0`): `0x07`
+for the room landed in, the unit flagged `0x10000`, the room stream (`0x554670` for the others'
+views); the next update pass (`0x580860`) sends `0x15` with flag 1 for a unit so flagged (0 for a
+`0x800` move seen by another client). The test does the same trip within Act I, without the
+ten-second guard and the free-spot search.
 
 ### The act clock (2026-09-13)
 
@@ -509,7 +521,7 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
 - Walk the player-state helpers under `SendUnitToClient` to the exact packet list for one's own
   player (stats, skills, items, states).
 - Shops: `0x38` trade/gamble/repair and the store's items; hirelings; NPC quest messages.
-- Waypoint travel (`0x49`), which needs warps and other acts.
+- Waypoint travel to other acts (`0x53ACC0`), which needs their maps.
 - Movement: paths and collision (`0x64DEA0`, libd2 `path.zig`/`collision.zig`) in place of
   straight lines; cross-level near rooms by visibility slots (`0x66C220`); shrine init (`InitFn`
   1) and the set pieces' map units (read at room init, not ported), then Blood Moor's monsters and
