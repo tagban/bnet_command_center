@@ -21,6 +21,10 @@ mod address {
     pub const SERVER_PACKET_SIZES: u32 = 0x0073_0AE8;
     /// `gpsPresetObjectTable`, read by `DRLGPRESET_GetObjectIdFromActTable` (`0x006658E0`).
     pub const PRESET_OBJECTS: u32 = 0x0074_8AD8;
+    /// The act environment's clock speeds, ticks per degree (`0x0061BE40`).
+    pub const CLOCK_SPEEDS: u32 = 0x0074_43E4;
+    /// The six day periods, `{angle, light phase, colour}` (`0x0061BEE0`, `0x0061C240`).
+    pub const DAY_PERIODS: u32 = 0x0074_43F0;
     /// `VS_FIXEDFILEINFO` 1.14.3.71.
     pub const FILE_VERSION: (u32, u32) = (0x0001_000E, 0x0003_0047);
 }
@@ -36,6 +40,20 @@ pub struct EngineData {
     pub server_packet_sizes: [i32; SERVER_OPCODES],
     /// Object class for each act's DS1 preset object ids below 150.
     preset_objects: Vec<i32>,
+    /// The act clock's speeds, ticks per degree; a new act uses the first.
+    pub clock_speeds: [i32; 3],
+    /// The day's six periods: the clock angle each starts at and its light phase (0 day, 1 dusk,
+    /// 2 night, 3 dawn).
+    pub day_periods: [DayPeriod; 6],
+}
+
+/// One period of an act's day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DayPeriod {
+    /// Clock angle, in degrees, the period starts at.
+    pub angle: i32,
+    /// Light phase: 0 day, 1 dusk, 2 night, 3 dawn.
+    pub phase: i32,
 }
 
 impl EngineData {
@@ -71,6 +89,11 @@ impl EngineData {
         image.i32s(address::SERVER_PACKET_SIZES, &mut server_packet_sizes).ok_or_else(|| out_of_range("server size table"))?;
         let mut preset_objects = vec![0i32; 5 * PRESET_OBJECTS_PER_ACT];
         image.i32s(address::PRESET_OBJECTS, &mut preset_objects).ok_or_else(|| out_of_range("preset object table"))?;
+        let mut clock_speeds = [0i32; 3];
+        image.i32s(address::CLOCK_SPEEDS, &mut clock_speeds).ok_or_else(|| out_of_range("clock speeds"))?;
+        let mut periods = [0i32; 18];
+        image.i32s(address::DAY_PERIODS, &mut periods).ok_or_else(|| out_of_range("day periods"))?;
+        let day_periods: [DayPeriod; 6] = std::array::from_fn(|i| DayPeriod { angle: periods[i * 3], phase: periods[i * 3 + 1] });
 
         // GAMELOGON 37, ENTERGAME 1, ping 13; GameFlags 8, LoadAct 12, AssignPlayer 26.
         let sizes_ok = client_packet_sizes[0x68] == 37
@@ -81,10 +104,13 @@ impl EngineData {
             && server_packet_sizes[0x59] == 26;
         // Every preset slot is an object class, -1 for none; the first Act I slot is 0.
         let presets_ok = preset_objects.iter().all(|&c| (-1..1000).contains(&c));
-        if !sizes_ok || !presets_ok {
+        // Angles within a circle, phases 0..=3, a positive speed.
+        let clock_ok = clock_speeds[0] > 0
+            && day_periods.iter().all(|p| (0..360).contains(&p.angle) && (0..=3).contains(&p.phase));
+        if !sizes_ok || !presets_ok || !clock_ok {
             return Err(bad("tables do not look like 1.14d's".into()));
         }
-        Ok(Self { huffman_code_lengths, client_packet_sizes, server_packet_sizes, preset_objects })
+        Ok(Self { huffman_code_lengths, client_packet_sizes, server_packet_sizes, preset_objects, clock_speeds, day_periods })
     }
 
     /// The object class a DS1 preset object (unit type 2) becomes: ids below 150 go through the
@@ -117,6 +143,7 @@ mod tests {
         };
         let engine = EngineData::from_game_exe(&std::fs::read(path).unwrap()).expect("1.14d tables");
         assert_eq!(engine.huffman_code_lengths[0], 1, "byte 0 costs one bit");
+        assert_eq!(engine.day_periods[2], DayPeriod { angle: 0, phase: 0 }, "a new act's period: day, at angle 0");
         if let Ok(libd2) = std::env::var("LIBD2_DIR") {
             let bin = std::fs::read(std::path::Path::new(&libd2).join("packages/drlg/src/excel/PresetObjectTable.bin")).unwrap();
             let theirs: Vec<i32> = bin.chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();

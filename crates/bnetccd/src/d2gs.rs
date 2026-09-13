@@ -27,6 +27,7 @@ use d2_data::{stat, GameData};
 use d2_drlg::act::Act;
 use d2_drlg::preset::PresetLevel;
 use d2_drlg::world::{RoomId, World};
+use d2_game::clock::ActClock;
 use d2_game::population::{unit_type, waypoint_spawn, Population, Spawned};
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -88,6 +89,9 @@ pub struct GameServer {
     towns: Towns,
     /// Multiplies walking and running speed — for tests.
     speed_scale: f64,
+    /// The engine's day periods and clock speed, from `Game.exe`; without them games stay at
+    /// the start of the day.
+    day: Option<([d2_data::engine::DayPeriod; 6], i32)>,
     games: Mutex<Games>,
 }
 
@@ -128,6 +132,12 @@ struct Game {
     spawn: (u16, u16),
     /// The town's objects and NPCs, spawned room by room as players come near.
     population: Option<Population>,
+    /// Act I's time of day, stepped once per server frame since the game was created.
+    clock: Option<ActClock>,
+    /// Frames the clock has been stepped.
+    clock_frames: u64,
+    /// How many times the clock asked for its clients to be told (`0x53`).
+    clock_reports: u64,
 }
 
 /// Why the realm could not create a game.
@@ -154,14 +164,23 @@ impl GameServer {
     /// A game server with no games.
     #[must_use]
     pub fn new(tables: EngineTables, rules: Option<GameData>) -> Self {
-        Self { tables, rules, towns: Towns::None, speed_scale: 1.0, games: Mutex::new(Games::default()) }
+        Self { tables, rules, towns: Towns::None, speed_scale: 1.0, day: None, games: Mutex::new(Games::default()) }
     }
 
     /// Build each new game's town from its own map seed with these engine tables (the rules
     /// must hold the install's maps).
     #[must_use]
     pub fn with_engine(mut self, engine: EngineData) -> Self {
+        self.day = Some((engine.day_periods, engine.clock_speeds[0]));
         self.towns = Towns::FromInstall(Box::new(engine));
+        self
+    }
+
+    /// Run games' clocks on these periods — for tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_day(mut self, periods: [d2_data::engine::DayPeriod; 6], ticks_per_degree: i32) -> Self {
+        self.day = Some((periods, ticks_per_degree));
         self
     }
 
@@ -298,6 +317,9 @@ impl GameServer {
                 spawn,
                 town,
                 world,
+                clock: self.day.map(|(periods, speed)| ActClock::new(0, periods, speed)),
+                clock_frames: 0,
+                clock_reports: 0,
             },
         );
         let game = &g.by_id[&id];
@@ -469,6 +491,24 @@ impl GameServer {
         packets
     }
 
+    /// The game's Act I clock brought up to date — stepped once per [`SERVER_FRAME`] since the
+    /// game was created, as the engine steps it every frame (`0x0052D7B0`) — as `(reports so far,
+    /// 0x53 packet)`. A client that has seen fewer reports is sent the packet.
+    fn clock(&self, game_id: u16) -> Option<(u64, Vec<u8>)> {
+        let mut g = self.lock();
+        let game = g.by_id.get_mut(&game_id)?;
+        let due = (game.created.elapsed().as_micros() / SERVER_FRAME.as_micros()) as u64;
+        let clock = game.clock.as_mut()?;
+        while game.clock_frames < due {
+            if clock.step() {
+                game.clock_reports += 1;
+            }
+            game.clock_frames += 1;
+        }
+        let (period, ticks, eclipse) = clock.state();
+        Some((game.clock_reports, d2gs::act_environment(period, ticks, eclipse)))
+    }
+
     /// A connected character left; an emptied game goes with it.
     fn leave(&self, game_id: u16, name: &str) {
         let mut g = self.lock();
@@ -584,6 +624,8 @@ async fn run(
     let mut chunk = [0u8; 2048];
     let mut outbox = Outbox::default();
     let mut walker: Option<Walker> = None;
+    let mut clock_seen: u64 = 0;
+    let mut last_packet = Instant::now();
     // The player's waypoint flags; a new character's are clear until it touches one.
     let mut waypoints = [0u8; d2gs::WAYPOINT_FLAG_BYTES];
     let mut frame = tokio::time::interval(SERVER_FRAME);
@@ -592,14 +634,26 @@ async fn run(
 
     loop {
         let limit = if stage == Stage::AwaitLogon { LOGON_TIMEOUT } else { IN_GAME_TIMEOUT };
-        let moving = walker.as_ref().is_some_and(Walker::moving);
+        let in_game = stage == Stage::InGame;
         let read = tokio::select! {
             r = tokio::time::timeout(limit, stream.read(&mut chunk)) => Some(r),
-            _ = frame.tick(), if moving => None,
+            _ = frame.tick(), if in_game => None,
         };
         let Some(read) = read else {
-            // A server frame while the player moves: advance it and follow it with rooms.
-            let (Some(w), Some(p)) = (walker.as_mut(), player.as_ref()) else { continue };
+            // A server frame: the act's clock, then the player if it moves.
+            if last_packet.elapsed() > IN_GAME_TIMEOUT {
+                info!(%peer, ?stage, "game connection timed out");
+                return Ok(());
+            }
+            let Some(p) = player.as_ref() else { continue };
+            if let Some((reports, packet)) = server.clock(p.game_id) {
+                if reports > clock_seen {
+                    clock_seen = reports;
+                    outbox.push(&packet);
+                    flush(stream, peer, tables, &mut outbox).await?;
+                }
+            }
+            let Some(w) = walker.as_mut().filter(|w| w.moving()) else { continue };
             let now = Instant::now();
             w.step(now.duration_since(last_step).min(SERVER_FRAME * 5));
             last_step = now;
@@ -628,6 +682,7 @@ async fn run(
         if n == 0 {
             return Ok(());
         }
+        last_packet = Instant::now();
         inbox.extend_from_slice(&chunk[..n]);
 
         loop {
@@ -659,6 +714,7 @@ async fn run(
                 (Stage::AwaitEnterGame, cs::ENTER_GAME) => {
                     let p = player.as_ref().expect("logged on");
                     walker = Some(enter_game(stream, peer, server, p, &mut outbox).await?);
+                    clock_seen = server.clock(p.game_id).map_or(0, |(reports, _)| reports);
                     stage = Stage::InGame;
                 }
                 (Stage::InGame, op @ (cs::WALK_TO_LOCATION | cs::RUN_TO_LOCATION)) => {
@@ -815,9 +871,10 @@ async fn enter_game(
         outbox.push(&d2gs::life_and_position(whole(stat::HITPOINTS), whole(stat::MANA), whole(stat::STAMINA), 0, 0, 0, 0));
     }
     outbox.push(&d2gs::load_act(0, p.map_seed, TOWN_AREA, 0));
-    // Period 2 starts at angle 0: the start of the day. The client's 0x53 handler reads its
-    // own player unit, which is why 0x0B has to be in first.
-    outbox.push(&d2gs::act_environment(2, 0, false));
+    // The act's time of day as it stands (a new act starts in period 2 at angle 0: day). The
+    // client's 0x53 handler reads its own player unit, which is why 0x0B has to be in first.
+    let environment = server.clock(p.game_id).map_or_else(|| d2gs::act_environment(2, 0, false), |(_, packet)| packet);
+    outbox.push(&environment);
     let mut walker = Walker { x: f64::from(x), y: f64::from(y), target: None, speed: 0.0, room: None, view: Vec::new() };
     let rooms = match server.near(p.game_id, walker.x, walker.y) {
         Some((room, near)) => {
@@ -1232,6 +1289,33 @@ pub(crate) mod tests {
         let mut camp = [0u8; d2gs::WAYPOINT_FLAG_BYTES];
         camp[0] = 1;
         assert_eq!(read_frame(&mut c, huffman).await, d2gs::waypoint_menu(2, &camp));
+    }
+
+    /// The act's clock runs from the game's creation: a joined client is told its time of day
+    /// again once it has moved more than 16 degrees (here at one tick a degree, 17 frames).
+    #[tokio::test]
+    async fn a_joined_client_is_told_as_the_day_moves_on() {
+        use d2_data::engine::DayPeriod;
+        let p = |angle, phase| DayPeriod { angle, phase };
+        let periods = [p(320, 3), p(340, 3), p(0, 0), p(160, 1), p(180, 1), p(200, 2)];
+        let gs = Arc::new(GameServer::new(test_tables(), Some(test_rules())).with_day(periods, 1));
+        let id = gs.create("probe", "", 0).unwrap();
+        let (_, hash) = gs.stage_join("probe", "", character("TestBan", 4, 0)).unwrap();
+        let addr = spawn(Arc::clone(&gs)).await;
+        let huffman = &gs.tables.huffman;
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.read_exact(&mut [0u8; 2]).await.unwrap();
+        c.write_all(&logon_packet(id, hash, 4, 0x0E, "TestBan")).await.unwrap();
+        read_frame(&mut c, huffman).await;
+        read_frame(&mut c, huffman).await;
+        c.write_all(&[cs::ENTER_GAME]).await.unwrap();
+        let joined = split_packets(&read_frame(&mut c, huffman).await);
+        let at_join = joined.iter().find(|p| p[0] == 0x53).unwrap().clone();
+        assert_eq!(read_frame(&mut c, huffman).await, vec![0x04]);
+        let update = tokio::time::timeout(Duration::from_secs(3), read_frame(&mut c, huffman)).await.expect("a clock report");
+        assert_eq!((update[0], &update[1..5]), (0x53, &2u32.to_le_bytes()[..]), "still day");
+        let ticks = |p: &[u8]| u32::from_le_bytes([p[5], p[6], p[7], p[8]]);
+        assert!(ticks(&update) >= 17 && ticks(&update) > ticks(&at_join), "{at_join:02x?} then {update:02x?}");
     }
 
     #[tokio::test]
