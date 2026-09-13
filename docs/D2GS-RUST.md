@@ -1,91 +1,99 @@
-# A Rust Diablo II game server — port plan
+# A native Rust Diablo II engine — plan
 
-Goal (tagban, 2026-09-13): convert `jaenster/d2-dedicated-server`'s game server to Rust, so closed
-realm games work on bnet.cc. tagban has spoken with jaenster about it. The source is MIT; the port
-keeps its copyright notice and credits it file by file (`docs/LEGAL.md` §1).
+Goal (tagban, 2026-09-13): closed-realm Diablo II games on bnet.cc, served by an engine that runs
+**natively on macOS, Linux and Windows** — a reimplementation, not a host for Blizzard's binary.
+Longer term, the same engine underpins a native modern client (§6).
 
-## 1. What is being converted
+## 1. Why reimplement, and why it is not from zero
 
-jaenster's repo contains **no Diablo II game engine of its own**. Every one of its game servers runs
-**Blizzard's own game code** headlessly, and his code is the host around it:
+Every game server in `jaenster/d2-dedicated-server` runs Blizzard's own **32-bit x86** code (wine,
+or the macOS 1.14d i386 image). Apple Silicon cannot execute that, so hosting it can never be
+native here. A reimplementation can.
 
-| His variant | Runs | Host needs |
-|---|---|---|
-| `apps/d2gs` | Windows 1.14d `Game.exe` + an injected DLL | wine |
-| `apps/d2host` | pre-1.14 Windows `D2Game`/`D2Common` DLLs (1.06b–1.13c) with his own `Fog.dll`/`D2Net.dll` | wine |
-| **`apps/d2gs-native`** | **macOS 1.14d `DiabloII` i386 Mach-O**, mapped and run directly | **32-bit x86 Linux** |
+It starts from **[`jaenster/libd2`](https://github.com/jaenster/libd2)**: a Zig reimplementation of
+the Diablo II **1.14d** engine core, **MIT** (the source; its Blizzard-derived data blobs and excel
+tables are expressly *not* covered — see §4), about 91k lines:
 
-`d2gs-native` is the one worth porting: one process, ~22 MB resident, no wine, measured as fast as
-the wine server on real hardware (`docs/native-vs-wine.md` in his repo), and a retail **Windows**
-1.14d client plays on it (same game version, same protocol). It is ~14k lines of Zig:
-
-| Part | His package | Lines | What it does |
+| libd2 package | Lines | What it is | Evidence it matches the game |
 |---|---|---|---|
-| Mach-O loader | `packages/macho` | ~830 | parse, map segments, rebase + bind fixups, protect — what `dyld` would do |
-| Darwin runtime | `packages/darwin` | ~5,400 | the `libSystem`/Carbon/C++ imports the image calls: libc, pthreads, mach, files, **sockets**, memory, `setjmp` |
-| Engine glue | `packages/d2engine` | ~2,500 | realm callback table (fastcall shims), character load/save, packet hooks, versioning |
-| The server | `apps/d2gs-native` | ~2,850 | boot, per-game tick loop, realm bridge, character DB, crash handling, health |
-| Realm store | `packages/gs-store`, `gs-seats` | ~1,700 | his Redis contract — **replaced** by a direct link to `bnetccd` |
+| `drlg` | 31.8k | the seed-driven map generator — rooms, tiles, collision, objects, monster presets | **cell-exact** vs. retail dumps, 11.1M subtiles/seed, all acts, blind holdouts |
+| `game` | 18.2k | the runtime: `GameInstance` server loop, units, stats, combat, skills (all 7 classes), monsters + AI, missiles, objects, shrines | rules read from the binary; determinism-tested; **not yet checked against a live server** |
+| `formats` | 7.3k | MPQ (incl. protected), ds1, dt1, dc6/dcc/cof, `.d2s` header | parsers |
+| `net` | 7.2k | the D2GS wire protocol, both directions, bit-packed packets | recovered layouts; not vs. live |
+| `pathfinding` | 5.5k | routing with the server's movement gates | generated maps |
+| `item` | 5.3k | treasure classes, quality, affixes | tables + rolls traced through the binary |
+| `core`, `world`, `bnet`, `client`, `render`, `save`, `util` | ~15k | RNG, stats base, live world, realm protocol, client world model, tile art, `.d2s` read/write (byte-exact), Huffman codec | varies |
 
-Address maps (`docs/mac-address-map.md`, `mac-tu-map.md`, `mac-tcpip-host-path.md`) are his
-reverse-engineering results for that exact binary; the port depends on them.
+**Why porting matters even with a working original:** the retail client generates the map itself
+from the game seed, so the server's world must match it cell for cell or players walk through
+walls. libd2's `drlg` already does; porting it faithfully inherits that.
 
-## 2. The constraint that shapes everything
+## 2. The reference models we compare against
 
-**Blizzard's code is 32-bit x86 (i386). This Mac is Apple Silicon, which cannot run 32-bit x86
-code natively** — Rosetta 2 translates 64-bit x86 only. The host calls into the game image and the
-game calls back into the host in one address space, so the Rust host must itself be an **i386
-process** (`i686-unknown-linux-musl`). Converting the language does not remove this; only
-replacing Blizzard's code would (ROADMAP Phase 5, a multi-year engine rewrite).
+1. **libd2 itself.** While porting, the Rust crate and the Zig package run on the same inputs
+   (seed, difficulty, level; attack inputs; item rolls) and must produce identical output.
+   Differential tests need no Blizzard data in the repo.
+2. **Blizzard's real engine**, run by jaenster's `d2gs-native` in a `linux/386` container under
+   `qemu` on this Mac — **test harness only, never production**. Record the D2GS packet stream for
+   scripted sessions against it and against our server, and diff. This is how `game` and `net`,
+   which libd2 has not yet checked against a live server, get checked. Needs the macOS 1.14d binary.
+3. **Your retail 1.14d Windows client** — the final judge of every milestone.
 
-Ways to run the result:
-
-| Where | How | Speed |
-|---|---|---|
-| Any x86-64 Linux box (VPS, NAS, PC) | natively — i386 binaries run on amd64 kernels | full |
-| **This Mac** | Docker Desktop / colima, `linux/386` image under `qemu-i386` — jaenster ran his full stress test this way, 20/20 clean | slower, fine for a handful of players |
-
-Later option — **Mac-native via an embedded x86 emulator** in the Rust host. Unicorn/QEMU are
-GPL (unusable here) and a pure-Rust i386 interpreter with the SSE the image uses is a project of
-its own; revisit once the ported server works.
-
-## 3. How it meets bnet.cc
-
-`bnetccd` (arm64 macOS) and the game server (i386 Linux) are separate processes, so they talk over
-a small TCP control link — the `GameHost` seam in `docs/ROADMAP.md` Phase 4 — instead of
-jaenster's Redis + Postgres:
+## 3. Shape
 
 ```
-client ── :6112 ──▶ bnetccd realm ── control link ──▶ d2gs-rs (i386)
-   │                  MCP_CREATEGAME → "create game X for char Y"      │
-   │                  ◀─ ok, game token                                  │
-   │                  MCP_JOINGAME → client told d2gs address + token     │
-   └────────────── :4000 ──────────────────────────────────────────────▶ │
-                      ◀─ "load char Y" / "save char Y (.d2s)" / "game ended"
+crates/d2-data      excel tables, read at runtime from the operator's own MPQs (never embedded)
+crates/d2-formats   MPQ + ds1/dt1 (+ dc6/dcc/cof for a client later)
+crates/d2-core      seed RNG, stats model, unit base
+crates/d2-drlg      map generator            ◀─ first port, diffed against libd2
+crates/d2-net       D2GS protocol + Huffman codec
+crates/d2-item, d2-world, d2-pathfinding, d2-game   the runtime
+bnetccd             realm (done) + a D2GS listener on :4000 hosting d2-game in-process
 ```
 
-The realm keeps characters (`characters.save` already exists for the `.d2s`), seat locks, game
-names and tokens. The game server keeps nothing durable.
+All plain Rust, no C, so it builds for macOS/Linux/Windows (and wasm) from one tree. The game
+server runs **inside `bnetccd`** behind the `GameHost` seam (`docs/ROADMAP.md` Phase 4) — no
+second process, no control link; `characters.save` already holds the `.d2s`.
 
-## 4. Milestones
+## 4. Legal posture — decide knowingly
+
+- **Game data**: libd2 commits Blizzard's 1.14d excel tables and derived blobs. We do not. Tables
+  and archives are read at runtime from the operator's own install (`diablo2.data_dir`), exactly
+  as `docs/ROADMAP.md` Phase 5 already requires. The repo ships no Blizzard bytes.
+- **Code provenance**: libd2 calls itself clean-room, but its READMEs describe porting from a
+  decompiled `Game.exe` ("every ported function cites its 1.14d address"). Code translated from a
+  decompilation is a weaker position than a true two-team clean room — the MIT licence covers
+  jaenster's work, it cannot license Blizzard's. Precedents exist on both sides (DevilutionX, a
+  decompilation-derived Diablo I, is long-lived and public; bnetd was sued). `docs/LEGAL.md` §2 is
+  the relevant section. Record the decision there before merging ported code.
+- **Attribution**: each ported file carries jaenster's MIT notice and names its libd2 source.
+
+## 5. Milestones
 
 | # | Milestone | Proves |
 |---|---|---|
-| 0 | **Prerequisites**: the macOS 1.14d `DiabloII` binary + its MPQs from tagban's own install; an i386 Linux runtime (colima/Docker on the Mac, or an x86 box) | we can run anything |
-| 1 | Rust Mach-O loader + `--dry-run` report (parse, map, resolve every import) — runs on any host, including this Mac | loader correctness against the real image |
-| 2 | Darwin runtime shims → the image boots headless and `QSERVER` listens on :4000 | the host ABI port works |
-| 3 | Control link + `bnetccd` realm: create/join routed to the game server; a fresh character's `.d2s` generated from the format spec | **first playable: a character standing in the Rogue Encampment** |
-| 4 | Save-back into `characters.save`, one-game-at-a-time seat lock, several games per server | characters persist |
-| 5 | Crash recovery, health, multiple game servers, operator docs | runs unattended |
+| 0 | tagban copies the 1.14d MPQs from his Windows install (`d2data`, `d2exp`, `d2char`, `d2sfx`…, `Patch_D2.mpq`) to a data directory on the Mac | real tables to load |
+| 1 | `d2-formats` MPQ + `d2-data` tables load from that directory | the data path, no embedded blobs |
+| 2 | `d2-drlg` ported; identical to libd2 over hundreds of seeds × acts × difficulties | the world the client will expect |
+| 3 | `d2-net` + a minimal `GameInstance` in `bnetccd`: create/join from the realm, **your character standing in the Rogue Encampment, a second player visible** | ROADMAP Phase 5 step 1 — the client accepts our packets |
+| 4 | Movement, warps between levels, save on leave into `characters.save` | a character that persists |
+| 5 | Monsters, combat, skills, items, loot — then quests — each diffed against the real-engine harness | the game |
 
-## 5. Open questions for tagban
+Milestone 3 is the risk gate: until a retail client stands in town on our packets, nothing else
+matters.
 
-1. **Game files**: do you have Diablo II **1.14d for macOS** (the `DiabloII` binary and MPQs)? The
-   disc images and 1.13c/1.13d zips on the backup volume are Windows/older builds. Blizzard's
-   legacy downloads have offered a Mac installer; jaenster's MIT `blizzard-legacy-dl` fetches the same
-   payload. Nothing from Blizzard goes in the repo either way.
-2. **Where it runs**: Docker/colima on this Mac (simplest to start), or an x86-64 Linux box?
-3. **Scope**: 1.14d only to start (matches your client), older engines later?
+## 6. A native modern client (later, separate)
 
-Not reused: `jaenster/libd2` has no licence grant (GitHub reports `NOASSERTION`), so the `.d2s`
-writer for new characters is written from the published save-format documentation instead.
+The server engine alone does not make the game playable on current macOS — that is the client:
+rendering, UI, audio, input. But the shared crates (data, formats including dc6/dcc/dt1 sprites and
+tiles, drlg, net, the client world model) are roughly half of one. A client would add an
+isometric renderer on `wgpu` (Metal on macOS, Vulkan/DX12 elsewhere), the UI, audio and input,
+loading art from the player's own MPQs — the OpenMW/DevilutionX model. Possible because of this
+engine; its own project after the server plays.
+
+## 7. Superseded
+
+An earlier version of this file planned a Rust *host* for Blizzard's i386 macOS binary (a port of
+`d2gs-native`). Dropped: it can never run natively on Apple Silicon. That binary survives only as
+the test oracle in §2. The earlier note that libd2 had no licence was wrong — GitHub's
+`NOASSERTION` came from the extra note about Blizzard-derived blobs appended to its MIT licence.

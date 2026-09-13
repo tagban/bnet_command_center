@@ -150,8 +150,10 @@ under wine, or a native Linux port of the macOS 1.14d build — and has a retail
 creating, joining and playing games. Its realm (`realmd`) and game servers meet in Redis rather
 than over a socket; characters are `.d2s` saves the game server reads and writes.
 
-**Decided 2026-09-13: port its native game server to Rust** — plan, constraints and milestones in
-[`docs/D2GS-RUST.md`](D2GS-RUST.md). The original integration sketch, for reference:
+**Decided 2026-09-13: a native Rust engine instead** — port `jaenster/libd2` (MIT, a Zig
+reimplementation of the 1.14d engine) and host the game server inside `bnetccd`, so it runs on
+macOS, Linux and Windows. Plan in [`docs/D2GS-RUST.md`](D2GS-RUST.md). The earlier sketch of
+using jaenster's game server as-is, kept for reference (it survives only as a test oracle):
 
 1. Run its `d2gs` (Linux containers; on this Mac that means a Linux VM — Apple Silicon adds
    x86-64 emulation).

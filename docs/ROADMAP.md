@@ -212,7 +212,9 @@ never received the fix `bnetd` got in 2003.
 
 ## Phase 5 — An in-house Diablo II game server
 
-**Committed, not scheduled.** This is the one part of the project that is a game engine
+**Started 2026-09-13** — as a Rust port of `jaenster/libd2` (MIT), not from zero: see
+`docs/D2GS-RUST.md` for the crate plan, reference models and milestones. The notes below remain
+the reasoning. This is the one part of the project that is a game engine
 rather than a protocol server, so it runs as its own long track and blocks nothing. The
 `GameHost` trait exists so it lands as a module, not a fourth daemon.
 
