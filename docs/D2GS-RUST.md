@@ -97,3 +97,15 @@ An earlier version of this file planned a Rust *host* for Blizzard's i386 macOS 
 `d2gs-native`). Dropped: it can never run natively on Apple Silicon. That binary survives only as
 the test oracle in §2. The earlier note that libd2 had no licence was wrong — GitHub's
 `NOASSERTION` came from the extra note about Blizzard-derived blobs appended to its MIT licence.
+
+**Also considered: [`tesseract2048/d2gs`](https://github.com/tesseract2048/d2gs)** — the classic
+marsgod/onlyer/faster D2GS PvPGN realms ran, as rebuilt for 91D2.cn (C, last updated 2015). Not
+chosen: it is **Windows-only** and runs **Blizzard's own 1.13c DLLs** through `d2server.dll`
+(its D2GE "based on Diablo II binaries", deployed into a 1.13c game folder), so it has the same
+"hosts Blizzard code" limit as above and cannot be native anywhere. It targets **1.13c**, while
+1.14d folded those DLLs into `Game.exe` — "updating it to 1.14" means redoing the hooking, which
+jaenster's MIT `apps/d2gs` already did. And it carries **no licence** (GitHub reports none; its
+headers say only "Copyright (C) 2000, 2001 Onlyer"), plus committed binaries built from Blizzard's
+library (`d2server.dll`, `D2GS.exe`, `patch_d2server.exe`), so it cannot be forked and
+redistributed as-is.
+
