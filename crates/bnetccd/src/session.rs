@@ -599,6 +599,10 @@ async fn bncs_session(
     }
 
     let mut buf = RecvBuf::with_capacity(READ_CHUNK);
+    let started = std::time::Instant::now();
+    // Why the loop ended, and the last packet the client sent, for the session-end log line.
+    let mut end_reason = String::from("client closed the connection");
+    let mut last_packet: Option<(u8, std::time::Instant)> = None;
     loop {
         // The short handshake deadline guards only the automated pre-login phase; once the
         // version check passes, a human may be at the login screen. A session that passed the
@@ -628,6 +632,7 @@ async fn bncs_session(
             () = s.kill.notified() => {
                 buf.commit(0, READ_CHUNK);
                 debug!(peer = %s.peer, "session closed by staff moderation");
+                end_reason = "closed by staff moderation".into();
                 break;
             }
             r = tokio::time::timeout(deadline, rd.read(tail)) => match r {
@@ -635,6 +640,7 @@ async fn bncs_session(
                 Ok(Err(e)) => {
                     buf.commit(0, READ_CHUNK);
                     let class = s.class;
+                    s.log_session_end(&format!("read error: {e}"), started, last_packet);
                     s.cleanup();
                     drop(tx);
                     drop(s);
@@ -644,6 +650,7 @@ async fn bncs_session(
                 Err(_) => {
                     buf.commit(0, READ_CHUNK);
                     debug!(peer = %s.peer, state = s.state.name(), "session timed out");
+                    end_reason = format!("no data for {}s (timeout)", deadline.as_secs());
                     break;
                 }
             },
@@ -661,10 +668,12 @@ async fn bncs_session(
                 Ok(None) => break,
                 Err(e) => {
                     debug!(peer = %s.peer, error = %e, "malformed frame; closing");
+                    end_reason = format!("server closed: malformed frame ({e})");
                     s.state = SessionState::Closing;
                     break;
                 }
             };
+            last_packet = Some((frame.id, std::time::Instant::now()));
             if !s.state.accepts(frame.id) {
                 if s.state.authenticated() {
                     // Post-login, an unrecognised packet is tolerated: real clients emit a
@@ -687,12 +696,14 @@ async fn bncs_session(
                     state = s.state.name(),
                     "packet not accepted in this state; closing"
                 );
+                end_reason = format!("server closed: {:#04x} not accepted while {}", frame.id, s.state.name());
                 s.state = SessionState::Closing;
                 break;
             }
             match s.handle(&frame).await {
                 Step::Continue => {}
                 Step::Close => {
+                    end_reason = format!("server closed while handling {:#04x}", frame.id);
                     s.state = SessionState::Closing;
                     break;
                 }
@@ -704,6 +715,7 @@ async fn bncs_session(
     }
 
     let class = s.class;
+    s.log_session_end(&end_reason, started, last_packet);
     s.cleanup();
     drop(tx);
     drop(s);
@@ -712,6 +724,36 @@ async fn bncs_session(
 }
 
 impl Bncs {
+    /// One INFO line when a logged-in session ends, saying which side ended it and why. A
+    /// client that reconnects in a loop is otherwise indistinguishable from one the server
+    /// keeps dropping. Sessions that never logged in stay at debug (scanners, failed logins).
+    fn log_session_end(
+        &self,
+        reason: &str,
+        started: std::time::Instant,
+        last_packet: Option<(u8, std::time::Instant)>,
+    ) {
+        let Some(account) = &self.account else {
+            debug!(peer = %self.peer, state = self.state.name(), reason, "session ended before logon");
+            return;
+        };
+        let last = last_packet.map_or_else(
+            || "none".to_string(),
+            |(id, at)| format!("{id:#04x} {}s before the end", at.elapsed().as_secs()),
+        );
+        info!(
+            peer = %self.peer,
+            account = %account.name,
+            name = %self.display_name,
+            product = %self.product.map_or_else(|| "?".to_string(), |p| p.to_string()),
+            state = self.state.name(),
+            online_secs = started.elapsed().as_secs(),
+            last_packet = %last,
+            reason,
+            "session ended"
+        );
+    }
+
     fn cleanup(&mut self) {
         // Temporary WC3 handshake trace (docs/WARCRAFT3.md §7): log where a WC3 session ended
         // so a client that stalls after SID_AUTH_INFO is diagnosable — `state=versioning` means
