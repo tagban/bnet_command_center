@@ -432,8 +432,19 @@ map's units strictly inside the group's box (`0x66FA10`) into the room at `base 
 * 5)` subtiles (`0x66BF30`: unit `+0` type, `+4` class, `+8` x, `+0x14` mode, `+0x18` y). The
 test runs the waypoint and shrine passes: each Act I waypoint room gets a waypoint (objects row 119;
 the large pad's two torches, row 37), and Cold Plains' small pad lines up with the preset marks
-(`0x10`) in libd2's engine collision recording. Shrines (`InitFn` 1, a `Shrines.txt` roll) are
-placed but not spawned; the terrain pass (decoration, and its rolls) is not ported.
+(`0x10`) in libd2's engine collision recording. The terrain pass (decoration, and its rolls) is not
+ported.
+
+**Shrines and wells.** An object's init routine gets a context `{game, unit, room, object
+control, objects.txt row, …}` (`0x54F5D0`); after it, the unit's selectable flag (bit 1) follows
+`Selectable[mode]`. `InitFn` 1 (`0x54F9D0`) rolls a shrine type on the object control's seed
+(`game+0x10F0`): with `Parm0` 0, `pick(types - 1) + 1`; `Parm0` 1 the health class, 2 mana,
+anything else a seed step and the boost class unless the low word is a multiple of ten, then the
+magic class; a class pick (`0x54F770`) is `pick(count)` in the types with that `effectclass`.
+Either way up to eight tries while the level id is below the type's `LevelMin`; 5, 4 and 16 become
+3, 2 and 18. The type is the object data's `+4`, the byte `0x51` carries. `InitFn` 16 (wells,
+`0x552B30`) puts twice `Parm2`'s low byte there. The test spawns both (a random game seed, as the
+engine's is); operating them is not answered.
 
 **Turning a waypoint on.** `OperateFn` 23 (`0x584E30`) on a mode-0 waypoint sets mode 1
 (`0x624690`), which flags the unit for update; the update pass (`0x581AD0` → `0x581A20`) sends

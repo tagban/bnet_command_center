@@ -127,8 +127,8 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
    have their waypoint standing on its pad (the big pads with two lit torches), dark: clicking
    it turns it on, and clicking again opens the menu with that area ticked. Choosing another
    area you have ticked takes you to its waypoint (`waypoint travel level=…` in the log).
-   Otherwise the areas are empty — no monsters, shrines or other objects, and cave entrances
-   do not lead anywhere. Walking through a fence can make the server think you are somewhere
+   Shrines and wells stand where they should, with their names (using them does nothing yet).
+   Otherwise the areas are empty — no monsters, and cave entrances do not lead anywhere. Walking through a fence can make the server think you are somewhere
    you are not (it has no collision).
 4. *Expect nothing else to work:* life/mana/stamina show (level-1 values from
    `charstats.txt`), NPCs never walk, there is no combat, no shop and no travel to other
