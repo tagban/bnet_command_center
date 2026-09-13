@@ -51,7 +51,8 @@ crates/d2-formats   MPQ + ds1/dt1 (+ dc6/dcc/cof for a client later)
 crates/d2-core      seed RNG, stats model, unit base
 crates/d2-drlg      map generator            ◀─ first port, diffed against libd2
 crates/d2-net       D2GS protocol + Huffman codec
-crates/d2-item, d2-world, d2-pathfinding, d2-game   the runtime
+crates/d2-game      the runtime: units as the engine creates them (started: map units, 2026-09-13)
+crates/d2-item, d2-world, d2-pathfinding            more of the runtime
 bnetccd             realm (done) + a D2GS listener on :4000 hosting d2-game in-process
 ```
 
@@ -80,6 +81,12 @@ second process, no control link; `characters.save` already holds the `.d2s`.
 | 0 ✅ | tagban copies the 1.14d MPQs from his Windows install (`d2data`, `d2exp`, `d2char`, `d2sfx`…, `Patch_D2.mpq`) to a data directory on the Mac | real tables to load |
 | 1 ✅ | `d2-formats` MPQ + `d2-data` tables load from that directory (2026-09-13: `charstats`, `experience`; a new character's stats per `0x5706D0`) | the data path, no embedded blobs |
 | 2 | `d2-drlg` ported; identical to libd2 over hundreds of seeds × acts × difficulties | the world the client will expect |
+
+Milestone 2 so far (2026-09-13, branch `d2-step2-drlg`): act layouts match libd2's recordings
+(402 levels); the Rogue Encampment's map, rooms and preset units match libd2's engine dump of its
+objects; `d2-game` populates rooms as the engine does and the handshake test sends the 3×3 rooms
+around the spawn with their objects and NPCs (`docs/D2GS-114D-WIRE.md` §5, *Town units*).
+Outdoor levels (mazes, wilderness) and movement are next.
 | 3 | `d2-net` + a minimal `GameInstance` in `bnetccd`: create/join from the realm, **your character standing in the Rogue Encampment, a second player visible** | ROADMAP Phase 5 step 1 — the client accepts our packets |
 | 4 | Movement, warps between levels, save on leave into `characters.save` | a character that persists |
 | 5 | Monsters, combat, skills, items, loot — then quests — each diffed against the real-engine harness | the game |

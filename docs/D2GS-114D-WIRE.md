@@ -113,16 +113,19 @@ Client join state lives at `client+4` (set by `0x5386D0`).
 | 3 | host delivers the character | SrvRecvDatabaseCharacter `0x5306E0`, `[JOIN 3]` | `0x02` | 1 |
 | 4 | C→S `0x6B` ENTERGAME (1) | SrvJoinAct `0x530190` → `ClientAddPlayerToGame` `0x539760`: load the character (new-character path `0x532590` calls `SendUnitToClient`), check expansion/hardcore against the game (failure → `0xB4` with its code) | `0x59` for the player, **unplaced (0, 0)**; `0x0B` `[type][guid]` "this unit is yours" (`0x537930`); `0x5F`; every stat as `0x1D`/`0x1E`/`0x1F` `[stat][value]` (stat-list walk with callback `0x548520` → `0x53BE40`); `0x7B` hotkeys; `0x23` selected skill ×2 (right, left); life/mana `0x548760` → `0x95` (first time, unplaced) | 1 |
 | 4a | | `0x52C210`: build the act if needed (`0x53AC70`, seed `game+0x7C`, difficulty `game+0x6D`) | `0x03` LoadAct (12), then `0x53` (10) | 2 |
-| 4b | | place the player `0x5394A0` | `0x07` `[room tile x u16][room tile y u16][level u8]` for the spawn room, `0x15` ReassignPlayer (11) `[type][guid][x][y][1]`, `0x7E` (5) | 3 |
+| 4b | | place the player `0x5394A0` | `0x07` `[room tile x u16][room tile y u16][level u8]` for the spawn room; then `0x5381F0` → `0x537B50` enters the player into that room: for each room "near" it (§5, *Town units*) `0x53A8E0` sends `0x07` and every unit already in the room (`SendUnitToClient`); `0x15` ReassignPlayer (11) `[type][guid][x][y][1]`, `0x7E` (5) | 3 |
 | 5 | next server frame | sUpdateClients `0x52D440` for state 3, `[JOIN 6] SCMD_STARTACT` | `0x04`; item/equipment pass `0x55DF00`; `0x5B` roster records both ways with every player already in the game (plus `0x8E` per entry of that player's unit`+0x60` list), then the joiner's own (`0x52C410`, confirmed in disassembly); `0x55B620`; host `+0x14`; broadcast `0x5A 02 04 …` "joined our world" (`0x54AA40`) | 4 |
 
 Units the client sees — itself included — arrive through **`SendUnitToClient 0x571F90`**,
 called from eight room/visibility paths rather than from the join itself. By unit type:
 player → `0x59` (26: `[guid u32][class u8][name 16][x u16][y u16]`, builder `0x53E8F0`) + `0x75`
 + player-state helpers (`0x571620`, `0x571CD0`, `0x570E30`, `0x5484B0`; these reach builders for
-`0x0B/0x76/0x7C/0x92`, `0x23`, `0x9E`–`0xA5`, `0xAB`, and item packets); monster → `0xAC` (+ `0x21`
-per skill); object → `0x51` (+ `0x60`, `0x82` for town portals); item → `0x9C`/`0x9D`; warp tile →
-`0x09`. So "standing in town" = the join table above **plus** the room-activation stream.
+`0x0B/0x76/0x7C/0x92`, `0x23`, `0x9E`–`0xA5`, `0xAB`, and item packets); monster → `0xAC`, `0x21`
+per skill `MonStats` `SendSkills` selects, `0xAA` states, queued unit events (`0x571CD0`), then its
+mode (`0x597E20`: `0x6D` standing, `0x67`/`0x68` walking, skill packets); object → `0x51` (+ `0x60`
+for portals, `objects.txt` SubClass bit 4); item → `0x9C`/`0x9D`; warp tile → `0x09`. So
+"standing in town" = the join table above **plus** the room-activation stream. §5 *Town units* has
+the monster and object packets in full.
 
 `0x7E` detail: `0x53DB70` writes only the opcode; the other 4 bytes are uninitialised stack. The
 client therefore cannot depend on them — send zeros.
@@ -173,7 +176,12 @@ so a client test can overturn it:
   `0x619730` fills) — the usual D2 coords layout, not traced further.
 - Map seed `0x12345678` with the spawn beside the Rogue Encampment campfire, from libd2's
   object dump for that seed; walkability of that exact subtile is not checked.
-- `0x5B` rosters and the post-`04` room stream are not sent.
+- `0x5B` rosters are not sent. Room units go out with the join, right after each near room's
+  `0x07`, as they would for a room another player had already populated; the engine's first
+  population of a fresh game may send them a frame later instead.
+- The near-room order compares the room fields `0x66BBC0` reads as x/y/w/h (not traced).
+- Warriv's map spot (5806, 4450) is 4 subtiles from our spawn; the engine would pick a free
+  spot (`0x61B060`), which is not ported.
 
 ### First client test (2026-09-13)
 
@@ -210,6 +218,72 @@ i8; handler `0x45DB20` sets stats 6/8/10 `<< 8` and nudges the position. Its sib
 `0x548640`) and `0x96` (9: stamina, x, y, dx, dy); `0x548760` picks whichever carries what
 changed since the last one it sent.
 
+### Town units (step 2, 2026-09-13)
+
+**Which rooms.** A room's "near" list is itself plus every room of its level less than 6 tiles
+away on both axes (`DRLGROOM_DefineRoomsNear` `0x66BC20`, ported in libd2 `DrlgRoom.zig`) — the
+3×3 neighbourhood for a town's 8×8-tile rooms — ordered by a bubble pass `0x66BBC0` that moves a
+room ahead of one it lies wholly left of or above. When a player's room changes, `0x537B50`
+sends `0x53A8E0` (`0x07` + units) for near rooms that are new and `0x53A9B0` (unit removals, then
+`0x08` `[tile x][tile y][level]`) for those left behind.
+
+**When units exist.** A room is populated the first time it is activated (`0x52D0F0`, room flag
+`+0x34` bit 0): `0x5559A0` walks its preset units twice — every non-monster first, then the
+monsters — skipping units flagged client-side (`+0x1C` bit 0); then inactive units come back
+(`0x542B40`), `Levels.txt` object groups roll (`0x552610`) and monsters spawn (`0x54EC90`). Units
+created while a client is in the room are sent to it at creation.
+
+**What the map places.** The DS1 loader `0x665950` gives preset monsters mode 1 (neutral),
+objects mode 0, items mode 3. Objects `0x23D` are dropped and larger ids go to a special spawner
+(`0x54F490`). Preset monsters spawn through `0x54E490`, which **skips critters** (`MonStats2`
+flag 13, `critter`): the client spawns those itself per room from `Levels.txt` `cmon1-4`,
+`cpct1-4`, `camt1-4` (`0x46C460`; the Rogue Encampment has `chicken` at 30%) — hence the
+chickens moving in the first test with no server units at all.
+
+**Ids and seeds.** Each unit takes the next guid of its type: `game+0x90+type×4`, pre-incremented
+from 0, 0 skipped on wrapping (`0x552EE0`). Its seed is `{low of the game seed stepped once,
+0x29A}` (`0x552DF0`, `0x650E40`) — and the game seed at `game+0xD0` starts from the clock
+(`0x650DE0`), so a real server's rogue bows differ game to game.
+
+**Object modes.** After allocation `0x54F5D0` calls `0x731BC0[InitFn]` (`objects.txt` InitFn,
+record `+0x1B1`); the selectable flag is record `+0xC4 + mode`; a `PreOperate` class
+(`+0x13D`) can roll into mode 2 afterwards. Ported so far: InitFn 8 (`0x5500C0`, torches) → mode
+2; InitFn 17 (`0x547210`, waypoints) → mode 2 in a town (`0x61AB00` → `0x6426A0`: levels 1, 40, 75,
+103, 109) unless a pending activation is queued; InitFn 54 (`0x5940E0`) only records Cain's start
+for his quest. The Rogue Encampment's bonfire has InitFn 0: mode 0 is its looping fire.
+
+**Monster components.** `0x5739D0` picks each of the 16 components with the unit seed's
+`RandomNumberSelector` over the class's variant count (`MonStats2` `HDv`…`S8v` entries; record
+`+0x15`), leaving the seed alone for a count of 0.
+
+**`0x51`** (14, builder `0x53BD10`): `[51][type u8 = 2][guid u32][class u16][x u16][y u16][mode
+u8][interaction u8 = object data +4]`.
+
+**`0xAC`** (variable, builder `0x53E2E0`, client `0x45F190`): `[AC][guid u32][class u16][x u16][y
+u16][life u8][total length u8]` then Fog bits (LSB first):
+- mode, 4 bits — 0, 8, 9, 12 as they are, anything else 1;
+- 1 bit "components follow"; if set, 16 values, each in 1 bit below 3 variants, else
+  `bitlen(variants − 1)` bits;
+- 1 bit "type block" (monster type flags or unit flag `+0xC4` bit 9); if set: 5 flag bits (the
+  client maps them to 4, 8, 2, 0x10, 0x40), 16 bits super-unique id when the third is set, name
+  bytes to a zero byte, 16 bits, and 1 bit + 32 bits for a minion's leader;
+- 1 bit "owner" (`+0xC8` bit 10, no owner unit): 31 bits;
+- 1 bit "stats" (stat list with flag 0x40): `[stat 9][param][value]`… up to `0x1FF` in 9.
+`life` is `hp × 128 ÷ max hp`, `0x80` at full (`0x5A5650`). A plain town NPC's body is one byte.
+
+**`0xAA`** (variable, `0x570E30`): `[AA][type u8][guid u32][total length u8]`, then per active
+state that is not flagged unsent: `[state 8]` + 1 bit + optional stat list; terminated by `0xFF`
+in 8 bits. A unit with no states: `AA 01 <guid> 08 FF`.
+
+**`0x6D`** (10, builder `0x53BB70`): `[6D][guid u32][x u16][y u16][life u8]` — `0x597E20` for a
+monster in mode 1 not using a skill.
+
+The handshake test sends, for the 3×3 rooms around the spawn, `07` then each room's objects
+(`51`) and monsters (`AC AA 6D`), populating a room the first time any player enters its
+neighbourhood. For seed `0x12345678` that is 24 objects (lit torches, the bonfire, the stash,
+the waypoint) and Warriv, Kashya, Akara, Charsi, Gheed and five rogues; the cows two rooms east
+are not sent. `crates/d2-game/examples/town_units.rs` prints the list for any seed and spot.
+
 ## 6. Server packet builders (opcode → function)
 
 `scripts/d2re/server_send_builders.py <Game.exe>` finds every call to the queue function
@@ -228,8 +302,10 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
 ## 7. Next
 
 - Walk the player-state helpers under `SendUnitToClient` to the exact packet list for one's own
-  player (stats, skills, items, states), and the room-activation callers that decide when units
-  are sent.
+  player (stats, skills, items, states).
+- Movement: the C→S walk/run packets, the player's path, and `0x537B50` on a room change —
+  `0x07` + units for new near rooms, `0x53A9B0` (unit removals via `0x571600`, then `0x08`) for
+  old ones; the spawn search `0x61B060`; NPC AI walking their DS1 paths (`0x666120`).
 - The byte at `0x68`+20 and the `0x6A`/`0x6C`/`0x6E` handlers.
 - A packet capture from the real engine (`docs/D2GS-RUST.md` §2 oracle) would confirm the dump
   faster than reading it; §4 and §6 say where to look in that capture.

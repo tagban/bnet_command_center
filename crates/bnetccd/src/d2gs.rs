@@ -1,12 +1,13 @@
 //! Diablo II game server — **handshake test only** (`diablo2.game_server_probe`).
 //!
-//! No world is simulated. A client that joins a game is taken through the join exactly as
+//! Nothing is simulated. A client that joins a game is taken through the join exactly as
 //! the 1.14d engine runs it (`docs/D2GS-114D-WIRE.md` §4): `AF 01`, then on `GAMELOGON`
-//! `01 00` and `02`, then on `ENTERGAME` `59 0B`, the player's stats, `23 23 95 03 53 07 15 7E`
-//! and, a server frame later, `04`.
+//! `01 00` and `02`, then on `ENTERGAME` `59 0B`, the player's stats, `23 23 95 03 53 07`, the
+//! rooms around the spawn with their objects and NPCs (`07`, `51`, `AC AA 6D`), `15 7E` and, a
+//! server frame later, `04`.
 //! After that nothing is sent but ping replies; every packet the client sends is logged.
-//! The point is to learn, against a real client, whether our compression and join sequence
-//! are accepted and what the client asks for next — not to play.
+//! The point is to learn, against a real client, whether our packets are accepted and what the
+//! client asks for next — not to play.
 //!
 //! Games live only in memory. The realm creates them (`MCP_CREATEGAME`), stages a join for
 //! one character (`MCP_JOINGAME`), and this module matches the client's `GAMELOGON` against
@@ -23,6 +24,9 @@ use bnetcc_proto::d2gs::{self, cs, join_failed, ClientPacketLen, EngineTables, G
 use bnetcc_storage::Character;
 use d2_data::engine::EngineData;
 use d2_data::{stat, GameData};
+use d2_drlg::act::Act;
+use d2_drlg::preset::PresetLevel;
+use d2_game::population::{unit_type, Population, Spawned};
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -67,6 +71,8 @@ pub struct GameServer {
     tables: EngineTables,
     /// `charstats.txt` and friends from the install; without them a player joins with no stats.
     rules: Option<GameData>,
+    /// The Rogue Encampment for [`MAP_SEED`]; without it a player stands in an empty town.
+    town: Option<PresetLevel>,
     games: Mutex<Games>,
 }
 
@@ -87,6 +93,8 @@ struct Game {
     staged: Vec<Character>,
     /// Characters connected to this game.
     connected: Vec<String>,
+    /// The town's objects and NPCs, spawned room by room as players come near.
+    population: Option<Population>,
 }
 
 /// Why the realm could not create a game.
@@ -113,7 +121,14 @@ impl GameServer {
     /// A game server with no games.
     #[must_use]
     pub fn new(tables: EngineTables, rules: Option<GameData>) -> Self {
-        Self { tables, rules, games: Mutex::new(Games::default()) }
+        Self { tables, rules, town: None, games: Mutex::new(Games::default()) }
+    }
+
+    /// Give new games this town to populate (it must be built from these rules).
+    #[must_use]
+    pub fn with_town(mut self, town: PresetLevel) -> Self {
+        self.town = Some(town);
+        self
     }
 
     /// Load `Game.exe` and the game rules from `data_dir`, bind the game port on `ip`, and start
@@ -121,10 +136,12 @@ impl GameServer {
     /// answering "Server Down". Rules that fail to load only cost the player its stats.
     pub async fn start(data_dir: &str, ip: std::net::IpAddr) -> Option<Arc<Self>> {
         let path = Path::new(data_dir).join("Game.exe");
-        let tables = match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|file| {
+        let (tables, engine) = match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|file| {
             let engine = EngineData::from_game_exe(&file).map_err(|e| e.to_string())?;
-            EngineTables::new(&engine.huffman_code_lengths, engine.client_packet_sizes, engine.server_packet_sizes)
-                .map_err(|e| e.to_string())
+            let tables =
+                EngineTables::new(&engine.huffman_code_lengths, engine.client_packet_sizes, engine.server_packet_sizes)
+                    .map_err(|e| e.to_string())?;
+            Ok((tables, engine))
         }) {
             Ok(t) => t,
             Err(e) => {
@@ -147,11 +164,23 @@ impl GameServer {
                 None
             }
         };
-        let server = Arc::new(Self::new(tables, rules));
+        let town = rules.as_ref().and_then(|data| {
+            let act = Act::build(data.levels(), 0, 0, MAP_SEED);
+            PresetLevel::build(data, &engine, &act, i32::from(TOWN_AREA))
+                .map_err(|e| warn!(error = %e, "town not built: players will stand in an empty town"))
+                .ok()
+        });
+        let mut server = Self::new(tables, rules);
+        if let Some(town) = town {
+            info!(map = %town.map, rooms = town.rooms.len(), units = town.units.len(), "Rogue Encampment built");
+            server = server.with_town(town);
+        }
+        let server = Arc::new(server);
         warn!(
             %addr,
-            "Diablo II game server HANDSHAKE TEST is on: games can be created and joined, but \
-             clients only stand in town: no NPCs or actions (diablo2.game_server_probe)"
+            "Diablo II game server HANDSHAKE TEST is on: games can be created and joined; clients \
+             stand in town with the objects and NPCs near the spawn, but cannot act \
+             (diablo2.game_server_probe)"
         );
         tokio::spawn(serve(listener, Arc::clone(&server)));
         Some(server)
@@ -187,6 +216,7 @@ impl GameServer {
                 created: Instant::now(),
                 staged: Vec::new(),
                 connected: Vec::new(),
+                population: self.town.as_ref().map(|t| Population::new(rand::thread_rng().gen(), t.rooms.len())),
             },
         );
         info!(game = %name, id, difficulty, "test game created");
@@ -225,6 +255,40 @@ impl GameServer {
         let character = game.staged.remove(at);
         game.connected.push(character.name.clone());
         Some((character, game.difficulty))
+    }
+
+    /// The rooms a player at `(x, y)` is sent on entering (the spawn room's near rooms,
+    /// `0x00537B50`), each as its `0x07` followed by the packets `SendUnitToClient` sends for
+    /// its units — populating rooms nobody has been near yet.
+    fn rooms_around(&self, game_id: u16, x: u16, y: u16) -> Vec<Vec<u8>> {
+        let (Some(town), Some(rules)) = (&self.town, &self.rules) else { return Vec::new() };
+        let Some(room) = town.room_index_at(x.into(), y.into()) else { return Vec::new() };
+        let mut g = self.lock();
+        let Some(population) = g.by_id.get_mut(&game_id).and_then(|game| game.population.as_mut()) else {
+            return Vec::new();
+        };
+        let mut packets = Vec::new();
+        for near in town.rooms_near(room) {
+            let r = town.rooms[near];
+            packets.push(d2gs::load_room(r.x as u16, r.y as u16, town.level_id as u8));
+            let activated = population.activate(rules, town, near);
+            for skipped in &activated.not_ported {
+                debug!(game_id, room = ?r, unit = %skipped, "map unit not spawned: not ported");
+            }
+            for unit in activated.units {
+                match *unit {
+                    Spawned::Object { guid, class, x, y, mode, interaction } => {
+                        packets.push(d2gs::assign_object(guid, class, x, y, mode, interaction));
+                    }
+                    Spawned::Monster { guid, class, x, y, mode, life, ref components, ref variants } => {
+                        packets.push(d2gs::assign_monster(guid, class, x, y, life, mode, components, variants));
+                        packets.push(d2gs::no_unit_states(unit_type::MONSTER, guid));
+                        packets.push(d2gs::monster_standing(guid, x, y, life));
+                    }
+                }
+            }
+        }
+        packets
     }
 
     /// A connected character left; an emptied game goes with it.
@@ -422,8 +486,9 @@ async fn logon(
 /// `ENTERGAME`, in the engine's order (`HandleSrvJoinAct`): `ClientAddPlayerToGame` creates
 /// the player — its `0x59`, before it has a position — names it the client's own with `0x0B`,
 /// sends its stats (`0x1D`–`0x1F`), both selected skills and its life/mana (`0x95`); then the act
-/// (`03 53`); then `PlacePlayerInAct` loads the spawn room and places the player (`07 15 7E`).
-/// `04` follows a frame later.
+/// (`03 53`); then `PlacePlayerInAct` loads the spawn room (`07`), enters the player into it —
+/// every near room's `07` and units — and places the player (`15 7E`). `04` follows a frame
+/// later.
 async fn enter_game(
     stream: &mut TcpStream,
     peer: SocketAddr,
@@ -454,6 +519,10 @@ async fn enter_game(
     // own player unit, which is why 0x0B has to be in first.
     outbox.push(&d2gs::act_environment(2, 0, false));
     outbox.push(&d2gs::load_room(SPAWN_ROOM.0, SPAWN_ROOM.1, TOWN_AREA as u8));
+    let rooms = server.rooms_around(p.game_id, x, y);
+    for packet in &rooms {
+        outbox.push(packet);
+    }
     outbox.push(&d2gs::reassign_player(0, PLAYER_GUID, x, y, 1));
     outbox.push(&d2gs::player_placed());
     flush(stream, peer, tables, outbox).await?;
@@ -464,6 +533,7 @@ async fn enter_game(
         %peer,
         character = %p.character.name,
         difficulty = p.difficulty,
+        room_packets = rooms.len(),
         "join sequence sent; from here the test only logs what the client does"
     );
     Ok(())
@@ -661,6 +731,99 @@ pub(crate) mod tests {
         c.write_all(&[cs::LEAVE_GAME]).await.unwrap();
         assert_eq!(read_frame(&mut c, huffman).await, vec![0x05, 0x06]);
         assert_eq!(read_frame(&mut c, huffman).await, vec![0xB0]);
+    }
+
+    /// A made-up town in a row of four rooms: the spawn room (the second) holds a torch (object
+    /// 1, InitFn 8) and an NPC (monster 10, two helmets to pick from); a crate stands in the
+    /// fourth room, two rooms away from the spawn.
+    fn test_town() -> (GameData, PresetLevel) {
+        use d2_data::monsters::{Monsters, COMPONENT_COLUMNS};
+        use d2_data::presets::{MonPresets, Objects, PresetMonster};
+        use d2_drlg::preset::{PlacedUnit, UnitClass};
+        use d2_drlg::Coords;
+        use d2_formats::excel::Table;
+        let mut rules = test_rules();
+        let objects = Table::parse(b"Name\tInitFn\tPreOperate\r\nnone\t0\t0\r\ntorch\t8\t0\r\ncrate\t0\t0\r\n");
+        let monstats = Table::parse(b"Id\thcIdx\tMonStatsEx\r\nguard\t10\tguard\r\n");
+        let mut ms2 = String::from("Id\tcritter");
+        for c in COMPONENT_COLUMNS {
+            ms2 += &format!("\t{c}");
+        }
+        ms2 += "\r\nguard\t0\tcap,helm\r\n";
+        let empty = |col: &str| Table::parse(format!("{col}\r\n").as_bytes());
+        let presets = MonPresets::from_tables(&Table::parse(b"Act\tPlace\r\n1\tguard\r\n"), &monstats, &empty("Superunique"), &empty("code")).unwrap();
+        rules.set_map_tables(presets, Monsters::from_tables(&monstats, &Table::parse(ms2.as_bytes())).unwrap(), Objects::from_table(&objects));
+        let room = |x, y| Coords { x, y, w: 8, h: 8 };
+        let at = |class, x, y| PlacedUnit { class, x, y, path: Vec::new() };
+        let town = PresetLevel {
+            level_id: 1,
+            area: room(1152, 888),
+            map: String::new(),
+            rooms: vec![room(1152, 888), room(1160, 888), room(1168, 888), room(1176, 888)],
+            units: vec![
+                at(UnitClass::Monster(PresetMonster::Class { class: 10, name: "guard".into() }), 5815, 4455),
+                at(UnitClass::Object(1), 5812, 4444),
+                at(UnitClass::Object(2), 5890, 4444),
+            ],
+        };
+        (rules, town)
+    }
+
+    #[tokio::test]
+    async fn the_rooms_around_the_spawn_come_with_their_units_before_the_player_is_placed() {
+        let (rules, town) = test_town();
+        let gs = Arc::new(GameServer::new(test_tables(), Some(rules)).with_town(town));
+        let id = gs.create("probe", "", 0).unwrap();
+        let (_, hash) = gs.stage_join("probe", "", character("TestBan", 4, 0)).unwrap();
+        let addr = spawn(Arc::clone(&gs)).await;
+        let huffman = &gs.tables.huffman;
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.read_exact(&mut [0u8; 2]).await.unwrap();
+        c.write_all(&logon_packet(id, hash, 4, 0x0E, "TestBan")).await.unwrap();
+        read_frame(&mut c, huffman).await;
+        read_frame(&mut c, huffman).await;
+        c.write_all(&[cs::ENTER_GAME]).await.unwrap();
+
+        let mut plain = Vec::new();
+        while plain.last() != Some(&0x04) || plain.len() < 2 {
+            plain.extend(read_frame(&mut c, huffman).await);
+        }
+        let mut ops = Vec::new();
+        let mut rest = plain.as_slice();
+        while let Some(&op) = rest.first() {
+            let size = match op {
+                0x59 => 26,
+                0x0B | 0x07 | 0x1F => 6,
+                0x04 => 1,
+                0x1D => 3,
+                0x1E => 4,
+                0x23 | 0x95 => 13,
+                0x03 => 12,
+                0x53 | 0x6D => 10,
+                0x15 => 11,
+                0x7E => 5,
+                0x51 => 14,
+                0xAA => usize::from(rest[6]),
+                0xAC => usize::from(rest[12]),
+                other => panic!("unexpected opcode {other:#04x}"),
+            };
+            ops.push((op, rest[..size].to_vec()));
+            rest = &rest[size..];
+        }
+        let tail: Vec<u8> = ops.iter().map(|(op, _)| *op).skip_while(|&op| op != 0x53).collect();
+        assert_eq!(
+            tail,
+            vec![0x53, 0x07, 0x07, 0x07, 0x51, 0xAC, 0xAA, 0x6D, 0x07, 0x15, 0x7E, 0x04],
+            "spawn room, then its three near rooms — units after their own room — then placement"
+        );
+        let body = |op: u8| ops.iter().find(|(o, _)| *o == op).map(|(_, b)| b.clone()).unwrap();
+        assert_eq!(body(0x51), d2gs::assign_object(1, 1, 5812, 4444, 2, 0), "the torch, lit");
+        let npc = body(0xAC);
+        assert_eq!((&npc[1..5], &npc[5..7], npc[11]), (&1u32.to_le_bytes()[..], &10u16.to_le_bytes()[..], 0x80));
+        assert_eq!(body(0x6D), d2gs::monster_standing(1, 5815, 4455, 0x80));
+        let rooms: Vec<Vec<u8>> = ops.iter().filter(|(op, _)| *op == 0x07).map(|(_, b)| b.clone()).collect();
+        assert_eq!(rooms[0], d2gs::load_room(1160, 888, 1), "PlacePlayerInAct's own 07 first");
+        assert!(!rooms.contains(&d2gs::load_room(1176, 888, 1)), "two rooms away is not near");
     }
 
     #[tokio::test]

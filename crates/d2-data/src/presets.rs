@@ -156,26 +156,47 @@ impl MonPresets {
     }
 }
 
-/// `objects.txt`: names by class id.
+/// `objects.txt`, by class id (row order).
 #[derive(Debug, Clone, Default)]
 pub struct Objects {
-    names: Vec<String>,
+    rows: Vec<ObjectClass>,
+}
+
+/// The `objects.txt` columns read so far.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectClass {
+    /// `description - not loaded`, else `Name`: for logs.
+    pub name: String,
+    /// `InitFn`: the engine's per-class spawn routine (table `0x00731BC0`, record `+0x1B1`).
+    pub init_fn: u8,
+    /// `PreOperate`: spawn some already operated (record `+0x13D`).
+    pub pre_operate: bool,
 }
 
 impl Objects {
     /// Parse the table.
     #[must_use]
     pub fn from_table(t: &Table) -> Self {
-        let names = t
+        let rows = t
             .rows()
-            .map(|r| r.get("description - not loaded").or_else(|| r.get("Name")).unwrap_or_default().to_string())
+            .map(|r| ObjectClass {
+                name: r.get("description - not loaded").or_else(|| r.get("Name")).unwrap_or_default().to_string(),
+                init_fn: r.int("InitFn").and_then(|v| u8::try_from(v).ok()).unwrap_or(0),
+                pre_operate: r.int("PreOperate").unwrap_or(0) != 0,
+            })
             .collect();
-        Self { names }
+        Self { rows }
+    }
+
+    /// An object class.
+    #[must_use]
+    pub fn get(&self, class: i32) -> Option<&ObjectClass> {
+        self.rows.get(usize::try_from(class).ok()?)
     }
 
     /// An object class's description, for logs.
     #[must_use]
     pub fn name(&self, class: i32) -> Option<&str> {
-        self.names.get(usize::try_from(class).ok()?).map(String::as_str)
+        self.get(class).map(|c| c.name.as_str())
     }
 }

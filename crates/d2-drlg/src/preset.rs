@@ -156,14 +156,81 @@ impl PresetLevel {
     /// The room containing a world subtile position.
     #[must_use]
     pub fn room_at(&self, x: i32, y: i32) -> Option<Coords> {
+        self.room_index_at(x, y).map(|i| self.rooms[i])
+    }
+
+    /// Index into [`PresetLevel::rooms`] of the room containing a world subtile position.
+    #[must_use]
+    pub fn room_index_at(&self, x: i32, y: i32) -> Option<usize> {
         let (tx, ty) = (x.div_euclid(SUBTILES), y.div_euclid(SUBTILES));
-        self.rooms.iter().copied().find(|r| tx >= r.x && tx < r.x + r.w && ty >= r.y && ty < r.y + r.h)
+        self.rooms.iter().position(|r| tx >= r.x && tx < r.x + r.w && ty >= r.y && ty < r.y + r.h)
+    }
+
+    /// The rooms "near" a room — itself and every room of the level less than 6 tiles away on
+    /// both axes, which for 8×8 rooms is its 3×3 neighbourhood (`DRLGROOM_DefineRoomsNear`,
+    /// `0x0066BC20`). A client gets `0x07` and the units of each of these rooms when its player
+    /// enters the room. Rooms of neighbouring levels are not included yet.
+    #[must_use]
+    pub fn rooms_near(&self, room: usize) -> Vec<usize> {
+        let Some(&a) = self.rooms.get(room) else { return Vec::new() };
+        let gap = |a0: i32, aw: i32, b0: i32, bw: i32| if a0 < b0 { b0 - aw - a0 } else { a0 - bw - b0 };
+        let mut near: Vec<usize> = (0..self.rooms.len())
+            .filter(|&i| {
+                let b = self.rooms[i];
+                gap(a.x, a.w, b.x, b.w) < 6 && gap(a.y, a.h, b.y, b.h) < 6
+            })
+            .collect();
+        // DRLGROOM_ReorderNearRoomList (0x0066BBC0): a bubble pass that moves a room ahead of one
+        // it lies wholly left of or above. The fields it compares are taken as x/y/w/h.
+        let n = near.len();
+        for _ in 1..n {
+            for i in 0..n - 1 {
+                let (cur, next) = (self.rooms[near[i]], self.rooms[near[i + 1]]);
+                if next.x + next.w <= cur.x || next.y + next.h <= cur.y {
+                    near.swap(i, i + 1);
+                }
+            }
+        }
+        near
+    }
+
+    /// The preset units standing in a room, in map order.
+    pub fn units_in(&self, room: usize) -> impl Iterator<Item = &PlacedUnit> {
+        self.units.iter().filter(move |u| self.room_index_at(u.x, u.y) == Some(room))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn grid(w: i32, h: i32) -> PresetLevel {
+        let rooms = (0..h)
+            .flat_map(|y| (0..w).map(move |x| Coords { x: 100 + x * ROOM_TILES, y: 50 + y * ROOM_TILES, w: ROOM_TILES, h: ROOM_TILES }))
+            .collect();
+        PresetLevel { level_id: 1, area: Coords::default(), map: String::new(), rooms, units: Vec::new() }
+    }
+
+    #[test]
+    fn a_room_is_near_itself_and_its_neighbours_only() {
+        let level = grid(4, 4);
+        let mut near = level.rooms_near(5); // column 1, row 1
+        near.sort_unstable();
+        assert_eq!(near, vec![0, 1, 2, 4, 5, 6, 8, 9, 10]);
+        let mut corner = level.rooms_near(15);
+        corner.sort_unstable();
+        assert_eq!(corner, vec![10, 11, 14, 15]);
+        assert!(level.rooms_near(99).is_empty());
+
+        let ordered = level.rooms_near(5);
+        for (i, &a) in ordered.iter().enumerate() {
+            for &b in &ordered[i + 1..] {
+                let (ra, rb) = (level.rooms[a], level.rooms[b]);
+                assert!(!(rb.x + rb.w <= ra.x && rb.y + rb.h <= ra.y), "{rb:?} is left of and above {ra:?} but comes later");
+            }
+        }
+        assert_eq!(level.room_index_at(100 * SUBTILES + 8 * SUBTILES, 50 * SUBTILES + 7 * SUBTILES - 1), Some(1));
+    }
 
     /// The Rogue Encampment for seed 0x12345678 against libd2's engine dump of the same town's
     /// objects (`LIBD2_DIR`), using the operator's install (`BNETCC_D2_DATA_DIR`) and `Game.exe`

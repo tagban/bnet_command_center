@@ -37,7 +37,7 @@ pub const QUEUE_CHUNK: usize = 0x200;
 /// which only the engine's in-process single-player path uses.
 pub const GREETING: [u8; 2] = [0xAF, 0x01];
 
-/// Server-to-client opcodes used by the join.
+/// Server-to-client opcodes used so far.
 pub mod sc {
     /// "Loading" — queued right after [`GAME_FLAGS`].
     pub const LOADING: u8 = 0x00;
@@ -71,8 +71,17 @@ pub mod sc {
     pub const REASSIGN_PLAYER: u8 = 0x15;
     /// The act's time of day (10 bytes).
     pub const ACT_ENVIRONMENT: u8 = 0x53;
+    /// An object: its class, position and mode (14 bytes).
+    pub const ASSIGN_OBJECT: u8 = 0x51;
     /// A player unit (26 bytes).
     pub const ASSIGN_PLAYER: u8 = 0x59;
+    /// A monster standing where it is, with its life (10 bytes).
+    pub const MONSTER_STANDING: u8 = 0x6D;
+    /// A unit's active states, bit-packed (variable; total length at `+6`).
+    pub const UNIT_STATES: u8 = 0xAA;
+    /// A monster or NPC: class, position, life, then a bit-packed look (variable; total length
+    /// at `+12`).
+    pub const ASSIGN_MONSTER: u8 = 0xAC;
     /// Sent after the player is placed; the engine fills only the opcode (5 bytes).
     pub const PLAYER_PLACED: u8 = 0x7E;
     /// Reply to the client's ping (33 bytes, all zero past the opcode).
@@ -510,6 +519,11 @@ impl BitWriter {
         Self { bytes: vec![0; len], bit: 0 }
     }
 
+    /// Whole bytes touched, as `0x00410E90` counts them.
+    fn bytes_used(&self) -> usize {
+        self.bit.div_ceil(8)
+    }
+
     fn put(&mut self, value: u32, bits: u32) -> &mut Self {
         for i in 0..bits {
             if value >> i & 1 != 0 {
@@ -537,6 +551,70 @@ pub fn life_and_position(life: u16, mana: u16, stamina: u16, x: u16, y: u16, dx:
         .put(u32::from(dx as u8), 8)
         .put(u32::from(dy as u8), 8);
     w.bytes
+}
+
+/// `0x51`: `[unit type u8][guid u32][class u16][x u16][y u16][mode u8][interaction u8]` (builder
+/// `0x0053BD10`, from `SendUnitToClient` with type 2 and the object data's byte `+4`).
+#[must_use]
+pub fn assign_object(guid: u32, class: u16, x: u16, y: u16, mode: u8, interaction: u8) -> Vec<u8> {
+    let mut w = Writer::with_capacity(14);
+    w.u8(sc::ASSIGN_OBJECT).u8(2).u32(guid).u16(class).u16(x).u16(y).u8(mode).u8(interaction);
+    w.finish()
+}
+
+/// Bits a graphics component's value takes in `0xAC`: one below three variants, else enough for
+/// `variants - 1` (`0x0053E2E0`, and the client's `0x0045F190` reads it the same way).
+#[must_use]
+pub fn component_bits(variants: u8) -> u32 {
+    if variants < 3 {
+        1
+    } else {
+        u8::BITS - (variants - 1).leading_zeros()
+    }
+}
+
+/// `0xAC` for a plain monster or NPC (builder `0x0053E2E0`): `[guid u32][class u16][x u16][y u16]
+/// [life u8][total length u8]`, then Fog bits — the unit mode in 4 (the engine sends modes 0, 8,
+/// 9 and 12 as they are and anything else as 1), a flag and the 16 graphics components when any
+/// is non-zero, each in [`component_bits`] of its class's variant count, then three clear flags:
+/// no champion/unique block, no owner, no stats. `life` is 128ths of full (`0x80` at full).
+#[must_use]
+#[allow(clippy::too_many_arguments)] // the packet's own fields
+pub fn assign_monster(guid: u32, class: u16, x: u16, y: u16, life: u8, mode: u8, components: &[u8; 16], variants: &[u8; 16]) -> Vec<u8> {
+    let mut bits = BitWriter::with_bytes(0xF4);
+    bits.put(u32::from(if matches!(mode, 0 | 8 | 9 | 12) { mode } else { 1 }), 4);
+    if components.iter().any(|&c| c != 0) {
+        bits.put(1, 1);
+        for (&value, &count) in components.iter().zip(variants) {
+            bits.put(u32::from(value), component_bits(count));
+        }
+    } else {
+        bits.put(0, 1);
+    }
+    bits.put(0, 1).put(0, 1).put(0, 1);
+    let body = &bits.bytes[..bits.bytes_used()];
+    let mut w = Writer::with_capacity(13 + body.len());
+    w.u8(sc::ASSIGN_MONSTER).u32(guid).u16(class).u16(x).u16(y).u8(life).u8((13 + body.len()) as u8).bytes(body);
+    w.finish()
+}
+
+/// `0xAA` for a unit with no states set (`0x00570E30`): `[unit type u8][guid u32][total length
+/// u8]` and the state list's terminator, `0xFF` in 8 bits. `SendUnitToClient` sends one after
+/// every monster.
+#[must_use]
+pub fn no_unit_states(unit_type: u8, guid: u32) -> Vec<u8> {
+    let mut w = Writer::with_capacity(8);
+    w.u8(sc::UNIT_STATES).u8(unit_type).u32(guid).u8(8).u8(0xFF);
+    w.finish()
+}
+
+/// `0x6D`: `[guid u32][x u16][y u16][life u8]` (builder `0x0053BB70`) — what `0x00597E20` sends
+/// for a monster in its neutral mode, standing still.
+#[must_use]
+pub fn monster_standing(guid: u32, x: u16, y: u16, life: u8) -> Vec<u8> {
+    let mut w = Writer::with_capacity(10);
+    w.u8(sc::MONSTER_STANDING).u32(guid).u16(x).u16(y).u8(life);
+    w.finish()
 }
 
 /// `0x59`: `[guid u32][class u8][name 16][x u16][y u16]` (builder `0x0053E8F0`).
@@ -738,6 +816,36 @@ mod tests {
     /// Read `bits` bits LSB-first starting at bit `from`.
     fn bits_at(p: &[u8], from: usize, bits: usize) -> u32 {
         (0..bits).fold(0, |v, i| v | u32::from(p[(from + i) / 8] >> ((from + i) % 8) & 1) << i)
+    }
+
+    #[test]
+    fn units_are_packed_as_the_engine_builds_them() {
+        assert_eq!(assign_object(3, 267, 5806, 4444, 0, 0), vec![0x51, 2, 3, 0, 0, 0, 0x0B, 0x01, 0xAE, 0x16, 0x5C, 0x11, 0, 0]);
+        assert_eq!(no_unit_states(1, 9), vec![0xAA, 1, 9, 0, 0, 0, 8, 0xFF]);
+        assert_eq!(monster_standing(9, 1, 2, 0x80), vec![0x6D, 9, 0, 0, 0, 1, 0, 2, 0, 0x80]);
+        assert_eq!((component_bits(0), component_bits(2), component_bits(3), component_bits(4), component_bits(5)), (1, 1, 2, 2, 3));
+
+        // Standing, no components: mode 1 then four clear flags — one byte.
+        let plain = assign_monster(7, 148, 5872, 4421, 0x80, 1, &[0; 16], &[1; 16]);
+        assert_eq!(plain, vec![0xAC, 7, 0, 0, 0, 148, 0, 0xF0, 0x16, 0x45, 0x11, 0x80, 14, 0x01]);
+        assert_eq!(assign_monster(7, 148, 0, 0, 0x80, 2, &[0; 16], &[1; 16])[13], 0x01, "walking is sent as neutral");
+        assert_eq!(assign_monster(7, 148, 0, 0, 0x80, 12, &[0; 16], &[1; 16])[13], 0x0C, "dead stays dead");
+
+        // A rogue with the second bow: components flagged, 16 values at their widths.
+        let mut components = [0u8; 16];
+        components[6] = 1;
+        let mut variants = [1u8; 16];
+        variants[6] = 2;
+        variants[8] = 5;
+        let p = assign_monster(7, 152, 0, 0, 0x80, 1, &components, &variants);
+        let body_bits: usize = 4 + 1 + 15 + 3 + 3;
+        assert_eq!(usize::from(p[12]), p.len());
+        assert_eq!(p.len(), 13 + body_bits.div_ceil(8));
+        assert_eq!(bits_at(&p, 104, 4), 1);
+        assert_eq!(bits_at(&p, 108, 1), 1, "components follow");
+        assert_eq!(bits_at(&p, 109 + 6, 1), 1, "LH, one bit");
+        assert_eq!(bits_at(&p, 109 + 8, 3), 0, "S1 takes three bits");
+        assert_eq!(bits_at(&p, 109 + 18, 3), 0, "no type flags, owner or stats");
     }
 
     #[test]

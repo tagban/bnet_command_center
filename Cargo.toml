@@ -12,6 +12,7 @@ members = [
     "crates/d2-formats",
     "crates/d2-data",
     "crates/d2-drlg",
+    "crates/d2-game",
 ]
 
 [workspace.package]

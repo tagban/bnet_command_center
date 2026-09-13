@@ -106,12 +106,17 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
 
 1. Select a character and **Create Game** (Normal). *Expect:* the client loads into the Rogue
    Encampment, beside the campfire. *Before:* "Server Down". (Verified 2026-09-13.)
-2. *Expect nothing else to work.* The server sends the join up to "load complete" and then
-   only answers pings: life/mana/stamina show (level-1 values from `charstats.txt`, when
-   `data_dir` holds the MPQs), but no NPCs or lit campfire, and the character walks only
-   on its own screen (the walk requests are logged). Past the town edge is black: nothing
-   tells the client to load those rooms. Esc → Save and Exit returns to chat (verified).
-3. Send the log from the moment you clicked Create Game.
+2. *Expect, around the campfire* (the 3×3 rooms around the spawn, when `data_dir` holds the
+   MPQs): Warriv beside you, Kashya, Akara, Charsi, Gheed and five rogue guards standing still;
+   the torches lit, the bonfire, the stash and the waypoint (active, blue). Hovering an NPC
+   or the stash may show its name; clicking does nothing. Chickens wander as before — the
+   client spawns those itself.
+3. *Expect nothing else to work.* After "load complete" the server only answers pings:
+   life/mana/stamina show (level-1 values from `charstats.txt`), NPCs never walk, the
+   character walks only on its own screen (the walk requests are logged), and anything two
+   rooms or more from the spawn — the cows, NPCs out of sight — is never sent. Past the town
+   edge is black. Esc → Save and Exit returns to chat (verified).
+4. Send the log from the moment you clicked Create Game.
 
 What it shows, in order:
 
@@ -123,14 +128,16 @@ D2GS packet in op=0x68 …  /  GAMELOGON …       the client's logon, every fie
 D2GS packets out packets=01… 00                GameFlags + loading
 D2GS packets out packets=02                    load success
 D2GS packet in op=0x6b                         ENTERGAME: the client accepted our compression
-D2GS packets out packets=59… 0b… 23… 23… 03… 53… 07… 15… 7e…   player, act, room, placement
+D2GS packets out packets=59… 0b… 23… 23… 03… 53… 07… 07… 51… ac… aa… 6d… 15… 7e…
+                                               player, act, rooms and their units, placement
 D2GS packets out packets=04                    load complete
 D2GS packet in op=…                            whatever the client asks for next
 ```
 
 The last lines are the point: how far down this list the client gets, and what it sends after
 `04`. No `0x6b` means it did not accept the first frames; a disconnect right after a
-`packets out` line names the packet it rejected.
+`packets out` line names the packet it rejected. `Rogue Encampment built` at start-up and
+`room_packets=…` on the join line say the town was sent; without them the MPQs did not load.
 
 ## 3. How it fits together
 

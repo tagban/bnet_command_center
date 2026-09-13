@@ -1,0 +1,18 @@
+[package]
+name = "d2-game"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Diablo II game runtime: the units a game holds, as the 1.14d engine creates them"
+
+[dependencies]
+d2-data = { path = "../d2-data" }
+d2-drlg = { path = "../d2-drlg" }
+
+[dev-dependencies]
+d2-formats = { path = "../d2-formats" }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

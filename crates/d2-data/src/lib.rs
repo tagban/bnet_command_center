@@ -16,10 +16,12 @@ use d2_formats::mpq::{self, ArchiveSet, DATA_ARCHIVES};
 
 pub mod engine;
 pub mod levels;
+pub mod monsters;
 pub mod presets;
 pub mod stat;
 
 use levels::Levels;
+use monsters::Monsters;
 use presets::{LvlPrests, MonPresets, Objects};
 
 /// Classes in `charstats.txt` order, which is the engine's class id.
@@ -86,6 +88,7 @@ pub struct GameData {
     levels: Levels,
     lvl_prests: LvlPrests,
     mon_presets: MonPresets,
+    monsters: Monsters,
     objects: Objects,
     /// The install's archives, kept open for map files; `None` when built from tables.
     archives: Option<Arc<ArchiveSet>>,
@@ -108,12 +111,10 @@ impl GameData {
         let mut data = Self::from_tables(&read("charstats.txt")?, &read("experience.txt")?)?;
         data.levels = Levels::from_table(&read("levels.txt")?)?;
         data.lvl_prests = LvlPrests::from_table(&read("lvlprest.txt")?)?;
-        data.mon_presets = MonPresets::from_tables(
-            &read("monpreset.txt")?,
-            &read("monstats.txt")?,
-            &read("superuniques.txt")?,
-            &read("monplace.txt")?,
-        )?;
+        let monstats = read("monstats.txt")?;
+        data.mon_presets =
+            MonPresets::from_tables(&read("monpreset.txt")?, &monstats, &read("superuniques.txt")?, &read("monplace.txt")?)?;
+        data.monsters = Monsters::from_tables(&monstats, &read("monstats2.txt")?)?;
         data.objects = Objects::from_table(&read("objects.txt")?);
         data.archives = Some(Arc::new(archives));
         Ok(data)
@@ -148,6 +149,19 @@ impl GameData {
     #[must_use]
     pub fn objects(&self) -> &Objects {
         &self.objects
+    }
+
+    /// `MonStats.txt` joined to `MonStats2.txt`.
+    #[must_use]
+    pub fn monsters(&self) -> &Monsters {
+        &self.monsters
+    }
+
+    /// Replace the map tables — for building rules from tables in tests.
+    pub fn set_map_tables(&mut self, mon_presets: MonPresets, monsters: Monsters, objects: Objects) {
+        self.mon_presets = mon_presets;
+        self.monsters = monsters;
+        self.objects = objects;
     }
 
     /// Build from already-parsed tables.
@@ -204,6 +218,7 @@ impl GameData {
             levels: Levels::default(),
             lvl_prests: LvlPrests::default(),
             mon_presets: MonPresets::default(),
+            monsters: Monsters::default(),
             objects: Objects::default(),
             archives: None,
         })
@@ -322,6 +337,12 @@ mod tests {
         assert_eq!((town.act, town.drlg_type), (0, levels::DrlgType::Preset));
         assert_eq!(data.lvl_prests().for_level(1).unwrap().files.len(), 4, "TownN1/E1/S1/W1");
         assert!(matches!(data.mon_presets().get(0, 2), Some(presets::PresetMonster::Class { name, .. }) if name == "akara"));
+        let chicken = data.monsters().get(149).expect("chicken");
+        assert_eq!((chicken.id.as_str(), chicken.critter), ("chicken", true));
+        let rogue = data.monsters().get(152).expect("rogue1");
+        assert_eq!((rogue.critter, rogue.components[6]), (false, 2), "a town rogue carries one of two bows");
+        let torch = data.objects().get(37).expect("objects.txt row 37");
+        assert_eq!(torch.init_fn, 8);
         assert!(data.read_file("data\\global\\tiles\\Act1\\Town\\TownN1.ds1").unwrap().is_some());
     }
 }

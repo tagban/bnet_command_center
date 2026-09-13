@@ -214,7 +214,9 @@ dependencies = [
  "bnetcc-storage-sqlite",
  "clap",
  "d2-data",
+ "d2-drlg",
  "d2-formats",
+ "d2-game",
  "rand",
  "rcgen",
  "rustls",
@@ -347,6 +349,15 @@ dependencies = [
 [[package]]
 name = "d2-formats"
 version = "0.2.3"
+
+[[package]]
+name = "d2-game"
+version = "0.2.3"
+dependencies = [
+ "d2-data",
+ "d2-drlg",
+ "d2-formats",
+]
 
 [[package]]
 name = "deranged"
