@@ -122,6 +122,9 @@ pub mod cs {
     pub const RUN_TO_UNIT: u8 = 0x04;
     /// Interact with a unit: `[type u32][guid u32]` (9 bytes).
     pub const INTERACT: u8 = 0x13;
+    /// Travel by waypoint: `[waypoint guid u32][level u16][u16]` (9 bytes; engine handler
+    /// `0x0054C5D0`).
+    pub const WAYPOINT_TRAVEL: u8 = 0x49;
     /// Where the client has its player: `[x u16][y u16]` (5 bytes; engine handler
     /// `0x0054CD50` re-syncs the server's unit to it).
     pub const UPDATE_POSITION: u8 = 0x5F;

@@ -28,7 +28,7 @@ use d2_drlg::act::Act;
 use d2_drlg::preset::PresetLevel;
 use d2_drlg::world::{RoomId, World};
 use d2_game::clock::ActClock;
-use d2_game::population::{unit_type, waypoint_spawn, Population, Spawned};
+use d2_game::population::{unit_type, waypoint_spawn, Population, Spawned, SUBCLASS_WAYPOINT};
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -448,6 +448,38 @@ impl GameServer {
         }
     }
 
+    /// Where waypoint travel from waypoint `guid` to `level` puts the player (`0x0054C5D0` →
+    /// `0x00584F60`): the waypoint must be one (`OperateFn` 23), the level another one the player
+    /// has learned, in Act I and in the world; the player lands on that level's waypoint tile at
+    /// subtile (3, 3) (`0x0061B060`, as at the start). The engine's ten-second guard and the
+    /// search for a free spot are not ported.
+    fn waypoint_travel(&self, game_id: u16, guid: u32, level: i32, learned: &[u8; d2gs::WAYPOINT_FLAG_BYTES]) -> Option<(u16, u16)> {
+        let rules = self.rules.as_ref()?;
+        let g = self.lock();
+        let game = g.by_id.get(&game_id)?;
+        let (room, unit) = game.population.as_ref()?.find(unit_type::OBJECT, guid)?;
+        let Spawned::Object { class, .. } = *unit else { return None };
+        if rules.objects().get(i32::from(class))?.operate_fn != 23 || room.level == level || level == 0 {
+            return None;
+        }
+        let def = rules.levels().get(level).filter(|d| d.act == 0)?;
+        let bit = def.waypoint?;
+        if learned.get(usize::from(bit / 8))? & (1 << (bit % 8)) == 0 {
+            return None;
+        }
+        let world = game.world.as_ref()?;
+        let target = world.levels().iter().find(|l| l.id == level)?;
+        target.units.iter().find_map(|u| match u.class {
+            d2_drlg::preset::UnitClass::Object(class)
+                if class <= 0x23C && rules.objects().get(class).is_some_and(|o| o.sub_class & SUBCLASS_WAYPOINT != 0) =>
+            {
+                let at = |v: i32| u16::try_from(v.div_euclid(5) * 5 + 3).ok();
+                Some((at(u.x)?, at(u.y)?))
+            }
+            _ => None,
+        })
+    }
+
     /// What a client is sent when its player's near rooms change from `from` to `to`, in the
     /// engine's order (`0x00537B50`): each room that came near as its `0x07` and the packets
     /// `SendUnitToClient` sends for its units (`0x0053A8E0`) — populating rooms nobody has been
@@ -740,6 +772,27 @@ async fn run(
                         flush(stream, peer, tables, &mut outbox).await?;
                     }
                 }
+                (Stage::InGame, cs::WAYPOINT_TRAVEL) => {
+                    let (Some(w), Some(p)) = (walker.as_mut(), player.as_ref()) else { continue };
+                    let level = i32::from(u16_at(5));
+                    let Some((x, y)) = server.waypoint_travel(p.game_id, u32_at(1), level, &waypoints) else {
+                        debug!(%peer, level, "waypoint travel refused");
+                        continue;
+                    };
+                    let Some((room, near)) = server.near(p.game_id, f64::from(x), f64::from(y)) else { continue };
+                    info!(%peer, level, x, y, "waypoint travel");
+                    // 0x00554EA0: the room landed in, then the room stream, then 0x15 flagged as a warp.
+                    let own = server.lock().by_id.get(&p.game_id).and_then(|g| g.world.as_ref()?.room(room));
+                    if let Some(r) = own {
+                        outbox.push(&d2gs::load_room(r.x as u16, r.y as u16, room.level as u8));
+                    }
+                    for packet in server.view_change(p.game_id, &w.view, &near) {
+                        outbox.push(&packet);
+                    }
+                    outbox.push(&d2gs::reassign_player(0, PLAYER_GUID, x, y, 1));
+                    (w.x, w.y, w.target, w.room, w.view) = (f64::from(x), f64::from(y), None, Some(room), near);
+                    flush(stream, peer, tables, &mut outbox).await?;
+                }
                 (Stage::InGame, cs::UPDATE_POSITION) => {
                     // The client's own idea of where its player is (engine `0x0054CD50` re-syncs to
                     // it): take it, and let the next frame follow it with rooms.
@@ -959,6 +1012,7 @@ pub(crate) mod tests {
         client[usize::from(cs::WALK_TO_UNIT)] = 9;
         client[usize::from(cs::RUN_TO_UNIT)] = 9;
         client[usize::from(cs::INTERACT)] = 9;
+        client[usize::from(cs::WAYPOINT_TRAVEL)] = 9;
         client[usize::from(cs::UPDATE_POSITION)] = 5;
         EngineTables::new(&lengths, client, [0i32; SERVER_OPCODES]).unwrap()
     }
@@ -1297,7 +1351,8 @@ pub(crate) mod tests {
     }
 
     /// A waypoint out in the wilderness starts inactive: the first click learns it and turns it
-    /// on (`0E`, mode 1), the next opens the menu with its level ticked.
+    /// on (`0E`, mode 1), the next opens the menu with its level ticked, from which the camp's
+    /// waypoint can be travelled to.
     #[test]
     fn a_wild_waypoint_turns_on_before_it_opens_its_menu() {
         use d2_drlg::preset::{PlacedUnit, UnitClass};
@@ -1323,6 +1378,10 @@ pub(crate) mod tests {
         assert_eq!(gs.interact(id, 2, 1, &mut learned), vec![d2gs::object_state(1, true, 1)]);
         assert_eq!(learned[0], 0b11, "the camp's and Cold Plains' bits");
         assert_eq!(gs.interact(id, 2, 1, &mut learned), vec![d2gs::waypoint_menu(1, &learned)]);
+        assert_eq!(gs.waypoint_travel(id, 1, 1, &learned), Some((5808, 4448)), "to the camp's waypoint tile, at (3, 3)");
+        assert_eq!(gs.waypoint_travel(id, 1, 3, &learned), None, "already there");
+        assert_eq!(gs.waypoint_travel(id, 1, 1, &[0; d2gs::WAYPOINT_FLAG_BYTES]), None, "not learned");
+        assert_eq!(gs.waypoint_travel(id, 9, 1, &learned), None, "no such waypoint");
         assert_eq!(gs.view_change(id, &[room], &[]), vec![d2gs::remove_unit(2, 1), d2gs::unload_room(1152, 896, 3)]);
     }
 
