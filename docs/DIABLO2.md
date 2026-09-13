@@ -6,7 +6,7 @@ real client.
 | Button in the client | What it is | Status |
 |---|---|---|
 | **Open Battle.net** | BNCS login + chat; characters live on the player's PC; games are peer-to-peer | Login and chat work through the same path as StarCraft |
-| **Battle.net** (closed realm) | BNCS login, then a *realm* connection (MCP) for server-side characters | **Characters: implemented, awaiting a real-client test.** Games: need a game server — not yet |
+| **Battle.net** (closed realm) | BNCS login, then a *realm* connection (MCP) for server-side characters | **Characters: verified with a real LoD 1.14d client (2026-09-13).** Games: need a game server — not yet |
 
 ---
 
@@ -33,6 +33,24 @@ Rules the realm enforces:
   make expansion characters**; LoD sees both and can upgrade classic characters.
 - A character belongs to one account: nobody else can list, select, delete, or chat as it.
 - Up to `diablo2.max_characters` per account (default 18).
+
+### Verified against a real client
+
+A retail Diablo II: LoD 1.14d client (Windows, version byte `0x0E`) on 2026-09-13: created an
+account, logged on to the realm, created a ladder expansion Barbarian, entered chat as
+`TestBan*TestRep`, joined channels and talked, and returned to character select. Observed on the
+wire, worth knowing:
+
+- **Creating a character goes straight into the realm** — the client sends `MCP_MOTD` and then
+  `SID_ENTERCHAT` for the new character with **no `MCP_CHARLOGON`**. Anything that must happen
+  "when a character is selected" cannot hang off `MCP_CHARLOGON` alone.
+- After `SID_ENTERCHAT` the client sends `SID_GETCHANNELLIST` (before it), `SID_NEWS_INFO`,
+  `SID_CHECKAD` every 15 s, and `SID_JOINCHANNEL "Diablo II"`. Leaving to character select is
+  `SID_LEAVECHAT` → `SID_QUERYREALMS2` → `MCP_CHARLIST2` on the still-open realm connection.
+- **Account creation needs `tos-unicode_USA.txt`** in the BNFTP files directory (a copy of
+  `tos_USA.txt` is fine). Without it the client disconnects when "Create Account" opens.
+- Ticking **Ladder** makes the client show its own ladder notice before sending
+  `MCP_CHARCREATE` with status `0x60` — not a server error.
 
 ## 2. Testing from Windows
 
