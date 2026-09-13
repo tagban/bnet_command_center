@@ -39,6 +39,10 @@ walls. libd2's `drlg` already does; porting it faithfully inherits that.
    which libd2 has not yet checked against a live server, get checked. Needs the macOS 1.14d binary.
 3. **Your retail 1.14d Windows client** — the final judge of every milestone.
 
+Where libd2 and the binary disagree, the binary wins. `docs/D2GS-114D-WIRE.md` records what was
+read directly from the 1.14d `Game.exe` — framing and compression (we send `AF 01` and compress,
+as Blizzard's servers did), the join state machine, and the two libd2 files not to port as-is.
+
 ## 3. Shape
 
 ```
