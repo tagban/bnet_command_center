@@ -86,7 +86,9 @@ Milestone 2 so far (2026-09-13, branch `d2-step2-drlg`): act layouts match libd2
 (402 levels); the Rogue Encampment's map, rooms and preset units match libd2's engine dump of its
 objects; `d2-game` populates rooms as the engine does and the handshake test sends the 3×3 rooms
 around the spawn with their objects and NPCs (`docs/D2GS-114D-WIRE.md` §5, *Town units*).
-Outdoor levels (mazes, wilderness) and movement are next.
+Movement streams rooms across levels; the Act I wilderness generator runs as far as the room
+set, which matches libd2's recordings for 2,800 levels (§5, *Walking and loading rooms*). The
+rest of the wilderness (roads, shrines, set pieces), mazes and the other acts are next.
 | 3 | `d2-net` + a minimal `GameInstance` in `bnetccd`: create/join from the realm, **your character standing in the Rogue Encampment, a second player visible** | ROADMAP Phase 5 step 1 — the client accepts our packets |
 | 4 | Movement, warps between levels, save on leave into `characters.save` | a character that persists |
 | 5 | Monsters, combat, skills, items, loot — then quests — each diffed against the real-engine harness | the game |

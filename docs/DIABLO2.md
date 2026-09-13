@@ -108,6 +108,7 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
    Encampment, standing on the waypoint. *Before:* "Server Down". (Verified 2026-09-13.)
    Each game has its own map seed, so the camp's layout — and the side its exit is on —
    changes from game to game (with the MPQs; without them every game is the same camp).
+   (Verified 2026-09-13.)
 2. *Expect, around the waypoint* (the 3×3 rooms around it, when `data_dir` holds the MPQs):
    the NPCs and objects nearby standing still — in the camp tagban tested, Warriv, Kashya, Akara,
    Charsi, Gheed and five rogue guards — the torches lit, the bonfire, the stash and the
@@ -121,9 +122,10 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
 3. *Expect walking to load the world:* the server follows your character, so NPCs and
    objects further from the waypoint appear as you approach, and walking out of the camp
    shows Blood Moor's ground as you go (`player entered a level level=2` in the log), on to
-   Cold Plains, Stony Field and Dark Wood. The outer edge of each wilderness area stays black
-   (the cliffs and borders are not sent yet), so are Black Marsh and Tamoe Highland, and the
-   areas are empty — no monsters, shrines or cave entrances. Walking through a fence can make
+   Cold Plains, Stony Field, Dark Wood, Black Marsh and Tamoe Highland, cliffs and borders
+   included up to the black beyond them. The areas are empty — the ground, cliffs and set
+   pieces show, but no monsters, shrines, waypoints or other objects, and cave entrances do
+   not lead anywhere. Walking through a fence can make
    the server think you are somewhere you are not (it has no collision).
 4. *Expect nothing else to work:* life/mana/stamina show (level-1 values from
    `charstats.txt`), NPCs never walk, there is no combat, no shop and no travel. Esc → Save
