@@ -1412,6 +1412,33 @@ pub(crate) mod tests {
         assert!(maps.len() > 1, "32 games, one camp: {maps:?}");
     }
 
+    /// With the operator's install: in every game the Cold Plains waypoint room sends its waypoint,
+    /// inactive, when it loads.
+    #[test]
+    fn with_a_real_install_the_cold_plains_waypoint_is_sent_with_its_room() {
+        let Ok(dir) = std::env::var("BNETCC_D2_DATA_DIR") else {
+            return;
+        };
+        let engine = EngineData::from_game_exe(&std::fs::read(Path::new(&dir).join("Game.exe")).unwrap()).unwrap();
+        let gs = GameServer::new(test_tables(), Some(GameData::load(&dir).unwrap())).with_engine(engine);
+        for i in 0..8 {
+            let id = gs.create(&format!("plains {i}"), "", 0).unwrap();
+            let (room, unit) = {
+                let g = gs.lock();
+                let world = g.by_id[&id].world.as_ref().unwrap();
+                assert!(world.unbuilt().is_empty(), "{:?}", world.unbuilt());
+                let plains = world.levels().iter().find(|l| l.id == 3).unwrap();
+                let unit = plains.units.iter().find(|u| matches!(u.class, d2_drlg::preset::UnitClass::Object(119))).cloned().unwrap();
+                (world.room_at(unit.x, unit.y).unwrap(), unit)
+            };
+            let packets = gs.view_change(id, &[], &[room]);
+            assert!(
+                packets.iter().any(|p| p[0] == 0x51 && p[6..8] == 119u16.to_le_bytes() && p[8..10] == (unit.x as u16).to_le_bytes() && p[12] == 0),
+                "game {i}: {packets:02x?}"
+            );
+        }
+    }
+
     /// With the operator's install: walking from the waypoint to the middle of Blood Moor, the
     /// server loads Blood Moor's rooms along the way, and every room it drops it had loaded.
     #[test]

@@ -400,6 +400,47 @@ change sends exactly the packets above — except that a room is dropped only on
 away (gap under 14), because the straight-line player can run ahead of the client's. Blood Moor's
 monsters, objects and warps are not generated.
 
+### Wilderness rooms, waypoints and shrines (2026-09-13)
+
+**Room seeds.** `DRLGOUTDOOR_CreateOutdoorRoomExGrid` (`0x6750F0`) walks the cells row by row;
+each room takes the level seed stepped once, and its own state is `{that low, 0x29A}` stepped once
+(`DRLGROOM_AllocRoomEx`, `0x66B3F0`), `nSeed` being its low word. A plain room then rolls its
+terrain picks on that state (`DRLGROOMEX_RollLevelSubstitutionMask`: a percent roll per row of the
+level's `SubType` group against `Prob[SubTheme]`). A piece's anchor cell first draws a map file
+from the level seed (`DRLGPRESET_AllocDrlgMap`; the cell's file index replaces it), reads the map's
+units if `LvlPrest.txt` `Scan` or `Pops` is set and rolls for some of them
+(`DRLGPRESET_AddPresetUnitToDrlgMap`: monster classes `0xCC`/`0xCD`/`0x173`/`0x174` keep on `%3 == 0`,
+placements `0x21..0x23` past the `MonStats` rows on `&3`/`&1`/`&3`, objects `0xC4`/`0x105` on even,
+`0x245` on `&3 != 0`; units walked newest first), then cuts the piece into 8×8 rooms, one level-seed
+step each. `d2_drlg::outdoor` reproduces all 1,739 rooms of libd2's 21 recorded Normal Act I
+wilderness levels — seed, terrain picks, piece and link flags.
+
+**What a room's init places** (`DRLGOUTROOM_InitGridCells`, `0x67D2D0`). The room's seed restarts
+at `{nSeed, 0x29A}`. A 9×9 floor grid gets `0x40002` on its 8×8; in Act I the level's roads —
+`pAdjacentVertices`, the jittered road vertices of `0x681240` (the target's outer point, the snapped
+target, each path cell nudged 2–3 tiles in a turning direction, the snapped start, the exit) — are
+drawn two tiles wide into an edge grid one tile larger on each side (`0x680A70`) and every edge
+cell's floor becomes `(orientation << 8) | 0x82` by its 8-neighbour mask (`0x680B10`, table
+`0x6F2700`). Then `SubTypeWpShrine` (`0x6707A0`) runs for the waypoint (`Levels.txt` `SubWaypoint`,
+rows by the room flags `>> 16 & 3`), the shrine (`SubShrine`, `>> 12 & 0xF`) and the terrain: each
+picked row with `CheckAll` 0 goes to `DoNotCheckAll` (`0x670170`) — `Max` times, a random group of
+the row's map, then (for `Trials` -1) every position `1..=8 - size` in a shuffle, placed at the
+first where `CheckSubTileOverlap` (`0x66FCF0`) finds plain floor (`& 2`, nothing in `0x3F0FF00`) and
+no wall under the group's floor or wall tiles. `ApplyLvlSubTileData` (`0x66FAD0`) stamps the floor
+(`| 0x80`) and walls, spawns shadow tiles (tile-library rolls on the room seed), and last copies the
+map's units strictly inside the group's box (`0x66FA10`) into the room at `base * 5 + (unit - box
+* 5)` subtiles (`0x66BF30`: unit `+0` type, `+4` class, `+8` x, `+0x14` mode, `+0x18` y). The
+test runs the waypoint and shrine passes: each Act I waypoint room gets a waypoint (objects row 119;
+the large pad's two torches, row 37), and Cold Plains' small pad lines up with the preset marks
+(`0x10`) in libd2's engine collision recording. Shrines (`InitFn` 1, a `Shrines.txt` roll) are
+placed but not spawned; the terrain pass (decoration, and its rolls) is not ported.
+
+**Turning a waypoint on.** `OperateFn` 23 (`0x584E30`) on a mode-0 waypoint sets mode 1
+(`0x624690`), which flags the unit for update; the update pass (`0x581AD0` → `0x581A20`) sends
+**`0x0E`** (12) `[2][guid u32][3][selectable u8 = unit flags bit 1][mode u32]` (`0x53B470`). The
+player learns the waypoint either way; only an active one (mode 1 or 2) answers with the menu. The
+test does the same.
+
 ### Talking, the stash and the waypoint (2026-09-13)
 
 `0x13` `[type u32][guid u32]` (handler `0x54AA90`, type ≤ 5) goes to `0x548B00`:
@@ -470,9 +511,9 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
 - Shops: `0x38` trade/gamble/repair and the store's items; hirelings; NPC quest messages.
 - Waypoint travel (`0x49`), which needs warps and other acts.
 - Movement: paths and collision (`0x64DEA0`, libd2 `path.zig`/`collision.zig`) in place of
-  straight lines; cross-level near rooms by visibility slots (`0x66C220`); wilderness room
-  creation (room seeds, piece files) and room init, for the waypoint, shrine and set-piece objects,
-  then Blood Moor's monsters and warps; NPC AI walking their DS1 paths (`0x666120`).
+  straight lines; cross-level near rooms by visibility slots (`0x66C220`); shrine init (`InitFn`
+  1) and the set pieces' map units (read at room init, not ported), then Blood Moor's monsters and
+  warps; NPC AI walking their DS1 paths (`0x666120`).
 - The byte at `0x68`+20 and the `0x6A`/`0x6C`/`0x6E` handlers.
 - A packet capture from the real engine (`docs/D2GS-RUST.md` §2 oracle) would confirm the dump
   faster than reading it; §4 and §6 say where to look in that capture.

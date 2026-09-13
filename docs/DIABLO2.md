@@ -123,9 +123,11 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
    objects further from the waypoint appear as you approach, and walking out of the camp
    shows Blood Moor's ground as you go (`player entered a level level=2` in the log), on to
    Cold Plains, Stony Field, Dark Wood, Black Marsh and Tamoe Highland, cliffs and borders
-   included up to the black beyond them. The areas are empty — the ground, cliffs and set
-   pieces show, but no monsters, shrines, waypoints or other objects, and cave entrances do
-   not lead anywhere. Walking through a fence can make
+   included up to the black beyond them. Cold Plains, Stony Field, Dark Wood and Black Marsh
+   have their waypoint standing on its pad (the big pads with two lit torches), dark: clicking
+   it turns it on, and clicking again opens the menu with that area ticked (travel does
+   nothing yet). Otherwise the areas are empty — no monsters, shrines or other objects, and
+   cave entrances do not lead anywhere. Walking through a fence can make
    the server think you are somewhere you are not (it has no collision).
 4. *Expect nothing else to work:* life/mana/stamina show (level-1 values from
    `charstats.txt`), NPCs never walk, there is no combat, no shop and no travel. Esc → Save
