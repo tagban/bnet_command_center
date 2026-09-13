@@ -234,6 +234,10 @@ pub struct ObjectClass {
     /// `SubClass` bits (record `+0x167`), e.g. 0x04 portals (`SendUnitToClient` adds `0x60`),
     /// 0x40 waypoints (the town spawn search looks for one).
     pub sub_class: u8,
+    /// `Parm0`: the class's `InitFn` argument (record `+0x178`), e.g. a shrine's kind.
+    pub parm0: i32,
+    /// `Parm2` (record `+0x180`), e.g. a well's refill.
+    pub parm2: i32,
 }
 
 impl Objects {
@@ -248,6 +252,8 @@ impl Objects {
                 operate_fn: r.int("OperateFn").and_then(|v| u8::try_from(v).ok()).unwrap_or(0),
                 pre_operate: r.int("PreOperate").unwrap_or(0) != 0,
                 sub_class: r.int("SubClass").and_then(|v| u8::try_from(v).ok()).unwrap_or(0),
+                parm0: r.int("Parm0").unwrap_or(0) as i32,
+                parm2: r.int("Parm2").unwrap_or(0) as i32,
             })
             .collect();
         Self { rows }
@@ -263,5 +269,58 @@ impl Objects {
     #[must_use]
     pub fn name(&self, class: i32) -> Option<&str> {
         self.get(class).map(|c| c.name.as_str())
+    }
+}
+
+/// One `Shrines.txt` row: what picking a shrine type reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Shrine {
+    /// `effectclass`: the kind the random pick groups shrines by (1 magic, 2 health, 3 mana,
+    /// 4 boost).
+    pub effect_class: i32,
+    /// `LevelMin`: the lowest level id the shrine may appear in.
+    pub level_min: i32,
+}
+
+/// `Shrines.txt`, by row (the shrine type).
+#[derive(Debug, Clone, Default)]
+pub struct Shrines {
+    rows: Vec<Shrine>,
+}
+
+impl Shrines {
+    /// Parse the table.
+    #[must_use]
+    pub fn from_table(t: &Table) -> Self {
+        let rows = t
+            .rows()
+            .map(|r| Shrine { effect_class: r.int("effectclass").unwrap_or(0) as i32, level_min: r.int("LevelMin").unwrap_or(0) as i32 })
+            .collect();
+        Self { rows }
+    }
+
+    /// Shrine types.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether there are none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// A shrine type.
+    #[must_use]
+    pub fn get(&self, shrine: usize) -> Option<&Shrine> {
+        self.rows.get(shrine)
+    }
+
+    /// The shrine types of an effect class, in table order (`aShrinesRng`, built when the
+    /// object control is made, `0x00546C60`).
+    #[must_use]
+    pub fn of_class(&self, effect_class: i32) -> Vec<usize> {
+        (0..self.rows.len()).filter(|&i| self.rows[i].effect_class == effect_class).collect()
     }
 }

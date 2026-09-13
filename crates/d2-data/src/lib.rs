@@ -24,7 +24,7 @@ pub mod stat;
 use levels::Levels;
 use lvlsub::LvlSubs;
 use monsters::Monsters;
-use presets::{LvlPrests, MonPresets, Objects};
+use presets::{LvlPrests, MonPresets, Objects, Shrines};
 
 /// Classes in `charstats.txt` order, which is the engine's class id.
 pub const CLASSES: [&str; 7] = ["Amazon", "Sorceress", "Necromancer", "Paladin", "Barbarian", "Druid", "Assassin"];
@@ -93,6 +93,7 @@ pub struct GameData {
     mon_presets: MonPresets,
     monsters: Monsters,
     objects: Objects,
+    shrines: Shrines,
     /// The install's archives, kept open for map files; `None` when built from tables.
     archives: Option<Arc<ArchiveSet>>,
 }
@@ -120,6 +121,7 @@ impl GameData {
             MonPresets::from_tables(&read("monpreset.txt")?, &monstats, &read("superuniques.txt")?, &read("monplace.txt")?)?;
         data.monsters = Monsters::from_tables(&monstats, &read("monstats2.txt")?)?;
         data.objects = Objects::from_table(&read("objects.txt")?);
+        data.shrines = Shrines::from_table(&read("shrines.txt")?);
         data.archives = Some(Arc::new(archives));
         Ok(data)
     }
@@ -159,6 +161,17 @@ impl GameData {
     #[must_use]
     pub fn objects(&self) -> &Objects {
         &self.objects
+    }
+
+    /// `Shrines.txt`.
+    #[must_use]
+    pub fn shrines(&self) -> &Shrines {
+        &self.shrines
+    }
+
+    /// Replace the shrine table — for building rules from tables in tests.
+    pub fn set_shrines(&mut self, shrines: Shrines) {
+        self.shrines = shrines;
     }
 
     /// `MonStats.txt` joined to `MonStats2.txt`.
@@ -231,6 +244,7 @@ impl GameData {
             mon_presets: MonPresets::default(),
             monsters: Monsters::default(),
             objects: Objects::default(),
+            shrines: Shrines::default(),
             archives: None,
         })
     }
@@ -366,5 +380,8 @@ mod tests {
         let cliffs = data.lvl_subs().group(0);
         assert_eq!((cliffs.len(), cliffs[0].bord_type, cliffs[0].grid_size), (1, 1, 1));
         assert!(data.lvl_subs().group(4).len() == 2, "two waypoint pieces");
+        assert_eq!(data.objects().get(2).unwrap().parm0, 3, "a shrine: boost or magic");
+        assert_eq!(data.shrines().get(1).map(|s| s.effect_class), Some(4), "Refill is a boost");
+        assert_eq!(data.shrines().of_class(1), (16..=22).collect::<Vec<_>>(), "the magic shrines");
     }
 }

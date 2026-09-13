@@ -99,6 +99,8 @@ pub fn is_town(level_id: i32) -> bool {
 /// - 8 (`0x005500C0`, torches): mode 2, lit.
 /// - 17 (`0x00547210`, waypoints): mode 2 in a town (`0x0061AB00`). The routine first looks for
 ///   a pending activation of this waypoint, which a fresh game does not have.
+/// - 16 (`0x00552B30`, wells): the mode stays 0; the interaction byte is twice `Parm2`
+///   ([`object_interaction`]).
 /// - 54 (`0x005940E0`, Cain's start in the Rogue Encampment): records the spot for his quest;
 ///   the mode stays 0.
 ///
@@ -109,10 +111,20 @@ pub fn object_mode(init_fn: u8, pre_operate: bool, level_id: i32) -> Option<u8> 
         return None;
     }
     match init_fn {
-        0 | 54 => Some(0),
+        0 | 16 | 54 => Some(0),
         8 => Some(2),
         17 => Some(if is_town(level_id) { 2 } else { 0 }),
         _ => None,
+    }
+}
+
+/// The byte `0x51` carries from the object's data (`+4`) after an `InitFn` that sets none by a
+/// roll: twice `Parm2` for a well (16); 0 otherwise.
+#[must_use]
+pub fn object_interaction(init_fn: u8, parm2: i32) -> u8 {
+    match init_fn {
+        16 => (parm2 as u8).wrapping_add(parm2 as u8),
+        _ => 0,
     }
 }
 
@@ -160,6 +172,8 @@ pub struct Activated<'a> {
 pub struct Population {
     /// `game+0xD0`.
     seed: Seed,
+    /// The object control's seed (`game+0x10F0`), which object init routines roll on.
+    control: Seed,
     /// `game+0x90`, by unit type.
     last_guid: [u32; 6],
     /// The rooms populated so far.
@@ -170,7 +184,8 @@ impl Population {
     /// An empty population with the game's random seed.
     #[must_use]
     pub fn new(game_seed: u32) -> Self {
-        Self { seed: Seed::new(game_seed, 0x29A), last_guid: [0; 6], rooms: HashMap::new() }
+        let control = Seed::new(Seed::new(game_seed, 0x29A).roll(), 0x29A);
+        Self { seed: Seed::new(game_seed, 0x29A), control, last_guid: [0; 6], rooms: HashMap::new() }
     }
 
     /// Take the next guid for a unit type (`0x00552EE0`, which skips 0 on wrapping).
@@ -190,6 +205,54 @@ impl Population {
     #[must_use]
     pub fn units(&self, room: RoomId) -> Option<&[Spawned]> {
         self.rooms.get(&room).map(Vec::as_slice)
+    }
+
+    /// `InitFn` 1 (`0x0054F9D0`): a shrine's type, rolled on the object control's seed. `Parm0`
+    /// 0 picks among every type; 1 is a health shrine, 2 a mana shrine, anything else a boost nine
+    /// times in ten and a magic shrine otherwise — each a pick from that effect class
+    /// (`0x0054F770`). Either way up to eight tries for a type allowed this deep (`LevelMin`).
+    /// Types 5, 4 and 16 become 3, 2 and 18.
+    fn roll_shrine(&mut self, data: &GameData, parm0: i32, level_id: i32) -> u8 {
+        let shrines = data.shrines();
+        let too_deep = |shrine: usize| shrines.get(shrine).is_some_and(|s| (level_id as u32) < s.level_min as u32);
+        let mut shrine;
+        if parm0 == 0 {
+            let mut tries = 8;
+            loop {
+                shrine = self.control.pick(shrines.len().saturating_sub(1) as u32) as usize + 1;
+                tries -= 1;
+                if !too_deep(shrine) || tries <= 0 {
+                    break;
+                }
+            }
+        } else {
+            let class = match parm0 {
+                1 => 2,
+                2 => 3,
+                _ => {
+                    if self.control.roll() % 10 != 0 {
+                        4
+                    } else {
+                        1
+                    }
+                }
+            };
+            let bucket = shrines.of_class(class);
+            let mut tries = 8;
+            loop {
+                shrine = bucket.get(self.control.pick(bucket.len() as u32) as usize).copied().unwrap_or(0).max(1);
+                tries -= 1;
+                if !too_deep(shrine) || tries <= 0 {
+                    break;
+                }
+            }
+        }
+        match shrine {
+            5 => 3,
+            4 => 2,
+            16 => 18,
+            other => u8::try_from(other).unwrap_or(0),
+        }
     }
 
     /// A spawned unit by engine unit type and guid, with the room it was spawned in.
@@ -238,12 +301,19 @@ impl Population {
                     &UnitClass::Object(class) if class > 0x23D => {
                         not_ported.push(format!("object {class} at ({x}, {y}): special spawn 0x0054F490"));
                     }
+                    &UnitClass::Object(class) if data.objects().get(class).is_some_and(|d| d.init_fn == 1 && !d.pre_operate) => {
+                        let (guid, _) = self.allocate(unit_type::OBJECT);
+                        let parm0 = data.objects().get(class).map_or(0, |d| d.parm0);
+                        let shrine = self.roll_shrine(data, parm0, level_id);
+                        units.push(Spawned::Object { guid, class: class as u16, x, y, mode: 0, interaction: shrine });
+                    }
                     &UnitClass::Object(class) => {
                         let def = data.objects().get(class);
                         match def.and_then(|d| object_mode(d.init_fn, d.pre_operate, level_id)) {
                             Some(mode) => {
                                 let (guid, _) = self.allocate(unit_type::OBJECT);
-                                units.push(Spawned::Object { guid, class: class as u16, x, y, mode, interaction: 0 });
+                                let interaction = def.map_or(0, |d| object_interaction(d.init_fn, d.parm2));
+                                units.push(Spawned::Object { guid, class: class as u16, x, y, mode, interaction });
                             }
                             None => not_ported.push(format!(
                                 "object {class} ({}) at ({x}, {y}): InitFn {} / PreOperate",
@@ -374,6 +444,35 @@ mod tests {
         assert!(pop.activate(&data, 1, room(7), level.units_in(7)).units.is_empty());
     }
 
+    /// A shrine is spawned with its type in the interaction byte: a health one from the health
+    /// class, and any from its class allowed at the level's depth.
+    #[test]
+    fn shrines_roll_their_type_from_their_class() {
+        use d2_data::presets::Shrines;
+        let mut data = rules();
+        let objects = Table::parse(b"Name\tInitFn\tPreOperate\tParm0\r\nnone\t0\t0\t0\r\nwell\t1\t0\t1\r\nshrine\t1\t0\t3\r\n");
+        let monstats = Table::parse(b"Id\thcIdx\r\n");
+        let empty = |col: &str| Table::parse(format!("{col}\r\n").as_bytes());
+        let presets = MonPresets::from_tables(&empty("Act\tPlace"), &monstats, &empty("Superunique"), &empty("code")).unwrap();
+        data.set_map_tables(presets, Monsters::default(), Objects::from_table(&objects));
+        // 0 none; 1-2 boosts; 3 health; 4 magic, only from level 50; 5 mana.
+        data.set_shrines(Shrines::from_table(&Table::parse(
+            b"effectclass\tLevelMin\r\n0\t0\r\n4\t1\r\n4\t1\r\n2\t1\r\n1\t50\r\n3\t1\r\n",
+        )));
+        let at = |class, x| PlacedUnit { class: UnitClass::Object(class), x, y: 505, path: Vec::new() };
+        let units = [at(1, 505), at(2, 506), at(2, 507), at(2, 508)];
+        for seed in 0..50 {
+            let mut pop = Population::new(seed);
+            let got = pop.activate(&data, 2, RoomId { level: 2, index: 0 }, units.iter());
+            assert!(got.not_ported.is_empty());
+            let types: Vec<u8> = got.units.iter().map(|u| match u { Spawned::Object { interaction, mode: 0, .. } => *interaction, _ => 99 }).collect();
+            assert_eq!(types[0], 3, "the well is the health shrine");
+            // A shrine is a boost (1, 2) nine times in ten; a magic pick finds only type 4, too
+            // deep for level 2, and gives up on it after eight tries; 4 is sent as 2.
+            assert!(types[1..].iter().all(|t| matches!(t, 1 | 2)), "seed {seed}: {types:?}");
+        }
+    }
+
     #[test]
     fn components_are_seed_picks_and_a_missing_component_leaves_the_seed_alone() {
         let mut variants = [0u8; 16];
@@ -434,6 +533,43 @@ mod tests {
         assert_eq!(maps.len(), 4, "{maps:?}");
     }
 
+    /// With the operator's install and `Game.exe`: every object the Act I wilderness rooms place
+    /// spawns — waypoints, their torches, shrines and wells — for a few seeds.
+    #[test]
+    fn with_a_real_install_the_wilderness_objects_spawn() {
+        let (Ok(dir), Ok(exe)) = (std::env::var("BNETCC_D2_DATA_DIR"), std::env::var("BNETCC_D2_GAME_EXE")) else {
+            return;
+        };
+        let data = GameData::load(&dir).unwrap();
+        let engine = d2_data::engine::EngineData::from_game_exe(&std::fs::read(exe).unwrap()).unwrap();
+        for seed in [1u32, 0x1234_5678, 0xBEEF] {
+            let act = d2_drlg::act::Act::build(data.levels(), 0, 0, seed);
+            let town = PresetLevel::build(&data, &engine, &act, 1).unwrap();
+            let world = d2_drlg::world::World::build(&data, &engine, &act, Some(&town));
+            let mut pop = Population::new(seed);
+            let (mut shrines, mut waypoints) = (0, 0);
+            for level in world.levels().iter().filter(|l| (2..=7).contains(&l.id)) {
+                for index in 0..level.rooms.len() {
+                    let room = RoomId { level: level.id, index };
+                    let got = pop.activate(&data, level.id, room, world.units_in(room));
+                    assert!(got.not_ported.is_empty(), "seed {seed:#x} {room:?}: {:?}", got.not_ported);
+                    for unit in got.units {
+                        if let Spawned::Object { class, interaction, .. } = *unit {
+                            let def = data.objects().get(i32::from(class)).unwrap();
+                            if def.init_fn == 1 {
+                                assert!(interaction > 0, "{} got no shrine type", def.name);
+                                shrines += 1;
+                            }
+                            waypoints += usize::from(def.sub_class & SUBCLASS_WAYPOINT != 0);
+                        }
+                    }
+                }
+            }
+            assert_eq!(waypoints, 4, "seed {seed:#x}");
+            assert!(shrines >= 20, "seed {seed:#x}: {shrines} shrines");
+        }
+    }
+
     #[test]
     fn object_modes_follow_the_init_routines() {
         assert_eq!(object_mode(0, false, 2), Some(0));
@@ -442,6 +578,7 @@ mod tests {
         assert_eq!(object_mode(17, false, 3), Some(0), "a waypoint in the wild starts inactive");
         assert_eq!(object_mode(0, true, 1), None);
         assert_eq!(object_mode(23, false, 1), None);
+        assert_eq!((object_mode(16, false, 3), object_interaction(16, 5), object_interaction(8, 5)), (Some(0), 10, 0), "a well");
         let mut pop = Population::new(0);
         pop.last_guid[2] = u32::MAX;
         assert_eq!(pop.next_guid(unit_type::OBJECT), 1, "0 is skipped on wrapping");
