@@ -331,6 +331,50 @@ player to the nearest free spot for its size. A waypoint has no collision (`HasC
 on a fresh game that is the waypoint's own tile. Over 400 seeds every camp builds, all four maps
 appear, and each has its waypoint inside the town.
 
+### Walking and loading rooms (2026-09-13)
+
+**Movement in.** The in-game C→S handlers sit in the table at `0x6E0D18` (8-byte entries
+`{handler, flag}` by opcode). `0x01` walk / `0x03` run to a spot `[x u16][y u16]` go through
+`0x5496F0` (length 5, `0x548EF0` validates the spot; a refused spot, if the last correction is
+more than 25 frames old, gets `0x15` with the server's position) and `0x5809D0`, which starts
+mode 2 (walk) or 3 (run) along a path. `0x02`/`0x04` do the same toward a unit
+`[type u32][guid u32]`. `0x5F` `[x u16][y u16]` is the client's own position (`0x54CD50`): when
+the server's unit is more than 4 subtiles off, it corrects the client or walks the unit there.
+Nothing is sent back to the moving client itself.
+
+**Speed.** `CharStats.txt` `WalkVelocity`/`RunVelocity` (6 and 9) as the path's `dwVelocity`
+(`<< 8`) move `velocity / 16` of a subtile a frame (libd2 `world/src/motion.zig`, from
+`0x64FE40`): 9.4 subtiles a second walking, 14 running, at 25 frames.
+
+**Rooms out.** When the player's room changes (`0x5380D0`), `0x537B50` compares the old and new
+near lists: every new room gets `0x53A8E0` (`0x07` and its units' packets), then every room left
+behind gets `0x53A9B0`: `0x0A` `[type u8][guid u32]` for each unit in it (`0x571600`, not for
+missiles), the client is taken off the room, and `0x08` `[tile x u16][tile y u16][level u8]`
+(`0x53BC90`). A level change also runs the quests' level callbacks (`0x543B90`) and town
+arrival/departure hooks (`0x537340`).
+
+**What the client needs to load a room.** The `0x07` handler (`0x45CAB0` → `0x61A070` →
+`0x61B640`) generates the level if needed (`0x642BB0`), finds the room *containing* the point
+(`0x642C30` → `0x642630`) and activates it when its user count goes from 0; `0x08`
+(`0x61B690`) counts down. A point in no room would dereference null. So a room origin is enough,
+and a wilderness level loads from its grid: `DRLGOUTDOOR_CreateOutdoorRoomExGrid` (`0x6750F0`, in
+libd2 `outdoors/Outdoors.zig`) makes each 8×8-tile cell a room, and a preset piece placed on a
+cell is cut into 8×8 rooms from it (`DRLGPRESET_BuildArea`), so every cell holds a room.
+
+**Near rooms across levels.** Within a level: gap under 6 tiles (above). Across levels the engine
+links rooms through their visibility slots (`DRLGROOMEX_LinkNearRoomsByVis`, `0x66C220`);
+`Levels.txt` `Vis*` lists only warp links (Blood Moor's are the Den of Evil), while walking
+between wilderness levels follows the act's placement chains.
+
+The handshake test (`d2_drlg::world`) takes the act's placed levels (and preset/wilderness levels
+depending on them), cuts preset levels and wilderness levels into their rooms, and treats rooms
+of different levels as near by the same gap — so two levels placed edge to edge without a passage
+also count as near, and the client loads terrain it cannot reach. It moves the player in a
+straight line at the engine's speeds (no collision, no path), re-syncs on `0x5F`, and on a room
+change sends exactly the packets above — except that a room is dropped only once it is two rooms
+away (gap under 14), because the straight-line player can run ahead of the client's. Blood Moor's
+monsters, objects and warps are not generated.
+
 ## 6. Server packet builders (opcode → function)
 
 `scripts/d2re/server_send_builders.py <Game.exe>` finds every call to the queue function
@@ -352,10 +396,10 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
   player (stats, skills, items, states).
 - NPC and object interaction: C→S `0x02`/`0x13`/`0x59` (above) and what the server answers.
 - The act clock: the server's starting period and the `0x53` updates as it advances.
-- Movement: the C→S walk/run packets, the player's path, and `0x537B50` on a room change —
-  `0x07` + units for new near rooms, `0x53A9B0` (unit removals via `0x571600`, then `0x08`) for
-  old ones; the free-spot search `0x64DEA0` (needs collision); NPC AI walking their DS1 paths
-  (`0x666120`).
+- Movement: paths and collision (`0x64DEA0`, libd2 `path.zig`/`collision.zig`) in place of
+  straight lines; cross-level near rooms by visibility slots (`0x66C220`); the wilderness
+  generator proper, for Blood Moor's monsters, objects and warps; NPC AI walking their DS1
+  paths (`0x666120`).
 - The byte at `0x68`+20 and the `0x6A`/`0x6C`/`0x6E` handlers.
 - A packet capture from the real engine (`docs/D2GS-RUST.md` §2 oracle) would confirm the dump
   faster than reading it; §4 and §6 say where to look in that capture.

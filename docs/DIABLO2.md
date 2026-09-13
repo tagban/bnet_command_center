@@ -115,13 +115,15 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
    low: the client lights it only at dusk and night, and test games stay at midday. Clicking
    an NPC or the stash does nothing. Chickens wander as before — the client spawns those
    itself. (Verified 2026-09-13.)
-3. *Expect nothing else to work.* After "load complete" the server only answers pings:
-   life/mana/stamina show (level-1 values from `charstats.txt`), NPCs never walk, the
-   character walks only on its own screen (the walk requests are logged), and anything two
-   rooms or more from the waypoint is never sent. Past the town
-   edge is black; the first build that sent town units halted the client there ("failed at
-   (96)", missing quest data), fixed since. Esc → Save and Exit returns to chat (verified).
-4. Send the log from the moment you clicked Create Game.
+3. *Expect walking to load the world:* the server follows your character, so NPCs and
+   objects further from the waypoint appear as you approach, and walking out of the camp
+   shows Blood Moor's ground as you go (`player entered a level level=2` in the log). Blood
+   Moor is empty — no monsters, shrines or the Den of Evil entrance yet — and walking through
+   a fence can make the server think you are somewhere you are not (it has no collision).
+4. *Expect nothing else to work:* life/mana/stamina show (level-1 values from
+   `charstats.txt`), NPCs never walk, clicking does nothing. Esc → Save and Exit returns to
+   chat (verified).
+5. Send the log from the moment you clicked Create Game.
 
 What it shows, in order:
 
