@@ -369,7 +369,18 @@ between wilderness levels follows the act's placement chains.
 The handshake test (`d2_drlg::world`) takes the act's placed levels (and preset/wilderness levels
 depending on them), cuts preset levels and wilderness levels into their rooms, and treats rooms
 of different levels as near by the same gap — so two levels placed edge to edge without a passage
-also count as near, and the client loads terrain it cannot reach. It moves the player in a
+also count as near, and the client loads terrain it cannot reach.
+
+**Voids.** Not every wilderness cell is a room. libd2's recordings of the engine's layouts
+(`deep_seed_*.jsonl` room lists, `coll_seed*_all.jsonl.gz` per-room collision; 8 seed and
+difficulty pairs, 56 Act I wilderness levels) show 2–13 cells a level with no room: blank cells
+the border placement leaves (`DRLGOUTDOOR_SetBlankGridCell`, outdoor flag `0x100` without a
+preset, skipped by the room grid). A `0x07` into one would crash the client. They lie on the
+level's outer ring of cells, sometimes where two wilderness levels meet but never near the town,
+except for interior blanks in Black Marsh and Tamoe Highland. Until the Act I outdoor generator
+(libd2 `outdoors/ActInit.zig`, `Border.zig`, `OutRoom.zig`, `OutPlace.zig`) is ported, the test
+keeps a wilderness level's ring cells only near the town and leaves out Black Marsh and Tamoe; a
+test checks every room it would send against the recorded layouts. It moves the player in a
 straight line at the engine's speeds (no collision, no path), re-syncs on `0x5F`, and on a room
 change sends exactly the packets above — except that a room is dropped only once it is two rooms
 away (gap under 14), because the straight-line player can run ahead of the client's. Blood Moor's

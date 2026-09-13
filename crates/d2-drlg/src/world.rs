@@ -14,6 +14,13 @@
 //!   (`0x07` → `0x0061B640` → `0x00642630`), so the grid is enough to load a wilderness level
 //!   without generating it here.
 //!
+//! **Voids.** Not every wilderness cell is a room: the border placement blanks some cells
+//! (`DRLGOUTDOOR_SetBlankGridCell`, flag `0x100` without a preset), and a `0x07` pointing into
+//! one would make the client dereference null. Until the outdoor generator is ported, the world
+//! keeps only cells libd2's engine recordings (8 seeds, both difficulties) never show as voids:
+//! a wilderness level's outer ring of cells only near the town, and no level where interior
+//! voids were seen ([`LEVELS_WITH_INTERIOR_VOIDS`]).
+//!
 //! Rooms of different levels are near when their gap is under 6 tiles on both axes, as within a
 //! level. The engine links cross-level rooms only through a room's visibility slots
 //! (`DRLGROOMEX_LinkNearRoomsByVis`, `0x0066C220`), so two levels placed edge to edge without a
@@ -25,6 +32,11 @@ use d2_data::levels::{DrlgType, Levels};
 use crate::act::Act;
 use crate::preset::{PresetLevel, ROOM_TILES, SUBTILES};
 use crate::Coords;
+
+/// Wilderness levels whose recorded layouts have voids inside, not only on their edge: Black
+/// Marsh (a blank cell by the Forgotten Tower) and Tamoe Highland. Left out of the world until
+/// the outdoor generator can say where the voids are.
+pub const LEVELS_WITH_INTERIOR_VOIDS: [i32; 2] = [6, 7];
 
 /// A room: its level and its index in that level's rooms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -126,9 +138,10 @@ impl World {
             ids.append(&mut extra);
         }
         let mut world = Self::default();
+        let town_area = town.map(|t| t.area);
         for id in ids {
             let Some(def) = levels.get(id) else { continue };
-            if !matches!(def.drlg_type, DrlgType::Preset | DrlgType::Wilderness) {
+            if !matches!(def.drlg_type, DrlgType::Preset | DrlgType::Wilderness) || LEVELS_WITH_INTERIOR_VOIDS.contains(&id) {
                 continue;
             }
             let Some(area) = act.coords(levels, id) else { continue };
@@ -138,6 +151,13 @@ impl World {
             let rooms = match town {
                 Some(t) if t.level_id == id => t.rooms.clone(),
                 _ => grid_rooms(area, def.drlg_type),
+            };
+            let rooms = match def.drlg_type {
+                DrlgType::Wilderness => rooms
+                    .into_iter()
+                    .filter(|&r| !on_edge(area, r) || town_area.is_some_and(|t| near(t, r)))
+                    .collect(),
+                _ => rooms,
             };
             world.levels.push(WorldLevel { id, area, rooms });
         }
@@ -211,6 +231,11 @@ impl World {
     }
 }
 
+/// Whether a room lies on its level's outer ring of cells.
+fn on_edge(area: Coords, r: Coords) -> bool {
+    r.x == area.x || r.y == area.y || r.x + 2 * ROOM_TILES > area.x + area.w || r.y + 2 * ROOM_TILES > area.y + area.h
+}
+
 fn overlaps(a: Coords, b: Coords) -> bool {
     a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
 }
@@ -230,7 +255,8 @@ mod tests {
     }
 
     /// With the operator's install (`BNETCC_D2_DATA_DIR`, `BNETCC_D2_GAME_EXE`): for a few seeds,
-    /// Act I's walkable levels are the camp, the wilderness trunks and the Monastery pieces,
+    /// Act I's walkable levels are the camp, the wilderness trunks up to Dark Wood and the
+    /// Monastery pieces,
     /// and the camp's rooms reach into Blood Moor.
     #[test]
     fn with_a_real_install_the_camp_borders_blood_moor() {
@@ -244,7 +270,7 @@ mod tests {
             let town = PresetLevel::build(&data, &engine, &act, 1).unwrap();
             let world = World::build(data.levels(), &act, Some(&town));
             let ids: Vec<i32> = world.levels().iter().map(|l| l.id).collect();
-            for id in [1, 2, 3, 4, 5, 6, 7, 17, 26] {
+            for id in [1, 2, 3, 4, 5, 17, 26] {
                 assert!(ids.contains(&id), "seed {seed:#x}: level {id} missing from {ids:?}");
             }
             let camp = &world.levels()[ids.iter().position(|&i| i == 1).unwrap()];
@@ -253,6 +279,52 @@ mod tests {
                 .any(|index| world.rooms_near(RoomId { level: 1, index }).iter().any(|r| r.level == 2));
             assert!(reaches_moor, "seed {seed:#x}: the camp does not touch Blood Moor");
         }
+    }
+
+    /// With the operator's install and libd2's recordings (`LIBD2_DIR`): no room the world would
+    /// send lies in a void of the engine's own layout, for the seeds whose rooms libd2 recorded.
+    #[test]
+    fn with_libd2_recordings_no_world_room_is_a_void() {
+        let (Ok(dir), Ok(exe), Ok(libd2)) =
+            (std::env::var("BNETCC_D2_DATA_DIR"), std::env::var("BNETCC_D2_GAME_EXE"), std::env::var("LIBD2_DIR"))
+        else {
+            return;
+        };
+        let data = d2_data::GameData::load(&dir).unwrap();
+        let engine = d2_data::engine::EngineData::from_game_exe(&std::fs::read(exe).unwrap()).unwrap();
+        let golden = std::path::Path::new(&libd2).join("packages/drlg/src/golden");
+        let number = |line: &str, key: &str, from: usize| -> Option<(i32, usize)> {
+            let at = line[from..].find(key)? + from + key.len();
+            let end = line[at..].find(|c: char| !(c.is_ascii_digit() || c == '-'))? + at;
+            Some((line[at..end].parse().ok()?, end))
+        };
+        let mut checked = 0;
+        for (file, seed) in [("deep_seed_1.jsonl", 1u32), ("deep_seed_2.jsonl", 2), ("deep_seed_305419896.jsonl", 305_419_896)] {
+            let text = std::fs::read_to_string(golden.join(file)).unwrap();
+            let act = Act::build(data.levels(), 0, 0, seed);
+            let town = PresetLevel::build(&data, &engine, &act, 1).unwrap();
+            let world = World::build(data.levels(), &act, Some(&town));
+            for line in text.lines() {
+                let Some((level, _)) = number(line, "\"levelId\":", 0) else { continue };
+                let Some(ours) = world.levels().iter().find(|l| l.id == level) else { continue };
+                let rooms_at = line.find("\"rooms\":").unwrap();
+                let mut recorded = Vec::new();
+                let mut at = rooms_at;
+                while let Some((x, next)) = number(line, "{\"x\":", at) {
+                    let (y, next) = number(line, "\"y\":", next).unwrap();
+                    let (w, next) = number(line, "\"w\":", next).unwrap();
+                    let (h, next) = number(line, "\"h\":", next).unwrap();
+                    recorded.push(Coords { x, y, w, h });
+                    at = next;
+                }
+                for room in &ours.rooms {
+                    let covered = recorded.iter().any(|r| room.x >= r.x && room.x < r.x + r.w && room.y >= r.y && room.y < r.y + r.h);
+                    assert!(covered, "seed {seed}: level {level} room {room:?} is a void in the engine's layout");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 500, "only {checked} rooms checked");
     }
 
     #[test]

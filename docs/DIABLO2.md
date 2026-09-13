@@ -120,9 +120,11 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
    at dusk, about 14 minutes after the game was created.
 3. *Expect walking to load the world:* the server follows your character, so NPCs and
    objects further from the waypoint appear as you approach, and walking out of the camp
-   shows Blood Moor's ground as you go (`player entered a level level=2` in the log). Blood
-   Moor is empty — no monsters, shrines or the Den of Evil entrance yet — and walking through
-   a fence can make the server think you are somewhere you are not (it has no collision).
+   shows Blood Moor's ground as you go (`player entered a level level=2` in the log), on to
+   Cold Plains, Stony Field and Dark Wood. The outer edge of each wilderness area stays black
+   (the cliffs and borders are not sent yet), so are Black Marsh and Tamoe Highland, and the
+   areas are empty — no monsters, shrines or cave entrances. Walking through a fence can make
+   the server think you are somewhere you are not (it has no collision).
 4. *Expect nothing else to work:* life/mana/stamina show (level-1 values from
    `charstats.txt`), NPCs never walk, there is no combat, no shop and no travel. Esc → Save
    and Exit returns to chat (verified).
