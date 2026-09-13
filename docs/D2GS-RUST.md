@@ -77,8 +77,8 @@ second process, no control link; `characters.save` already holds the `.d2s`.
 
 | # | Milestone | Proves |
 |---|---|---|
-| 0 | tagban copies the 1.14d MPQs from his Windows install (`d2data`, `d2exp`, `d2char`, `d2sfx`…, `Patch_D2.mpq`) to a data directory on the Mac | real tables to load |
-| 1 | `d2-formats` MPQ + `d2-data` tables load from that directory | the data path, no embedded blobs |
+| 0 ✅ | tagban copies the 1.14d MPQs from his Windows install (`d2data`, `d2exp`, `d2char`, `d2sfx`…, `Patch_D2.mpq`) to a data directory on the Mac | real tables to load |
+| 1 ✅ | `d2-formats` MPQ + `d2-data` tables load from that directory (2026-09-13: `charstats`, `experience`; a new character's stats per `0x5706D0`) | the data path, no embedded blobs |
 | 2 | `d2-drlg` ported; identical to libd2 over hundreds of seeds × acts × difficulties | the world the client will expect |
 | 3 | `d2-net` + a minimal `GameInstance` in `bnetccd`: create/join from the realm, **your character standing in the Rogue Encampment, a second player visible** | ROADMAP Phase 5 step 1 — the client accepts our packets |
 | 4 | Movement, warps between levels, save on leave into `characters.save` | a character that persists |

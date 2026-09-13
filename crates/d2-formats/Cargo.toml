@@ -1,0 +1,15 @@
+[package]
+name = "d2-formats"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Diablo II file formats: MPQ archives and the compression inside them"
+
+# No dependencies, like bnetcc-proto: this crate parses bytes from files the operator
+# supplies, so it is the one to fuzz and keep small.
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

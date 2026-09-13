@@ -3958,10 +3958,10 @@ mod tests {
 
     #[tokio::test]
     async fn with_the_game_server_test_on_a_realm_client_creates_a_game_and_logs_on_to_it() {
-        use crate::d2gs::tests::{logon_packet, read_frame, spawn, test_tables};
+        use crate::d2gs::tests::{logon_packet, read_frame, spawn, test_rules, test_tables};
         use bnetcc_proto::mcp::{create_game_result, join_result, msg};
 
-        let game_server = Arc::new(crate::d2gs::GameServer::new(test_tables()));
+        let game_server = Arc::new(crate::d2gs::GameServer::new(test_tables(), Some(test_rules())));
         let game_addr = spawn(Arc::clone(&game_server)).await;
         let node = crate::node::test_node_with(|c| {
             if let Some(realm) = c.d2_realm.as_mut() {

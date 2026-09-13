@@ -2,8 +2,8 @@
 //!
 //! No world is simulated. A client that joins a game is taken through the join exactly as
 //! the 1.14d engine runs it (`docs/D2GS-114D-WIRE.md` §4): `AF 01`, then on `GAMELOGON`
-//! `01 00` and `02`, then on `ENTERGAME` `59 0B 23 23 03 53 07 15 7E` and, a server frame
-//! later, `04`.
+//! `01 00` and `02`, then on `ENTERGAME` `59 0B`, the player's stats, `23 23 95 03 53 07 15 7E`
+//! and, a server frame later, `04`.
 //! After that nothing is sent but ping replies; every packet the client sends is logged.
 //! The point is to learn, against a real client, whether our compression and join sequence
 //! are accepted and what the client asks for next — not to play.
@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use bnetcc_proto::d2::status;
 use bnetcc_proto::d2gs::{self, cs, join_failed, ClientPacketLen, EngineTables, GameLogon, Outbox};
 use bnetcc_storage::Character;
+use d2_data::{stat, GameData};
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -59,10 +60,12 @@ const SPAWN_ROOM: (u16, u16) = (1160, 888);
 /// Guid of the joining player's unit.
 const PLAYER_GUID: u32 = 1;
 
-/// The test game server: its engine tables and the games the realm has created.
+/// The test game server: its engine tables, the game rules, and the games the realm has created.
 #[derive(Debug)]
 pub struct GameServer {
     tables: EngineTables,
+    /// `charstats.txt` and friends from the install; without them a player joins with no stats.
+    rules: Option<GameData>,
     games: Mutex<Games>,
 }
 
@@ -108,12 +111,13 @@ pub enum JoinError {
 impl GameServer {
     /// A game server with no games.
     #[must_use]
-    pub fn new(tables: EngineTables) -> Self {
-        Self { tables, games: Mutex::new(Games::default()) }
+    pub fn new(tables: EngineTables, rules: Option<GameData>) -> Self {
+        Self { tables, rules, games: Mutex::new(Games::default()) }
     }
 
-    /// Load `Game.exe` from `data_dir`, bind the game port on `ip`, and start serving.
-    /// `None` (with a warning) if either fails — the realm then keeps answering "Server Down".
+    /// Load `Game.exe` and the game rules from `data_dir`, bind the game port on `ip`, and start
+    /// serving. `None` (with a warning) if `Game.exe` or the port fails — the realm then keeps
+    /// answering "Server Down". Rules that fail to load only cost the player its stats.
     pub async fn start(data_dir: &str, ip: std::net::IpAddr) -> Option<Arc<Self>> {
         let path = Path::new(data_dir).join("Game.exe");
         let tables = match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|file| {
@@ -133,11 +137,18 @@ impl GameServer {
                 return None;
             }
         };
-        let server = Arc::new(Self::new(tables));
+        let rules = match GameData::load(data_dir) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                warn!(dir = data_dir, error = %e, "game rules not loaded: players will join with no stats");
+                None
+            }
+        };
+        let server = Arc::new(Self::new(tables, rules));
         warn!(
             %addr,
             "Diablo II game server HANDSHAKE TEST is on: games can be created and joined, but \
-             clients only stand in town: no stats, NPCs or actions (diablo2.game_server_probe)"
+             clients only stand in town: no NPCs or actions (diablo2.game_server_probe)"
         );
         tokio::spawn(serve(listener, Arc::clone(&server)));
         Some(server)
@@ -406,9 +417,10 @@ async fn logon(
 }
 
 /// `ENTERGAME`, in the engine's order (`HandleSrvJoinAct`): `ClientAddPlayerToGame` creates
-/// the player — its `0x59`, before it has a position — and names it the client's own with
-/// `0x0B` plus both selected skills; then the act (`03 53`); then `PlacePlayerInAct` loads
-/// the spawn room and places the player (`07 15 7E`). `04` follows a frame later.
+/// the player — its `0x59`, before it has a position — names it the client's own with `0x0B`,
+/// sends its stats (`0x1D`–`0x1F`), both selected skills and its life/mana (`0x95`); then the act
+/// (`03 53`); then `PlacePlayerInAct` loads the spawn room and places the player (`07 15 7E`).
+/// `04` follows a frame later.
 async fn enter_game(
     stream: &mut TcpStream,
     peer: SocketAddr,
@@ -421,8 +433,19 @@ async fn enter_game(
     // Unplaced: at (0, 0) the client creates the unit without looking for a room.
     outbox.push(&d2gs::assign_player(PLAYER_GUID, p.character.class, &p.character.name, 0, 0));
     outbox.push(&d2gs::own_unit(0, PLAYER_GUID));
+    // Its stats, one packet each (ClientAddPlayerToGame walks the stat list through 0x548520),
+    // as a new character: no .d2s is loaded yet.
+    let stats = server.rules.as_ref().and_then(|r| r.new_character_stats(p.character.class)).unwrap_or_default();
+    for &(id, value) in &stats {
+        outbox.push(&d2gs::set_stat(id, value));
+    }
     outbox.push(&d2gs::select_skill(0, PLAYER_GUID, true, 0, u32::MAX));
     outbox.push(&d2gs::select_skill(0, PLAYER_GUID, false, 0, u32::MAX));
+    // Then life, mana and stamina in whole points, before the player has a position (0x548760).
+    if !stats.is_empty() {
+        let whole = |id: u8| stats.iter().find(|&&(s, _)| s == id).map_or(0, |&(_, v)| (v >> 8) as u16);
+        outbox.push(&d2gs::life_and_position(whole(stat::HITPOINTS), whole(stat::MANA), whole(stat::STAMINA), 0, 0, 0, 0));
+    }
     outbox.push(&d2gs::load_act(0, MAP_SEED, TOWN_AREA, 0));
     // Period 2 starts at angle 0: the start of the day. The client's 0x53 handler reads its
     // own player unit, which is why 0x0B has to be in first.
@@ -464,6 +487,20 @@ pub(crate) mod tests {
 
     /// Tables shaped like the engine's for the packets the join uses, with a made-up
     /// complete Huffman code (no Blizzard data in tests).
+    /// Game rules from made-up tables in the real shape: every class has vitality 20, hpadd 30,
+    /// energy 15 and stamina 80.
+    pub(crate) fn test_rules() -> GameData {
+        use d2_formats::excel::Table;
+        let mut cs = String::from("class\tstr\tdex\tint\tvit\ttot\tstamina\thpadd\r\n");
+        for name in d2_data::CLASSES {
+            cs.push_str(&format!("{name}\t25\t20\t15\t20\t0\t80\t30\r\n"));
+        }
+        let exp = "Level\tAmazon\tSorceress\tNecromancer\tPaladin\tBarbarian\tDruid\tAssassin\tExpRatio\r\n\
+                   MaxLvl\t99\t99\t99\t99\t99\t99\t99\t10\r\n0\t0\t0\t0\t0\t0\t0\t0\t1024\r\n\
+                   1\t500\t500\t500\t500\t500\t500\t500\t1024\r\n";
+        GameData::from_tables(&Table::parse(cs.as_bytes()), &Table::parse(exp.as_bytes())).unwrap()
+    }
+
     pub(crate) fn test_tables() -> EngineTables {
         let mut lengths = [9u8; 256];
         lengths[0] = 1;
@@ -528,7 +565,7 @@ pub(crate) mod tests {
 
     #[test]
     fn games_are_created_joined_and_claimed_by_name() {
-        let gs = GameServer::new(test_tables());
+        let gs = GameServer::new(test_tables(), Some(test_rules()));
         let id = gs.create("Baal Run", "pw", 2).unwrap();
         assert_eq!(gs.create("baal run", "", 0), Err(CreateError::NameTaken));
         assert_eq!(gs.stage_join("nope", "", character("A", 0, 0)), Err(JoinError::NoSuchGame));
@@ -549,7 +586,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_client_is_taken_through_the_join_sequence() {
-        let gs = Arc::new(GameServer::new(test_tables()));
+        let gs = Arc::new(GameServer::new(test_tables(), Some(test_rules())));
         let id = gs.create("probe", "", 0).unwrap();
         let (_, hash) = gs.stage_join("probe", "", character("TestBan", 4, 0x60)).unwrap();
         let addr = spawn(Arc::clone(&gs)).await;
@@ -572,8 +609,10 @@ pub(crate) mod tests {
         while let Some(&op) = rest.first() {
             let size = match op {
                 0x59 => 26,
-                0x0B | 0x07 => 6,
-                0x23 => 13,
+                0x0B | 0x07 | 0x1F => 6,
+                0x1D => 3,
+                0x1E => 4,
+                0x23 | 0x95 => 13,
                 0x03 => 12,
                 0x53 => 10,
                 0x15 => 11,
@@ -583,12 +622,16 @@ pub(crate) mod tests {
             packets.push(&rest[..size]);
             rest = &rest[size..];
         }
-        let ops: Vec<u8> = packets.iter().map(|p| p[0]).collect();
-        assert_eq!(ops, vec![0x59, 0x0B, 0x23, 0x23, 0x03, 0x53, 0x07, 0x15, 0x7E], "the engine's order, one frame");
+        let ops: Vec<u8> = packets.iter().map(|p| p[0]).filter(|op| !(0x1D..=0x1F).contains(op)).collect();
+        assert_eq!(ops, vec![0x59, 0x0B, 0x23, 0x23, 0x95, 0x03, 0x53, 0x07, 0x15, 0x7E], "the engine's order, one frame");
+        let stats: Vec<&[u8]> = packets[2..].iter().copied().take_while(|p| (0x1D..=0x1F).contains(&p[0])).collect();
+        assert_eq!(stats.len(), 15, "every stat a new character starts with, right after 0x0B");
+        assert!(stats.contains(&&[0x1E, stat::MAXHP, 0x00, 50][..]), "max life (20 vit + 30) << 8");
+        assert!(stats.contains(&&[0x1D, stat::LEVEL, 1][..]));
         assert_eq!(&packets[0][6..13], b"TestBan", "the character's name in 0x59");
         assert_eq!(&packets[0][22..26], &[0, 0, 0, 0], "0x59 before placement: no position");
         assert_eq!(packets[1], &[0x0B, 0, 1, 0, 0, 0], "then: that unit is yours");
-        assert_eq!(&packets[4][2..6], &MAP_SEED.to_le_bytes());
+        assert_eq!(&packets[2 + 15 + 3][2..6], &MAP_SEED.to_le_bytes(), "0x03 carries the seed");
         assert_eq!(read_frame(&mut c, huffman).await, vec![0x04]);
 
         let mut ping = vec![0u8; 13];
@@ -604,7 +647,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_wrong_version_is_refused_with_the_engines_reason() {
-        let gs = Arc::new(GameServer::new(test_tables()));
+        let gs = Arc::new(GameServer::new(test_tables(), Some(test_rules())));
         let id = gs.create("probe", "", 0).unwrap();
         let (_, hash) = gs.stage_join("probe", "", character("TestBan", 4, 0)).unwrap();
         let addr = spawn(Arc::clone(&gs)).await;

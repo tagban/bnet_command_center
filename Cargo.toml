@@ -9,6 +9,8 @@ members = [
     "crates/bnetccd",
     "crates/bnetcc-storage-sqlite",
     "crates/bnetcc-launcher",
+    "crates/d2-formats",
+    "crates/d2-data",
 ]
 
 [workspace.package]

@@ -213,6 +213,8 @@ dependencies = [
  "bnetcc-storage",
  "bnetcc-storage-sqlite",
  "clap",
+ "d2-data",
+ "d2-formats",
  "rand",
  "rcgen",
  "rustls",
@@ -326,6 +328,17 @@ dependencies = [
  "generic-array",
  "typenum",
 ]
+
+[[package]]
+name = "d2-data"
+version = "0.2.3"
+dependencies = [
+ "d2-formats",
+]
+
+[[package]]
+name = "d2-formats"
+version = "0.2.3"
 
 [[package]]
 name = "deranged"

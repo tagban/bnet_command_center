@@ -58,6 +58,14 @@ pub mod sc {
     pub const OWN_UNIT: u8 = 0x0B;
     /// A unit's selected skill on one mouse button (13 bytes).
     pub const SELECT_SKILL: u8 = 0x23;
+    /// One of the player's own stats, value in a byte (3 bytes).
+    pub const SET_STAT_BYTE: u8 = 0x1D;
+    /// One of the player's own stats, value in a word (4 bytes).
+    pub const SET_STAT_WORD: u8 = 0x1E;
+    /// One of the player's own stats, value in a dword (6 bytes).
+    pub const SET_STAT_DWORD: u8 = 0x1F;
+    /// The player's life, mana, stamina and position, bit-packed (13 bytes).
+    pub const LIFE_AND_POSITION: u8 = 0x95;
     /// Place a unit (11 bytes).
     pub const REASSIGN_PLAYER: u8 = 0x15;
     /// The act's time of day (10 bytes).
@@ -591,6 +599,60 @@ pub fn select_skill(unit_type: u8, guid: u32, right_hand: bool, skill: u16, item
     w.finish()
 }
 
+/// `0x1D`/`0x1E`/`0x1F`: `[stat u8][value]`, the smallest of byte, word and dword the value
+/// fits below its all-ones (builder `0x0053BE40`). The client sets the stat on its own player
+/// (handler `0x0045D780`), so this must follow `0x0B`. Stat `0xFF` is refused by the engine.
+#[must_use]
+pub fn set_stat(stat: u8, value: u32) -> Vec<u8> {
+    let mut w = Writer::with_capacity(6);
+    match value {
+        v if v < 0xFF => w.u8(sc::SET_STAT_BYTE).u8(stat).u8(v as u8),
+        v if v < 0xFFFF => w.u8(sc::SET_STAT_WORD).u8(stat).u16(v as u16),
+        v => w.u8(sc::SET_STAT_DWORD).u8(stat).u32(v),
+    };
+    w.finish()
+}
+
+/// Fog's bit buffer (`0x00410EB0`): values packed least significant bit first.
+struct BitWriter {
+    bytes: Vec<u8>,
+    bit: usize,
+}
+
+impl BitWriter {
+    fn with_bytes(len: usize) -> Self {
+        Self { bytes: vec![0; len], bit: 0 }
+    }
+
+    fn put(&mut self, value: u32, bits: u32) -> &mut Self {
+        for i in 0..bits {
+            if value >> i & 1 != 0 {
+                self.bytes[self.bit / 8] |= 1 << (self.bit % 8);
+            }
+            self.bit += 1;
+        }
+        self
+    }
+}
+
+/// `0x95`: `[life u15][mana u15][stamina u15][x u16][y u16][dx i8][dy i8]`, bit-packed (builder
+/// `0x0053C320`), life/mana/stamina in whole points. The client sets its player's life, mana and
+/// stamina and nudges its position to `(x + dx, y + dy)` (handler `0x0045DB20`); the engine's
+/// first one, before the player is placed, has position zero.
+#[must_use]
+pub fn life_and_position(life: u16, mana: u16, stamina: u16, x: u16, y: u16, dx: i8, dy: i8) -> Vec<u8> {
+    let mut w = BitWriter::with_bytes(13);
+    w.put(u32::from(sc::LIFE_AND_POSITION), 8)
+        .put(u32::from(life), 15)
+        .put(u32::from(mana), 15)
+        .put(u32::from(stamina), 15)
+        .put(u32::from(x), 16)
+        .put(u32::from(y), 16)
+        .put(u32::from(dx as u8), 8)
+        .put(u32::from(dy as u8), 8);
+    w.bytes
+}
+
 /// `0x59`: `[guid u32][class u8][name 16][x u16][y u16]` (builder `0x0053E8F0`).
 #[must_use]
 pub fn assign_player(guid: u32, class: u8, name: &str, x: u16, y: u16) -> Vec<u8> {
@@ -779,9 +841,26 @@ mod tests {
         assert_eq!(own_unit(0, 1), vec![0x0B, 0, 1, 0, 0, 0]);
         assert_eq!(load_room(1160, 888, 1), vec![0x07, 0x88, 0x04, 0x78, 0x03, 1]);
         assert_eq!(select_skill(0, 1, true, 0, u32::MAX).len(), 13);
+        assert_eq!(set_stat(12, 1), vec![0x1D, 12, 1]);
+        assert_eq!(set_stat(7, 55 << 8), vec![0x1E, 7, 0x00, 0x37]);
+        assert_eq!(set_stat(13, 0xFFFF), vec![0x1F, 13, 0xFF, 0xFF, 0, 0], "0xFFFF itself needs the dword");
         assert_eq!(player_placed().len(), 5);
         assert_eq!(pong().len(), 33);
         assert_eq!(join_failed_packet(join_failed::WRONG_VERSION), vec![0xB4, 0x10, 0, 0, 0]);
+    }
+
+    /// Read `bits` bits LSB-first starting at bit `from`.
+    fn bits_at(p: &[u8], from: usize, bits: usize) -> u32 {
+        (0..bits).fold(0, |v, i| v | u32::from(p[(from + i) / 8] >> ((from + i) % 8) & 1) << i)
+    }
+
+    #[test]
+    fn life_and_position_packs_least_significant_bit_first() {
+        let p = life_and_position(55, 15, 89, 0, 0, 0, 0);
+        assert_eq!((p.len(), p[0]), (13, 0x95));
+        assert_eq!((bits_at(&p, 8, 15), bits_at(&p, 23, 15), bits_at(&p, 38, 15)), (55, 15, 89));
+        let p = life_and_position(1, 2, 3, 5810, 4450, -1, 2);
+        assert_eq!((bits_at(&p, 53, 16), bits_at(&p, 69, 16), bits_at(&p, 85, 8), bits_at(&p, 93, 8)), (5810, 4450, 0xFF, 2));
     }
 
     /// With the operator's real `Game.exe` (set `BNETCC_D2_GAME_EXE`), the tables load and the

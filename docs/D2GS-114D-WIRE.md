@@ -111,7 +111,7 @@ Client join state lives at `client+4` (set by `0x5386D0`).
 | 2b | realm game | `[JOIN 2]` host `+0x08`: fetch character, wait | — | 1 |
 | 2b′ | open game | — | `0x02` | 1 |
 | 3 | host delivers the character | SrvRecvDatabaseCharacter `0x5306E0`, `[JOIN 3]` | `0x02` | 1 |
-| 4 | C→S `0x6B` ENTERGAME (1) | SrvJoinAct `0x530190` → `ClientAddPlayerToGame` `0x539760`: load the character (new-character path `0x532590` calls `SendUnitToClient`), check expansion/hardcore against the game (failure → `0xB4` with its code) | `0x59` for the player, **unplaced (0, 0)**; `0x0B` `[type][guid]` "this unit is yours" (`0x537930`); `0x5F`; `0x7B` hotkeys; `0x23` selected skill ×2 (right, left) | 1 |
+| 4 | C→S `0x6B` ENTERGAME (1) | SrvJoinAct `0x530190` → `ClientAddPlayerToGame` `0x539760`: load the character (new-character path `0x532590` calls `SendUnitToClient`), check expansion/hardcore against the game (failure → `0xB4` with its code) | `0x59` for the player, **unplaced (0, 0)**; `0x0B` `[type][guid]` "this unit is yours" (`0x537930`); `0x5F`; every stat as `0x1D`/`0x1E`/`0x1F` `[stat][value]` (stat-list walk with callback `0x548520` → `0x53BE40`); `0x7B` hotkeys; `0x23` selected skill ×2 (right, left); life/mana `0x548760` → `0x95` (first time, unplaced) | 1 |
 | 4a | | `0x52C210`: build the act if needed (`0x53AC70`, seed `game+0x7C`, difficulty `game+0x6D`) | `0x03` LoadAct (12), then `0x53` (10) | 2 |
 | 4b | | place the player `0x5394A0` | `0x07` `[room tile x u16][room tile y u16][level u8]` for the spawn room, `0x15` ReassignPlayer (11) `[type][guid][x][y][1]`, `0x7E` (5) | 3 |
 | 5 | next server frame | sUpdateClients `0x52D440` for state 3, `[JOIN 6] SCMD_STARTACT` | `0x04`; item/equipment pass `0x55DF00`; `0x5B` roster records both ways with every player already in the game (plus `0x8E` per entry of that player's unit`+0x60` list), then the joiner's own (`0x52C410`, confirmed in disassembly); `0x55B620`; host `+0x14`; broadcast `0x5A 02 04 …` "joined our world" (`0x54AA40`) | 4 |
@@ -192,6 +192,23 @@ the Rogue Encampment, standing where §5's spawn put it, and stays connected (a 
 steps from the spawn (`01 ad16 5f11` = 5805, 4447), which confirms map seed, spawn and room.
 Missing, as expected with nothing sent after `04`: life/mana/stamina (no stat packets), and no
 response to actions (walking needs the server to answer).
+
+### Player stats (step 1, 2026-09-13)
+
+A new character's stats come from `charstats.txt` (`0x5706D0`, class record `+0x30..+0x35`):
+str, energy (`int`), dex, vit as is; life = max life = `(vit + hpadd) << 8`; mana = max mana =
+`int << 8`; stamina = max stamina = `stamina << 8`; level 1; `nextexp` (30) from
+`experience.txt` row `"1"` (`0x611800` indexes `[(level + 1) × 8 + class]` past the `MaxLvl`
+row); velocity/attack rate/animation rate (67/68/69) 100. Stat ids are `ItemStatCost.txt` rows.
+
+The wire: `0x1D`/`0x1E`/`0x1F` `[stat u8][value]` in the smallest of byte/word/dword the value
+fits below all-ones; the client's handler `0x45D780` sets it on its own player (and asserts that
+player exists — another reason `0x0B` comes first). `0x95` (13) is bit-packed LSB-first by Fog's
+bit buffer `0x410EB0`: life u15, mana u15, stamina u15 (whole points), x u16, y u16, dx i8, dy
+i8; handler `0x45DB20` sets stats 6/8/10 `<< 8` and nudges the position. Its siblings are `0x18`
+(15: the same plus two u7 fields after stamina — projected regen percentages, `0x5485B0` /
+`0x548640`) and `0x96` (9: stamina, x, y, dx, dy); `0x548760` picks whichever carries what
+changed since the last one it sent.
 
 ## 6. Server packet builders (opcode → function)
 

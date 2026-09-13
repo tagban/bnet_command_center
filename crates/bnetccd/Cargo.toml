@@ -12,6 +12,8 @@ bnetcc-crypto = { path = "../bnetcc-crypto" }
 bnetcc-proto = { path = "../bnetcc-proto" }
 bnetcc-storage = { path = "../bnetcc-storage" }
 bnetcc-storage-sqlite = { path = "../bnetcc-storage-sqlite" }
+d2-data = { path = "../d2-data" }
+d2-formats = { path = "../d2-formats" }
 tokio.workspace = true
 socket2.workspace = true
 tracing.workspace = true
