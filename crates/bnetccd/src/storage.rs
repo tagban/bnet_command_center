@@ -107,6 +107,10 @@ enum Command {
         name: String,
         resp: oneshot::Sender<Option<Character>>,
     },
+    /// Every realm character of every account (for the ladder).
+    AllCharacters {
+        resp: oneshot::Sender<Vec<Character>>,
+    },
     CreateCharacter {
         character: Character,
         resp: oneshot::Sender<Result<(), CreateCharacterError>>,
@@ -353,6 +357,15 @@ impl StorageHandle {
         rx.await.unwrap_or_else(|_| Err("storage actor is gone".into()))
     }
 
+    /// Every realm character, account by account. Empty on failure.
+    pub async fn all_characters(&self) -> Vec<Character> {
+        let (resp, rx) = oneshot::channel();
+        if self.0.send(Command::AllCharacters { resp }).is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
     /// A realm character by name (realm-wide, case-insensitive). `None` on failure too.
     pub async fn character_by_name(&self, name: &str) -> Option<Character> {
         let (resp, rx) = oneshot::channel();
@@ -407,6 +420,20 @@ pub fn spawn(mut backend: Box<dyn Storage + Send>) -> StorageHandle {
                     }
                     Command::CharacterByName { name, resp } => {
                         let _ = resp.send(backend.character_by_name(&name).ok().flatten());
+                    }
+                    Command::AllCharacters { resp } => {
+                        let mut all = Vec::new();
+                        let mut offset = 0u64;
+                        while let Ok(page) = backend.list_accounts(offset, 500) {
+                            if page.is_empty() {
+                                break;
+                            }
+                            offset += page.len() as u64;
+                            for account in page {
+                                all.extend(backend.characters(account.id).unwrap_or_default());
+                            }
+                        }
+                        let _ = resp.send(all);
                     }
                     Command::CreateCharacter { character, resp } => {
                         let result = backend.create_character(character).map_err(|e| match e {
@@ -636,6 +663,21 @@ mod tests {
         h.delete_user(acct.id).await.expect("delete");
         assert!(h.account_by_name("Zealot").await.is_none());
         assert!(h.list_users(0, 10).await.iter().all(|u| u.id != acct.id));
+    }
+
+    #[tokio::test]
+    async fn every_accounts_characters_are_listed_for_the_ladder() {
+        let h = spawn(Box::new(MemoryStorage::new()));
+        for (account, names) in [("One", ["Aa", "Ab"]), ("Two", ["Ba", "Bb"])] {
+            let acct = h.create_account(account, Credential::Xsha1 { digest: [1u8; 20] }).await.unwrap();
+            for name in names {
+                let c = Character { account: acct.id, name: name.into(), class: 0, status: 0, level: 1, progression: 0, created_at: 0, last_played: 0, save: None };
+                h.create_character(c).await.unwrap();
+            }
+        }
+        let mut names: Vec<String> = h.all_characters().await.into_iter().map(|c| c.name).collect();
+        names.sort();
+        assert_eq!(names, ["Aa", "Ab", "Ba", "Bb"]);
     }
 
     #[tokio::test]

@@ -699,6 +699,11 @@ impl Node {
         self.storage.characters(account_id).await
     }
 
+    /// Every realm character, for the ladder.
+    pub async fn all_characters(&self) -> Vec<bnetcc_storage::Character> {
+        self.storage.all_characters().await
+    }
+
     /// A realm character by name, realm-wide.
     pub async fn character_by_name(&self, name: &str) -> Option<bnetcc_storage::Character> {
         self.storage.character_by_name(name).await
