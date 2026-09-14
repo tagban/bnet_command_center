@@ -4,6 +4,7 @@
 
 mod admin;
 mod config;
+mod d2_characters;
 mod d2_equipment;
 mod d2gs;
 mod discord;
@@ -51,6 +52,11 @@ struct Args {
     /// `diablo2.data_dir` to this path and exit.
     #[arg(long, value_name = "PATH")]
     write_d2_equipment: Option<PathBuf>,
+
+    /// Write the Diablo II character pack (`diablo2.character_pack`) built from
+    /// `diablo2.data_dir` to this path and exit.
+    #[arg(long, value_name = "PATH")]
+    write_d2_characters: Option<PathBuf>,
 }
 
 fn main() -> std::process::ExitCode {
@@ -82,6 +88,19 @@ fn main() -> std::process::ExitCode {
     if args.check {
         info!("configuration is valid");
         return std::process::ExitCode::SUCCESS;
+    }
+
+    if let Some(path) = &args.write_d2_characters {
+        return match d2_characters::write(&cfg.diablo2.data_dir, path) {
+            Ok(_) => {
+                info!(path = %path.display(), "wrote the Diablo II character pack");
+                std::process::ExitCode::SUCCESS
+            }
+            Err(e) => {
+                error!("{e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
     }
 
     if let Some(path) = &args.write_d2_equipment {
@@ -176,8 +195,14 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
     if let Some(dir) = &files_dir {
         info!(dir = %dir.display(), "serving operator-supplied files over BNFTP");
         let d2 = &cfg.diablo2;
-        if !d2.data_dir.trim().is_empty() && !d2.equipment_file.is_empty() {
-            tokio::spawn(d2_equipment::publish(d2.data_dir.clone(), dir.clone(), d2.equipment_file.clone()));
+        let wanted = !d2.equipment_file.is_empty() || !d2.character_pack.is_empty();
+        if wanted && !d2.data_dir.trim().is_empty() {
+            tokio::spawn(d2_equipment::publish(
+                d2.data_dir.clone(),
+                dir.clone(),
+                d2.equipment_file.clone(),
+                d2.character_pack.clone(),
+            ));
         }
     }
 

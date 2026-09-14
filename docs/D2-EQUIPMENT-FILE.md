@@ -33,6 +33,9 @@ The file:
 Several items share a value — a Cap, a War Hat and a Shako look the same — so a value names a
 look, not an item: show the list, or the first name.
 
+To draw the character rather than name its gear, use the character pack,
+[`d2-characters.zip`](D2-CHARACTER-PACK.md).
+
 Reading a statstring, in Python:
 
 ```python

@@ -85,6 +85,21 @@ still keeps to:
   the 1.14d address they reproduce, so each can be checked against the binary.
 - **Attribution.** Files ported from libd2 carry its MIT notice and name their libd2 source.
 
+### Decision: the server hands out character artwork drawn from the install (2026-09-14)
+
+**Made by tagban (project owner), 2026-09-14**, after being told it conflicts with "do not use
+Blizzard artwork" above: `bnetccd` builds `d2-characters.zip` — Diablo II's character animations
+as GIF layers, with the palette and tint maps — from the operator's install at startup and serves
+it over BNFTP so chat bots can draw realm characters (`docs/D2-CHARACTER-PACK.md`). This is the
+same kind of act as serving an operator's `icons.bni`, at a larger scale. What still holds:
+
+- **No artwork in the repository.** The pack is generated at run time into the operator's files
+  directory; `diablo2.character_pack = ""` turns it off.
+- **Decoders written clean.** libd2's `dcc.zig` and `cof.zig` say they port OpenDiablo2, which is
+  GPL, so they were not used: `d2_formats::dcc` is written from Bilian Belchev's published DCC
+  format description, and `cof`, `gif` and `zip` from the files, `Game.exe` and the public
+  specifications.
+
 ---
 
 ## 3. WarCraft III will need a patched client, and you cannot fix that

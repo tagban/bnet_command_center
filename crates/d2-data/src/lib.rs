@@ -15,6 +15,7 @@ use d2_formats::excel::Table;
 use d2_formats::mpq::{self, ArchiveSet, DATA_ARCHIVES};
 
 pub mod appearance;
+pub mod character;
 pub mod engine;
 pub mod items;
 pub mod levels;

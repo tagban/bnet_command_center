@@ -64,6 +64,21 @@ mod address {
     /// by slot; the graphics table builder keeps weapons and armour out of each other's slots
     /// with it (`0x0063D710`).
     pub const RESERVED_GRAPHICS: u32 = 0x0074_4CA8;
+    /// The front end's own copy of that list, `{code, hand class, item type}` by slot, which the
+    /// character-select screen draws from (`D2Comp.cpp`, `0x00506000`).
+    pub const FRONT_END_GRAPHICS: u32 = 0x0072_E1E0;
+    /// The front end's player class tokens, after their count (`0x00503740`).
+    pub const FRONT_END_CLASSES: u32 = 0x0072_E04C;
+    /// Its animation mode tokens, after their count.
+    pub const FRONT_END_MODES: u32 = 0x0072_E0B4;
+    /// Its body component tokens, followed by their count.
+    pub const FRONT_END_COMPONENTS: u32 = 0x0072_E108;
+    /// Its weapon class tokens, index 0 empty, followed by their count.
+    pub const FRONT_END_WEAPON_CLASSES: u32 = 0x0072_E15C;
+    /// An item's `wclass` code to a row of the hand-class list below, followed by the count.
+    pub const FRONT_END_ITEM_WEAPON_CLASSES: u32 = 0x0072_EF68;
+    /// Hand class (a weapon class token index) by that row; row 0 is anything unlisted.
+    pub const FRONT_END_HAND_CLASSES: u32 = 0x0072_EF30;
     /// `VS_FIXEDFILEINFO` 1.14.3.71.
     pub const FILE_VERSION: (u32, u32) = (0x0001_000E, 0x0003_0047);
 }
@@ -89,6 +104,27 @@ pub struct EngineData {
     /// The graphics slots appearance bytes were first laid out for, `(code, item type)` by
     /// slot — what [`crate::appearance::Graphics::build`] reads.
     pub reserved_graphics: Vec<(crate::items::Code, i32)>,
+    /// What the front end draws characters with.
+    pub front_end: FrontEndTables,
+}
+
+/// The front end's character-drawing tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrontEndTables {
+    /// `(code, hand class, item type)` by graphics slot, 255 of them.
+    pub graphics: Vec<(crate::items::Code, i32, i32)>,
+    /// Player class tokens (`AM`, `SO`, …, then the fallbacks `RO`, `RH`, …), space-padded.
+    pub classes: Vec<crate::items::Code>,
+    /// Animation mode tokens (`DT`, `NU`, …, `TN` is 5).
+    pub modes: Vec<crate::items::Code>,
+    /// Body component tokens (`HD`, `TR`, …).
+    pub components: Vec<crate::items::Code>,
+    /// Weapon class tokens by hand class (0 empty, 1 `hth`, 2 `1ht`, …).
+    pub weapon_classes: Vec<crate::items::Code>,
+    /// An item's `wclass` code and its row in [`Self::hand_classes`].
+    pub item_weapon_classes: Vec<(crate::items::Code, u32)>,
+    /// Hand class by row.
+    pub hand_classes: Vec<i32>,
 }
 
 /// The outdoor (wilderness) generator's lookup tables.
@@ -179,6 +215,7 @@ impl EngineData {
             .chunks_exact(8)
             .map(|e| ([e[0], e[1], e[2], e[3]], i32::from_le_bytes([e[4], e[5], e[6], e[7]])))
             .collect();
+        let front_end = FrontEndTables::read(&image).ok_or_else(|| out_of_range("front-end tables"))?;
 
         // GAMELOGON 37, ENTERGAME 1, ping 13; GameFlags 8, LoadAct 12, AssignPlayer 26.
         let sizes_ok = client_packet_sizes[0x68] == 37
@@ -200,7 +237,12 @@ impl EngineData {
             && outdoor.path_directions.iter().all(|d| (0..8).contains(d))
             && outdoor.path_deltas[16..].iter().all(|d| (-1..=1).contains(d));
         // The body armour weights, then the first helm.
-        let graphics_ok = reserved_graphics[1] == (*b"lit ", 1) && reserved_graphics[4] == (*b"cap ", 37);
+        let graphics_ok = reserved_graphics[1] == (*b"lit ", 1)
+            && reserved_graphics[4] == (*b"cap ", 37)
+            && front_end.graphics[4] == (*b"cap ", 0, 37)
+            && front_end.classes.first() == Some(b"AM  ")
+            && front_end.modes.get(5) == Some(b"TN  ")
+            && front_end.weapon_classes.get(1) == Some(b"hth ");
         if !sizes_ok || !presets_ok || !clock_ok || !outdoor_ok || !graphics_ok {
             return Err(bad("tables do not look like 1.14d's".into()));
         }
@@ -213,6 +255,7 @@ impl EngineData {
             day_periods,
             outdoor,
             reserved_graphics,
+            front_end,
         })
     }
 
@@ -229,6 +272,41 @@ impl EngineData {
         }
         let class = *self.preset_objects.get(usize::from(act.min(4)) * PRESET_OBJECTS_PER_ACT + ds1_id as usize)?;
         (class >= 0).then_some(class)
+    }
+}
+
+impl FrontEndTables {
+    fn read(image: &Image) -> Option<Self> {
+        let u32_at = |at: u32| image.bytes(at, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        let codes = |at: u32, n: u32| -> Option<Vec<crate::items::Code>> {
+            let bytes = image.bytes(at, n as usize * 4)?;
+            Some(bytes.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect())
+        };
+        let graphics = image
+            .bytes(address::FRONT_END_GRAPHICS, crate::appearance::SLOTS * 12)?
+            .chunks_exact(12)
+            .map(|e| {
+                let int = |o: usize| i32::from_le_bytes([e[o], e[o + 1], e[o + 2], e[o + 3]]);
+                ([e[0], e[1], e[2], e[3]], int(4), int(8))
+            })
+            .collect();
+        let limit = |n: u32| (n <= 64).then_some(n);
+        let classes = codes(address::FRONT_END_CLASSES + 4, limit(u32_at(address::FRONT_END_CLASSES)?)?)?;
+        let modes = codes(address::FRONT_END_MODES + 4, limit(u32_at(address::FRONT_END_MODES)?)?)?;
+        let components = codes(address::FRONT_END_COMPONENTS, 16)?;
+        let weapon_classes = codes(address::FRONT_END_WEAPON_CLASSES, limit(u32_at(address::FRONT_END_WEAPON_CLASSES + 15 * 4)?)?)?;
+        let item_count = limit(u32_at(address::FRONT_END_ITEM_WEAPON_CLASSES + 13 * 8)?)?;
+        let item_weapon_classes = image
+            .bytes(address::FRONT_END_ITEM_WEAPON_CLASSES, item_count as usize * 8)?
+            .chunks_exact(8)
+            .map(|e| ([e[0], e[1], e[2], e[3]], u32::from_le_bytes([e[4], e[5], e[6], e[7]])))
+            .collect();
+        let hand_classes = image
+            .bytes(address::FRONT_END_HAND_CLASSES, (item_count as usize + 1) * 4)?
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        Some(Self { graphics, classes, modes, components, weapon_classes, item_weapon_classes, hand_classes })
     }
 }
 

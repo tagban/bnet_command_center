@@ -164,6 +164,8 @@ pub struct ItemDef {
     pub armor_pieces: [u8; 6],
     /// `wclass`: the weapon's animation class (`1hs`, `bow`, …).
     pub weapon_class: Option<Code>,
+    /// `2handedwclass`: its class when a Barbarian holds it in both hands.
+    pub two_handed_class: Option<Code>,
     /// `Transform`: which colour palette an item's tint picks from.
     pub transform: i32,
     /// The table it came from.
@@ -207,6 +209,7 @@ impl Items {
                     component: row.get("component").map_or(16, |_| int("component")),
                     armor_pieces: [piece("rArm"), piece("lArm"), piece("Torso"), piece("Legs"), piece("rSPad"), piece("lSPad")],
                     weapon_class: row.get("wclass").map(code),
+                    two_handed_class: row.get("2handedwclass").map(code),
                     transform: int("Transform"),
                     file,
                 }

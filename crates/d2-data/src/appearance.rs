@@ -75,6 +75,8 @@ const CROSSBOW: Code = *b"xbw ";
 pub struct Graphics {
     /// Codes as little-endian integers, 0 for an empty slot.
     slots: [u32; SLOTS + 1],
+    /// The class id of the item that filled each slot.
+    sources: [Option<usize>; SLOTS + 1],
 }
 
 impl Graphics {
@@ -88,12 +90,13 @@ impl Graphics {
         let drawn_types = [weapon_type, id(items::types::ARMOR), id(items::types::ANY_SHIELD), id(items::types::HELM)];
         let circlet_type = id(items::types::CIRCLET);
         let mut slots = [0u32; SLOTS + 1];
+        let mut sources = [None; SLOTS + 1];
         for (slot, weight) in slots[1..=3].iter_mut().zip(WEIGHTS) {
             *slot = u32::from_le_bytes(weight);
         }
         let reserved_type = |slot: usize| reserved.get(slot).map_or(0, |&(_, t)| t);
         let mut next = 4;
-        for item in items.iter() {
+        for (class, item) in items.iter().enumerate() {
             let gfx = u32::from_le_bytes(item.alternate_gfx.unwrap_or(item.code));
             let t = item.item_type;
             let drawn = drawn_types.iter().any(|&p| types.is_a(t, p)) && !types.is_a(t, circlet_type);
@@ -114,11 +117,19 @@ impl Graphics {
                 at = next;
             }
             slots[at] = gfx;
+            sources[at] = Some(class);
             if at == next {
                 next += 1;
             }
         }
-        Self { slots }
+        Self { slots, sources }
+    }
+
+    /// The class id of the item whose graphics filled a slot; `None` for the weights and empty
+    /// slots.
+    #[must_use]
+    pub fn source(&self, value: u8) -> Option<usize> {
+        self.sources.get(usize::from(value)).copied().flatten()
     }
 
     /// The value an item with graphics `gfx` (its code when blank) and code `code` is saved

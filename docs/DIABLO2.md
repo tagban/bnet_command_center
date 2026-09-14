@@ -187,7 +187,9 @@ client ── (login connection) SID_ENTERCHAT "Tyrael", "bncc,Tyrael"
   with the same data after each game.
 - **The portrait** is 33 bytes: see `bnetcc_proto::d2` for the byte table. Its equipment bytes
   are graphics values, not items; the server writes a map for chat bots,
-  [`d2-equipment.json`](D2-EQUIPMENT-FILE.md), into the BNFTP files directory at startup.
+  [`d2-equipment.json`](D2-EQUIPMENT-FILE.md), into the BNFTP files directory at startup, and a
+  pack of the character-select animations, [`d2-characters.zip`](D2-CHARACTER-PACK.md), so a bot
+  can draw the character.
 
 Wire layouts that matter and are easy to get wrong:
 
@@ -211,6 +213,7 @@ address = ""                          # public host/IP for internet players
 max_characters = 18
 data_dir = ""                         # your 1.14d install: Game.exe and the MPQs
 equipment_file = "d2-equipment.json"  # written into [files] dir for bots; "" disables
+character_pack = "d2-characters.zip"  # the character animations as layers, for bots; "" disables
 ```
 
 The realm's *name* is `server.realm`.

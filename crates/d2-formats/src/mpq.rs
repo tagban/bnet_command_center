@@ -365,6 +365,10 @@ fn expand(src: &[u8], dst: &mut [u8], block_flags: u32) -> Result<(), Error> {
 /// unpatched game that mostly works.
 pub const DATA_ARCHIVES: [&str; 3] = ["Patch_D2.mpq", "d2exp.mpq", "d2data.mpq"];
 
+/// [`DATA_ARCHIVES`] with the classic characters' graphics (`d2char.mpq`); the expansion's
+/// classes are in `d2exp.mpq`.
+pub const CHARACTER_ARCHIVES: [&str; 4] = ["Patch_D2.mpq", "d2exp.mpq", "d2char.mpq", "d2data.mpq"];
+
 /// Several archives searched as one, first match wins.
 #[derive(Debug)]
 pub struct ArchiveSet {

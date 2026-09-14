@@ -220,6 +220,9 @@ game_server_probe = false
 # armour, weapons, shield) to the items they show, for chat bots to download over BNFTP like
 # icons.bni. Built from your install; rewritten only when it changes. Empty disables it.
 equipment_file = "d2-equipment.json"
+# Likewise a ZIP of the character-select animations as layers (about 6 MB), with a manifest that
+# says how to draw a realm character from its statstring. See docs/D2-CHARACTER-PACK.md.
+character_pack = "d2-characters.zip"
 
 [admins]
 # Accounts treated as Battle.net Administrators (sysops). They carry the admin flag and

@@ -78,6 +78,10 @@ pub struct Diablo2Config {
     /// bytes to the items they show (`crate::d2_equipment`), built from `data_dir` at startup for
     /// chat bots to fetch over BNFTP. Needs both directories; empty disables it.
     pub equipment_file: String,
+    /// File name, in `[files] dir`, of the character pack (`crate::d2_characters`): the
+    /// character-select animations as layers with their manifest, built from `data_dir` at
+    /// startup for chat bots to fetch over BNFTP. Needs both directories; empty disables it.
+    pub character_pack: String,
 }
 
 impl Default for Diablo2Config {
@@ -90,6 +94,7 @@ impl Default for Diablo2Config {
             data_dir: String::new(),
             game_server_probe: false,
             equipment_file: "d2-equipment.json".into(),
+            character_pack: "d2-characters.zip".into(),
         }
     }
 }

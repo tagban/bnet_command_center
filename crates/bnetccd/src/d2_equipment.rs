@@ -165,7 +165,8 @@ pub fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
     if std::fs::read(path).is_ok_and(|old| old == bytes) {
         return Ok(false);
     }
-    let partial = path.with_extension("json.partial");
+    let name = path.file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
+    let partial = path.with_file_name(format!("{name}.partial"));
     std::fs::write(&partial, bytes)?;
     std::fs::rename(&partial, path)?;
     Ok(true)
@@ -178,34 +179,83 @@ pub fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
 ///
 /// What failed to load or write, as text.
 pub fn write(data_dir: &str, path: &Path) -> Result<bool, String> {
+    let (data, engine) = load_install(data_dir)?;
+    write_if_changed(path, &encode(&data, &engine)).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The file's bytes: [`build`], pretty-printed.
+#[must_use]
+pub fn encode(data: &GameData, engine: &EngineData) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec_pretty(&build(data, engine)).unwrap_or_default();
+    bytes.push(b'\n');
+    bytes
+}
+
+/// Load the rules and `Game.exe`'s tables from the install in `data_dir`. Blocking.
+///
+/// # Errors
+///
+/// What failed to load, as text.
+pub fn load_install(data_dir: &str) -> Result<(GameData, EngineData), String> {
     if data_dir.trim().is_empty() {
         return Err("diablo2.data_dir is not set".into());
     }
     let exe = std::fs::read(Path::new(data_dir).join("Game.exe")).map_err(|e| format!("Game.exe: {e}"))?;
     let engine = EngineData::from_game_exe(&exe).map_err(|e| e.to_string())?;
     let data = GameData::load(data_dir).map_err(|e| e.to_string())?;
-    let mut bytes = serde_json::to_vec_pretty(&build(&data, &engine)).map_err(|e| e.to_string())?;
-    bytes.push(b'\n');
-    write_if_changed(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))
+    Ok((data, engine))
 }
 
-/// Build the file from `data_dir` and write it into `files_dir` as `name`, off the async
-/// runtime. Failures are logged, never fatal: the file is a convenience for bots.
-pub async fn publish(data_dir: String, files_dir: PathBuf, name: String) {
-    let Some(file_name) = bnetcc_proto::bnftp::sanitize_filename(name.as_bytes()).map(str::to_string) else {
-        warn!(name = %name, "diablo2.equipment_file is not a plain file name; not written");
-        return;
+/// Build the bot files from `data_dir` and write them into `files_dir` — the equipment map as
+/// `equipment` and the character pack (`crate::d2_characters`) as `characters`; an empty name
+/// skips that file. Off the async runtime; failures are logged, never fatal.
+pub async fn publish(data_dir: String, files_dir: PathBuf, equipment: String, characters: String) {
+    let plain = |name: &str, setting: &str| -> Option<String> {
+        if name.is_empty() {
+            return None;
+        }
+        let ok = bnetcc_proto::bnftp::sanitize_filename(name.as_bytes()).map(str::to_string);
+        if ok.is_none() {
+            warn!(name = %name, setting, "not a plain file name; not written");
+        }
+        ok
     };
-    let result = tokio::task::spawn_blocking(move || {
-        let path = files_dir.join(file_name);
-        write(&data_dir, &path).map(|written| (path, written))
+    let equipment = plain(&equipment, "diablo2.equipment_file");
+    let characters = plain(&characters, "diablo2.character_pack");
+    if equipment.is_none() && characters.is_none() {
+        return;
+    }
+    /// A file written: where, what, and whether it changed.
+    type Written = (PathBuf, &'static str, Result<bool, String>);
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<Written>, String> {
+        let (data, engine) = load_install(&data_dir)?;
+        let mut done = Vec::new();
+        if let Some(name) = equipment {
+            let path = files_dir.join(name);
+            let written = write_if_changed(&path, &encode(&data, &engine)).map_err(|e| e.to_string());
+            done.push((path, "Diablo II equipment map", written));
+        }
+        if let Some(name) = characters {
+            let path = files_dir.join(name);
+            let written = crate::d2_characters::build_zip(&data_dir, &data, &engine)
+                .and_then(|zip| write_if_changed(&path, &zip).map_err(|e| e.to_string()));
+            done.push((path, "Diablo II character pack", written));
+        }
+        Ok(done)
     })
     .await;
     match result {
-        Ok(Ok((path, true))) => info!(path = %path.display(), "wrote the Diablo II equipment map for bots"),
-        Ok(Ok((path, false))) => info!(path = %path.display(), "Diablo II equipment map is up to date"),
-        Ok(Err(e)) => warn!(error = %e, "Diablo II equipment map not written"),
-        Err(e) => warn!(error = %e, "Diablo II equipment map task failed"),
+        Ok(Ok(done)) => {
+            for (path, what, written) in done {
+                match written {
+                    Ok(true) => info!(path = %path.display(), "wrote the {what} for bots"),
+                    Ok(false) => info!(path = %path.display(), "{what} is up to date"),
+                    Err(e) => warn!(path = %path.display(), error = %e, "{what} not written"),
+                }
+            }
+        }
+        Ok(Err(e)) => warn!(error = %e, "Diablo II bot files not written"),
+        Err(e) => warn!(error = %e, "Diablo II bot files task failed"),
     }
 }
 
