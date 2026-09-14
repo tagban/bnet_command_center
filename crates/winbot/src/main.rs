@@ -8,6 +8,10 @@
 //! than two minutes to count, so the default length is 2:05; a shorter `--length` checks that
 //! short games do not count.
 //!
+//! StarCraft and Warcraft II let a player on the ladder only after ten normal-game wins. With
+//! `--ladder` or `--iron-man` the bot first plays normal games (the account with fewer wins winning
+//! each) until both accounts have ten.
+//!
 //! ```text
 //! winbot --product SEXP                                # normal games, forever
 //! winbot --product W2BN --ladder --games 10            # ten ladder games
@@ -122,6 +126,31 @@ async fn run(cli: &Cli) -> Result<(), Error> {
     }
 
     let tag = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() % 100_000);
+    let mut count = 0u32;
+    let mut next_name = || {
+        count += 1;
+        format!("wb {tag}-{count}")
+    };
+
+    // The ladder takes ten normal-game wins: earn them first.
+    if league != 0 && !warcraft3 {
+        loop {
+            let (a_wins, b_wins) = (normal_wins(&mut a).await?, normal_wins(&mut b).await?);
+            if a_wins >= LADDER_MIN_WINS && b_wins >= LADDER_MIN_WINS {
+                break;
+            }
+            if cli.length <= 120 {
+                return Err(Error(format!(
+                    "{} and {} need ten normal wins for the ladder ({a_wins} and {b_wins} now), and games of two minutes or less do not count: use a longer --length",
+                    a.account, b.account
+                )));
+            }
+            info!(first = a_wins, second = b_wins, needed = LADDER_MIN_WINS, "warming up: normal games until both have ten wins");
+            // The account with fewer wins wins this one.
+            play(cli, &mut a, &mut b, &next_name(), (0x02, 0, 0), a_wins >= b_wins, false).await?;
+        }
+    }
+
     let mut played = 0u32;
     while cli.games == 0 || played < cli.games {
         let first_surrenders = match cli.surrender {
@@ -129,45 +158,61 @@ async fn run(cli: &Cli) -> Result<(), Error> {
             Surrender::Second => false,
             Surrender::Alternate => played % 2 == 0,
         };
-        let name = format!("wb {tag}-{played}");
-        a.host(&name, game_type, ladder).await?;
-        b.join(&name).await?;
-        a.start().await?;
-        info!(game = %name, length = cli.length, surrenders = if first_surrenders { &a.account } else { &b.account }, "game started");
-        // Both stay connected for the game.
-        let length = Duration::from_secs(cli.length);
-        let (ra, rb) = tokio::join!(a.idle(length), b.idle(length));
-        ra?;
-        rb?;
-
-        if !warcraft3 {
-            let (a_code, b_code) = if first_surrenders { (2, 1) } else { (1, 2) };
-            let slots = [(a.account.clone(), a_code), (b.account.clone(), b_code)];
-            let slots: Vec<(&str, u32)> = slots.iter().map(|(n, c)| (n.as_str(), *c)).collect();
-            // The surrenderer leaves first.
-            let (loser, winner) = if first_surrenders { (&mut a, &mut b) } else { (&mut b, &mut a) };
-            loser.report(league, &slots).await?;
-            loser.leave(&cli.channel).await?;
-            winner.report(league, &slots).await?;
-            winner.leave(&cli.channel).await?;
-        } else {
-            let (loser, winner) = if first_surrenders { (&mut a, &mut b) } else { (&mut b, &mut a) };
-            loser.leave(&cli.channel).await?;
-            winner.leave(&cli.channel).await?;
-        }
+        play(cli, &mut a, &mut b, &next_name(), (game_type, ladder, league), first_surrenders, warcraft3).await?;
         played += 1;
-        info!(game = %name, played, "game over");
-        if !warcraft3 {
-            for who in [&mut a, &mut b] {
-                show_record(who, league).await?;
-            }
-        }
-        let pause = Duration::from_secs(cli.pause);
-        let (ra, rb) = tokio::join!(a.idle(pause), b.idle(pause));
-        ra?;
-        rb?;
+        info!(played, "games played");
     }
     Ok(())
+}
+
+/// Normal-game wins a StarCraft or Warcraft II player needs before the ladder.
+const LADDER_MIN_WINS: u32 = 10;
+
+/// One game: `a` hosts `name`, `b` joins, the host starts it, and after `--length` one side
+/// surrenders. `kind` is the advertised game type, ladder field and result game type.
+async fn play(cli: &Cli, a: &mut Client, b: &mut Client, name: &str, kind: (u16, u32, u32), first_surrenders: bool, warcraft3: bool) -> Result<(), Error> {
+    let (game_type, ladder, league) = kind;
+    a.host(name, game_type, ladder).await?;
+    b.join(name).await?;
+    a.start().await?;
+    let ladder_word = match league {
+        1 => "ladder",
+        3 => "Iron Man",
+        _ => "normal",
+    };
+    info!(game = %name, kind = ladder_word, length = cli.length, surrenders = if first_surrenders { &a.account } else { &b.account }, "game started");
+    // Both stay connected for the game.
+    let length = Duration::from_secs(cli.length);
+    let (ra, rb) = tokio::join!(a.idle(length), b.idle(length));
+    ra?;
+    rb?;
+
+    let (a_code, b_code) = if first_surrenders { (2, 1) } else { (1, 2) };
+    let slots = [(a.account.clone(), a_code), (b.account.clone(), b_code)];
+    let slots: Vec<(&str, u32)> = slots.iter().map(|(n, c)| (n.as_str(), *c)).collect();
+    // The surrenderer leaves first.
+    let (loser, winner) = if first_surrenders { (a, b) } else { (b, a) };
+    for side in [&mut *loser, &mut *winner] {
+        if !warcraft3 {
+            side.report(league, &slots).await?;
+        }
+        side.leave(&cli.channel).await?;
+    }
+    info!(game = %name, winner = %winner.account, "game over");
+    if !warcraft3 {
+        show_record(loser, league).await?;
+        show_record(winner, league).await?;
+    }
+    let pause = Duration::from_secs(cli.pause);
+    let (ra, rb) = tokio::join!(loser.idle(pause), winner.idle(pause));
+    ra?;
+    rb
+}
+
+/// An account's normal-game wins.
+async fn normal_wins(client: &mut Client) -> Result<u32, Error> {
+    let key = format!(r"Record\{}\0\wins", client.product);
+    Ok(client.read(&[key]).await?.first().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
 /// Print an account's normal record, and its ladder record and rank when playing the ladder.
