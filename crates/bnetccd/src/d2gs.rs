@@ -160,6 +160,17 @@ struct Game {
     outgoing: HashMap<String, Vec<Vec<u8>>>,
     /// Guids of the warp tiles sent so far, by level and index into the level's warps.
     warp_guids: HashMap<(i32, usize), u32>,
+    /// Gold lying on the ground, by item guid.
+    ground: HashMap<u32, GroundGold>,
+}
+
+/// A gold pile on the ground.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GroundGold {
+    room: RoomId,
+    x: u16,
+    y: u16,
+    amount: u32,
 }
 
 /// Why the realm could not create a game.
@@ -413,6 +424,7 @@ impl GameServer {
                 battle: Battle::new(difficulty, rand::thread_rng().gen()),
                 outgoing: HashMap::new(),
                 warp_guids: HashMap::new(),
+                ground: HashMap::new(),
             },
         );
         let game = &g.by_id[&id];
@@ -534,6 +546,10 @@ impl GameServer {
             let (&(level, index), _) = game.warp_guids.iter().find(|(_, &g)| g == guid)?;
             let warp = game.world.as_ref()?.levels().iter().find(|l| l.id == level)?.warps.get(index)?;
             return Some((u16::try_from(warp.x).ok()?, u16::try_from(warp.y).ok()?));
+        }
+        if kind == u32::from(unit_type::ITEM) {
+            let pile = g.by_id.get(&game_id)?.ground.get(&guid)?;
+            return Some((pile.x, pile.y));
         }
         let population = g.by_id.get(&game_id)?.population.as_ref()?;
         match *population.find(u8::try_from(kind).ok()?, guid)?.1 {
@@ -665,6 +681,10 @@ impl GameServer {
                     }
                 }
             }
+            // Gold already lying there.
+            for (&guid, pile) in game.ground.iter().filter(|(_, p)| p.room == id) {
+                packets.push(d2gs::ground_gold(guid, pile.x, pile.y, pile.amount, false));
+            }
             // The room's warps that lead somewhere built, after its other units.
             let Some(level) = world.levels().iter().find(|l| l.id == id.level) else { continue };
             for (index, warp) in level.warps.iter().enumerate().filter(|(_, w)| w.room == id.index) {
@@ -684,6 +704,9 @@ impl GameServer {
                     Spawned::Monster { .. } => unit_type::MONSTER,
                 };
                 packets.push(d2gs::remove_unit(kind, unit.guid()));
+            }
+            for (&guid, _) in game.ground.iter().filter(|(_, p)| p.room == id) {
+                packets.push(d2gs::remove_unit(unit_type::ITEM, guid));
             }
             if let Some(level) = world.levels().iter().find(|l| l.id == id.level) {
                 for (index, _) in level.warps.iter().enumerate().filter(|(_, w)| w.room == id.index) {
@@ -750,7 +773,7 @@ impl GameServer {
         game.battle.set_motion(name, motion);
         let due = (game.created.elapsed().as_micros() / SERVER_FRAME.as_micros()) as u64;
         if due > game.battle.frame() {
-            let Game { battle, world, positions, views, population, outgoing, .. } = game;
+            let Game { battle, world, positions, views, population, outgoing, ground, .. } = game;
             for (player, &(x, y)) in positions.iter() {
                 let level = world.as_ref().and_then(|w| w.room_at(x, y)).map(|r| r.level);
                 battle.place_player(player, level.map(|l| (x, y, l)), views.get(player).map_or(&[], Vec::as_slice));
@@ -765,6 +788,18 @@ impl GameServer {
                 battle.advance(rules, due, &open)
             };
             for event in events {
+                if let Event::GoldDrop { room, x, y, amount } = event {
+                    // A pile on the ground, seen by whoever holds its room.
+                    let Some(population) = population.as_mut() else { continue };
+                    let guid = population.next_guid(unit_type::ITEM);
+                    ground.insert(guid, GroundGold { room, x, y, amount });
+                    for (player, view) in views.iter() {
+                        if view.contains(&room) {
+                            outgoing.entry(player.clone()).or_default().push(d2gs::ground_gold(guid, x, y, amount, true));
+                        }
+                    }
+                    continue;
+                }
                 share_out(event, rules, world, battle, views, outgoing, population.as_mut());
             }
         }
@@ -776,6 +811,39 @@ impl GameServer {
         let g = self.lock();
         let (x, y, mode, _) = g.by_id.get(&game_id)?.battle.monster(guid)?;
         (mode != battle::DEAD_MODE).then_some((x, y))
+    }
+
+    /// A player picks up a gold pile (engine `0x16`): it takes what its purse holds. Its client
+    /// gets the pile removed and its new gold (`0x1D`–`0x1F`, stat 14); others near see the pile
+    /// go. A remainder is put back as a smaller pile. Items other than gold are not on the ground
+    /// yet; anything else is ignored.
+    ///
+    /// ⚠️ Range is not checked (the client walks up before it asks), and what the engine does
+    /// with a remainder is not confirmed.
+    fn pick_up(&self, game_id: u16, name: &str, guid: u32) -> Vec<Vec<u8>> {
+        let mut g = self.lock();
+        let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
+        let Some(pile) = game.ground.get(&guid).copied() else { return Vec::new() };
+        let Some((taken, total)) = game.battle.pick_up_gold(name, pile.amount) else { return Vec::new() };
+        if taken == 0 {
+            return Vec::new();
+        }
+        let mut gone = vec![d2gs::remove_unit(unit_type::ITEM, guid)];
+        if taken < pile.amount {
+            let left = GroundGold { amount: pile.amount - taken, ..pile };
+            game.ground.insert(guid, left);
+            gone.push(d2gs::ground_gold(guid, left.x, left.y, left.amount, false));
+        } else {
+            game.ground.remove(&guid);
+        }
+        for (player, view) in &game.views {
+            if player != name && view.contains(&pile.room) {
+                game.outgoing.entry(player.clone()).or_default().extend(gone.iter().cloned());
+            }
+        }
+        info!(game_id, player = name, guid, taken, total, "gold picked up");
+        gone.push(d2gs::set_stat(stat::GOLD, total));
+        gone
     }
 
     /// A player swings at a monster.
@@ -835,7 +903,7 @@ fn battle_packet(event: &Event, recipient: &str) -> Option<Vec<u8>> {
         Event::MonsterWalk { guid, x, y, .. } => d2gs::monster_walk(*guid, *x, *y),
         Event::MonsterStop { guid, x, y, life, .. } => d2gs::monster_standing(*guid, *x, *y, *life),
         Event::MonsterAttack { guid, target, x, y, .. } if target == recipient => d2gs::monster_attack(*guid, PLAYER_GUID, *x, *y),
-        Event::MonsterAttack { .. } | Event::MonsterState { .. } => return None,
+        Event::MonsterAttack { .. } | Event::MonsterState { .. } | Event::GoldDrop { .. } => return None,
         Event::PlayerReaction { event, .. } => d2gs::player_reaction(unit_type::PLAYER, PLAYER_GUID, *event, 0, 0),
         Event::PlayerVitals { life, mana, stamina, .. } => d2gs::life_and_position(*life, *mana, *stamina, 0, 0, 0, 0),
         Event::Experience { old, new, .. } => d2gs::experience(*old, *new),
@@ -1318,6 +1386,17 @@ async fn run(
                     }
                     flush(stream, peer, tables, &mut outbox).await?;
                 }
+                (Stage::InGame, cs::PICK_UP_ITEM) => {
+                    let Some(p) = player.as_mut() else { continue };
+                    let replies = server.pick_up(p.game_id, &p.character.name, u32_at(5));
+                    if !replies.is_empty() {
+                        for packet in &replies {
+                            outbox.push(packet);
+                        }
+                        flush(stream, peer, tables, &mut outbox).await?;
+                        server.save_character(p).await;
+                    }
+                }
                 (Stage::InGame, cs::RESPAWN) => {
                     // Done on the next frame the corpse has settled (see `respawn`).
                     pending_respawn = true;
@@ -1550,6 +1629,7 @@ pub(crate) mod tests {
         client[usize::from(cs::INTERACT)] = 9;
         client[usize::from(cs::WAYPOINT_TRAVEL)] = 9;
         client[usize::from(cs::UPDATE_POSITION)] = 5;
+        client[usize::from(cs::PICK_UP_ITEM)] = 13;
         EngineTables::new(&lengths, client, [0i32; SERVER_OPCODES]).unwrap()
     }
 
@@ -2105,7 +2185,8 @@ pub(crate) mod tests {
 
     /// A hostile monster out in a made-up Blood Moor room joins the fight when its room loads;
     /// swinging at it until it dies sends the player its death frames — dying, then the corpse a
-    /// death animation later — and the experience; its room loaded again shows the corpse.
+    /// death animation later — the experience and its gold; its room loaded again shows the
+    /// corpse and the pile, which the player picks up once.
     #[test]
     fn a_monster_hit_until_it_dies_pays_out_and_stays_dead() {
         use d2_data::monsters::Monsters;
@@ -2116,10 +2197,12 @@ pub(crate) mod tests {
         use d2_formats::excel::Table;
         let (mut rules, town) = test_town();
         let monstats = Table::parse(
-            b"Id\thcIdx\tMonStatsEx\tnpc\tinteract\tCode\tLevel\tminHP\tmaxHP\tExp\tA1MinD\tA1MaxD\tA1TH\taidel\r\n\
-              guard\t10\tguard\t1\t1\tGU\t1\t1\t1\t0\t0\t0\t0\t5\r\n\
-              brute\t11\tguard\t0\t0\tXX\t1\t1\t1\t50\t1\t1\t1\t5\r\n",
+            b"Id\thcIdx\tMonStatsEx\tnpc\tinteract\tCode\tLevel\tminHP\tmaxHP\tExp\tA1MinD\tA1MaxD\tA1TH\taidel\tTreasureClass1\r\n\
+              guard\t10\tguard\t1\t1\tGU\t1\t1\t1\t0\t0\t0\t0\t5\t\r\n\
+              brute\t11\tguard\t0\t0\tXX\t1\t1\t1\t50\t1\t1\t1\t5\tPurse\r\n",
         );
+        let treasure = Table::parse(b"Treasure Class\tgroup\tlevel\tPicks\tNoDrop\tItem1\tProb1\r\nPurse\t\t\t-1\t\tgld\t1\r\n");
+        rules.set_treasure(d2_data::treasure::TreasureClasses::from_table(&treasure).unwrap());
         let objects = rules.objects().clone();
         rules.set_map_tables(MonPresets::default(), Monsters::from_tables(&monstats, &Table::parse(b"Id\r\nguard\r\n")).unwrap(), objects);
         let monlvl = Table::parse(b"Level\tAC\tTH\tHP\tDM\tXP\r\n0\t100\t100\t100\t100\t100\r\n1\t100\t100\t100\t100\t100\r\n");
@@ -2156,11 +2239,25 @@ pub(crate) mod tests {
         let dead = seen.iter().position(|p| *p == d2gs::monster_reaction(guid, battle::reaction::DEAD, 5780, 4500, 0, false)).expect("dead");
         assert!(dying < dead);
         assert!(seen.contains(&d2gs::experience(0, 50)), "{seen:02x?}");
-        gs.view_change(id, &[room], &[]);
+        let drop = seen.iter().find(|p| p[0] == 0x9C).expect("its gold falls");
+        let pile = u32::from_le_bytes([drop[4], drop[5], drop[6], drop[7]]);
+        assert_eq!((drop[1], drop[9] & 0x20), (0, 0x20), "added to the ground, falling");
+        let left = gs.view_change(id, &[room], &[]);
+        assert!(left.contains(&d2gs::remove_unit(unit_type::ITEM, pile)));
         let again = gs.view_change(id, &[], &[room]);
         let corpse = again.iter().find(|p| p[0] == 0xAC).unwrap();
         assert_eq!(corpse[11], 0, "no life");
         assert!(!again.iter().any(|p| p[0] == 0x6D), "a corpse is not stood up");
+        assert!(again.iter().any(|p| p[0] == 0x9C && p[4..8] == pile.to_le_bytes() && p[9] & 0x20 == 0), "the pile lies there");
+        assert_eq!(gs.unit_position(id, u32::from(unit_type::ITEM), pile), Some((5780, 4500)));
+        let got = gs.pick_up(id, "Hero", pile);
+        assert_eq!(got[0], d2gs::remove_unit(unit_type::ITEM, pile));
+        let gold = gs.lock().by_id[&id].battle.player_stats("Hero").unwrap().iter().find(|s| s.0 == stat::GOLD).unwrap().1;
+        assert!((1..=5).contains(&gold), "level 1: 1 + rand(5): {gold}");
+        assert_eq!(got[1], d2gs::set_stat(stat::GOLD, gold));
+        assert!(gs.pick_up(id, "Hero", pile).is_empty(), "once");
+        gs.view_change(id, &[room], &[]);
+        assert!(!gs.view_change(id, &[], &[room]).iter().any(|p| p[0] == 0x9C), "gone for good");
     }
 
     /// A character leaving a game is saved as a `.d2s` holding its stats and its waypoints; the

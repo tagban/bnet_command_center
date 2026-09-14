@@ -27,6 +27,7 @@ pub mod presets;
 pub mod stat;
 pub mod strings;
 pub mod tiles;
+pub mod treasure;
 
 use items::{Code, Items};
 use levels::Levels;
@@ -124,6 +125,7 @@ pub struct GameData {
     objects: Objects,
     shrines: Shrines,
     items: Items,
+    treasure: treasure::TreasureClasses,
     /// `ArmType.txt`'s tokens, by body armour weight.
     armor_types: Vec<Code>,
     /// The install's archives, kept open for map files; `None` when built from tables.
@@ -162,6 +164,7 @@ impl GameData {
         data.shrines = Shrines::from_table(&read("shrines.txt")?);
         data.items = Items::from_tables(&read("itemtypes.txt")?, &read("weapons.txt")?, &read("armor.txt")?, &read("misc.txt")?)?;
         data.armor_types = read("armtype.txt")?.rows().filter_map(|r| r.get("Token").map(items::code)).collect();
+        data.treasure = treasure::TreasureClasses::from_table(&read("treasureclassex.txt")?)?;
         data.archives = Some(Arc::new(archives));
         Ok(data)
     }
@@ -280,6 +283,12 @@ impl GameData {
         &self.monster_levels
     }
 
+    /// `TreasureClassEx.txt`.
+    #[must_use]
+    pub fn treasure(&self) -> &treasure::TreasureClasses {
+        &self.treasure
+    }
+
     /// `animdata.d2`: animation lengths and hit frames.
     #[must_use]
     pub fn anim_data(&self) -> &AnimData {
@@ -290,6 +299,11 @@ impl GameData {
     pub fn set_combat_tables(&mut self, monster_levels: MonLvls, anim_data: AnimData) {
         self.monster_levels = monster_levels;
         self.anim_data = anim_data;
+    }
+
+    /// Replace the treasure classes — for building rules from tables in tests.
+    pub fn set_treasure(&mut self, treasure: treasure::TreasureClasses) {
+        self.treasure = treasure;
     }
 
     /// Replace the map tables — for building rules from tables in tests.
@@ -390,6 +404,7 @@ impl GameData {
             objects: Objects::default(),
             shrines: Shrines::default(),
             items: Items::default(),
+            treasure: treasure::TreasureClasses::default(),
             armor_types: Vec::new(),
             archives: None,
         })

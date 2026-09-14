@@ -61,6 +61,8 @@ pub mod sc {
     pub const ASSIGN_WARP: u8 = 0x09;
     /// Forget a unit (6 bytes).
     pub const REMOVE_UNIT: u8 = 0x0A;
+    /// An item made, moved or placed where no unit owns it (variable; size at `+2`).
+    pub const ITEM_ACTION_WORLD: u8 = 0x9C;
     /// An object's mode changed (12 bytes).
     pub const OBJECT_STATE: u8 = 0x0E;
     /// Which unit is the client's own player (6 bytes).
@@ -162,6 +164,8 @@ pub mod cs {
     pub const ADD_STAT_POINT: u8 = 0x3A;
     /// Leave the corpse and restart in town, after "You have died" (1 byte).
     pub const RESPAWN: u8 = 0x41;
+    /// Pick an item up: `[container u32][item guid u32][to cursor u32]` (13 bytes).
+    pub const PICK_UP_ITEM: u8 = 0x16;
     /// Travel by waypoint: `[waypoint guid u32][level u16][u16]` (9 bytes; engine handler
     /// `0x0054C5D0`).
     pub const WAYPOINT_TRAVEL: u8 = 0x49;
@@ -688,6 +692,32 @@ pub fn set_stat(stat: u8, value: u32) -> Vec<u8> {
     w.finish()
 }
 
+/// `0x9C` action 0 (add to ground; client `0x004C25B0`) for a gold pile at `(x, y)`: the 8-byte
+/// header `[0x9C][action][size][category][guid u32]`, then the item bits — flags (identified
+/// `0x10`, just dropped `0x2000` for the fall and its sound, simple `0x200000`, `0x800000` set on
+/// every item), version 101, mode 3 (ground), `x`/`y`, code `gld `, and the amount behind a
+/// one-bit width flag (12 bits, or 32 above 4095; `0x0062A970` stores it as stat 14).
+/// `dropping` false leaves a pile that is just there. ⚠️ The category byte is sent as 0; the
+/// client does not read it for action 0.
+#[must_use]
+pub fn ground_gold(guid: u32, x: u16, y: u16, amount: u32, dropping: bool) -> Vec<u8> {
+    let big = amount > 0xFFF;
+    let bits = 32 + 10 + 3 + 32 + 32 + 1 + if big { 32 } else { 12 };
+    let mut w = BitWriter::with_bytes(8 + bits / 8 + 1);
+    w.bit = 8 * 8;
+    let flags = 0x10 | 0x0020_0000 | 0x0080_0000 | if dropping { 0x2000 } else { 0 };
+    w.put(flags, 32).put(101, 10).put(3, 3).put(u32::from(x), 16).put(u32::from(y), 16);
+    w.put(u32::from_le_bytes(*b"gld "), 32).put(u32::from(big), 1).put(amount, if big { 32 } else { 12 });
+    let size = w.bytes_used();
+    let mut bytes = w.bytes;
+    bytes.truncate(size);
+    bytes[0] = sc::ITEM_ACTION_WORLD;
+    bytes[1] = 0;
+    bytes[2] = size as u8;
+    bytes[4..8].copy_from_slice(&guid.to_le_bytes());
+    bytes
+}
+
 /// Fog's bit buffer (`0x00410EB0`): values packed least significant bit first.
 struct BitWriter {
     bytes: Vec<u8>,
@@ -953,6 +983,25 @@ mod tests {
         l[0] = 1;
         l[0xAF] = 8;
         l
+    }
+
+    #[test]
+    fn a_gold_pile_is_a_simple_ground_item() {
+        let p = ground_gold(0x1234, 5000, 5700, 37, true);
+        assert_eq!(&p[..8], &[0x9C, 0, p.len() as u8, 0, 0x34, 0x12, 0, 0]);
+        assert_eq!(p.len(), 8 + 16, "122 bits");
+        // Flags 0x00A02010, then version 101 in the next 10 bits: the same leading bytes as a
+        // retail ground-to-inventory item's `10 00 a0 00 65 00` apart from the drop bit.
+        assert_eq!(&p[8..13], &[0x10, 0x20, 0xA0, 0x00, 0x65]);
+        let bit = |i: usize| (p[8 + i / 8] >> (i % 8)) & 1;
+        let field = |from: usize, len: usize| (0..len).map(|i| u32::from(bit(from + i)) << i).sum::<u32>();
+        assert_eq!(field(42, 3), 3, "mode ground");
+        assert_eq!((field(45, 16), field(61, 16)), (5000, 5700));
+        assert_eq!(field(77, 32).to_le_bytes(), *b"gld ");
+        assert_eq!((field(109, 1), field(110, 12)), (0, 37));
+        let big = ground_gold(1, 0, 0, 5000, false);
+        assert_eq!(big.len(), 8 + 18, "142 bits");
+        assert_eq!(big[9] & 0x20, 0, "no drop animation");
     }
 
     fn sizes_for_tests() -> [i32; CLIENT_OPCODES] {

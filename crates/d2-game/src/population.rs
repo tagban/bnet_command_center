@@ -28,6 +28,8 @@ pub mod unit_type {
     pub const MONSTER: u8 = 1;
     /// An object.
     pub const OBJECT: u8 = 2;
+    /// An item.
+    pub const ITEM: u8 = 4;
     /// A warp tile.
     pub const WARP: u8 = 5;
 }

@@ -36,6 +36,7 @@ use std::collections::BTreeMap;
 
 use d2_data::monlvl::Scale;
 use d2_data::{stat, GameData};
+use d2_data::treasure::{gold_amount, Drop, MAX_DROPS};
 use d2_drlg::rng::Seed;
 use d2_drlg::world::RoomId;
 
@@ -59,6 +60,9 @@ pub mod reaction {
 
 /// A monster's mode once dead, as `0xAC` sends it.
 pub const DEAD_MODE: u8 = 12;
+
+/// Gold a character carries per level.
+pub const GOLD_PER_LEVEL: u32 = 10_000;
 
 /// How far a monster whose `aidist` is blank notices a player, subtiles (bnemu's reading of the
 /// retail fights; the engine keeps it per AI routine, not ported).
@@ -190,6 +194,17 @@ pub enum Event {
         /// After.
         new: u32,
     },
+    /// A dying monster dropped a gold pile (`0x9C`).
+    GoldDrop {
+        /// The room it lies in.
+        room: RoomId,
+        /// World subtiles.
+        x: u16,
+        /// World subtiles.
+        y: u16,
+        /// Gold.
+        amount: u32,
+    },
     /// `0x1D`–`0x1F`: one of a player's stats.
     PlayerStat {
         /// The player.
@@ -218,6 +233,8 @@ struct MonsterSheet {
     dying_frames: u64,
     /// `Velocity`: sixteenths of a subtile a frame while walking.
     glide: u64,
+    /// `TreasureClass1` for the difficulty.
+    treasure: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -485,6 +502,7 @@ impl Battle {
             hit_frame: hit_frames(data, &m.combat.token, "A1", weapon, attack_frames / 2),
             get_hit_frames: anim_frames(data, &m.combat.token, "GH", weapon, 8),
             dying_frames: anim_frames(data, &m.combat.token, "DT", weapon, 20),
+            treasure: c.treasure[d].clone(),
         };
         let think = sheet.think;
         self.monsters.insert(
@@ -765,9 +783,40 @@ impl Battle {
         }
         m.life = 0;
         m.doing = Doing::Dying { until: now + m.sheet.dying_frames };
+        let (treasure, level) = (m.sheet.treasure.clone(), m.sheet.level);
         events.push(Event::MonsterReaction { room, guid, event: reaction::DYING, x: ux, y: uy, life: 0, alive: true });
         events.push(Event::MonsterState { guid, x: ux, y: uy, mode: DEAD_MODE, life: 0 });
         self.gain_experience(data, player, experience_gain, events);
+        self.drop_treasure(data, room, (x, y), &treasure, level, events);
+    }
+
+    /// Roll a dead monster's treasure class (upgraded to its level) for the players in the game.
+    /// Gold piles are dropped around where it fell; items are not made yet.
+    ///
+    /// ⚠️ The engine finds each drop a free spot near the corpse (`0x00555DA0`); piles here go
+    /// on the corpse and the subtiles beside it, unchecked.
+    fn drop_treasure(&mut self, data: &GameData, room: RoomId, (x, y): (i32, i32), treasure: &str, level: i32, events: &mut Vec<Event>) {
+        const SPOTS: [(i32, i32); MAX_DROPS] = [(0, 0), (1, 0), (0, 1), (-1, 0), (0, -1), (1, 1)];
+        let Some(class) = data.treasure().upgraded(treasure, level) else { return };
+        let players = (self.heroes.len() as u32).max(1);
+        let seed = &mut self.seed;
+        let drops = data.treasure().roll(class, players, &mut |n| seed.pick(n));
+        for (drop, (dx, dy)) in drops.into_iter().zip(SPOTS) {
+            if let Drop::Gold { mul } = drop {
+                let amount = gold_amount(level, mul, &mut |n| self.seed.pick(n));
+                events.push(Event::GoldDrop { room, x: (x + dx) as u16, y: (y + dy) as u16, amount });
+            }
+        }
+    }
+
+    /// A player picks up a gold pile of `amount`: as much as its purse holds (10,000 a level).
+    /// What it took and its new total, `None` for a player not in the fight.
+    pub fn pick_up_gold(&mut self, name: &str, amount: u32) -> Option<(u32, u32)> {
+        let h = self.heroes.get_mut(name)?;
+        let room = (h.level.saturating_mul(GOLD_PER_LEVEL)).saturating_sub(h.gold);
+        let taken = amount.min(room);
+        h.gold += taken;
+        Some((taken, h.gold))
     }
 
     fn gain_experience(&mut self, data: &GameData, name: &str, gain: u32, events: &mut Vec<Event>) {

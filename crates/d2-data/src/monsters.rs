@@ -75,6 +75,8 @@ pub struct CombatStats {
     pub token: String,
     /// `MonStats2.txt` `BaseW`: the weapon class its animations are drawn with.
     pub weapon_class: String,
+    /// `TreasureClass1` by difficulty: what it drops.
+    pub treasure: [String; 3],
 }
 
 /// The `MonStats.txt` columns room population reads, class names resolved to class ids (-1 for
@@ -186,6 +188,7 @@ impl Monsters {
                     ai: row.get("AI").unwrap_or_default().to_string(),
                     token: row.get("Code").unwrap_or_default().to_string(),
                     weapon_class: weapon_classes.get(&ex).cloned().unwrap_or_else(|| "hth".into()),
+                    treasure: ["TreasureClass1", "TreasureClass1(N)", "TreasureClass1(H)"].map(|c| row.get(c).unwrap_or_default().to_string()),
                 };
                 Some((class, MonsterClass { id, critter, components, interact: flag("interact"), npc: flag("npc"), align: int("Align") as u8, size, spawn_collision, spawn, combat }))
             })
