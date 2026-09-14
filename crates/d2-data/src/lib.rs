@@ -35,7 +35,7 @@ use monlvl::MonLvls;
 use monsters::Monsters;
 use presets::{LvlPrests, MonPresets, Objects, Shrines};
 use strings::Strings;
-use tiles::{LvlTypes, LvlWarps};
+use tiles::{LvlMazes, LvlTypes, LvlWarps};
 
 /// Classes in `charstats.txt` order, which is the engine's class id.
 pub const CLASSES: [&str; 7] = ["Amazon", "Sorceress", "Necromancer", "Paladin", "Barbarian", "Druid", "Assassin"];
@@ -116,6 +116,7 @@ pub struct GameData {
     lvl_subs: LvlSubs,
     lvl_types: LvlTypes,
     lvl_warps: LvlWarps,
+    lvl_mazes: LvlMazes,
     mon_presets: MonPresets,
     monsters: Monsters,
     monster_levels: MonLvls,
@@ -149,6 +150,7 @@ impl GameData {
         data.lvl_subs = LvlSubs::from_table(&read("lvlsub.txt")?)?;
         data.lvl_types = LvlTypes::from_table(&read("lvltypes.txt")?)?;
         data.lvl_warps = LvlWarps::from_table(&read("lvlwarp.txt")?)?;
+        data.lvl_mazes = LvlMazes::from_table(&read("lvlmaze.txt")?)?;
         let monstats = read("monstats.txt")?;
         data.mon_presets =
             MonPresets::from_tables(&read("monpreset.txt")?, &monstats, &read("superuniques.txt")?, &read("monplace.txt")?)?;
@@ -235,6 +237,12 @@ impl GameData {
     #[must_use]
     pub fn lvl_warps(&self) -> &LvlWarps {
         &self.lvl_warps
+    }
+
+    /// `LvlMaze.txt`.
+    #[must_use]
+    pub fn lvl_mazes(&self) -> &LvlMazes {
+        &self.lvl_mazes
     }
 
     /// `MonPreset.txt`, resolved.
@@ -374,6 +382,7 @@ impl GameData {
             lvl_subs: LvlSubs::default(),
             lvl_types: LvlTypes::default(),
             lvl_warps: LvlWarps::default(),
+            lvl_mazes: LvlMazes::default(),
             mon_presets: MonPresets::default(),
             monsters: Monsters::default(),
             monster_levels: MonLvls::default(),

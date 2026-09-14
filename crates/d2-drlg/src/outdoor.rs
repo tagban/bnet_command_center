@@ -2100,7 +2100,7 @@ fn direction_index(dx: i32, dy: i32) -> i32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use d2_data::engine::EngineData;
     use std::path::PathBuf;
@@ -2158,7 +2158,7 @@ mod tests {
     /// The operator's install (`BNETCC_D2_DATA_DIR`, `BNETCC_D2_GAME_EXE`) and a libd2 checkout
     /// (`LIBD2_DIR`) whose engine recordings the tests compare against; nothing from them is
     /// copied here.
-    fn install() -> Option<(GameData, EngineData, PathBuf)> {
+    pub(crate) fn install() -> Option<(GameData, EngineData, PathBuf)> {
         let (Ok(dir), Ok(exe), Ok(libd2)) =
             (std::env::var("BNETCC_D2_DATA_DIR"), std::env::var("BNETCC_D2_GAME_EXE"), std::env::var("LIBD2_DIR"))
         else {
@@ -2169,13 +2169,13 @@ mod tests {
         Some((data, engine, PathBuf::from(libd2).join("packages/drlg/src/golden")))
     }
 
-    fn number(line: &str, key: &str, from: usize) -> Option<(i64, usize)> {
+    pub(crate) fn number(line: &str, key: &str, from: usize) -> Option<(i64, usize)> {
         let at = line.get(from..)?.find(key)? + from + key.len();
         let end = line[at..].find(|c: char| !(c.is_ascii_digit() || c == '-')).map_or(line.len(), |e| e + at);
         Some((line[at..end].parse().ok()?, end))
     }
 
-    fn read_golden(path: &std::path::Path) -> String {
+    pub(crate) fn read_golden(path: &std::path::Path) -> String {
         if path.extension().is_some_and(|e| e == "gz") {
             let out = std::process::Command::new("gzip").arg("-dc").arg(path).output().expect("gzip");
             String::from_utf8(out.stdout).expect("utf-8")
@@ -2185,10 +2185,10 @@ mod tests {
     }
 
     /// Recorded rooms by `(level, px, py)`: width and cells.
-    type RecordedRooms = HashMap<(i32, i32, i32), (i32, Vec<u16>)>;
+    pub(crate) type RecordedRooms = HashMap<(i32, i32, i32), (i32, Vec<u16>)>;
 
     /// A collision recording's seed and rooms, strips joined.
-    fn recorded_collision(text: &str, levels: &[i32]) -> (u32, RecordedRooms) {
+    pub(crate) fn recorded_collision(text: &str, levels: &[i32]) -> (u32, RecordedRooms) {
         let mut seed = 0;
         let mut rooms = RecordedRooms::new();
         for line in text.lines() {

@@ -69,6 +69,59 @@ pub struct LvlWarp {
     pub direction: u8,
 }
 
+/// One `LvlMaze.txt` row: how a maze level grows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LvlMaze {
+    /// `Level`.
+    pub level: i32,
+    /// `Rooms`, `Rooms(N)`, `Rooms(H)`: cells to grow to.
+    pub rooms: [i32; 3],
+    /// `SizeX`/`SizeY`: a cell's size in tiles.
+    pub size: (i32, i32),
+    /// `Merge`: per-mille chance two touching cells join.
+    pub merge: i32,
+}
+
+/// `LvlMaze.txt`.
+#[derive(Debug, Clone, Default)]
+pub struct LvlMazes {
+    rows: Vec<LvlMaze>,
+}
+
+impl LvlMazes {
+    /// Parse the table.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadTable`] if `Level` or `SizeX` is missing.
+    pub fn from_table(t: &Table) -> Result<Self, Error> {
+        for column in ["Level", "SizeX"] {
+            if t.column(column).is_none() {
+                return Err(Error::BadTable { table: "lvlmaze.txt", problem: format!("no {column} column") });
+            }
+        }
+        let rows = t
+            .rows()
+            .filter_map(|row| {
+                let int = |c: &str| row.int(c).unwrap_or(0) as i32;
+                Some(LvlMaze {
+                    level: row.int("Level")? as i32,
+                    rooms: [int("Rooms"), int("Rooms(N)"), int("Rooms(H)")],
+                    size: (int("SizeX"), int("SizeY")),
+                    merge: int("Merge"),
+                })
+            })
+            .collect();
+        Ok(Self { rows })
+    }
+
+    /// `TXT_LvlMaze_FindLineByLevelId`: the first row for a level.
+    #[must_use]
+    pub fn for_level(&self, level: i32) -> Option<&LvlMaze> {
+        self.rows.iter().find(|r| r.level == level && level != 0)
+    }
+}
+
 /// `LvlWarp.txt`, in file order.
 #[derive(Debug, Clone, Default)]
 pub struct LvlWarps {

@@ -14,6 +14,7 @@
 
 pub mod act;
 pub mod collision;
+pub mod maze;
 pub mod outdoor;
 pub mod preset;
 pub mod rng;
