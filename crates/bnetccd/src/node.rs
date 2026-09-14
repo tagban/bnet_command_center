@@ -362,6 +362,9 @@ pub struct Node {
     pub bans: BanStore,
     /// The Diablo II ladder season.
     pub d2_season: crate::season::LadderSeasons,
+    /// Woken when a ladder changes (a counted ladder game, a season's end), so the ladder push
+    /// can send fresh standings.
+    pub ladder_changed: tokio::sync::Notify,
     /// Every logged-in session, keyed by lowercased display name, so staff moderation can
     /// reach a session in any channel (or none). Populated at logon, cleared on disconnect.
     sessions: Mutex<HashMap<String, SessionEntry>>,
@@ -511,6 +514,7 @@ impl Node {
             key_holder_names: Mutex::new(HashMap::new()),
             bans: BanStore::load(cfg.bans_path),
             d2_season: crate::season::LadderSeasons::load(cfg.d2_season_path),
+            ladder_changed: tokio::sync::Notify::new(),
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -661,7 +665,9 @@ impl Node {
         outcome: crate::storage::GameOutcome,
         opponent: u32,
     ) -> Result<u32, String> {
-        self.storage.record_ladder_game(account_id, product, league, outcome, opponent).await
+        let rating = self.storage.record_ladder_game(account_id, product, league, outcome, opponent).await;
+        self.ladder_changed.notify_one();
+        rating
     }
 
     /// Every account's record in a product's ladder league.
@@ -745,6 +751,7 @@ impl Node {
         let ended = self.d2_season.current();
         let (softcore, hardcore) = self.storage.end_ladder_season().await?;
         let begun = self.d2_season.begin_next();
+        self.ladder_changed.notify_one();
         tracing::info!(ended = ended.number, begun = begun.number, softcore, hardcore, "Diablo II ladder season ended");
         Ok((ended, begun, softcore, hardcore))
     }
