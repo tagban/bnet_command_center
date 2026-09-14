@@ -687,15 +687,21 @@ On the wire:
 - Piles stay in the game: a room coming near sends its piles without the drop flag, a room left
   behind sends their `0x0A`s.
 
-Not done / not confirmed: items other than gold (the TC rolls them; quality, affixes, inventory
-placement and the `.d2s` item list are next), the engine's free-spot search for each drop
-(`0x555DA0` → `0x64E810`, mask `0x3E01`; piles go on and beside the corpse), the second player
-count. Pickup (`0x16` is `[unit type u32][guid u32][to cursor u32]`, handler `0x54AAD0` →
-`0x548B00` type 4, as `0x13`): within 5 subtiles and unblocked the engine picks up (`0x563560`
-auto-place, `0x55CF50` to cursor), else walks the player there; we do not check range. Gold
-(`0x55C850`) takes what the purse holds (level × 10,000, `0x622E70`) and drops the rest as a new
-pile by the player (`0x55B030` → `0x55A090`, free-spot search from the player's position); ours
-goes on the player's subtile.
+Where a drop lands (`0x555DA0`): the search starts two subtiles right and three down from the
+unit when a room is there, and `0x64E810` → `0x64DEA0` takes that spot or the free one with the
+least `|dx|+|dy|` ring by ring out to 50 (each ring's side edges row by row, then its top and
+bottom, first found winning a tie). Free means clear of the spawn mask `0x3E01` (wall, item,
+object, door, no-path, pet) and seen from the unit past no wall or door (`0x801`, `0x66A670`). We
+track walls and piles only, and look along a plain straight line.
+
+Pickup: `0x16` goes through `0x54AAD0` to `0x548B00` with the unit type, as `0x13` does. Within 5
+subtiles and unblocked the engine picks the item up (`0x563560` auto-place, `0x55CF50` to cursor),
+else walks the player there; we do not check range. Gold (`0x55C850`) takes what the purse holds
+(level × 10,000, `0x622E70`) and drops the rest as a new pile from the player (`0x55B030` →
+`0x55A090`); ours goes on the player's subtile.
+
+Not done: items other than gold (the TC rolls them; quality, affixes, inventory placement and the
+`.d2s` item list are next), and the second player count in `NoDrop`.
 
 ## 6. Server packet builders (opcode → function)
 

@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 
 use d2_data::monlvl::Scale;
 use d2_data::{stat, GameData};
-use d2_data::treasure::{gold_amount, Drop, MAX_DROPS};
+use d2_data::treasure::{gold_amount, Drop};
 use d2_drlg::rng::Seed;
 use d2_drlg::world::RoomId;
 
@@ -194,13 +194,13 @@ pub enum Event {
         /// After.
         new: u32,
     },
-    /// A dying monster dropped a gold pile (`0x9C`).
+    /// A dying monster dropped a gold pile (`0x9C`), from where it fell.
     GoldDrop {
-        /// The room it lies in.
+        /// The room the monster died in.
         room: RoomId,
-        /// World subtiles.
+        /// Where it fell, world subtiles.
         x: u16,
-        /// World subtiles.
+        /// Where it fell, world subtiles.
         y: u16,
         /// Gold.
         amount: u32,
@@ -791,20 +791,17 @@ impl Battle {
     }
 
     /// Roll a dead monster's treasure class (upgraded to its level) for the players in the game.
-    /// Gold piles are dropped around where it fell; items are not made yet.
-    ///
-    /// ⚠️ The engine finds each drop a free spot near the corpse (`0x00555DA0`); piles here go
-    /// on the corpse and the subtiles beside it, unchecked.
+    /// Gold piles are dropped from where it fell (the caller finds each its spot); items are not
+    /// made yet.
     fn drop_treasure(&mut self, data: &GameData, room: RoomId, (x, y): (i32, i32), treasure: &str, level: i32, events: &mut Vec<Event>) {
-        const SPOTS: [(i32, i32); MAX_DROPS] = [(0, 0), (1, 0), (0, 1), (-1, 0), (0, -1), (1, 1)];
         let Some(class) = data.treasure().upgraded(treasure, level) else { return };
         let players = (self.heroes.len() as u32).max(1);
         let seed = &mut self.seed;
         let drops = data.treasure().roll(class, players, &mut |n| seed.pick(n));
-        for (drop, (dx, dy)) in drops.into_iter().zip(SPOTS) {
+        for drop in drops {
             if let Drop::Gold { mul } = drop {
                 let amount = gold_amount(level, mul, &mut |n| self.seed.pick(n));
-                events.push(Event::GoldDrop { room, x: (x + dx) as u16, y: (y + dy) as u16, amount });
+                events.push(Event::GoldDrop { room, x: x as u16, y: y as u16, amount });
             }
         }
     }

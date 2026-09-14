@@ -788,9 +788,12 @@ impl GameServer {
                 battle.advance(rules, due, &open)
             };
             for event in events {
-                if let Event::GoldDrop { room, x, y, amount } = event {
+                if let Event::GoldDrop { x, y, amount, .. } = event {
                     // A pile on the ground, seen by whoever holds its room.
                     let Some(population) = population.as_mut() else { continue };
+                    let taken = |x: i32, y: i32| ground.values().any(|p| (i32::from(p.x), i32::from(p.y)) == (x, y));
+                    let Some((room, x, y)) = drop_spot(world, &taken, (i32::from(x), i32::from(y))) else { continue };
+                    let (x, y) = (x as u16, y as u16);
                     let guid = population.next_guid(unit_type::ITEM);
                     ground.insert(guid, GroundGold { room, x, y, amount });
                     for (player, view) in views.iter() {
@@ -981,6 +984,46 @@ fn share_out(
             }
         }
     }
+}
+
+/// Where the engine puts something dropped by a unit at `from` (`0x00555DA0`): it starts two
+/// subtiles right and three down when there is a room there, else at `from`, and takes that spot
+/// or the nearest free one ring by ring out to 50 subtiles (`0x0064E810` → `0x0064DEA0`, the
+/// candidate with the least `|dx| + |dy|` in the first ring holding one). Free is in a room, clear
+/// of the spawn mask `0x3E01` — here walls and items (`taken`); objects, doors and the no-path bit
+/// are not tracked — and in a straight line from `from` past no wall (mask `0x801`, `0x0066A670`;
+/// the engine's line walk is not ported). `None` when nothing is free: the engine then makes nothing.
+fn drop_spot(world: &World, taken: &dyn Fn(i32, i32) -> bool, from: (i32, i32)) -> Option<(RoomId, i32, i32)> {
+    // A room without a collision map (the town's, for now) blocks nothing.
+    let open = |x: i32, y: i32| world.room_at(x, y).is_some() && world.collision_at(x, y).map_or(true, |c| c & d2_game::path::WALL == 0);
+    let free = |x: i32, y: i32| open(x, y) && !taken(x, y) && d2_game::path::clear_line(from, (x, y), &open);
+    let start = if world.room_at(from.0 + 2, from.1 + 3).is_some() { (from.0 + 2, from.1 + 3) } else { from };
+    let spot = |x: i32, y: i32| Some((world.room_at(x, y)?, x, y));
+    if free(start.0, start.1) {
+        return spot(start.0, start.1);
+    }
+    let (sx, sy) = start;
+    for r in 1..50 {
+        let mut best: Option<(i32, i32, i32)> = None;
+        let mut consider = |x: i32, y: i32| {
+            let d = (x - sx).abs() + (y - sy).abs();
+            if free(x, y) && best.map_or(true, |(_, _, bd)| d < bd) {
+                best = Some((x, y, d));
+            }
+        };
+        for y in sy - r..=sy + r {
+            consider(sx - r, y);
+            consider(sx + r, y);
+        }
+        for x in sx - r + 1..=sx + r - 1 {
+            consider(x, sy - r);
+            consider(x, sy + r);
+        }
+        if let Some((x, y, _)) = best {
+            return spot(x, y);
+        }
+    }
+    None
 }
 
 /// Accept game connections forever.
@@ -2261,7 +2304,7 @@ pub(crate) mod tests {
         assert_eq!(corpse[11], 0, "no life");
         assert!(!again.iter().any(|p| p[0] == 0x6D), "a corpse is not stood up");
         assert!(again.iter().any(|p| p[0] == 0x9C && p[4..8] == pile.to_le_bytes() && p[9] & 0x20 == 0), "the pile lies there");
-        assert_eq!(gs.unit_position(id, u32::from(unit_type::ITEM), pile), Some((5780, 4500)));
+        assert_eq!(gs.unit_position(id, u32::from(unit_type::ITEM), pile), Some((5782, 4503)), "two right and three down");
         let got = gs.pick_up(id, "Hero", pile);
         assert_eq!(got[0], d2gs::remove_unit(unit_type::ITEM, pile));
         let gold = gs.lock().by_id[&id].battle.player_stats("Hero").unwrap().iter().find(|s| s.0 == stat::GOLD).unwrap().1;
@@ -2270,6 +2313,31 @@ pub(crate) mod tests {
         assert!(gs.pick_up(id, "Hero", pile).is_empty(), "once");
         gs.view_change(id, &[room], &[]);
         assert!(!gs.view_change(id, &[], &[room]).iter().any(|p| p[0] == 0x9C), "gone for good");
+    }
+
+    /// A drop takes the spot two right and three down from its unit, or the nearest free one ring
+    /// by ring (least `|dx| + |dy|`): not a wall, not another pile, not behind a wall.
+    #[test]
+    fn drops_find_the_nearest_free_spot() {
+        use d2_drlg::world::WorldLevel;
+        use d2_drlg::Coords;
+        let area = Coords { x: 0, y: 0, w: 4, h: 4 };
+        // 20 × 20 subtiles, open but for a wall along x = 12 from y = 0 to 19.
+        let world = World::from_levels(vec![WorldLevel { id: 2, area, rooms: vec![area], units: Vec::new(), pieces: vec![0], collision: Vec::new(), warps: Vec::new() }]);
+        let wall = |x: i32, _y: i32| x == 12;
+        let with_wall = |taken: &dyn Fn(i32, i32) -> bool, from| {
+            let open_world = |x: i32, y: i32| (0..20).contains(&x) && (0..20).contains(&y);
+            let taken = |x: i32, y: i32| taken(x, y) || wall(x, y) || !open_world(x, y);
+            drop_spot(&world, &taken, from).map(|(_, x, y)| (x, y))
+        };
+        assert_eq!(with_wall(&|_, _| false, (5, 5)), Some((7, 8)));
+        // The start taken: ring 1's side edges come first, row by row, and the least |dx| + |dy|
+        // wins; a tie keeps the first found.
+        assert_eq!(with_wall(&|x, y| (x, y) == (7, 8), (5, 5)), Some((6, 8)));
+        let busy = |x: i32, y: i32| (6..=8).contains(&x) && (7..=9).contains(&y);
+        assert_eq!(with_wall(&busy, (5, 5)), Some((5, 8)), "ring 2: the left edge's middle ties straight up, and comes first");
+        // From beside the wall, the start (12, 8) is the wall: the nearest free spot is on this side.
+        assert_eq!(with_wall(&|_, _| false, (10, 5)), Some((11, 8)));
     }
 
     /// A purse holds 10,000 gold a level: picking up more takes what fits and drops the rest as a
@@ -2511,7 +2579,7 @@ pub(crate) mod tests {
         let rules = GameData::load(&dir).unwrap();
         let stats = rules.new_character_stats(4).unwrap();
         let gs = GameServer::new(test_tables(), Some(rules)).with_engine(engine);
-        let (mut fought, mut hit_back) = (0, 0);
+        let (mut fought, mut hit_back, mut piles) = (0, 0, 0);
         for i in 0..6 {
             let id = gs.create(&format!("fight {i}"), "", 0).unwrap();
             let moor: Vec<RoomId> = {
@@ -2552,11 +2620,21 @@ pub(crate) mod tests {
                 assert!(death.iter().any(|p| p[5] == 0x08) && death.iter().any(|p| p[5] == 0x09 && p[11] == 0), "{death:02x?}");
                 assert!(ops.contains(&0x1A), "experience for the kill: {ops:02x?}");
                 fought += 1;
+                // Any gold lands on open ground.
+                for p in seen.iter().filter(|p| p[0] == 0x9C) {
+                    let bits = |from: usize, len: usize| (0..len).map(|i| u32::from((p[8 + (from + i) / 8] >> ((from + i) % 8)) & 1) << i).sum::<u32>();
+                    let (x, y) = (bits(45, 16) as i32, bits(61, 16) as i32);
+                    let g = gs.lock();
+                    let world = g.by_id[&id].world.as_ref().unwrap();
+                    assert!(world.collision_at(x, y).is_some_and(|c| c & d2_game::path::WALL == 0), "gold at ({x}, {y}) is in a wall");
+                    piles += 1;
+                }
             }
             hit_back += usize::from(ops.contains(&0x6C) && ops.contains(&0x95) && ops.contains(&0x0D));
         }
         assert!(fought > 0, "no game had a monster to fight");
         assert!(hit_back > 0, "no pack fought back");
+        eprintln!("{fought} kills, {piles} gold piles");
     }
 
     #[test]
