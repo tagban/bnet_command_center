@@ -363,6 +363,19 @@ impl Population {
         })
     }
 
+    /// Where a spawned monster now stands, its mode and its life in 128ths — so a room that comes
+    /// back into view sends it as it is.
+    pub fn update_monster(&mut self, monster: u32, to: (u16, u16), new_mode: u8, new_life: u8) {
+        for unit in self.rooms.values_mut().flatten() {
+            if let Spawned::Monster { guid, x, y, mode, life, .. } = unit {
+                if *guid == monster {
+                    (*x, *y, *mode, *life) = (to.0, to.1, new_mode, new_life);
+                    return;
+                }
+            }
+        }
+    }
+
     /// Change a spawned object's mode (`0x00624690`); `true` if it changed.
     pub fn set_object_mode(&mut self, object: u32, to: u8) -> bool {
         for unit in self.rooms.values_mut().flatten() {

@@ -1,13 +1,13 @@
-//! Diablo II game server — **handshake test only** (`diablo2.game_server_probe`).
+//! Diablo II game server — **test server** (`diablo2.game_server_probe`).
 //!
-//! Nothing is simulated. A client that joins a game is taken through the join exactly as
+//! A client that joins a game is taken through the join exactly as
 //! the 1.14d engine runs it (`docs/D2GS-114D-WIRE.md` §4): `AF 01`, then on `GAMELOGON`
 //! `01 00` and `02`, then on `ENTERGAME` `59 5E 28 29 0B`, the player's stats, `23 23 95 03 53 07`, the
 //! rooms around the spawn with their objects and NPCs (`07`, `51`, `AC AA 6D`), `15 7E` and, a
 //! server frame later, `04`.
-//! After that nothing is sent but ping replies; every packet the client sends is logged.
-//! The point is to learn, against a real client, whether our packets are accepted and what the
-//! client asks for next — not to play.
+//! After that the server follows the player's walking with rooms, answers NPCs, the stash and
+//! waypoints, and runs the fight (`d2_game::battle`): swings at monsters, monsters chasing and
+//! hitting back, deaths, experience and levels. Every packet the client sends is logged.
 //!
 //! Games live only in memory. The realm creates them (`MCP_CREATEGAME`), stages a join for
 //! one character (`MCP_JOINGAME`), and this module matches the client's `GAMELOGON` against
@@ -28,6 +28,7 @@ use d2_drlg::act::Act;
 use d2_drlg::collision::TileSources;
 use d2_drlg::preset::PresetLevel;
 use d2_drlg::world::{RoomId, World};
+use d2_game::battle::{self, Battle, Event};
 use d2_game::clock::ActClock;
 use d2_game::population::{unit_type, waypoint_spawn, MonsterRoom, Population, Spawned, SUBCLASS_WAYPOINT};
 use rand::Rng;
@@ -68,6 +69,9 @@ const FALLBACK_SPAWN: (u16, u16) = (5798, 4413);
 const FALLBACK_SPAWN_ROOM: (u16, u16) = (1152, 880);
 /// Guid of the joining player's unit.
 const PLAYER_GUID: u32 = 1;
+
+/// How long a swing at a monster out of reach waits for the player to get there.
+const ATTACK_WAIT: Duration = Duration::from_secs(3);
 
 /// Walking speed in subtiles a second: `CharStats.txt` `WalkVelocity` 6 as the engine's
 /// `dwVelocity` (`6 << 8`), which moves `velocity / 16` of a subtile a frame (libd2
@@ -145,6 +149,12 @@ struct Game {
     clock_reports: u64,
     /// Where each connected player stands, world subtiles, for the admin panel's map.
     positions: HashMap<String, (i32, i32)>,
+    /// The rooms each connected player's client holds.
+    views: HashMap<String, Vec<RoomId>>,
+    /// The fight: the hostile monsters of the rooms populated so far, and the players.
+    battle: Battle,
+    /// Packets the fight has for each player, sent on its connection's next frame.
+    outgoing: HashMap<String, Vec<Vec<u8>>>,
 }
 
 /// Why the realm could not create a game.
@@ -284,8 +294,8 @@ impl GameServer {
         let server = Arc::new(Self::new(tables, rules).with_engine(engine));
         warn!(
             %addr,
-            "Diablo II game server HANDSHAKE TEST is on: games can be created and joined; clients \
-             stand in town with the objects and NPCs near the spawn, but cannot act \
+            "Diablo II TEST game server is on: games can be created and joined; Act I's town and \
+             wilderness, their monsters and the fight are simulated; nothing is saved \
              (diablo2.game_server_probe)"
         );
         tokio::spawn(serve(listener, Arc::clone(&server)));
@@ -345,6 +355,9 @@ impl GameServer {
                 clock_frames: 0,
                 clock_reports: 0,
                 positions: HashMap::new(),
+                views: HashMap::new(),
+                battle: Battle::new(difficulty, rand::thread_rng().gen()),
+                outgoing: HashMap::new(),
             },
         );
         let game = &g.by_id[&id];
@@ -399,6 +412,7 @@ impl GameServer {
         let game = g.by_id.get_mut(&logon.game_id).filter(|game| game.hash == logon.game_hash)?;
         let at = game.staged.iter().position(|c| c.name.eq_ignore_ascii_case(&logon.name))?;
         let character = game.staged.remove(at);
+        game.battle.set_expansion(character.status & status::EXPANSION != 0);
         game.connected.push(character.name.clone());
         Some(Player {
             game_id: logon.game_id,
@@ -554,10 +568,15 @@ impl GameServer {
                         packets.push(d2gs::assign_object(guid, class, x, y, mode, interaction));
                     }
                     Spawned::Monster { guid, class, x, y, mode, life, ref components, ref variants } => {
+                        if !d2_game::population::is_town(id.level) {
+                            game.battle.add_monster(rules, guid, i32::from(class), id, x, y);
+                        }
                         packets.push(d2gs::assign_monster(guid, class, x, y, life, mode, components, variants));
                         let alignment = rules.monsters().get(i32::from(class)).map_or(0, d2_data::monsters::MonsterClass::alignment);
                         packets.push(d2gs::alignment_state(unit_type::MONSTER, guid, alignment));
-                        packets.push(d2gs::monster_standing(guid, x, y, life));
+                        if mode != battle::DEAD_MODE {
+                            packets.push(d2gs::monster_standing(guid, x, y, life));
+                        }
                     }
                 }
             }
@@ -594,7 +613,6 @@ impl GameServer {
         Some((game.clock_reports, d2gs::act_environment(period, ticks, eclipse)))
     }
 
-    /// A connected character left; an emptied game goes with it.
     /// Record where a player stands.
     fn set_position(&self, game_id: u16, name: &str, x: f64, y: f64) {
         let mut g = self.lock();
@@ -603,14 +621,133 @@ impl GameServer {
         }
     }
 
+    /// Record the rooms a player's client holds.
+    fn set_view(&self, game_id: u16, name: &str, view: &[RoomId]) {
+        let mut g = self.lock();
+        if let Some(game) = g.by_id.get_mut(&game_id) {
+            game.views.insert(name.to_string(), view.to_vec());
+        }
+    }
+
+    /// A player joins its game's fight with a new character's stats.
+    fn join_battle(&self, game_id: u16, name: &str, class: u8, stats: &[(u8, u32)]) {
+        let Some(rules) = &self.rules else { return };
+        let mut g = self.lock();
+        if let Some(game) = g.by_id.get_mut(&game_id) {
+            game.battle.add_player(rules, name, class, stats);
+        }
+    }
+
+    /// Run the game's fight up to now — one step per [`SERVER_FRAME`] since the game was
+    /// created, whichever connection gets here first — sharing out what it produces, and hand
+    /// back what `name`'s client is to be sent.
+    fn battle_step(&self, game_id: u16, name: &str) -> Vec<Vec<u8>> {
+        let Some(rules) = &self.rules else { return Vec::new() };
+        let mut g = self.lock();
+        let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
+        let due = (game.created.elapsed().as_micros() / SERVER_FRAME.as_micros()) as u64;
+        if due > game.battle.frame() {
+            let Game { battle, world, positions, views, population, outgoing, .. } = game;
+            for (player, &(x, y)) in positions.iter() {
+                let level = world.as_ref().and_then(|w| w.room_at(x, y)).map(|r| r.level);
+                battle.place_player(player, level.map(|l| (x, y, l)), views.get(player).map_or(&[], Vec::as_slice));
+            }
+            let open = |x: i32, y: i32| world.as_ref().and_then(|w| w.collision_at(x, y)).is_some_and(|c| c & d2_game::path::WALL == 0);
+            for event in battle.advance(rules, due, &open) {
+                share_out(event, views, outgoing, population.as_mut());
+            }
+        }
+        game.outgoing.remove(name).unwrap_or_default()
+    }
+
+    /// Where a monster in the game's fight stands, while it lives.
+    fn battle_monster(&self, game_id: u16, guid: u32) -> Option<(u16, u16)> {
+        let g = self.lock();
+        let (x, y, mode, _) = g.by_id.get(&game_id)?.battle.monster(guid)?;
+        (mode != battle::DEAD_MODE).then_some((x, y))
+    }
+
+    /// A player swings at a monster.
+    fn player_attack(&self, game_id: u16, name: &str, guid: u32) -> bool {
+        let mut g = self.lock();
+        g.by_id.get_mut(&game_id).is_some_and(|game| game.battle.player_attack(name, guid))
+    }
+
+    /// Whether a player lies dead.
+    fn player_dead(&self, game_id: u16, name: &str) -> bool {
+        self.lock().by_id.get(&game_id).is_some_and(|game| game.battle.player_dead(name))
+    }
+
+    /// A player spends an attribute point (`0x3A`): the stats that change.
+    fn spend_stat_point(&self, game_id: u16, name: &str, stat: u8) -> Vec<Vec<u8>> {
+        let Some(rules) = &self.rules else { return Vec::new() };
+        let mut g = self.lock();
+        let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
+        game.battle.spend_stat_point(rules, name, stat).iter().filter_map(|e| battle_packet(e, name)).collect()
+    }
+
+    /// A dead player restarts at full life: its life, mana and stamina.
+    fn revive(&self, game_id: u16, name: &str) -> Vec<Vec<u8>> {
+        let mut g = self.lock();
+        let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
+        game.battle.revive(name).iter().filter_map(|e| battle_packet(e, name)).collect()
+    }
+
+    /// A connected character left; an emptied game goes with it.
     fn leave(&self, game_id: u16, name: &str) {
         let mut g = self.lock();
         let Some(game) = g.by_id.get_mut(&game_id) else { return };
         game.connected.retain(|n| !n.eq_ignore_ascii_case(name));
         game.positions.remove(name);
+        game.views.remove(name);
+        game.outgoing.remove(name);
+        game.battle.remove_player(name);
         if game.connected.is_empty() && game.staged.is_empty() {
             let game = g.by_id.remove(&game_id).expect("present");
             info!(game = %game.name, id = game_id, "test game closed: last player left");
+        }
+    }
+}
+
+/// The packet `recipient` is sent for a fight event, if any: the player's own events use its
+/// unit, [`PLAYER_GUID`]; a monster's swing is shown only to the player swung at, whose unit the
+/// packet can name.
+fn battle_packet(event: &Event, recipient: &str) -> Option<Vec<u8>> {
+    Some(match event {
+        Event::MonsterLife { guid, life, .. } => d2gs::unit_life(unit_type::MONSTER, *guid, *life),
+        Event::MonsterReaction { guid, event, x, y, life, alive, .. } => d2gs::monster_reaction(*guid, *event, *x, *y, *life, *alive),
+        Event::MonsterWalk { guid, x, y, .. } => d2gs::monster_walk(*guid, *x, *y),
+        Event::MonsterStop { guid, x, y, life, .. } => d2gs::monster_standing(*guid, *x, *y, *life),
+        Event::MonsterAttack { guid, target, x, y, .. } if target == recipient => d2gs::monster_attack(*guid, PLAYER_GUID, *x, *y),
+        Event::MonsterAttack { .. } | Event::MonsterState { .. } => return None,
+        Event::PlayerReaction { event, .. } => d2gs::player_reaction(unit_type::PLAYER, PLAYER_GUID, *event, 0, 0),
+        Event::PlayerVitals { life, mana, stamina, .. } => d2gs::life_and_position(*life, *mana, *stamina, 0, 0, 0, 0),
+        Event::Experience { old, new, .. } => d2gs::experience(*old, *new),
+        Event::PlayerStat { stat, value, .. } => d2gs::set_stat(*stat, *value),
+    })
+}
+
+/// Queue a fight event's packet for each player it concerns — its own player, or every player
+/// whose client holds the monster's room — and keep the room's population in step.
+fn share_out(event: Event, views: &HashMap<String, Vec<RoomId>>, outgoing: &mut HashMap<String, Vec<Vec<u8>>>, population: Option<&mut Population>) {
+    if let Event::MonsterState { guid, x, y, mode, life } = event {
+        if let Some(population) = population {
+            population.update_monster(guid, (x, y), mode, life);
+        }
+        return;
+    }
+    if let Some(player) = event.player() {
+        if let Some(packet) = battle_packet(&event, player) {
+            outgoing.entry(player.to_string()).or_default().push(packet);
+        }
+        return;
+    }
+    let Some(room) = event.room() else { return };
+    for (player, view) in views {
+        if view.contains(&room) {
+            if let Some(packet) = battle_packet(&event, player) {
+                outgoing.entry(player.clone()).or_default().push(packet);
+            }
         }
     }
 }
@@ -689,6 +826,11 @@ impl Walker {
     }
 }
 
+/// Whether the server's idea of the player stands close enough to a monster at (`x`, `y`) to hit it.
+fn within_reach(w: &Walker, x: u16, y: u16) -> bool {
+    d2_game::path::distance((w.x as i32, w.y as i32), (i32::from(x), i32::from(y))) <= battle::PLAYER_REACH
+}
+
 /// One client on the game port.
 async fn session(mut stream: TcpStream, peer: SocketAddr, server: &GameServer) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
@@ -725,6 +867,8 @@ async fn run(
     let mut frame = tokio::time::interval(SERVER_FRAME);
     frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_step = Instant::now();
+    // A swing at a monster the player is still walking up to: its guid and when it was asked.
+    let mut pending_attack: Option<(u32, Instant)> = None;
 
     loop {
         let limit = if stage == Stage::AwaitLogon { LOGON_TIMEOUT } else { IN_GAME_TIMEOUT };
@@ -747,6 +891,25 @@ async fn run(
                     flush(stream, peer, tables, &mut outbox).await?;
                 }
             }
+            for packet in server.battle_step(p.game_id, &p.character.name) {
+                outbox.push(&packet);
+            }
+            if let (Some((guid, asked)), Some(w)) = (pending_attack, walker.as_mut()) {
+                match server.battle_monster(p.game_id, guid) {
+                    Some((mx, my)) if asked.elapsed() < ATTACK_WAIT => {
+                        if within_reach(w, mx, my) {
+                            server.player_attack(p.game_id, &p.character.name, guid);
+                            pending_attack = None;
+                            w.target = None;
+                        } else if !w.moving() {
+                            last_step = Instant::now();
+                            w.go(f64::from(mx), f64::from(my), RUN_SPEED * server.speed_scale);
+                        }
+                    }
+                    _ => pending_attack = None,
+                }
+            }
+            flush(stream, peer, tables, &mut outbox).await?;
             let Some(w) = walker.as_mut().filter(|w| w.moving()) else { continue };
             let now = Instant::now();
             w.step(now.duration_since(last_step).min(SERVER_FRAME * 5));
@@ -762,6 +925,7 @@ async fn run(
                         outbox.push(&packet);
                     }
                     (w.room, w.view) = (Some(room), view);
+                    server.set_view(p.game_id, &p.character.name, &w.view);
                     flush(stream, peer, tables, &mut outbox).await?;
                 }
             }
@@ -810,6 +974,7 @@ async fn run(
                     let p = player.as_ref().expect("logged on");
                     let joined = enter_game(stream, peer, server, p, &mut outbox).await?;
                     server.set_position(p.game_id, &p.character.name, joined.x, joined.y);
+                    server.set_view(p.game_id, &p.character.name, &joined.view);
                     walker = Some(joined);
                     clock_seen = server.clock(p.game_id).map_or(0, |(reports, _)| reports);
                     stage = Stage::InGame;
@@ -853,6 +1018,73 @@ async fn run(
                     outbox.push(&d2gs::reassign_player(0, PLAYER_GUID, x, y, 1));
                     (w.x, w.y, w.target, w.room, w.view) = (f64::from(x), f64::from(y), None, Some(room), near);
                     server.set_position(p.game_id, &p.character.name, w.x, w.y);
+                    server.set_view(p.game_id, &p.character.name, &w.view);
+                    flush(stream, peer, tables, &mut outbox).await?;
+                }
+                (
+                    Stage::InGame,
+                    cs::LEFT_SKILL_ON_UNIT
+                    | cs::LEFT_SKILL_ON_UNIT_HOLD
+                    | cs::LEFT_SKILL_ON_UNIT_REPEAT
+                    | cs::LEFT_SKILL_ON_UNIT_HOLD_REPEAT
+                    | cs::RIGHT_SKILL_ON_UNIT
+                    | cs::RIGHT_SKILL_ON_UNIT_HOLD
+                    | cs::RIGHT_SKILL_ON_UNIT_REPEAT
+                    | cs::RIGHT_SKILL_ON_UNIT_HOLD_REPEAT,
+                ) => {
+                    // Every character's skills are Attack for now: a swing at the monster, once
+                    // the player is close enough (the engine walks it there, as does the client).
+                    let (Some(w), Some(p)) = (walker.as_mut(), player.as_ref()) else { continue };
+                    let guid = u32_at(5);
+                    if u32_at(1) != u32::from(unit_type::MONSTER) {
+                        continue;
+                    }
+                    let Some((mx, my)) = server.battle_monster(p.game_id, guid) else { continue };
+                    if within_reach(w, mx, my) {
+                        server.player_attack(p.game_id, &p.character.name, guid);
+                        pending_attack = None;
+                    } else {
+                        if !w.moving() {
+                            last_step = Instant::now();
+                        }
+                        w.go(f64::from(mx), f64::from(my), RUN_SPEED * server.speed_scale);
+                        pending_attack = Some((guid, Instant::now()));
+                    }
+                }
+                (Stage::InGame, cs::ADD_STAT_POINT) => {
+                    let Some(p) = player.as_ref() else { continue };
+                    let Ok(stat) = u8::try_from(u16_at(1)) else { continue };
+                    for packet in server.spend_stat_point(p.game_id, &p.character.name, stat) {
+                        outbox.push(&packet);
+                    }
+                    flush(stream, peer, tables, &mut outbox).await?;
+                }
+                (Stage::InGame, cs::RESPAWN) => {
+                    // After "You have died": back to the camp's waypoint, as waypoint travel moves
+                    // a player between levels, then full life — which also stands the client's
+                    // corpse back up (0x0045DB20).
+                    let (Some(w), Some(p)) = (walker.as_mut(), player.as_ref()) else { continue };
+                    if !server.player_dead(p.game_id, &p.character.name) {
+                        continue;
+                    }
+                    let (x, y) = p.spawn;
+                    let Some((room, near)) = server.near(p.game_id, f64::from(x), f64::from(y)) else { continue };
+                    info!(%peer, x, y, "respawn in town");
+                    let own = server.lock().by_id.get(&p.game_id).and_then(|g| g.world.as_ref()?.room(room));
+                    if let Some(r) = own {
+                        outbox.push(&d2gs::load_room(r.x as u16, r.y as u16, room.level as u8));
+                    }
+                    for packet in server.view_change(p.game_id, &w.view, &near) {
+                        outbox.push(&packet);
+                    }
+                    outbox.push(&d2gs::reassign_player(0, PLAYER_GUID, x, y, 1));
+                    (w.x, w.y, w.target, w.room, w.view) = (f64::from(x), f64::from(y), None, Some(room), near);
+                    pending_attack = None;
+                    server.set_position(p.game_id, &p.character.name, w.x, w.y);
+                    server.set_view(p.game_id, &p.character.name, &w.view);
+                    for packet in server.revive(p.game_id, &p.character.name) {
+                        outbox.push(&packet);
+                    }
                     flush(stream, peer, tables, &mut outbox).await?;
                 }
                 (Stage::InGame, cs::UPDATE_POSITION) => {
@@ -987,6 +1219,7 @@ async fn enter_game(
     for &(id, value) in &stats {
         outbox.push(&d2gs::set_stat(id, value));
     }
+    server.join_battle(p.game_id, &p.character.name, p.character.class, &stats);
     outbox.push(&d2gs::select_skill(0, PLAYER_GUID, true, 0, u32::MAX));
     outbox.push(&d2gs::select_skill(0, PLAYER_GUID, false, 0, u32::MAX));
     // Then life, mana and stamina in whole points, before the player has a position (0x548760).
@@ -1566,8 +1799,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// With the operator's install: walking from the waypoint to the middle of Blood Moor, the
-    /// server loads Blood Moor's rooms along the way, and every room it drops it had loaded.
     /// With the operator's install: the admin map describes a game — its levels, Blood Moor's
     /// collision map with walls, open ground and the Den of Evil's mouth, and the monsters of
     /// the rooms a player has walked into. With `BNETCC_D2_MAP_DUMP` set to a directory, the
@@ -1619,6 +1850,140 @@ pub(crate) mod tests {
             std::fs::write(out.join("d2/level.json"), serde_json::to_string(&level).unwrap()).unwrap();
             std::fs::write(out.join("d2/live.json"), serde_json::to_string(&live).unwrap()).unwrap();
         }
+    }
+
+    /// Run a game's fight forward by `frames` server frames at once, as if that much time had
+    /// passed, and return what `name`'s client is sent.
+    fn fight_for(gs: &GameServer, id: u16, name: &str, frames: u32) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for _ in 0..frames {
+            {
+                let mut g = gs.lock();
+                let game = g.by_id.get_mut(&id).unwrap();
+                game.created = game.created.checked_sub(SERVER_FRAME).unwrap();
+            }
+            out.extend(gs.battle_step(id, name));
+        }
+        out
+    }
+
+    /// A hostile monster out in a made-up Blood Moor room joins the fight when its room loads;
+    /// swinging at it until it dies sends the player its death frames — dying, then the corpse a
+    /// death animation later — and the experience; its room loaded again shows the corpse.
+    #[test]
+    fn a_monster_hit_until_it_dies_pays_out_and_stays_dead() {
+        use d2_data::monsters::Monsters;
+        use d2_data::presets::MonPresets;
+        use d2_drlg::preset::{PlacedUnit, UnitClass};
+        use d2_drlg::world::WorldLevel;
+        use d2_drlg::Coords;
+        use d2_formats::excel::Table;
+        let (mut rules, town) = test_town();
+        let monstats = Table::parse(
+            b"Id\thcIdx\tMonStatsEx\tnpc\tinteract\tCode\tLevel\tminHP\tmaxHP\tExp\tA1MinD\tA1MaxD\tA1TH\taidel\r\n\
+              guard\t10\tguard\t1\t1\tGU\t1\t1\t1\t0\t0\t0\t0\t5\r\n\
+              brute\t11\tguard\t0\t0\tXX\t1\t1\t1\t50\t1\t1\t1\t5\r\n",
+        );
+        let objects = rules.objects().clone();
+        rules.set_map_tables(MonPresets::default(), Monsters::from_tables(&monstats, &Table::parse(b"Id\r\nguard\r\n")).unwrap(), objects);
+        let monlvl = Table::parse(b"Level\tAC\tTH\tHP\tDM\tXP\r\n0\t100\t100\t100\t100\t100\r\n1\t100\t100\t100\t100\t100\r\n");
+        rules.set_combat_tables(d2_data::monlvl::MonLvls::from_table(&monlvl).unwrap(), Default::default());
+        let stats = rules.new_character_stats(4).unwrap();
+        let gs = GameServer::new(test_tables(), Some(rules)).with_town(town);
+        let id = gs.create("probe", "", 0).unwrap();
+        let moor = Coords { x: 1152, y: 896, w: 8, h: 8 };
+        {
+            let mut g = gs.lock();
+            let game = g.by_id.get_mut(&id).unwrap();
+            let mut levels = game.world.take().unwrap().levels().to_vec();
+            let brute = PlacedUnit { class: UnitClass::Monster(d2_data::presets::PresetMonster::Class { class: 11, name: "brute".into() }), x: 5780, y: 4500, path: Vec::new() };
+            levels.push(WorldLevel { id: 2, area: moor, rooms: vec![moor], units: vec![brute], pieces: vec![0], collision: Vec::new() });
+            game.world = Some(World::from_levels(levels));
+        }
+        let room = RoomId { level: 2, index: 0 };
+        gs.join_battle(id, "Hero", 4, &stats);
+        gs.set_position(id, "Hero", 5782.0, 4500.0);
+        gs.set_view(id, "Hero", &[room]);
+        let loaded = gs.view_change(id, &[], &[room]);
+        let guid = loaded.iter().find(|p| p[0] == 0xAC).map(|p| u32::from_le_bytes([p[1], p[2], p[3], p[4]])).expect("the brute is sent");
+        assert!(gs.battle_monster(id, guid).is_some(), "and fights");
+        let mut seen = Vec::new();
+        for _ in 0..50 {
+            if gs.battle_monster(id, guid).is_none() {
+                break;
+            }
+            gs.player_attack(id, "Hero", guid);
+            seen.extend(fight_for(&gs, id, "Hero", 20));
+        }
+        seen.extend(fight_for(&gs, id, "Hero", 40));
+        let dying = seen.iter().position(|p| *p == d2gs::monster_reaction(guid, battle::reaction::DYING, 5780, 4500, 0, true)).expect("dying");
+        let dead = seen.iter().position(|p| *p == d2gs::monster_reaction(guid, battle::reaction::DEAD, 5780, 4500, 0, false)).expect("dead");
+        assert!(dying < dead);
+        assert!(seen.contains(&d2gs::experience(0, 50)), "{seen:02x?}");
+        gs.view_change(id, &[room], &[]);
+        let again = gs.view_change(id, &[], &[room]);
+        let corpse = again.iter().find(|p| p[0] == 0xAC).unwrap();
+        assert_eq!(corpse[11], 0, "no life");
+        assert!(!again.iter().any(|p| p[0] == 0x6D), "a corpse is not stood up");
+    }
+
+    /// With the operator's install: a new character standing among Blood Moor's monsters is
+    /// noticed and hit, and hitting one back until it dies gets its death frames and experience.
+    #[test]
+    fn with_a_real_install_a_blood_moor_fight_runs() {
+        let Ok(dir) = std::env::var("BNETCC_D2_DATA_DIR") else {
+            return;
+        };
+        let engine = EngineData::from_game_exe(&std::fs::read(Path::new(&dir).join("Game.exe")).unwrap()).unwrap();
+        let rules = GameData::load(&dir).unwrap();
+        let stats = rules.new_character_stats(4).unwrap();
+        let gs = GameServer::new(test_tables(), Some(rules)).with_engine(engine);
+        let (mut fought, mut hit_back) = (0, 0);
+        for i in 0..6 {
+            let id = gs.create(&format!("fight {i}"), "", 0).unwrap();
+            let moor: Vec<RoomId> = {
+                let g = gs.lock();
+                let level = g.by_id[&id].world.as_ref().unwrap().levels().iter().find(|l| l.id == 2).unwrap();
+                (0..level.rooms.len()).map(|index| RoomId { level: 2, index }).collect()
+            };
+            gs.view_change(id, &[], &moor);
+            let target = {
+                let g = gs.lock();
+                let game = &g.by_id[&id];
+                moor.iter()
+                    .flat_map(|&room| game.population.as_ref().unwrap().units(room).unwrap_or(&[]).iter())
+                    .find_map(|u| match *u {
+                        Spawned::Monster { guid, x, y, .. } if game.battle.monster(guid).is_some() => Some((guid, x, y)),
+                        _ => None,
+                    })
+            };
+            let Some((guid, x, y)) = target else { continue };
+            gs.join_battle(id, "Hero", 4, &stats);
+            gs.set_position(id, "Hero", f64::from(x) + 2.0, f64::from(y));
+            gs.set_view(id, "Hero", &moor);
+            let mut seen = fight_for(&gs, id, "Hero", 1);
+            for _ in 0..400 {
+                if gs.battle_monster(id, guid).is_none() || gs.player_dead(id, "Hero") {
+                    break;
+                }
+                let (mx, my) = gs.battle_monster(id, guid).unwrap();
+                gs.set_position(id, "Hero", f64::from(mx) + 2.0, f64::from(my));
+                gs.player_attack(id, "Hero", guid);
+                seen.extend(fight_for(&gs, id, "Hero", 5));
+            }
+            // Then stand there while the rest of the pack comes.
+            seen.extend(fight_for(&gs, id, "Hero", 500));
+            let ops: std::collections::BTreeSet<u8> = seen.iter().map(|p| p[0]).collect();
+            if gs.battle_monster(id, guid).is_none() {
+                let death: Vec<&Vec<u8>> = seen.iter().filter(|p| p[0] == 0x69 && p[1..5] == guid.to_le_bytes()).collect();
+                assert!(death.iter().any(|p| p[5] == 0x08) && death.iter().any(|p| p[5] == 0x09 && p[11] == 0), "{death:02x?}");
+                assert!(ops.contains(&0x1A), "experience for the kill: {ops:02x?}");
+                fought += 1;
+            }
+            hit_back += usize::from(ops.contains(&0x6C) && ops.contains(&0x95) && ops.contains(&0x0D));
+        }
+        assert!(fought > 0, "no game had a monster to fight");
+        assert!(hit_back > 0, "no pack fought back");
     }
 
     #[test]

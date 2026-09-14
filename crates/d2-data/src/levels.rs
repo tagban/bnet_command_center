@@ -68,6 +68,11 @@ pub struct LevelMonsters {
     pub types: i32,
     /// `rangedspawn`: the first type picked should be ranged.
     pub ranged_first: bool,
+    /// `MonLvl1`..`MonLvl3`: the level of monsters on Nightmare and Hell in a classic game
+    /// (Normal takes each class's own `Level`).
+    pub area_level: [i32; 3],
+    /// `MonLvl1Ex`..`MonLvl3Ex`: the same in an expansion game.
+    pub area_level_expansion: [i32; 3],
     /// `MonDen`, per difficulty: spawn density, in 100000ths per 3×3-subtile slot.
     pub density: [i32; 3],
     /// `MonUMin`/`MonUMax`, per difficulty: unique packs.
@@ -134,6 +139,8 @@ impl Levels {
                 monsters: LevelMonsters {
                     types: int("NumMon"),
                     ranged_first: int("rangedspawn") != 0,
+                    area_level: [int("MonLvl1"), int("MonLvl2"), int("MonLvl3")],
+                    area_level_expansion: [int("MonLvl1Ex"), int("MonLvl2Ex"), int("MonLvl3Ex")],
                     density: [int("MonDen"), int("MonDen(N)"), int("MonDen(H)")],
                     uniques: [
                         (int("MonUMin"), int("MonUMax")),

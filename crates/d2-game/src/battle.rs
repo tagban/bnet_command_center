@@ -1,0 +1,1044 @@
+//! Fights: players hitting monsters, monsters chasing and hitting players, deaths, experience
+//! and levels.
+//!
+//! A game's [`Battle`] runs in engine frames (25 a second). It knows the hostile monsters of the
+//! rooms populated so far and the players in the game, and turns what they do into [`Event`]s —
+//! a life bar dropping, a flinch, a death, a walk, a swing, experience — that the game server
+//! sends as packets. Nothing here touches the network.
+//!
+//! What follows the engine, and where from:
+//! - Monster life, defence, attack rating, damage and experience are the class's `MonStats.txt`
+//!   value times `MonLvl.txt`'s percentage for its level, the `L-` columns in an expansion game
+//!   (`0x005A0000` looks the row up, stride `0x78`; `0x005A1990` indexes it by difficulty and
+//!   game type). Monster level is `MonStats.txt` `Level` on Normal and the area's `MonLvl2`/`3`
+//!   (`Ex` in an expansion game) on Nightmare and Hell.
+//! - Chance to hit (`0x0057D9B0`): `200 × AR / (AR + DEF) × alvl / (alvl + dlvl)`, clamped to
+//!   5..95. A player's rating is `(dexterity − 7) × 5 + ToHitFactor` (`0x00622560`), its defence
+//!   `dexterity / 4` (`0x006223F0`); a monster's rating is its `A1TH` scaled, its defence `AC`.
+//! - Whether a hit makes the victim flinch (`0x0057CB00`): never below a sixteenth of its maximum
+//!   life for physical damage, always from a quarter.
+//! - Animation lengths and hit frames come from `animdata.d2`.
+//! - The packets' shapes and pacing are from a recorded retail fight (bnemu
+//!   `docs/d2/re/combat.md`): a kill is `DYING`, then `DEAD` one death animation later; a
+//!   monster's walk glides at a fixed speed whatever its class.
+//!
+//! Not the engine's: the AI is a plain chase-and-swing loop (the per-class AI routines are not
+//! ported), paths come from [`crate::path`], an unarmed player hits for 1–2, and the experience
+//! penalty for a level gap is the published table rather than read from `Game.exe`.
+
+use std::collections::BTreeMap;
+
+use d2_data::monlvl::Scale;
+use d2_data::{stat, GameData};
+use d2_drlg::rng::Seed;
+use d2_drlg::world::RoomId;
+
+use crate::path;
+
+/// Engine frames a second.
+pub const FRAMES_PER_SECOND: u64 = 25;
+
+/// The event codes reaction packets carry — `0x0D` for a player, `0x69` for a monster — which the
+/// client's unit event dispatcher (`0x00461250`) turns into modes.
+pub mod reaction {
+    /// Get-hit: the victim flinches.
+    pub const GET_HIT: u8 = 0x06;
+    /// Death throes start (and "You have died" for the client's own player).
+    pub const DYING: u8 = 0x08;
+    /// The corpse pose.
+    pub const DEAD: u8 = 0x09;
+    /// A small hit: a sound, no flinch.
+    pub const HIT_SOUND: u8 = 0x13;
+}
+
+/// A monster's mode once dead, as `0xAC` sends it.
+pub const DEAD_MODE: u8 = 12;
+
+/// How far a monster whose `aidist` is blank notices a player, subtiles (bnemu's reading of the
+/// retail fights; the engine keeps it per AI routine, not ported).
+const DEFAULT_AI_DISTANCE: i32 = 35;
+/// A chase is given up past this multiple of the notice distance.
+const LEASH: i32 = 2;
+/// Subtiles a monster covers each frame while walking: the recorded walk speed field (75) glides
+/// about 5.77 subtiles a second.
+const GLIDE_PER_FRAME: f64 = 75.0 / 13.0 / FRAMES_PER_SECOND as f64;
+/// How far along its path one walk packet sends a monster.
+const WALK_LEAD: usize = 8;
+/// How close a player must be to hit a monster, subtiles. The server follows a player only
+/// roughly, so this is generous.
+pub const PLAYER_REACH: i32 = 6;
+/// How many frames one call may catch up; a game nobody drove for longer skips the rest.
+const MAX_CATCH_UP: u64 = 5 * FRAMES_PER_SECOND;
+/// Unarmed damage.
+const FIST_DAMAGE: (i32, i32) = (1, 2);
+/// Player animation tokens by class.
+const CLASS_TOKENS: [&str; 7] = ["AM", "SO", "NE", "PA", "BA", "DZ", "AI"];
+
+/// Something a client should be told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    /// `0xAB`: a monster's life bar, in 128ths.
+    MonsterLife {
+        /// The room it spawned in: who can see it.
+        room: RoomId,
+        /// Its guid.
+        guid: u32,
+        /// Life in 128ths.
+        life: u8,
+    },
+    /// `0x69`: a monster flinches, starts dying or lies dead.
+    MonsterReaction {
+        /// Who can see it.
+        room: RoomId,
+        /// Its guid.
+        guid: u32,
+        /// A [`reaction`] code.
+        event: u8,
+        /// World subtiles.
+        x: u16,
+        /// World subtiles.
+        y: u16,
+        /// Life in 128ths.
+        life: u8,
+        /// Still alive (the packet's last byte, `0x03`, else 0).
+        alive: bool,
+    },
+    /// `0x67`: a monster walks to a spot.
+    MonsterWalk {
+        /// Who can see it.
+        room: RoomId,
+        /// Its guid.
+        guid: u32,
+        /// World subtiles.
+        x: u16,
+        /// World subtiles.
+        y: u16,
+    },
+    /// `0x6D`: a monster stands still.
+    MonsterStop {
+        /// Who can see it.
+        room: RoomId,
+        /// Its guid.
+        guid: u32,
+        /// World subtiles.
+        x: u16,
+        /// World subtiles.
+        y: u16,
+        /// Life in 128ths.
+        life: u8,
+    },
+    /// `0x6C`: a monster swings at a player.
+    MonsterAttack {
+        /// Who can see it.
+        room: RoomId,
+        /// Its guid.
+        guid: u32,
+        /// The player swung at.
+        target: String,
+        /// Where the monster stands.
+        x: u16,
+        /// Where the monster stands.
+        y: u16,
+    },
+    /// A monster moved, was hurt or died: where the room's population should keep it.
+    MonsterState {
+        /// Its guid.
+        guid: u32,
+        /// World subtiles.
+        x: u16,
+        /// World subtiles.
+        y: u16,
+        /// Unit mode.
+        mode: u8,
+        /// Life in 128ths.
+        life: u8,
+    },
+    /// `0x0D` to a player about itself.
+    PlayerReaction {
+        /// The player.
+        player: String,
+        /// A [`reaction`] code.
+        event: u8,
+    },
+    /// `0x95`: a player's life, mana and stamina, whole points.
+    PlayerVitals {
+        /// The player.
+        player: String,
+        /// Life.
+        life: u16,
+        /// Mana.
+        mana: u16,
+        /// Stamina.
+        stamina: u16,
+    },
+    /// `0x1A`–`0x1C`: a player's experience went from `old` to `new`.
+    Experience {
+        /// The player.
+        player: String,
+        /// Before.
+        old: u32,
+        /// After.
+        new: u32,
+    },
+    /// `0x1D`–`0x1F`: one of a player's stats.
+    PlayerStat {
+        /// The player.
+        player: String,
+        /// `ItemStatCost.txt` id.
+        stat: u8,
+        /// The value, 256ths for life, mana and stamina.
+        value: u32,
+    },
+}
+
+/// How a monster fights, worked out when it joins the battle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MonsterSheet {
+    level: i32,
+    defense: i32,
+    to_hit: i32,
+    damage: (i32, i32),
+    experience: u32,
+    notice: i32,
+    think: u64,
+    reach: i32,
+    attack_frames: u64,
+    hit_frame: u64,
+    get_hit_frames: u64,
+    dying_frames: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Glide {
+    from: (f64, f64),
+    to: (f64, f64),
+    start: u64,
+    frames: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Doing {
+    Idle,
+    Chasing(String),
+    Attacking { target: String, hit_at: u64, done_at: u64 },
+    Recovering { target: String, until: u64 },
+    Dying { until: u64 },
+    Dead,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Monster {
+    room: RoomId,
+    x: f64,
+    y: f64,
+    life: i32,
+    max_life: i32,
+    sheet: MonsterSheet,
+    doing: Doing,
+    next_think: u64,
+    glide: Option<Glide>,
+}
+
+impl Monster {
+    fn at(&self) -> (i32, i32) {
+        (self.x.round() as i32, self.y.round() as i32)
+    }
+
+    fn life_byte(&self) -> u8 {
+        life_byte(self.life, self.max_life)
+    }
+
+    fn alive(&self) -> bool {
+        !matches!(self.doing, Doing::Dying { .. } | Doing::Dead)
+    }
+}
+
+/// A life as `0xAB` and `0x69` carry it: 128ths of the maximum, at least 1 while alive.
+#[must_use]
+pub fn life_byte(life: i32, max: i32) -> u8 {
+    if life <= 0 || max <= 0 {
+        return 0;
+    }
+    (i64::from(life) * 128 / i64::from(max)).clamp(1, 128) as u8
+}
+
+/// A player in the fight. Life, mana and stamina are 256ths, as the engine keeps them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Hero {
+    class: u8,
+    level: u32,
+    experience: u32,
+    attributes: [i32; 4],
+    life: i32,
+    max_life: i32,
+    mana: i32,
+    max_mana: i32,
+    stamina: i32,
+    max_stamina: i32,
+    stat_points: u32,
+    skill_points: u32,
+    at: Option<(i32, i32, i32)>,
+    view: Vec<RoomId>,
+    dead: bool,
+    swing_until: u64,
+    attack_frames: u64,
+    hit_frame: u64,
+    dying_frames: u64,
+}
+
+impl Hero {
+    fn attack_rating(&self, data: &GameData) -> i32 {
+        (self.attributes[usize::from(stat::DEXTERITY)] - 7) * 5 + data.class(self.class).map_or(0, |c| c.to_hit_factor)
+    }
+
+    fn defense(&self) -> i32 {
+        self.attributes[usize::from(stat::DEXTERITY)] / 4
+    }
+
+    fn vitals(&self, name: &str) -> Event {
+        let whole = |v: i32| (v.max(0) >> 8).min(0x7FFF) as u16;
+        Event::PlayerVitals { player: name.to_string(), life: whole(self.life), mana: whole(self.mana), stamina: whole(self.stamina) }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Due {
+    PlayerHit { player: String, guid: u32 },
+    PlayerDead { player: String },
+}
+
+/// One game's fighting.
+#[derive(Debug, Clone)]
+pub struct Battle {
+    frame: u64,
+    difficulty: u8,
+    expansion: bool,
+    seed: Seed,
+    monsters: BTreeMap<u32, Monster>,
+    heroes: BTreeMap<String, Hero>,
+    due: BTreeMap<u64, Vec<Due>>,
+}
+
+/// The chance to hit, percent (`0x0057D9B0`).
+#[must_use]
+pub fn chance_to_hit(rating: i32, defense: i32, attacker_level: i32, defender_level: i32) -> i32 {
+    let (rating, defense) = (i64::from(rating.max(0)), i64::from(defense.max(0)));
+    let base = if rating + defense == 0 { 100 } else { rating * 100 / (rating + defense) };
+    let (a, d) = (i64::from(attacker_level.max(1)), i64::from(defender_level.max(1)));
+    (base * 2 * a / (a + d)).clamp(5, 95) as i32
+}
+
+/// Whether a physical hit of `damage` makes a victim with `max_life` flinch (`0x0057CB00`): never
+/// below a sixteenth, always from a quarter, and between them on two rolls the engine makes with
+/// a width Ghidra loses (taken here as even odds each).
+fn flinches(seed: &mut Seed, damage: i32, max_life: i32) -> bool {
+    if damage * 16 < max_life {
+        return false;
+    }
+    (damage * 8 >= max_life || seed.pick(2) == 0) && (damage * 4 >= max_life || seed.pick(2) == 0)
+}
+
+/// Experience for killing a monster of `monster_level` at `player_level`: the published level-gap
+/// table (not yet read from `Game.exe`).
+#[must_use]
+pub fn experience_for(base: u32, player_level: u32, monster_level: i32) -> u32 {
+    let (p, m) = (i64::from(player_level), i64::from(monster_level.max(1)));
+    let base = i64::from(base);
+    let exp = if p - m > 5 {
+        base * [81, 62, 43, 24, 5][((p - m - 6) as usize).min(4)] / 100
+    } else if m - p > 5 {
+        base * p / m
+    } else {
+        base
+    };
+    exp.max(if base > 0 { 1 } else { 0 }) as u32
+}
+
+/// Game frames of `token`'s `mode` animation with a weapon class, or `fallback`.
+fn anim_frames(data: &GameData, token: &str, mode: &str, weapon_class: &str, fallback: u64) -> u64 {
+    data.anim_data().get(token, mode, weapon_class).map_or(fallback, |a| u64::from(a.game_frames(100)).max(1))
+}
+
+fn hit_frames(data: &GameData, token: &str, mode: &str, weapon_class: &str, fallback: u64) -> u64 {
+    data.anim_data().get(token, mode, weapon_class).and_then(|a| a.trigger_game_frames(100)).map_or(fallback, u64::from)
+}
+
+impl Battle {
+    /// A battle for a game of `difficulty`, rolling on `seed`.
+    #[must_use]
+    pub fn new(difficulty: u8, seed: u32) -> Self {
+        Self {
+            frame: 0,
+            difficulty: difficulty.min(2),
+            expansion: false,
+            seed: Seed::new(seed, 0x29A),
+            monsters: BTreeMap::new(),
+            heroes: BTreeMap::new(),
+            due: BTreeMap::new(),
+        }
+    }
+
+    /// Scale monsters by the expansion columns from now on.
+    pub fn set_expansion(&mut self, expansion: bool) {
+        self.expansion = expansion;
+    }
+
+    /// The frame the battle has reached.
+    #[must_use]
+    pub fn frame(&self) -> u64 {
+        self.frame
+    }
+
+    /// Bring a monster of `class` standing at (`x`, `y`) in `room` into the fight, with its life
+    /// and numbers rolled for this game. Monsters that are not hostile, and guids already in, are
+    /// left alone; returns whether it joined.
+    pub fn add_monster(&mut self, data: &GameData, guid: u32, class: i32, room: RoomId, x: u16, y: u16) -> bool {
+        let Some(m) = data.monsters().get(class) else { return false };
+        if self.monsters.contains_key(&guid) || m.npc || m.interact || m.alignment() != 0 || m.critter {
+            return false;
+        }
+        let d = usize::from(self.difficulty);
+        let c = &m.combat;
+        let level = if d == 0 {
+            c.level[0]
+        } else {
+            data.levels().get(room.level).map_or(c.level[d], |l| {
+                if self.expansion {
+                    l.monsters.area_level_expansion[d]
+                } else {
+                    l.monsters.area_level[d]
+                }
+            })
+        }
+        .max(1);
+        let scale = |value: i32, s: Scale| (i64::from(value) * i64::from(data.monster_levels().get(level, s, self.difficulty, self.expansion)) / 100) as i32;
+        let (lo, hi) = c.life[d];
+        let rolled = if hi > lo { lo + self.seed.pick((hi - lo + 1) as u32) as i32 } else { lo };
+        let max_life = scale(rolled, Scale::Life).max(1);
+        let weapon = if m.combat.weapon_class.is_empty() { "hth" } else { m.combat.weapon_class.as_str() };
+        let attack_frames = anim_frames(data, &m.combat.token, "A1", weapon, 16);
+        let sheet = MonsterSheet {
+            level,
+            defense: scale(c.defense[d], Scale::Defense),
+            to_hit: scale(c.to_hit[d], Scale::ToHit),
+            damage: (scale(c.damage[d].0, Scale::Damage).max(1), scale(c.damage[d].1, Scale::Damage).max(1)),
+            experience: scale(c.experience[d], Scale::Experience).max(0) as u32,
+            notice: if c.ai_distance[d] > 0 { c.ai_distance[d] } else { DEFAULT_AI_DISTANCE },
+            think: u64::try_from(c.ai_delay[d]).unwrap_or(0).max(1),
+            reach: 2 + c.melee_range.max(0),
+            attack_frames,
+            hit_frame: hit_frames(data, &m.combat.token, "A1", weapon, attack_frames / 2),
+            get_hit_frames: anim_frames(data, &m.combat.token, "GH", weapon, 8),
+            dying_frames: anim_frames(data, &m.combat.token, "DT", weapon, 20),
+        };
+        let think = sheet.think;
+        self.monsters.insert(
+            guid,
+            Monster {
+                room,
+                x: f64::from(x),
+                y: f64::from(y),
+                life: max_life,
+                max_life,
+                sheet,
+                doing: Doing::Idle,
+                next_think: self.frame + self.seed.pick(think as u32) as u64,
+                glide: None,
+            },
+        );
+        true
+    }
+
+    /// A monster in the fight: where it stands, its mode and its life in 128ths.
+    #[must_use]
+    pub fn monster(&self, guid: u32) -> Option<(u16, u16, u8, u8)> {
+        let m = self.monsters.get(&guid)?;
+        let (x, y) = m.at();
+        let mode = if m.alive() { 1 } else { DEAD_MODE };
+        Some((x as u16, y as u16, mode, m.life_byte()))
+    }
+
+    /// A player joins with a new character's stats (`(stat, value)`, as
+    /// [`GameData::new_character_stats`] gives them).
+    pub fn add_player(&mut self, data: &GameData, name: &str, class: u8, stats: &[(u8, u32)]) {
+        let get = |id: u8| stats.iter().find(|&&(s, _)| s == id).map_or(0, |&(_, v)| v);
+        let token = CLASS_TOKENS[usize::from(class.min(6))];
+        let attack_frames = anim_frames(data, token, "A1", "hth", 12);
+        let hero = Hero {
+            class,
+            level: get(stat::LEVEL).max(1),
+            experience: get(stat::EXPERIENCE),
+            attributes: [get(stat::STRENGTH) as i32, get(stat::ENERGY) as i32, get(stat::DEXTERITY) as i32, get(stat::VITALITY) as i32],
+            life: get(stat::HITPOINTS) as i32,
+            max_life: get(stat::MAXHP) as i32,
+            mana: get(stat::MANA) as i32,
+            max_mana: get(stat::MAXMANA) as i32,
+            stamina: get(stat::STAMINA) as i32,
+            max_stamina: get(stat::MAXSTAMINA) as i32,
+            stat_points: 0,
+            skill_points: 0,
+            at: None,
+            view: Vec::new(),
+            dead: false,
+            swing_until: 0,
+            attack_frames,
+            hit_frame: hit_frames(data, token, "A1", "hth", attack_frames / 2),
+            dying_frames: anim_frames(data, token, "DT", "hth", 28),
+        };
+        self.heroes.insert(name.to_string(), hero);
+    }
+
+    /// A player left.
+    pub fn remove_player(&mut self, name: &str) {
+        self.heroes.remove(name);
+    }
+
+    /// Where a player stands — world subtiles and level — and the rooms its client holds.
+    pub fn place_player(&mut self, name: &str, at: Option<(i32, i32, i32)>, view: &[RoomId]) {
+        if let Some(h) = self.heroes.get_mut(name) {
+            h.at = at;
+            if h.view != view {
+                h.view = view.to_vec();
+            }
+        }
+    }
+
+    /// Whether a player is dead.
+    #[must_use]
+    pub fn player_dead(&self, name: &str) -> bool {
+        self.heroes.get(name).is_some_and(|h| h.dead)
+    }
+
+    /// A player swings at monster `guid` (`0x06` and the other skill-on-unit packets). It lands on
+    /// the swing's hit frame; a swing still under way ignores more. Returns whether it started.
+    pub fn player_attack(&mut self, name: &str, guid: u32) -> bool {
+        let Some(h) = self.heroes.get_mut(name) else { return false };
+        if h.dead || self.frame < h.swing_until || !self.monsters.get(&guid).is_some_and(Monster::alive) {
+            return false;
+        }
+        h.swing_until = self.frame + h.attack_frames;
+        self.due.entry(self.frame + h.hit_frame.max(1)).or_default().push(Due::PlayerHit { player: name.to_string(), guid });
+        true
+    }
+
+    /// Spend a stat point (`0x3A`) on strength, energy, dexterity or vitality.
+    pub fn spend_stat_point(&mut self, data: &GameData, name: &str, which: u8) -> Vec<Event> {
+        let Some(h) = self.heroes.get_mut(name) else { return Vec::new() };
+        if which > stat::VITALITY || h.stat_points == 0 {
+            return Vec::new();
+        }
+        h.stat_points -= 1;
+        h.attributes[usize::from(which)] += 1;
+        let player = name.to_string();
+        let mut events = vec![
+            Event::PlayerStat { player: player.clone(), stat: which, value: h.attributes[usize::from(which)] as u32 },
+            Event::PlayerStat { player: player.clone(), stat: stat::STATPTS, value: h.stat_points },
+        ];
+        let per = data.class(h.class).map_or((0, 0, 0), |c| c.per_point);
+        let mut grow = |value: &mut i32, max: &mut i32, quarters: i32, current: u8, maximum: u8| {
+            *max += quarters << 6;
+            *value += quarters << 6;
+            events.push(Event::PlayerStat { player: player.clone(), stat: maximum, value: (*max).max(0) as u32 });
+            events.push(Event::PlayerStat { player: player.clone(), stat: current, value: (*value).max(0) as u32 });
+        };
+        if which == stat::VITALITY {
+            grow(&mut h.life, &mut h.max_life, per.0, stat::HITPOINTS, stat::MAXHP);
+            grow(&mut h.stamina, &mut h.max_stamina, per.1, stat::STAMINA, stat::MAXSTAMINA);
+        } else if which == stat::ENERGY {
+            grow(&mut h.mana, &mut h.max_mana, per.2, stat::MANA, stat::MAXMANA);
+        }
+        events
+    }
+
+    /// Bring a dead player back to full life (after the server has moved it to town).
+    pub fn revive(&mut self, name: &str) -> Vec<Event> {
+        let Some(h) = self.heroes.get_mut(name) else { return Vec::new() };
+        h.dead = false;
+        h.life = h.max_life;
+        h.mana = h.max_mana;
+        h.stamina = h.max_stamina;
+        h.swing_until = self.frame;
+        vec![h.vitals(name)]
+    }
+
+    /// Run the battle up to `frame`, walking monsters on `open` ground.
+    pub fn advance(&mut self, data: &GameData, frame: u64, open: &dyn Fn(i32, i32) -> bool) -> Vec<Event> {
+        let mut events = Vec::new();
+        if frame > self.frame + MAX_CATCH_UP {
+            self.frame = frame - MAX_CATCH_UP;
+        }
+        while self.frame < frame {
+            self.frame += 1;
+            self.step(data, open, &mut events);
+        }
+        events
+    }
+
+    fn step(&mut self, data: &GameData, open: &dyn Fn(i32, i32) -> bool, events: &mut Vec<Event>) {
+        let now = self.frame;
+        if let Some(due) = self.due.remove(&now) {
+            for d in due {
+                match d {
+                    Due::PlayerHit { player, guid } => self.player_hit(data, &player, guid, events),
+                    Due::PlayerDead { player } => {
+                        if self.heroes.get(&player).is_some_and(|h| h.dead) {
+                            events.push(Event::PlayerReaction { player, event: reaction::DEAD });
+                        }
+                    }
+                }
+            }
+        }
+        let guids: Vec<u32> = self.monsters.keys().copied().collect();
+        for guid in guids {
+            self.monster_step(guid, open, events);
+        }
+    }
+
+    fn player_hit(&mut self, data: &GameData, player: &str, guid: u32, events: &mut Vec<Event>) {
+        let Some(h) = self.heroes.get(player) else { return };
+        let Some(m) = self.monsters.get(&guid) else { return };
+        let Some((hx, hy, level)) = h.at else { return };
+        if h.dead || !m.alive() || level != m.room.level || path::distance((hx, hy), m.at()) > PLAYER_REACH + m.sheet.reach {
+            return;
+        }
+        let chance = chance_to_hit(h.attack_rating(data), m.sheet.defense, h.level as i32, m.sheet.level);
+        if self.seed.pick(100) as i32 >= chance {
+            return;
+        }
+        // Unarmed: no weapon, so no strength bonus.
+        let damage = FIST_DAMAGE.0 + self.seed.pick((FIST_DAMAGE.1 - FIST_DAMAGE.0 + 1) as u32) as i32;
+        let now = self.frame;
+        let experience_gain = experience_for(m.sheet.experience, h.level, m.sheet.level);
+        let flinch = flinches(&mut self.seed, damage, m.max_life);
+        let m = self.monsters.get_mut(&guid).expect("checked");
+        if let Some(glide) = m.glide.take() {
+            let (x, y) = glide_at(&glide, now);
+            (m.x, m.y) = (x, y);
+        }
+        m.life -= damage;
+        let (x, y) = m.at();
+        let (room, ux, uy) = (m.room, x as u16, y as u16);
+        if m.life > 0 {
+            let life = m.life_byte();
+            events.push(Event::MonsterLife { room, guid, life });
+            if flinch {
+                events.push(Event::MonsterReaction { room, guid, event: reaction::GET_HIT, x: ux, y: uy, life, alive: true });
+                m.doing = Doing::Recovering { target: player.to_string(), until: now + m.sheet.get_hit_frames };
+            } else if !matches!(m.doing, Doing::Attacking { .. }) {
+                m.doing = Doing::Chasing(player.to_string());
+            }
+            events.push(Event::MonsterState { guid, x: ux, y: uy, mode: 1, life });
+            return;
+        }
+        m.life = 0;
+        m.doing = Doing::Dying { until: now + m.sheet.dying_frames };
+        events.push(Event::MonsterReaction { room, guid, event: reaction::DYING, x: ux, y: uy, life: 0, alive: true });
+        events.push(Event::MonsterState { guid, x: ux, y: uy, mode: DEAD_MODE, life: 0 });
+        self.gain_experience(data, player, experience_gain, events);
+    }
+
+    fn gain_experience(&mut self, data: &GameData, name: &str, gain: u32, events: &mut Vec<Event>) {
+        let Some(h) = self.heroes.get_mut(name) else { return };
+        if gain == 0 {
+            return;
+        }
+        let old = h.experience;
+        let cap = data.next_level_experience(h.class, 98).unwrap_or(u32::MAX);
+        h.experience = old.saturating_add(gain).min(cap);
+        let player = name.to_string();
+        events.push(Event::Experience { player: player.clone(), old, new: h.experience });
+        let class = data.class(h.class).copied();
+        while h.level < 99 && data.next_level_experience(h.class, h.level as usize).is_some_and(|next| h.experience >= next) {
+            h.level += 1;
+            let (life, stamina, mana) = class.map_or((0, 0, 0), |c| c.per_level);
+            h.max_life += life << 6;
+            h.life += life << 6;
+            h.max_stamina += stamina << 6;
+            h.stamina += stamina << 6;
+            h.max_mana += mana << 6;
+            h.mana += mana << 6;
+            h.stat_points += class.map_or(5, |c| c.stat_per_level.max(0) as u32);
+            h.skill_points += 1;
+            for (stat, value) in [
+                (stat::LEVEL, h.level),
+                (stat::STATPTS, h.stat_points),
+                (stat::NEWSKILLS, h.skill_points),
+                (stat::MAXHP, h.max_life as u32),
+                (stat::HITPOINTS, h.life.max(0) as u32),
+                (stat::MAXMANA, h.max_mana as u32),
+                (stat::MANA, h.mana.max(0) as u32),
+                (stat::MAXSTAMINA, h.max_stamina as u32),
+                (stat::STAMINA, h.stamina.max(0) as u32),
+                (stat::LASTEXP, data.next_level_experience(h.class, h.level as usize - 1).unwrap_or(0)),
+                (stat::NEXTEXP, data.next_level_experience(h.class, h.level as usize).unwrap_or(0)),
+            ] {
+                events.push(Event::PlayerStat { player: player.clone(), stat, value });
+            }
+        }
+    }
+
+    /// The nearest living player a monster in `room` at `at` can see and that can see it,
+    /// within `range`.
+    fn nearest_player(&self, room: RoomId, at: (i32, i32), range: i32) -> Option<String> {
+        self.heroes
+            .iter()
+            .filter(|(_, h)| !h.dead && h.view.contains(&room))
+            .filter_map(|(name, h)| {
+                let (x, y, level) = h.at?;
+                let d = path::distance(at, (x, y));
+                (level == room.level && d <= range).then_some((d, name))
+            })
+            .min()
+            .map(|(_, name)| name.clone())
+    }
+
+    fn monster_step(&mut self, guid: u32, open: &dyn Fn(i32, i32) -> bool, events: &mut Vec<Event>) {
+        let now = self.frame;
+        let Some(m) = self.monsters.get_mut(&guid) else { return };
+        // A walk that has run its course ends where it was going.
+        if let Some(glide) = &m.glide {
+            if now >= glide.start + glide.frames {
+                (m.x, m.y) = glide.to;
+                m.glide = None;
+                let (x, y) = m.at();
+                events.push(Event::MonsterState { guid, x: x as u16, y: y as u16, mode: 1, life: m.life_byte() });
+            }
+        }
+        match m.doing.clone() {
+            Doing::Dead => return,
+            Doing::Dying { until } => {
+                if now >= until {
+                    m.doing = Doing::Dead;
+                    let (x, y) = m.at();
+                    events.push(Event::MonsterReaction { room: m.room, guid, event: reaction::DEAD, x: x as u16, y: y as u16, life: 0, alive: false });
+                }
+                return;
+            }
+            Doing::Recovering { target, until } => {
+                if now >= until {
+                    m.doing = Doing::Chasing(target);
+                    m.next_think = now;
+                } else {
+                    return;
+                }
+            }
+            Doing::Attacking { target, hit_at, done_at } => {
+                if now == hit_at {
+                    self.monster_hit(guid, &target, events);
+                }
+                let Some(m) = self.monsters.get_mut(&guid) else { return };
+                if now >= done_at {
+                    if matches!(m.doing, Doing::Attacking { .. }) {
+                        m.doing = Doing::Chasing(target);
+                    }
+                    m.next_think = now + m.sheet.think;
+                }
+                return;
+            }
+            Doing::Idle | Doing::Chasing(_) => {}
+        }
+        let Some(m) = self.monsters.get(&guid) else { return };
+        if now < m.next_think {
+            return;
+        }
+        let at = match &m.glide {
+            Some(glide) => {
+                let (x, y) = glide_at(glide, now);
+                (x.round() as i32, y.round() as i32)
+            }
+            None => m.at(),
+        };
+        let (room, notice, reach, think) = (m.room, m.sheet.notice, m.sheet.reach, m.sheet.think);
+        let target = match &m.doing {
+            Doing::Chasing(name) => {
+                let keep = self.heroes.get(name).is_some_and(|h| {
+                    !h.dead && h.view.contains(&room) && h.at.is_some_and(|(x, y, level)| level == room.level && path::distance(at, (x, y)) <= notice * LEASH)
+                });
+                keep.then(|| name.clone()).or_else(|| self.nearest_player(room, at, notice))
+            }
+            _ => self.nearest_player(room, at, notice),
+        };
+        let m = self.monsters.get_mut(&guid).expect("present");
+        m.next_think = now + think;
+        let Some(target) = target else {
+            if m.glide.is_some() || matches!(m.doing, Doing::Chasing(_)) {
+                stop(m, guid, now, events);
+            }
+            m.doing = Doing::Idle;
+            return;
+        };
+        let Some((hx, hy, _)) = self.heroes.get(&target).and_then(|h| h.at) else { return };
+        if path::distance(at, (hx, hy)) <= reach {
+            if m.glide.is_some() {
+                stop(m, guid, now, events);
+            }
+            let (x, y) = m.at();
+            events.push(Event::MonsterAttack { room, guid, target: target.clone(), x: x as u16, y: y as u16 });
+            m.doing = Doing::Attacking { target, hit_at: now + m.sheet.hit_frame.max(1), done_at: now + m.sheet.attack_frames.max(1) };
+            return;
+        }
+        m.doing = Doing::Chasing(target);
+        // A walk under way is left to finish while it still brings the monster closer: a client
+        // sent a new walk mid-stride restarts the animation (bnemu's recorded fights).
+        if let Some(glide) = &m.glide {
+            let end = (glide.to.0.round() as i32, glide.to.1.round() as i32);
+            if path::distance(end, (hx, hy)) < path::distance(at, (hx, hy)) {
+                m.next_think = (glide.start + glide.frames).min(now + think);
+                return;
+            }
+        }
+        // Other monsters' spots and walk ends are taken, so a pack spreads around its prey.
+        let taken: std::collections::HashSet<(i32, i32)> = self
+            .monsters
+            .iter()
+            .filter(|&(&g, other)| g != guid && other.alive() && other.room.level == room.level && path::distance(other.at(), (hx, hy)) <= notice)
+            .flat_map(|(_, other)| [Some(other.at()), other.glide.as_ref().map(|g| (g.to.0.round() as i32, g.to.1.round() as i32))])
+            .flatten()
+            .collect();
+        let free = |x: i32, y: i32| open(x, y) && !taken.contains(&(x, y));
+        let m = self.monsters.get_mut(&guid).expect("present");
+        let step = path::find(at, (hx, hy), reach, 12, 3000, &free).and_then(|p| {
+            if p.is_empty() {
+                return None;
+            }
+            // The farthest point within the lead that a straight walk reaches.
+            let limit = p.len().min(WALK_LEAD);
+            (1..=limit).rev().map(|i| p[i - 1]).find(|&q| path::clear_line(at, q, &free))
+        });
+        let Some((tx, ty)) = step else {
+            if m.glide.is_some() {
+                stop(m, guid, now, events);
+            }
+            return;
+        };
+        let from = match &m.glide {
+            Some(glide) => glide_at(glide, now),
+            None => (m.x, m.y),
+        };
+        (m.x, m.y) = from;
+        let length = (f64::from(tx) - from.0).hypot(f64::from(ty) - from.1);
+        let frames = (length / GLIDE_PER_FRAME).ceil().max(1.0) as u64;
+        m.glide = Some(Glide { from, to: (f64::from(tx), f64::from(ty)), start: now, frames });
+        m.next_think = now + frames.min(think);
+        events.push(Event::MonsterWalk { room, guid, x: tx as u16, y: ty as u16 });
+    }
+
+    fn monster_hit(&mut self, guid: u32, target: &str, events: &mut Vec<Event>) {
+        let Some(m) = self.monsters.get(&guid) else { return };
+        let Some(h) = self.heroes.get(target) else { return };
+        let Some((hx, hy, level)) = h.at else { return };
+        if h.dead || level != m.room.level || path::distance(m.at(), (hx, hy)) > m.sheet.reach + 2 {
+            return;
+        }
+        let chance = chance_to_hit(m.sheet.to_hit, h.defense(), m.sheet.level, h.level as i32);
+        if self.seed.pick(100) as i32 >= chance {
+            return;
+        }
+        let (lo, hi) = m.sheet.damage;
+        let damage = lo + self.seed.pick((hi - lo).max(0) as u32 + 1) as i32;
+        let max_life = h.max_life >> 8;
+        let flinch = flinches(&mut self.seed, damage, max_life);
+        let dying_frames = h.dying_frames;
+        let h = self.heroes.get_mut(target).expect("checked");
+        h.life -= damage << 8;
+        let player = target.to_string();
+        if h.life > 0 {
+            events.push(h.vitals(target));
+            events.push(Event::PlayerReaction { player, event: if flinch { reaction::GET_HIT } else { reaction::HIT_SOUND } });
+            return;
+        }
+        h.life = 0;
+        h.dead = true;
+        events.push(h.vitals(target));
+        events.push(Event::PlayerReaction { player: player.clone(), event: reaction::DYING });
+        self.due.entry(self.frame + dying_frames.max(1)).or_default().push(Due::PlayerDead { player });
+    }
+}
+
+fn glide_at(glide: &Glide, now: u64) -> (f64, f64) {
+    let t = if glide.frames == 0 { 1.0 } else { (now.saturating_sub(glide.start) as f64 / glide.frames as f64).min(1.0) };
+    (glide.from.0 + (glide.to.0 - glide.from.0) * t, glide.from.1 + (glide.to.1 - glide.from.1) * t)
+}
+
+/// End a monster's walk where it has got to and say so.
+fn stop(m: &mut Monster, guid: u32, now: u64, events: &mut Vec<Event>) {
+    if let Some(glide) = m.glide.take() {
+        (m.x, m.y) = glide_at(&glide, now);
+    }
+    let (x, y) = m.at();
+    let life = m.life_byte();
+    events.push(Event::MonsterStop { room: m.room, guid, x: x as u16, y: y as u16, life });
+    events.push(Event::MonsterState { guid, x: x as u16, y: y as u16, mode: 1, life });
+}
+
+/// Which players an event is for: `None` for a monster event, which goes to every player whose
+/// client holds its room.
+impl Event {
+    /// The player a player event is for.
+    #[must_use]
+    pub fn player(&self) -> Option<&str> {
+        match self {
+            Self::PlayerReaction { player, .. } | Self::PlayerVitals { player, .. } | Self::Experience { player, .. } | Self::PlayerStat { player, .. } => {
+                Some(player)
+            }
+            _ => None,
+        }
+    }
+
+    /// The room a monster event is seen from.
+    #[must_use]
+    pub fn room(&self) -> Option<RoomId> {
+        match self {
+            Self::MonsterLife { room, .. }
+            | Self::MonsterReaction { room, .. }
+            | Self::MonsterWalk { room, .. }
+            | Self::MonsterStop { room, .. }
+            | Self::MonsterAttack { room, .. } => Some(*room),
+            _ => None,
+        }
+    }
+}
+
+/// The players of a battle, for callers that fan events out.
+impl Battle {
+    /// Names of the players in the fight.
+    pub fn players(&self) -> impl Iterator<Item = &str> {
+        self.heroes.keys().map(String::as_str)
+    }
+
+    /// The rooms a player's client holds, as last placed.
+    #[must_use]
+    pub fn view_of(&self, name: &str) -> &[RoomId] {
+        self.heroes.get(name).map_or(&[], |h| h.view.as_slice())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use d2_data::monsters::Monsters;
+    use d2_data::presets::{MonPresets, Objects};
+    use d2_formats::excel::Table;
+
+    /// Made-up tables in the real shapes: one hostile class with 10 life, one friendly.
+    fn data() -> GameData {
+        let mut cs = String::from("class\tstr\tdex\tint\tvit\ttot\tstamina\thpadd\tToHitFactor\tLifePerLevel\tStaminaPerLevel\tManaPerLevel\tLifePerVitality\tStaminaPerVitality\tManaPerMagic\tStatPerLevel\r\n");
+        for name in ["Amazon", "Sorceress", "Necromancer", "Paladin", "Barbarian"] {
+            cs.push_str(&format!("{name}\t30\t27\t10\t25\t0\t92\t30\t20\t8\t4\t4\t16\t4\t4\t5\r\n"));
+        }
+        cs.push_str("Expansion\r\n");
+        for name in ["Druid", "Assassin"] {
+            cs.push_str(&format!("{name}\t30\t27\t10\t25\t0\t92\t30\t20\t8\t4\t4\t16\t4\t4\t5\r\n"));
+        }
+        let mut exp = String::from("Level\tAmazon\tSorceress\tNecromancer\tPaladin\tBarbarian\tDruid\tAssassin\tExpRatio\r\nMaxLvl\t99\t99\t99\t99\t99\t99\t99\t10\r\n");
+        for (level, v) in [(0, 0), (1, 20), (2, 60), (3, 1000)] {
+            exp.push_str(&format!("{level}\t{v}\t{v}\t{v}\t{v}\t{v}\t{v}\t{v}\t1024\r\n"));
+        }
+        let mut data = GameData::from_tables(&Table::parse(cs.as_bytes()), &Table::parse(exp.as_bytes())).unwrap();
+        let monstats = Table::parse(
+            b"Id\thcIdx\tMonStatsEx\tCode\tAlign\tnpc\tinteract\tLevel\tminHP\tmaxHP\tAC\tExp\tA1MinD\tA1MaxD\tA1TH\taidist\taidel\r\n\
+              brute\t0\tbrute\tXX\t0\t0\t0\t1\t10\t10\t0\t100\t100\t100\t100\t\t5\r\n\
+              friend\t1\tbrute\tYY\t1\t1\t1\t1\t10\t10\t0\t0\t0\t0\t0\t\t5\r\n",
+        );
+        let monstats2 = Table::parse(b"Id\tSizeX\tBaseW\tMeleeRng\r\nbrute\t1\thth\t0\r\n");
+        data.set_map_tables(MonPresets::default(), Monsters::from_tables(&monstats, &monstats2).unwrap(), Objects::default());
+        let monlvl = Table::parse(
+            b"Level\tAC\tAC(N)\tAC(H)\tTH\tHP\tDM\tXP\r\n0\t100\t100\t100\t100\t100\t100\t100\r\n1\t100\t100\t100\t100\t100\t2\t100\r\n",
+        );
+        data.set_combat_tables(d2_data::monlvl::MonLvls::from_table(&monlvl).unwrap(), Default::default());
+        data
+    }
+
+    const ROOM: RoomId = RoomId { level: 2, index: 0 };
+
+    fn battle(data: &GameData) -> Battle {
+        let mut b = Battle::new(0, 1234);
+        assert!(b.add_monster(data, 7, 0, ROOM, 100, 100));
+        assert!(!b.add_monster(data, 8, 1, ROOM, 100, 100), "a friendly NPC does not fight");
+        b.add_player(data, "hero", 4, &data.new_character_stats(4).unwrap());
+        b
+    }
+
+    #[test]
+    fn numbers_follow_the_formulas() {
+        assert_eq!(chance_to_hit(85, 5, 1, 1), 94);
+        assert_eq!(chance_to_hit(0, 0, 1, 1), 95, "clamped");
+        assert_eq!(chance_to_hit(1, 1000, 1, 30), 5, "clamped");
+        assert_eq!(life_byte(5, 10), 64);
+        assert_eq!(life_byte(1, 1000), 1, "a sliver while alive");
+        assert_eq!(life_byte(0, 10), 0);
+        assert_eq!(experience_for(100, 1, 1), 100);
+        assert_eq!(experience_for(100, 8, 2), 81);
+        assert_eq!(experience_for(100, 20, 2), 5);
+        assert_eq!(experience_for(100, 2, 10), 20);
+    }
+
+    #[test]
+    fn hitting_a_monster_to_death_pays_experience_and_levels_up() {
+        let data = data();
+        let mut b = battle(&data);
+        b.place_player("hero", Some((102, 100, ROOM.level)), &[ROOM]);
+        let open = |_: i32, _: i32| true;
+        let mut all = Vec::new();
+        for _ in 0..60 {
+            b.player_attack("hero", 7);
+            all.extend(b.advance(&data, b.frame() + 25, &open));
+            if b.monster(7).is_some_and(|m| m.2 == DEAD_MODE) {
+                break;
+            }
+        }
+        all.extend(b.advance(&data, b.frame() + 50, &open));
+        assert!(all.iter().any(|e| matches!(e, Event::MonsterLife { guid: 7, .. })), "the bar drops first: {all:?}");
+        let dying = all.iter().position(|e| matches!(e, Event::MonsterReaction { event: reaction::DYING, .. })).expect("it dies");
+        let dead = all.iter().position(|e| matches!(e, Event::MonsterReaction { event: reaction::DEAD, alive: false, .. })).expect("and lies dead");
+        assert!(dying < dead);
+        assert!(all.contains(&Event::Experience { player: "hero".into(), old: 0, new: 100 }));
+        assert!(all.contains(&Event::PlayerStat { player: "hero".into(), stat: stat::LEVEL, value: 3 }), "100 exp passes 20 and 60");
+        assert!(all.contains(&Event::PlayerStat { player: "hero".into(), stat: stat::STATPTS, value: 10 }));
+        assert!(!b.player_attack("hero", 7), "a corpse cannot be hit");
+        let points = b.spend_stat_point(&data, "hero", stat::VITALITY);
+        assert!(points.contains(&Event::PlayerStat { player: "hero".into(), stat: stat::STATPTS, value: 9 }));
+        assert!(points.iter().any(|e| matches!(e, Event::PlayerStat { stat: stat::MAXHP, .. })));
+    }
+
+    #[test]
+    fn a_monster_chases_swings_and_can_kill() {
+        let data = data();
+        let mut b = battle(&data);
+        let open = |_: i32, _: i32| true;
+        b.place_player("hero", Some((120, 100, ROOM.level)), &[]);
+        assert!(b.advance(&data, 50, &open).is_empty(), "a player whose client does not hold the room is not noticed");
+        b.place_player("hero", Some((120, 100, ROOM.level)), &[ROOM]);
+        let mut all = Vec::new();
+        for _ in 0..200 {
+            all.extend(b.advance(&data, b.frame() + 5, &open));
+            if b.player_dead("hero") {
+                break;
+            }
+        }
+        all.extend(b.advance(&data, b.frame() + 60, &open));
+        let walk = all.iter().position(|e| matches!(e, Event::MonsterWalk { guid: 7, .. })).expect("it walks over");
+        let swing = all.iter().position(|e| matches!(e, Event::MonsterAttack { guid: 7, .. })).expect("then swings");
+        assert!(walk < swing);
+        assert!(all.iter().any(|e| matches!(e, Event::PlayerVitals { .. })), "the player's life drops");
+        let dying = all.iter().position(|e| *e == Event::PlayerReaction { player: "hero".into(), event: reaction::DYING }).expect("and dies");
+        let dead = all.iter().position(|e| *e == Event::PlayerReaction { player: "hero".into(), event: reaction::DEAD }).expect("then lies dead");
+        assert!(dying < dead);
+        let after = b.advance(&data, b.frame() + 100, &open);
+        assert!(!after.iter().any(|e| matches!(e, Event::MonsterAttack { .. })), "nobody hits a corpse");
+        let revived = b.revive("hero");
+        assert!(matches!(revived[..], [Event::PlayerVitals { life, .. }] if life > 0));
+        assert!(!b.player_dead("hero"));
+    }
+
+    #[test]
+    fn a_walled_off_player_is_not_reached() {
+        let data = data();
+        let mut b = battle(&data);
+        let open = |x: i32, _: i32| x != 110;
+        b.place_player("hero", Some((120, 100, ROOM.level)), &[ROOM]);
+        let all = b.advance(&data, 200, &open);
+        assert!(!all.iter().any(|e| matches!(e, Event::MonsterAttack { .. })));
+        assert!(!all.iter().any(|e| matches!(e, Event::MonsterWalk { x, .. } if *x >= 110)));
+    }
+}

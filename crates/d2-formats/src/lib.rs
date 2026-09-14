@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod animdata;
 pub mod cof;
 pub mod dcc;
 pub mod ds1;

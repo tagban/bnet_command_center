@@ -63,6 +63,22 @@ pub mod sc {
     pub const OBJECT_STATE: u8 = 0x0E;
     /// Which unit is the client's own player (6 bytes).
     pub const OWN_UNIT: u8 = 0x0B;
+    /// A reaction of a player unit — hit, death — (13 bytes).
+    pub const PLAYER_REACTION: u8 = 0x0D;
+    /// Experience gained, in a byte (2 bytes).
+    pub const ADD_EXPERIENCE_BYTE: u8 = 0x1A;
+    /// Experience gained, in a word (3 bytes).
+    pub const ADD_EXPERIENCE_WORD: u8 = 0x1B;
+    /// Experience total (5 bytes).
+    pub const SET_EXPERIENCE: u8 = 0x1C;
+    /// A monster walks to a spot (16 bytes).
+    pub const MONSTER_WALK: u8 = 0x67;
+    /// A reaction of a monster — hit, death — (12 bytes).
+    pub const MONSTER_REACTION: u8 = 0x69;
+    /// A monster attacks a unit (16 bytes).
+    pub const MONSTER_ATTACK: u8 = 0x6C;
+    /// A unit's life in 128ths (7 bytes).
+    pub const UNIT_LIFE: u8 = 0xAB;
     /// What an NPC has to say about quests, before its dialog opens (40 bytes).
     pub const NPC_QUEST_MESSAGES: u8 = 0x27;
     /// Quest flags: the player's own (type 6) or an NPC's quest dialog update (103 bytes).
@@ -120,8 +136,30 @@ pub mod cs {
     pub const RUN_TO_LOCATION: u8 = 0x03;
     /// Run to a unit: `[type u32][guid u32]` (9 bytes).
     pub const RUN_TO_UNIT: u8 = 0x04;
+    /// Use the left skill on a unit: `[type u32][guid u32]` (9 bytes; engine handler
+    /// `0x00549D80`). `0x07`, `0x09` and `0x0A` carry the same body (handlers `0x00549E00`,
+    /// `0x00549EE0` and `0x00549F40` end in the same two routines).
+    pub const LEFT_SKILL_ON_UNIT: u8 = 0x06;
+    /// See [`LEFT_SKILL_ON_UNIT`].
+    pub const LEFT_SKILL_ON_UNIT_HOLD: u8 = 0x07;
+    /// See [`LEFT_SKILL_ON_UNIT`].
+    pub const LEFT_SKILL_ON_UNIT_REPEAT: u8 = 0x09;
+    /// See [`LEFT_SKILL_ON_UNIT`].
+    pub const LEFT_SKILL_ON_UNIT_HOLD_REPEAT: u8 = 0x0A;
+    /// Use the right skill on a unit; `0x0E`, `0x10` and `0x11` as the left skill's variants.
+    pub const RIGHT_SKILL_ON_UNIT: u8 = 0x0D;
+    /// See [`RIGHT_SKILL_ON_UNIT`].
+    pub const RIGHT_SKILL_ON_UNIT_HOLD: u8 = 0x0E;
+    /// See [`RIGHT_SKILL_ON_UNIT`].
+    pub const RIGHT_SKILL_ON_UNIT_REPEAT: u8 = 0x10;
+    /// See [`RIGHT_SKILL_ON_UNIT`].
+    pub const RIGHT_SKILL_ON_UNIT_HOLD_REPEAT: u8 = 0x11;
     /// Interact with a unit: `[type u32][guid u32]` (9 bytes).
     pub const INTERACT: u8 = 0x13;
+    /// Spend an attribute point: `[stat u16]` (3 bytes).
+    pub const ADD_STAT_POINT: u8 = 0x3A;
+    /// Leave the corpse and restart in town, after "You have died" (1 byte).
+    pub const RESPAWN: u8 = 0x41;
     /// Travel by waypoint: `[waypoint guid u32][level u16][u16]` (9 bytes; engine handler
     /// `0x0054C5D0`).
     pub const WAYPOINT_TRAVEL: u8 = 0x49;
@@ -810,6 +848,72 @@ pub fn player_placed() -> Vec<u8> {
     vec![sc::PLAYER_PLACED, 0, 0, 0, 0]
 }
 
+/// `0xAB`: `[unit type u8][guid u32][life u8]` (builder `0x0053C150`) — a unit's life bar,
+/// 128ths of full (client handler `0x0045F120` sets its life stat from it).
+#[must_use]
+pub fn unit_life(unit_type: u8, guid: u32, life: u8) -> Vec<u8> {
+    let mut w = Writer::with_capacity(7);
+    w.u8(sc::UNIT_LIFE).u8(unit_type).u32(guid).u8(life);
+    w.finish()
+}
+
+/// `0x69`: `[guid u32][event u8][x u16][y u16][life u8][flag u8]` (builder `0x0053BA40`) — a
+/// monster reacts: `event` is the unit event code (`0x06` get-hit, `0x08` dying, `0x09` dead),
+/// `flag` `0x03` while alive and 0 on the dead frame, as a recorded retail kill carries them.
+#[must_use]
+pub fn monster_reaction(guid: u32, event: u8, x: u16, y: u16, life: u8, alive: bool) -> Vec<u8> {
+    let mut w = Writer::with_capacity(12);
+    w.u8(sc::MONSTER_REACTION).u32(guid).u8(event).u16(x).u16(y).u8(life).u8(if alive { 3 } else { 0 });
+    w.finish()
+}
+
+/// `0x67`: `[guid u32][01][x u16][y u16][01][00][0D][speed u16 = 75][05]` — a monster walks to
+/// (`x`, `y`); the client finds its own way there (handler `0x0045CDE0`). The fixed bytes are a
+/// recorded retail monster walk's.
+#[must_use]
+pub fn monster_walk(guid: u32, x: u16, y: u16) -> Vec<u8> {
+    let mut w = Writer::with_capacity(16);
+    w.u8(sc::MONSTER_WALK).u32(guid).u8(1).u16(x).u16(y).u8(1).u8(0).u8(0x0D).u16(75).u8(5);
+    w.finish()
+}
+
+/// `0x6C`: `[guid u32][10][00][target guid u32][00][x u16][y u16]` (builder `0x0053BAA0`) — a
+/// monster standing at (`x`, `y`) swings at a unit; the client asserts its position (handler
+/// `0x0045CFB0`). The fixed bytes are a recorded retail melee attack's.
+#[must_use]
+pub fn monster_attack(guid: u32, target: u32, x: u16, y: u16) -> Vec<u8> {
+    let mut w = Writer::with_capacity(16);
+    w.u8(sc::MONSTER_ATTACK).u32(guid).u8(0x10).u8(0).u32(target).u8(0).u16(x).u16(y);
+    w.finish()
+}
+
+/// `0x0D`: `[unit type u8][guid u32][event u8][x u16][y u16][state u8][seed u8]` (builder
+/// `0x0053B4B0`) — a player reacts (client handler `0x0045CCC0`): `0x06` get-hit, `0x13` a small
+/// hit's sound, `0x08` dying (the client's own player also gets "You have died"), `0x09` the
+/// corpse. A zero position leaves the client's idea of it alone (`0x004804E0`); the trailing
+/// bytes are a recorded retail hit's (`03 60`) while alive and zero for death.
+#[must_use]
+pub fn player_reaction(unit_type: u8, guid: u32, event: u8, x: u16, y: u16) -> Vec<u8> {
+    let alive = !matches!(event, 0x08 | 0x09);
+    let mut w = Writer::with_capacity(13);
+    w.u8(sc::PLAYER_REACTION).u8(unit_type).u32(guid).u8(event).u16(x).u16(y).u8(if alive { 3 } else { 0 }).u8(if alive { 0x60 } else { 0 });
+    w.finish()
+}
+
+/// Experience from `old` to `new` the way `0x0053BDD0` sends it: the gain in a byte (`0x1A`)
+/// below `0xFF`, in a word (`0x1B`) below `0xFFFF`, else the new total (`0x1C`).
+#[must_use]
+pub fn experience(old: u32, new: u32) -> Vec<u8> {
+    let gain = new.wrapping_sub(old);
+    let mut w = Writer::with_capacity(5);
+    match gain {
+        g if new >= old && g < 0xFF => w.u8(sc::ADD_EXPERIENCE_BYTE).u8(g as u8),
+        g if new >= old && g < 0xFFFF => w.u8(sc::ADD_EXPERIENCE_WORD).u16(g as u16),
+        _ => w.u8(sc::SET_EXPERIENCE).u32(new),
+    };
+    w.finish()
+}
+
 /// `0x8F`, the ping reply: 33 bytes, zero past the opcode (builder `0x0053E020`).
 #[must_use]
 pub fn pong() -> Vec<u8> {
@@ -1038,5 +1142,33 @@ mod tests {
         assert_eq!((bits_at(&p, 8, 15), bits_at(&p, 23, 15), bits_at(&p, 38, 15)), (55, 15, 89));
         let p = life_and_position(1, 2, 3, 5810, 4450, -1, 2);
         assert_eq!((bits_at(&p, 53, 16), bits_at(&p, 69, 16), bits_at(&p, 85, 8), bits_at(&p, 93, 8)), (5810, 4450, 0xFF, 2));
+    }
+
+    /// The fight packets reproduce a recorded retail Blood Moor fight (bnemu
+    /// `docs/d2/re/combat.md`, MIT, used with permission).
+    #[test]
+    fn fight_packets_match_a_recorded_retail_fight() {
+        assert_eq!(unit_life(1, 0xA4E8_2DF0, 0x20), [0xAB, 0x01, 0xF0, 0x2D, 0xE8, 0xA4, 0x20]);
+        assert_eq!(
+            monster_reaction(0xA4E8_2DF0, 0x06, 0x1247, 0x124D, 0x1F, true),
+            [0x69, 0xF0, 0x2D, 0xE8, 0xA4, 0x06, 0x47, 0x12, 0x4D, 0x12, 0x1F, 0x03]
+        );
+        assert_eq!(
+            monster_reaction(0xA4E8_2DF0, 0x09, 0x1247, 0x124D, 0x14, false),
+            [0x69, 0xF0, 0x2D, 0xE8, 0xA4, 0x09, 0x47, 0x12, 0x4D, 0x12, 0x14, 0x00]
+        );
+        assert_eq!(
+            monster_walk(0xDA93_90B7, 0x1282, 0x126F),
+            [0x67, 0xB7, 0x90, 0x93, 0xDA, 0x01, 0x82, 0x12, 0x6F, 0x12, 0x01, 0x00, 0x0D, 0x4B, 0x00, 0x05]
+        );
+        assert_eq!(
+            monster_attack(0xDA93_90B7, 0x7F0B_15F3, 0x127E, 0x1272),
+            [0x6C, 0xB7, 0x90, 0x93, 0xDA, 0x10, 0x00, 0xF3, 0x15, 0x0B, 0x7F, 0x00, 0x7E, 0x12, 0x72, 0x12]
+        );
+        assert_eq!(player_reaction(0, 1, 0x13, 0x1247, 0x124D), [0x0D, 0x00, 0x01, 0x00, 0x00, 0x00, 0x13, 0x47, 0x12, 0x4D, 0x12, 0x03, 0x60]);
+        assert_eq!(&player_reaction(0, 1, 0x08, 0, 0)[11..], &[0, 0], "death frames carry no state");
+        assert_eq!(experience(10, 30), [0x1A, 20]);
+        assert_eq!(experience(10, 10 + 0xFF), [0x1B, 0xFF, 0x00]);
+        assert_eq!(experience(0, 0x1_0000), [0x1C, 0x00, 0x00, 0x01, 0x00]);
     }
 }

@@ -41,6 +41,40 @@ pub struct MonsterClass {
     pub spawn_collision: u8,
     /// How the class spawns in a level's rooms.
     pub spawn: SpawnRules,
+    /// How it fights.
+    pub combat: CombatStats,
+}
+
+/// The `MonStats.txt` columns a fight reads, by difficulty (Normal, Nightmare, Hell). Life,
+/// defence, attack rating, damage and experience are percentages of `MonLvl.txt` at its level.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CombatStats {
+    /// `Level`.
+    pub level: [i32; 3],
+    /// `minHP`/`maxHP`.
+    pub life: [(i32, i32); 3],
+    /// `AC`.
+    pub defense: [i32; 3],
+    /// `Exp`.
+    pub experience: [i32; 3],
+    /// `A1MinD`/`A1MaxD`.
+    pub damage: [(i32, i32); 3],
+    /// `A1TH`.
+    pub to_hit: [i32; 3],
+    /// `aidist`: how far it notices a player, subtiles; 0 for the default.
+    pub ai_distance: [i32; 3],
+    /// `aidel`: frames between its AI's thoughts.
+    pub ai_delay: [i32; 3],
+    /// `Velocity` and `Run`: walking and running speed.
+    pub speed: (i32, i32),
+    /// `MonStats2.txt` `MeleeRng`: how far its melee reaches, subtiles.
+    pub melee_range: i32,
+    /// `AI`.
+    pub ai: String,
+    /// `Code`: the animation token, e.g. `FA`.
+    pub token: String,
+    /// `MonStats2.txt` `BaseW`: the weapon class its animations are drawn with.
+    pub weapon_class: String,
 }
 
 /// The `MonStats.txt` columns room population reads, class names resolved to class ids (-1 for
@@ -93,7 +127,11 @@ impl Monsters {
                 return Err(Error::BadTable { table, problem: format!("no {column} column") });
             }
         }
-        let display: HashMap<String, (bool, [u8; 16], u8, u8)> = monstats2
+        let weapon_classes: HashMap<String, String> = monstats2
+            .rows()
+            .filter_map(|row| Some((row.get("Id")?.to_ascii_lowercase(), row.get("BaseW").unwrap_or("hth").to_string())))
+            .collect();
+        let display: HashMap<String, (bool, [u8; 16], u8, u8, i32)> = monstats2
             .rows()
             .filter_map(|row| {
                 let mut components = [0u8; 16];
@@ -102,7 +140,8 @@ impl Monsters {
                     *count = u8::try_from(variants).unwrap_or(u8::MAX);
                 }
                 let byte = |c: &str| u8::try_from(row.int(c).unwrap_or(0)).unwrap_or(0);
-                Some((row.get("Id")?.to_ascii_lowercase(), (row.int("critter").unwrap_or(0) != 0, components, byte("SizeX"), byte("spawnCol"))))
+                let melee = row.int("MeleeRng").unwrap_or(0) as i32;
+                Some((row.get("Id")?.to_ascii_lowercase(), (row.int("critter").unwrap_or(0) != 0, components, byte("SizeX"), byte("spawnCol"), melee)))
             })
             .collect();
         let by_name: HashMap<String, i32> = monstats
@@ -115,7 +154,8 @@ impl Monsters {
             .filter_map(|row| {
                 let class = i32::try_from(row.int("hcIdx")?).ok()?;
                 let id = row.get("Id")?.to_string();
-                let &(critter, components, size, spawn_collision) = display.get(&row.get("MonStatsEx")?.to_ascii_lowercase())?;
+                let ex = row.get("MonStatsEx")?.to_ascii_lowercase();
+                let &(critter, components, size, spawn_collision, melee_range) = display.get(&ex)?;
                 let flag = |c: &str| row.int(c).unwrap_or(0) != 0;
                 let int = |c: &str| row.int(c).unwrap_or(0) as i32;
                 let spawn = SpawnRules {
@@ -130,7 +170,24 @@ impl Monsters {
                     sparse: int("sparsePopulate"),
                     base: class_of(row.get("BaseId")),
                 };
-                Some((class, MonsterClass { id, critter, components, interact: flag("interact"), npc: flag("npc"), align: int("Align") as u8, size, spawn_collision, spawn }))
+                let per = |a: &str, b: &str, c: &str| [int(a), int(b), int(c)];
+                let range = |lo: [&str; 3], hi: [&str; 3]| [(int(lo[0]), int(hi[0])), (int(lo[1]), int(hi[1])), (int(lo[2]), int(hi[2]))];
+                let combat = CombatStats {
+                    level: per("Level", "Level(N)", "Level(H)"),
+                    life: range(["minHP", "MinHP(N)", "MinHP(H)"], ["maxHP", "MaxHP(N)", "MaxHP(H)"]),
+                    defense: per("AC", "AC(N)", "AC(H)"),
+                    experience: per("Exp", "Exp(N)", "Exp(H)"),
+                    damage: range(["A1MinD", "A1MinD(N)", "A1MinD(H)"], ["A1MaxD", "A1MaxD(N)", "A1MaxD(H)"]),
+                    to_hit: per("A1TH", "A1TH(N)", "A1TH(H)"),
+                    ai_distance: per("aidist", "aidist(N)", "aidist(H)"),
+                    ai_delay: per("aidel", "aidel(N)", "aidel(H)"),
+                    speed: (int("Velocity"), int("Run")),
+                    melee_range,
+                    ai: row.get("AI").unwrap_or_default().to_string(),
+                    token: row.get("Code").unwrap_or_default().to_string(),
+                    weapon_class: weapon_classes.get(&ex).cloned().unwrap_or_else(|| "hth".into()),
+                };
+                Some((class, MonsterClass { id, critter, components, interact: flag("interact"), npc: flag("npc"), align: int("Align") as u8, size, spawn_collision, spawn, combat }))
             })
             .collect();
         Ok(Self { by_class, by_name })

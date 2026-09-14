@@ -11,6 +11,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
+use d2_formats::animdata::AnimData;
 use d2_formats::excel::Table;
 use d2_formats::mpq::{self, ArchiveSet, DATA_ARCHIVES};
 
@@ -20,6 +21,7 @@ pub mod engine;
 pub mod items;
 pub mod levels;
 pub mod lvlsub;
+pub mod monlvl;
 pub mod monsters;
 pub mod presets;
 pub mod stat;
@@ -29,6 +31,7 @@ pub mod tiles;
 use items::{Code, Items};
 use levels::Levels;
 use lvlsub::LvlSubs;
+use monlvl::MonLvls;
 use monsters::Monsters;
 use presets::{LvlPrests, MonPresets, Objects, Shrines};
 use strings::Strings;
@@ -87,6 +90,19 @@ pub struct ClassStats {
     pub stamina: u8,
     /// `hpadd`: life on top of vitality at level 1.
     pub life_bonus: u8,
+    /// `ToHitFactor`: attack rating the class adds.
+    pub to_hit_factor: i32,
+    /// `RunDrain`: how fast running spends stamina.
+    pub run_drain: i32,
+    /// `LifePerLevel`, `StaminaPerLevel`, `ManaPerLevel`: quarters of a point per level.
+    pub per_level: (i32, i32, i32),
+    /// `StatPerLevel`: stat points per level.
+    pub stat_per_level: i32,
+    /// `LifePerVitality`, `StaminaPerVitality`, `ManaPerMagic`: quarters of a point per point
+    /// of vitality or energy.
+    pub per_point: (i32, i32, i32),
+    /// `WalkVelocity`, `RunVelocity`.
+    pub velocity: (i32, i32),
 }
 
 /// The rules loaded so far.
@@ -102,6 +118,8 @@ pub struct GameData {
     lvl_warps: LvlWarps,
     mon_presets: MonPresets,
     monsters: Monsters,
+    monster_levels: MonLvls,
+    anim_data: AnimData,
     objects: Objects,
     shrines: Shrines,
     items: Items,
@@ -135,6 +153,9 @@ impl GameData {
         data.mon_presets =
             MonPresets::from_tables(&read("monpreset.txt")?, &monstats, &read("superuniques.txt")?, &read("monplace.txt")?)?;
         data.monsters = Monsters::from_tables(&monstats, &read("monstats2.txt")?)?;
+        data.monster_levels = MonLvls::from_table(&read("monlvl.txt")?)?;
+        let anim = archives.read("data\\global\\animdata.d2")?.ok_or(Error::MissingTable("animdata.d2"))?;
+        data.anim_data = AnimData::parse(&anim).map_err(|e| Error::BadTable { table: "animdata.d2", problem: e.to_string() })?;
         data.objects = Objects::from_table(&read("objects.txt")?);
         data.shrines = Shrines::from_table(&read("shrines.txt")?);
         data.items = Items::from_tables(&read("itemtypes.txt")?, &read("weapons.txt")?, &read("armor.txt")?, &read("misc.txt")?)?;
@@ -245,6 +266,24 @@ impl GameData {
         &self.monsters
     }
 
+    /// `MonLvl.txt`.
+    #[must_use]
+    pub fn monster_levels(&self) -> &MonLvls {
+        &self.monster_levels
+    }
+
+    /// `animdata.d2`: animation lengths and hit frames.
+    #[must_use]
+    pub fn anim_data(&self) -> &AnimData {
+        &self.anim_data
+    }
+
+    /// Replace the monster level and animation tables — for building rules in tests.
+    pub fn set_combat_tables(&mut self, monster_levels: MonLvls, anim_data: AnimData) {
+        self.monster_levels = monster_levels;
+        self.anim_data = anim_data;
+    }
+
     /// Replace the map tables — for building rules from tables in tests.
     pub fn set_map_tables(&mut self, mon_presets: MonPresets, monsters: Monsters, objects: Objects) {
         self.mon_presets = mon_presets;
@@ -259,7 +298,20 @@ impl GameData {
     /// [`Error::BadTable`] if a class row or column is missing or out of range.
     pub fn from_tables(charstats: &Table, experience: &Table) -> Result<Self, Error> {
         let bad = |table, problem: String| Error::BadTable { table, problem };
-        let mut classes = [ClassStats { strength: 0, dexterity: 0, energy: 0, vitality: 0, stamina: 0, life_bonus: 0 }; 7];
+        let mut classes = [ClassStats {
+            strength: 0,
+            dexterity: 0,
+            energy: 0,
+            vitality: 0,
+            stamina: 0,
+            life_bonus: 0,
+            to_hit_factor: 0,
+            run_drain: 0,
+            per_level: (0, 0, 0),
+            stat_per_level: 0,
+            per_point: (0, 0, 0),
+            velocity: (0, 0),
+        }; 7];
         for (id, name) in CLASSES.iter().enumerate() {
             let row = charstats
                 .rows()
@@ -277,6 +329,20 @@ impl GameData {
                 vitality: byte("vit")?,
                 stamina: byte("stamina")?,
                 life_bonus: byte("hpadd")?,
+                to_hit_factor: row.int("ToHitFactor").unwrap_or(0) as i32,
+                run_drain: row.int("RunDrain").unwrap_or(0) as i32,
+                per_level: (
+                    row.int("LifePerLevel").unwrap_or(0) as i32,
+                    row.int("StaminaPerLevel").unwrap_or(0) as i32,
+                    row.int("ManaPerLevel").unwrap_or(0) as i32,
+                ),
+                stat_per_level: row.int("StatPerLevel").unwrap_or(0) as i32,
+                per_point: (
+                    row.int("LifePerVitality").unwrap_or(0) as i32,
+                    row.int("StaminaPerVitality").unwrap_or(0) as i32,
+                    row.int("ManaPerMagic").unwrap_or(0) as i32,
+                ),
+                velocity: (row.int("WalkVelocity").unwrap_or(0) as i32, row.int("RunVelocity").unwrap_or(0) as i32),
             };
         }
 
@@ -310,6 +376,8 @@ impl GameData {
             lvl_warps: LvlWarps::default(),
             mon_presets: MonPresets::default(),
             monsters: Monsters::default(),
+            monster_levels: MonLvls::default(),
+            anim_data: AnimData::default(),
             objects: Objects::default(),
             shrines: Shrines::default(),
             items: Items::default(),
