@@ -43,6 +43,8 @@ pub struct Config {
     pub discord: DiscordConfig,
     /// Optional stats push to an external website.
     pub stats_push: StatsPushConfig,
+    /// Optional ladder standings push to an external website.
+    pub ladder_push: LadderPushConfig,
     /// Optional PvPGN-compatible server tracking (advertise us / host a list).
     pub tracker: TrackerConfig,
     /// The Diablo II closed realm (private characters).
@@ -156,6 +158,26 @@ pub struct StatsPushConfig {
 impl Default for StatsPushConfig {
     fn default() -> Self {
         Self { url: String::new(), interval_secs: 60, token: String::new(), include_users: false }
+    }
+}
+
+/// Push the ladder standings JSON to an external URL (see `crate::ladder_push`): on an interval,
+/// and soon after a ladder changes. Disabled unless `url` is set.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LadderPushConfig {
+    /// The `https://` endpoint on your site that receives the ladder POST (`web/bnet.cc/ladder-push.php`).
+    /// Empty disables it.
+    pub url: String,
+    /// Bearer token, sent as `Authorization: Bearer <token>`. Empty uses `[stats_push] token`. A secret.
+    pub token: String,
+    /// Seconds between pushes when nothing changes (minimum 60).
+    pub interval_secs: u64,
+}
+
+impl Default for LadderPushConfig {
+    fn default() -> Self {
+        Self { url: String::new(), token: String::new(), interval_secs: 300 }
     }
 }
 

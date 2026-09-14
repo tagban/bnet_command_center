@@ -15,6 +15,7 @@ mod public_status;
 mod realm;
 mod season;
 mod session;
+mod ladder_push;
 mod stats_push;
 mod status;
 mod tracker;
@@ -310,6 +311,14 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
     // Optional stats push to an external website (outbound-only, no forwarded port needed).
     if !cfg.stats_push.url.trim().is_empty() {
         tokio::spawn(stats_push::run(Arc::clone(&node), cfg.stats_push.clone()));
+    }
+    // The ladder standings, the same way.
+    if !cfg.ladder_push.url.trim().is_empty() {
+        let mut ladder = cfg.ladder_push.clone();
+        if ladder.token.trim().is_empty() {
+            ladder.token = cfg.stats_push.token.clone();
+        }
+        tokio::spawn(ladder_push::run(Arc::clone(&node), ladder));
     }
 
     // Optional PvPGN-compatible tracking: advertise this server to public trackers, and/or

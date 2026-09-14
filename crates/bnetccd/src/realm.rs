@@ -562,7 +562,7 @@ pub fn ladder_filter(ladder: u8) -> Option<(bool, bool, Option<u8>)> {
 }
 
 /// A character's experience, from its `.d2s` (0 without one).
-fn experience_of(character: &Character) -> u32 {
+pub(crate) fn experience_of(character: &Character) -> u32 {
     character.save.as_deref().and_then(|b| d2_formats::d2s::Save::parse(b).ok()).map_or(0, |s| s.stat(13))
 }
 

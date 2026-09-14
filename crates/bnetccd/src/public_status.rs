@@ -9,6 +9,8 @@
 //! It serves two routes:
 //! * `GET /status.json` — the machine-readable feed to hook into.
 //! * `GET /` — a small self-contained HTML page that renders that feed and refreshes.
+//! * `GET /ladder.json` — every ladder's standings (`crate::ladder_push`), what a game's own
+//!   ladder screen shows anyone.
 //!
 //! The one privacy lever is the online-users list: included only when the operator turns it
 //! on (`[status] public_show_users`). Counts, uptime, channel/game totals and the MOTD are
@@ -73,6 +75,9 @@ pub async fn run(listen: SocketAddr, node: Arc<Node>, show_users: bool) {
             };
             let response = match path.as_str() {
                 "/status.json" => json_response(&node, show_users),
+                "/ladder.json" => {
+                    http_response("200 OK", "application/json; charset=utf-8", &crate::ladder_push::snapshot_json(&node).await, true)
+                }
                 "/" | "/index.html" => http_response("200 OK", "text/html; charset=utf-8", HTML, false),
                 _ => http_response("404 Not Found", "text/plain; charset=utf-8", "Not found.", false),
             };

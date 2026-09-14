@@ -334,6 +334,9 @@ ul { margin:6px 0; padding-left:20px; }
 <tr><td><code>interval_secs</code></td><td>Seconds between pushes (minimum 5; default 60).</td></tr>
 <tr><td><code>token</code></td><td>Optional; sent as <code>Authorization: Bearer &lt;token&gt;</code> so your endpoint can authenticate the POST.</td></tr>
 <tr><td><code>include_users</code></td><td>Whether the pushed JSON includes the online-usernames list.</td></tr>
+<tr><td><code>[ladder_push] url</code></td><td>Your site's ladder ingest endpoint (https), e.g. <code>ladder-push.php</code> from <code>web/bnet.cc/</code>. Empty = disabled. The standings are also at the public endpoint's <code>/ladder.json</code>.</td></tr>
+<tr><td><code>token</code></td><td>Bearer token for the ladder POST; empty uses <code>[stats_push] token</code>.</td></tr>
+<tr><td><code>interval_secs</code></td><td>Seconds between ladder pushes when nothing changes (minimum 60; default 300). A ladder game or a season's end sends one within a minute.</td></tr>
 </table>
 <p class="muted">The body is identical to <code>/status.json</code>. Best-effort, on its own task — a slow or failing endpoint never affects the server.</p>
 
