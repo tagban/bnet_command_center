@@ -594,6 +594,71 @@ Not yet: the towns' and other preset levels' maps, cross-level seams where a nei
 preset room reaches into a room (`DRLGROOMEX_LinkNearRoomsByVis`), and using the maps — monster
 spots, walk checks and paths.
 
+### Fighting (2026-09-14)
+
+`d2_game::battle` runs a game's fight in engine frames; the wire shapes and pacing are bnemu's
+recorded retail Blood Moor fight (`docs/d2/re/combat.md`, MIT, permission in `docs/LEGAL.md`), the
+builders confirmed here:
+
+- C→S `0x06`/`0x07`/`0x09`/`0x0A` (left skill) and `0x0D`/`0x0E`/`0x10`/`0x11` (right) carry
+  `[unit type u32][guid u32]`; handlers `0x549D80`, `0x549E00`, `0x549EE0`, `0x549F40` (`0x09`
+  and `0x0A` call the first two) all start the skill. A new character's skills are Attack, so
+  each is a swing; one under way ignores more. The hit lands on the swing's `animdata.d2`
+  trigger frame (Barbarian `BAA1HTH` 12 frames, hit on 6).
+- Monster numbers: `MonStats.txt` value × `MonLvl.txt` percentage for the monster's level
+  (`0x5A0000` row lookup, stride `0x78`, 30 values: AC, TH, HP, DM, XP each classic then `L-`,
+  per difficulty; `0x5A1990` indexes `difficulty + (expansion + group) × 3`). Level: `Level` on
+  Normal, the area's `MonLvl2`/`3` (`Ex`) otherwise.
+- To-hit `0x57D9B0`: `200·AR/(AR+DEF)·alvl/(alvl+dlvl)`, 5..95; player AR `(dex−7)·5 +
+  ToHitFactor` (`0x622560`), defence `dex/4` (`0x6223F0`). Flinch gate `0x57CB00` (physical:
+  never under max/16, always from max/4).
+- Monster hit: `0xAB` `[type][guid][life/128]` (`0x53C150`) and, when it flinches, `0x69`
+  `[guid][event 06][x][y][life][03]` (`0x53BA40`). Kill: `0x69` event `08` flag 3, then `09` flag
+  0 one `DT` animation later (Fallen 800 ms, as recorded). Experience: `0x1A` byte / `0x1B` word
+  gain, `0x1C` total (`0x53BDD0`); level-ups as `0x1D`–`0x1F` stats 12, 4, 5, 6–11, 29, 30.
+- Monsters: notice within `aidist` (35 when blank), walk `0x67` `[guid][01][x][y][01][00][0D]
+  [75 u16][05]` (handler `0x45CDE0`; the client paths there and glides ≈5.77 subtiles/s whatever the
+  class), attack `0x6C` `[guid][10][00][target][00][x][y]` (`0x53BAA0`; client `0x45CFB0` asserts
+  the attacker's position), `0x6D` to stand.
+- A player hit: `0x95` with life/mana/stamina and **position zero** — the client re-seats its
+  player only for non-zero x and y (`0x45DB20` → `0x4804E0`) — then `0x0D` `[0][guid][event]
+  [0][0][03][60]` (`0x53B4B0`; client `0x45CCC0` → `0x461250`): `13` a small hit's sound, `06`
+  get-hit, `08` dying (+ "You have died"), `09` corpse. `0x41` (1 byte) is the release: the
+  server moves the player to the camp like waypoint travel and sends full life; `0x95` with life
+  on a dead unit stands it up (`0x45DB20`).
+- Not the engine's yet: the per-class AI routines, the path finder (`d2_game::path`, bounded A*),
+  unarmed 1–2 damage, the experience level-gap table.
+
+**Stamina.** On Battle.net the client only displays stat 10 (bnemu's gdb trace). The server steps
+it every frame: running outside a town spends `RunDrain × 2` 256ths (`0x57F240`, CharStats
+`+0x42`), standing gains `max >> 8`, walking `max >> 9` (walking out of town only above one
+point), anything else nothing (`0x580500`). Sent as `0x95` on whole-point changes.
+
+### Maze levels and warps (2026-09-14)
+
+`d2_drlg::maze` ports libd2's `DRLGMAZE_GenerateLevel` for Act I's caves (level type 3): the
+Den of Evil (`LvlMaze` Rooms 1, grown by the cave tables to three cells), Cave, Underground
+Passage, Hole and Pit. Matches libd2's engine recordings room for room (place, seed, preset,
+flags) and cell for cell in collision, and by checksum for 200 seeds on Normal and Hell.
+
+Warps, from the engine:
+- A room's warp nodes (`RoomEx+0x4C`: `[0]` destination RoomEx, `[4]` next, `+0xC` its tiles,
+  `+0x10` `LvlWarp.txt` row) are set up as its tiles are (`0x66E260`, `0x66E360`).
+- Warp tiles reach the client as units of type 5: `0x09` (11) `[5][guid][class u8][x u16][y u16]`
+  from `SendUnitToClient`'s default case (`0x53BCD0`); the client makes one at that spot
+  (`0x45CB90` → `0x4661C0` → `0x465FD0` case 5). `class` is the `LvlWarp` `Id`.
+- C→S `0x13` with type 5 (`0x54AA90` → `0x548B00` case 5): within 5 subtiles `0x5550B0`, else the
+  player walks there. `0x5550B0` → `0x6195A0` → `0x66AB00` finds the node whose `LvlWarp` `Id` is
+  the unit's class, the destination room's node back, initializes that room (`0x61B730`) and
+  returns its tile unit; the player goes to a free spot by it (`0x64E7B0`, mask `0x1C09`) through
+  `0x554EA0` — as waypoint travel — then walks by the destination row's `ExitWalkX`/`Y`
+  (`+0x14`/`+0x18`) with `0x0D` event 1.
+- **Not found:** where the server allocates the tile units (their guid, and exactly where they
+  stand). The allocator `0x555230`'s 44 callers pass no literal 5, and the D2Common room alloc
+  `0x619890` calls a callback at `act+0x4C` whose setter was not found. The test server puts the
+  unit on the warp cell's corner, gives it the next type-5 guid, and lands the player on the
+  destination cell plus `ExitWalk`.
+
 ## 6. Server packet builders (opcode → function)
 
 `scripts/d2re/server_send_builders.py <Game.exe>` finds every call to the queue function
@@ -615,13 +680,18 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
   player (stats, skills, items, states).
 - Shops: `0x38` trade/gamble/repair and the store's items; hirelings; NPC quest messages.
 - Waypoint travel to other acts (`0x53ACC0`), which needs their maps.
-- Collision for the town and other preset levels (the wilderness is done, §5 *Collision*; monster
-  spots use it), then walk checks (`0x548EF0`) and paths (`0x64DEA0`, `path.zig`) in place of
-  straight lines; cross-level near rooms by visibility slots (`0x66C220`).
-- bnemu (MIT, permission recorded in `docs/LEGAL.md`) has worked combat, monster AI, items and
-  vendors to port from; its wilderness collision is approximate, so collision stays on libd2.
-- Monster AI, combat and experience; unique packs and champions; wandering monsters; NPCs
-  walking their DS1 paths (`0x666120`); the set pieces' map units (read at room init).
+- Collision for the town and other preset levels (the wilderness and Act I's maze caves are done),
+  then walk checks (`0x548EF0`) and paths (`0x64DEA0`, `path.zig`) in place of straight lines;
+  cross-level near rooms by visibility slots (`0x66C220`).
+- Where the server allocates warp tile units (§5 *Maze levels and warps*); the preset levels
+  behind the caves (Cave Level 2 and the other treasure levels, `DrlgType` 2) and the other acts'
+  mazes.
+- Combat (§5 *Fighting*): the per-class AI routines, items and weapons, drops (`0x9C`, bnemu has
+  the item bitstream), skills; saving level and experience to the character.
+- bnemu (MIT, permission recorded in `docs/LEGAL.md`) has worked items and vendors to port from;
+  its wilderness collision is approximate, so collision stays on libd2.
+- Unique packs and champions; wandering monsters; NPCs walking their DS1 paths (`0x666120`); the
+  set pieces' map units (read at room init).
 - The byte at `0x68`+20 and the `0x6A`/`0x6C`/`0x6E` handlers.
 - A packet capture from the real engine (`docs/D2GS-RUST.md` §2 oracle) would confirm the dump
   faster than reading it; §4 and §6 say where to look in that capture.
