@@ -9,8 +9,8 @@
 //! pages are gone and no permissive source gives the formula, so [`rating_after`] is plain Elo
 //! from [`START_RATING`] with [`K_FACTOR`] until the formula is chosen. Every rating change goes
 //! through that one function. The classic eligibility rule (ten normal-game wins before playing
-//! on the ladder, [`LADDER_MIN_WINS`]) is recorded here but not enforced: how the client is told
-//! no has not been confirmed.
+//! on the ladder, [`LADDER_MIN_WINS`]) is enforced by the chat server (tagban, 2026-09-14): a
+//! player with fewer normal wins cannot host a ladder game and its ladder results do not count.
 
 pub mod war3;
 
@@ -51,7 +51,8 @@ impl League {
 pub const START_RATING: u32 = 1000;
 /// Elo's K for [`rating_after`] (provisional).
 pub const K_FACTOR: f64 = 32.0;
-/// Normal-game wins classic Battle.net required before ladder play (not enforced).
+/// Normal-game wins a StarCraft or Warcraft II player needs before playing on the ladder, as on
+/// classic Battle.net. Diablo II's ladder has no such rule.
 pub const LADDER_MIN_WINS: u32 = 10;
 /// How long a game must last for its result to count, ladder or not: longer than two minutes
 /// (tagban, 2026-09-14). A player who surrenders or leaves a counted game loses it, and the other

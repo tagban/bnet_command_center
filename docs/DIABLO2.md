@@ -20,7 +20,8 @@ A closed-realm client can:
   in this server's database (`characters` table, schema v2),
 - enter chat as the character: shown as **`Character*Account`** with the character's portrait
   (class, level, hardcore/expansion/ladder bits) in its statstring,
-- open the game lobby: the game list is empty, the ladder is empty.
+- open the game lobby and the **ladder**: ladder characters ranked by experience, softcore and
+  hardcore, classic and expansion, overall and by class, down to rank 500.
 
 **Creating or joining a game answers "Server Down" / "Game does not exist."** That is
 expected: hosting a closed-realm game needs a Diablo II game server (§5).
@@ -33,6 +34,21 @@ Rules the realm enforces:
   make expansion characters**; LoD sees both and can upgrade classic characters.
 - A character belongs to one account: nobody else can list, select, delete, or chat as it.
 - Up to `diablo2.max_characters` per account (default 18).
+
+### Ladder seasons
+
+The ladder runs in **seasons**, ended by hand from the admin panel's **D2 ladder** page
+(`/d2/season`), since how long a season should last depends on how many people play (tagban,
+2026-09-14). The page shows the season, when it began and how many softcore and hardcore
+characters are on the ladder. **End season** turns every ladder character, softcore and hardcore
+alike, into a normal character that keeps its level, items and progress, in the realm and in its
+`.d2s`. The ladder is then empty, and new ladder characters belong to the next season. A player
+still in a game when the season ends plays that game as a ladder character and is saved without
+the ladder bit.
+
+The season number and start are kept in `bnetccd-d2-season.json` beside the account database (in
+memory with in-memory storage). Unlike StarCraft and Warcraft II, the Diablo II ladder needs no
+wins: a character is on it from creation.
 
 ### Verified against a real client
 

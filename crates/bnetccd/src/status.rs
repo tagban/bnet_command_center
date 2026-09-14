@@ -263,6 +263,8 @@ async fn route(req: &Request, peer_ip: IpAddr, panel: &Panel) -> Response {
         ("POST", "/users/reset") => do_user_reset(req, node).await,
         ("POST", "/users/delete") => do_user_delete(req, node).await,
         ("GET", "/d2") => html_page(D2_MAP.to_string()),
+        ("GET", "/d2/season") => season_page(node, None).await,
+        ("POST", "/d2/season/end") => do_end_season(node).await,
         ("GET", "/d2/games.json") => d2_json(node, req, D2Query::Games),
         ("GET", "/d2/level.json") => d2_json(node, req, D2Query::Level),
         ("GET", "/d2/live.json") => d2_json(node, req, D2Query::Live),
@@ -467,6 +469,82 @@ async fn do_user_delete(req: &Request, node: &Node) -> Response {
         Err(e) => (false, format!("Could not delete account: {e}")),
     };
     users_page(node, req, Some((flash.0, &flash.1))).await
+}
+
+/// `GET /d2/season` — the Diablo II ladder season: its number, when it began, how many
+/// characters are on the ladder, and the button that ends it.
+async fn season_page(node: &Node, flash: Option<(bool, &str)>) -> Response {
+    use bnetcc_proto::d2::status::{HARDCORE, LADDER};
+    let season = node.d2_season.current();
+    let ladder: Vec<_> = node.all_characters().await.into_iter().filter(|c| c.status & LADDER != 0).collect();
+    let hardcore = ladder.iter().filter(|c| c.status & HARDCORE != 0).count();
+    html_page(render_season(season, ladder.len() - hardcore, hardcore, flash))
+}
+
+/// `POST /d2/season/end` — end the season and start the next.
+async fn do_end_season(node: &Node) -> Response {
+    let flash = match node.end_ladder_season().await {
+        Ok((ended, begun, softcore, hardcore)) => (
+            true,
+            format!(
+                "Season {} is over: {softcore} softcore and {hardcore} hardcore characters are now non-ladder. Season {} has begun.",
+                ended.number, begun.number
+            ),
+        ),
+        Err(e) => (false, format!("The season was not ended: {e}")),
+    };
+    season_page(node, Some((flash.0, &flash.1))).await
+}
+
+/// The ladder season page.
+fn render_season(season: crate::season::Season, softcore: usize, hardcore: usize, flash: Option<(bool, &str)>) -> String {
+    let flash_html = match flash {
+        Some((true, m)) => format!(r#"<p class="ok">{}</p>"#, html_escape(m)),
+        Some((false, m)) => err_banner(m),
+        None => String::new(),
+    };
+    let number = season.number;
+    let next = number + 1;
+    format!(
+        r##"<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Diablo II ladder — Command Center</title>
+<style>
+:root {{ color-scheme: light dark; --bg:#0f1115; --card:#1a1d24; --fg:#e6e8ec; --muted:#9aa0aa; --accent:#5aa9e6; --line:#2a2e37; --err:#e06a6a; --ok:#5ac47d; --danger:#a33; }}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif; }}
+header {{ padding:16px 20px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }}
+header h1 {{ font-size:16px; margin:0; }}
+header nav {{ margin-left:auto; }} header nav a {{ color:var(--accent); text-decoration:none; font-size:13px; }}
+main {{ padding:20px; max-width:720px; }}
+.card {{ background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin-bottom:16px; }}
+.big {{ font-size:28px; font-weight:600; font-variant-numeric:tabular-nums; }}
+.sub {{ color:var(--muted); font-size:13px; }}
+.row {{ display:flex; gap:32px; flex-wrap:wrap; margin-top:10px; }}
+button {{ padding:8px 14px; border:none; border-radius:6px; background:var(--danger); color:#fff; font-weight:600; font-size:13px; cursor:pointer; }}
+.err {{ background:rgba(224,106,106,.12); border:1px solid var(--err); color:var(--err); padding:9px 12px; border-radius:8px; margin-bottom:12px; }}
+.ok {{ background:rgba(90,196,125,.12); border:1px solid var(--ok); color:var(--ok); padding:9px 12px; border-radius:8px; margin-bottom:12px; }}
+</style></head><body>
+<header><h1>Diablo II ladder</h1><nav><a href="/">Dashboard</a> · <a href="/d2">D2 map</a> · <a href="/users">Users</a> · <a href="/help">Help</a></nav></header>
+<main>
+{flash_html}
+<div class="card">
+  <div class="sub">Current season</div>
+  <div class="big">Season {number}</div>
+  <div class="sub">Began {began}</div>
+  <div class="row">
+    <div><div class="big">{softcore}</div><div class="sub">softcore ladder characters</div></div>
+    <div><div class="big">{hardcore}</div><div class="sub">hardcore ladder characters</div></div>
+  </div>
+</div>
+<div class="card">
+  <p>Ending the season turns every ladder character, softcore and hardcore, into a normal character. They keep their levels, items and progress. The ladder starts empty, and characters created as ladder characters from then on belong to season {next}.</p>
+  <form method="post" action="/d2/season/end" onsubmit="return confirm('End season {number}? Every ladder character becomes a normal character. This cannot be undone.')">
+    <button type="submit">End season {number}</button>
+  </form>
+</div>
+</main></body></html>"##,
+        began = ago(season.started),
+    )
 }
 
 /// Render "N{unit} ago" for a timestamp `secs` epoch-seconds in the past, avoiding a date
@@ -1962,7 +2040,7 @@ const DASHBOARD: &str = r##"<!doctype html>
 <header>
   <h1>BNET Command Center · <span class="name" id="server">…</span></h1>
   <span class="meta" id="meta"></span>
-  <nav><a href="/d2">D2 map</a> · <a href="/users">Users</a> · <a href="/settings">Settings</a> · <a href="/help">Help</a> · <a href="/change-password">Password</a></nav>
+  <nav><a href="/d2">D2 map</a> · <a href="/d2/season">D2 ladder</a> · <a href="/users">Users</a> · <a href="/settings">Settings</a> · <a href="/help">Help</a> · <a href="/change-password">Password</a></nav>
 </header>
 <main>
   <div class="tiles">
@@ -2185,5 +2263,36 @@ mod settings_tests {
         assert_eq!(cfg_opt_int(&doc, &["limits", "clients", "gateway", "global"]), "");
         // Unsetting through a missing path is a no-op, not a panic.
         unset_cfg(&mut doc, &["nope", "missing", "key"]);
+    }
+}
+
+#[cfg(test)]
+mod season_tests {
+    use super::*;
+
+    fn body(r: &Response) -> String {
+        r.body.clone()
+    }
+
+    /// The ladder page shows the season and its ladder characters; its button ends the season,
+    /// which empties the ladder and shows the next season.
+    #[tokio::test]
+    async fn the_season_page_ends_the_season() {
+        use bnetcc_proto::d2::status::{HARDCORE, LADDER};
+        use bnetcc_storage::model::Credential;
+        let node = crate::node::test_node();
+        let acct = node.create_account("Owner", Credential::Xsha1 { digest: [1u8; 20] }).await.unwrap();
+        for (name, status) in [("Soft", LADDER), ("Hard", LADDER | HARDCORE), ("Plain", 0)] {
+            let c = bnetcc_storage::Character { account: acct.id, name: name.into(), class: 1, status, level: 1, progression: 0, created_at: 0, last_played: 0, save: None };
+            node.create_character(c).await.unwrap();
+        }
+        let page = body(&season_page(&node, None).await);
+        assert!(page.contains("Season 1<") && page.contains(r#"<div class="big">1</div><div class="sub">softcore"#), "{page}");
+        assert!(page.contains(r#"<div class="big">1</div><div class="sub">hardcore"#));
+
+        let ended = body(&do_end_season(&node).await);
+        assert!(ended.contains("Season 1 is over: 1 softcore and 1 hardcore characters are now non-ladder. Season 2 has begun."), "{ended}");
+        assert!(ended.contains("Season 2<") && ended.contains(r#"<div class="big">0</div><div class="sub">softcore"#));
+        assert!(node.all_characters().await.iter().all(|c| c.status & LADDER == 0));
     }
 }

@@ -38,6 +38,10 @@ at the same time, give each its own pair of accounts.
 - A game starts when its host takes the ad down (`SID_STOPADV`). Time in the lobby does not count.
 - Each player's own report counts for that player only. The player who surrenders reports its loss,
   and the other player reports its win.
+- StarCraft and Warcraft II players need **ten normal-game wins** before the ladder: fewer, and
+  the server refuses to host a ladder game and ignores their ladder results. With `--ladder` or
+  `--iron-man` the bot first plays normal games, the account with fewer wins winning each, until
+  both have ten. That is about twenty games, some 45 minutes at the default length.
 - Ladder games change the rating, high rating and rank (ranks 1 to 500).
 
 ## One game on the wire

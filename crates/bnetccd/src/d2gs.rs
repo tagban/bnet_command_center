@@ -232,10 +232,19 @@ impl GameServer {
     }
 
     /// Write a player's character to storage: its `.d2s`, and its level for the realm's
-    /// character list. The stored character is read back first, so only these two fields change.
+    /// character list. The stored character is read back first, so only these two fields change,
+    /// and its ladder bit wins over the save's: a season that ended while the player was in the
+    /// game has already taken it off the ladder.
     async fn save_character(&self, p: &mut Player) {
         let (Some(storage), Some((bytes, level))) = (&self.storage, self.character_save(p)) else { return };
         let Some(mut character) = storage.character_by_name(&p.character.name).await else { return };
+        let bytes = match Save::parse(&bytes) {
+            Ok(mut save) => {
+                save.set_status((save.status() & !status::LADDER) | (character.status & status::LADDER));
+                save.to_bytes()
+            }
+            Err(_) => bytes,
+        };
         character.save = Some(bytes.clone());
         character.level = u8::try_from(level).unwrap_or(99);
         match storage.update_character(character).await {

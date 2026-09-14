@@ -360,6 +360,8 @@ pub struct Node {
     key_holder_names: Mutex<HashMap<KeyId, String>>,
     /// Staff-set tag bans, IP bans, and mutes, persisted to disk. See [`BanStore`].
     pub bans: BanStore,
+    /// The Diablo II ladder season.
+    pub d2_season: crate::season::LadderSeasons,
     /// Every logged-in session, keyed by lowercased display name, so staff moderation can
     /// reach a session in any channel (or none). Populated at logon, cleared on disconnect.
     sessions: Mutex<HashMap<String, SessionEntry>>,
@@ -407,6 +409,8 @@ pub struct NodeConfig {
     /// How long a game must have run for `SID_GAMERESULT` to count it (strictly longer);
     /// `bnetcc_core::ladder::MIN_GAME_LENGTH` in production, zero counts every game.
     pub min_game_length: std::time::Duration,
+    /// Where the Diablo II ladder season is kept; `None` keeps it in memory (tests).
+    pub d2_season_path: Option<std::path::PathBuf>,
 }
 
 /// The Diablo II closed realm's settings (see `crate::config::Diablo2Config`).
@@ -506,6 +510,7 @@ impl Node {
             key_registry: Mutex::new(KeyRegistry::new(500)),
             key_holder_names: Mutex::new(HashMap::new()),
             bans: BanStore::load(cfg.bans_path),
+            d2_season: crate::season::LadderSeasons::load(cfg.d2_season_path),
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -727,6 +732,21 @@ impl Node {
     /// An account's Diablo II realm characters, oldest first.
     pub async fn characters(&self, account_id: AccountId) -> Result<Vec<bnetcc_storage::Character>, String> {
         self.storage.characters(account_id).await
+    }
+
+    /// End the Diablo II ladder season: every ladder character becomes a normal one, and the
+    /// next season begins. The season ended, the one begun, and how many softcore and hardcore
+    /// characters left the ladder. The season only moves on once every character is converted.
+    ///
+    /// # Errors
+    ///
+    /// The storage error, if a character could not be converted; the season stays as it was.
+    pub async fn end_ladder_season(&self) -> Result<(crate::season::Season, crate::season::Season, u32, u32), String> {
+        let ended = self.d2_season.current();
+        let (softcore, hardcore) = self.storage.end_ladder_season().await?;
+        let begun = self.d2_season.begin_next();
+        tracing::info!(ended = ended.number, begun = begun.number, softcore, hardcore, "Diablo II ladder season ended");
+        Ok((ended, begun, softcore, hardcore))
     }
 
     /// Every realm character, for the ladder.
@@ -1414,6 +1434,7 @@ pub(crate) fn test_node_with(tweak: impl FnOnce(&mut NodeConfig)) -> Node {
         bans_path: None,
         // Tests that are not about the two-minute rule count every game.
         min_game_length: std::time::Duration::ZERO,
+        d2_season_path: None,
     };
     tweak(&mut cfg);
     Node::new(cfg, storage)

@@ -173,6 +173,17 @@ impl Save {
         Ok(Self { header: data[..HEADER_LEN].to_vec(), quests, waypoints, waypoint_tail, npcs, stats, skills, items })
     }
 
+    /// The status byte (`0x24`): hardcore `0x04`, died `0x08`, expansion `0x20`, ladder `0x40`.
+    #[must_use]
+    pub fn status(&self) -> u8 {
+        self.header[0x24]
+    }
+
+    /// Replace the status byte.
+    pub fn set_status(&mut self, status: u8) {
+        self.header[0x24] = status;
+    }
+
     /// The whole file, with its size and checksum filled in.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {

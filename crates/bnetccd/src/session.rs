@@ -873,7 +873,7 @@ impl Bncs {
             sid::GETCHANNELLIST => self.channel_list(),
             sid::GETADVLISTEX => self.game_list(frame),
             sid::CHECKAD => self.check_ad(frame),
-            sid::STARTADVEX3 => self.advertise(frame),
+            sid::STARTADVEX3 => self.advertise(frame).await,
             // A game ended (STOPADV is also sent spuriously on logoff, which is harmless —
             // withdrawing a game the host does not have is a no-op).
             sid::STOPADV => self.stop_advertising(true),
@@ -2783,7 +2783,7 @@ impl Bncs {
     /// in the node's directory so `SID_GETADVLISTEX` can hand it to other clients.
     ///
     /// ⚠️ Request layout unverified against a real client — see `game_list`.
-    fn advertise(&mut self, frame: &Frame) -> Step {
+    async fn advertise(&mut self, frame: &Frame) -> Step {
         if !self.node.policy.game_hosting.allowed() {
             // Warnet mode: hosting is off. Reply with the game's own documented code so the
             // client shows a real message rather than hanging on a dropped packet.
@@ -2802,15 +2802,25 @@ impl Bncs {
             let game_type = r.u16()?;
             let parameter = r.u16()?;
             let _unknown = r.u32()?;
-            let _ladder = r.u32()?;
+            let ladder = r.u32()?;
             let name = r.cstr(CHANNEL_NAME_MAX)?.to_vec();
             let password = r.cstr(CHANNEL_NAME_MAX)?.to_vec();
             let statstring = r.cstr(512)?.to_vec();
-            Ok::<_, bnetcc_proto::ProtoError>((state, game_type, parameter, name, password, statstring))
+            Ok::<_, bnetcc_proto::ProtoError>((state, game_type, parameter, ladder, name, password, statstring))
         })();
-        let Ok((state, game_type, parameter, name, password, statstring)) = parsed else {
+        let Ok((state, game_type, parameter, ladder, name, password, statstring)) = parsed else {
             return Step::Close;
         };
+        // A ladder or Iron Man game (the ladder field, 1 or 3) needs ten normal-game wins.
+        if ladder != 0 {
+            let wins = self.normal_wins(&account.name).await;
+            if wins < bnetcc_core::ladder::LADDER_MIN_WINS {
+                info!(peer = %self.peer, account = %account.name, wins, "ladder game refused: too few normal wins");
+                let mut w = Writer::with_capacity(4);
+                w.u32(advertise_status::TYPE_UNAVAILABLE);
+                return self.send(&Frame::new(sid::STARTADVEX3, w.finish()));
+            }
+        }
 
         let host_ip = match self.peer.ip() {
             std::net::IpAddr::V4(v4) => v4,
@@ -2883,6 +2893,14 @@ impl Bncs {
         Step::Continue
     }
 
+    /// An account's normal-game wins for this session's product (`Record\<product>\0\wins`).
+    async fn normal_wins(&self, account: &str) -> u32 {
+        let Some(product) = self.product else { return 0 };
+        let key = bnetcc_storage::attr::AttrKey::new(&format!(r"Record\{product}\0\wins"));
+        let attrs = self.node.read_readable_attrs(account, vec![key.clone()]).await;
+        attrs.get(&key).and_then(|v| v.parse().ok()).unwrap_or(0)
+    }
+
     /// `SID_NOTIFYJOIN` (0x22): `(u32)` product, `(u32)` version, `(string)` game name,
     /// `(string)` password — the client joined a game. No reply.
     fn notify_join(&mut self, frame: &Frame) -> Step {
@@ -2945,7 +2963,8 @@ impl Bncs {
     /// from its start — its host's `SID_STOPADV` — or, if that was not seen, from when this
     /// player hosted or joined it. A result from a session that neither hosted nor joined a
     /// game is not counted. So a player who surrenders a counted game loses it, and the other
-    /// side's own report of its win counts.
+    /// side's own report of its win counts. A ladder or Iron Man result from a player with fewer
+    /// than ten normal-game wins does not count either.
     async fn game_result(&mut self, frame: &Frame) -> Step {
         let Some(account) = self.account.clone() else {
             return Step::Continue;
@@ -2991,6 +3010,11 @@ impl Bncs {
         let outcome = slot.and_then(|i| results.get(i).copied()).and_then(crate::storage::GameOutcome::from_code);
         let league = bnetcc_core::ladder::League::from_code(game_type);
         if let (Some(o), Some(slot), bnetcc_core::ladder::League::Ladder | bnetcc_core::ladder::League::IronMan) = (outcome, slot, league) {
+            let wins = self.normal_wins(&account.name).await;
+            if wins < bnetcc_core::ladder::LADDER_MIN_WINS {
+                info!(peer = %self.peer, account = %account.name, wins, "ladder result not counted: too few normal wins");
+                return Step::Continue;
+            }
             let key = bnetcc_storage::attr::AttrKey::new(&format!(r"Record\{product}\{}\rating", league.index()));
             let mut ratings = Vec::new();
             for (i, name) in names.iter().enumerate() {
@@ -3530,6 +3554,55 @@ mod tests {
         Frame::new(sid::NOTIFYJOIN, w.finish())
     }
 
+    /// Record `wins` normal-game wins for an account.
+    async fn give_normal_wins(node: &Node, name: &str, wins: u32) {
+        let id = node.account(name).await.expect("account").id;
+        for _ in 0..wins {
+            node.record_game(id, "SEXP", crate::storage::GameOutcome::Win).await.unwrap();
+        }
+    }
+
+    /// A StarCraft or Warcraft II player needs ten normal-game wins for the ladder: before that
+    /// a ladder game cannot be hosted (the "game type unavailable" status) and a ladder result
+    /// does not count.
+    #[tokio::test]
+    async fn the_ladder_takes_ten_normal_wins() {
+        let node = Arc::new(crate::node::test_node());
+        let addr = spawn_node(Arc::clone(&node)).await;
+        let mut host = login(addr, "Artanis", "pw", 621).await;
+        let mut guest = login(addr, "Vorazun", "pw", 622).await;
+        give_normal_wins(&node, "Artanis", 9).await;
+        give_normal_wins(&node, "Vorazun", 10).await;
+        let ladder_game = |name: &str| {
+            let mut w = Writer::with_capacity(64);
+            w.u32(0).u32(0).u16(0x09).u16(0).u32(0xFF).u32(1).cstr(name.as_bytes()).cstr(b"").cstr(b",,,,1,,,,,,Artanis\rmap\r");
+            Frame::new(sid::STARTADVEX3, w.finish())
+        };
+        send_frame(&mut host, &ladder_game("ranked")).await;
+        assert_eq!(recv_frame(&mut host).await.reader().u32().unwrap(), advertise_status::TYPE_UNAVAILABLE, "nine wins");
+        assert!(list_game_names(&mut guest).await.is_empty());
+
+        // Vorazun hosts instead; Artanis joins and wins, but its result does not count.
+        send_frame(&mut guest, &ladder_game("ranked")).await;
+        assert_eq!(recv_frame(&mut guest).await.reader().u32().unwrap(), advertise_status::OK, "ten wins");
+        send_frame(&mut host, &notify_join_frame("ranked")).await;
+        send_frame(&mut guest, &Frame::empty(sid::STOPADV)).await;
+        let slots = [("Vorazun", 2), ("Artanis", 1)];
+        send_frame(&mut host, &game_result_frame(1, slots)).await;
+        send_frame(&mut guest, &game_result_frame(1, slots)).await;
+        let page = ladder_page(&mut guest, 1).await.expect("Vorazun's loss counts");
+        let mut r = page.reader();
+        r.bytes(20).unwrap();
+        let fields: Vec<u32> = (0..16).map(|_| r.u32().unwrap()).collect();
+        r.bytes(16).unwrap();
+        assert_eq!((String::from_utf8_lossy(r.cstr(64).unwrap()).as_ref(), fields[1]), ("Vorazun", 1));
+
+        // A tenth win, and Artanis's next ladder result counts.
+        give_normal_wins(&node, "Artanis", 1).await;
+        send_frame(&mut host, &game_result_frame(1, slots)).await;
+        assert!(ladder_page(&mut guest, 2).await.is_some(), "on the ladder now");
+    }
+
     /// Normal-game wins and losses stored for an account.
     async fn normal_record(node: &Node, name: &str) -> (u32, u32) {
         let keys = ["wins", "losses"].map(|leaf| bnetcc_storage::attr::AttrKey::new(&format!(r"Record\SEXP\0\{leaf}")));
@@ -3621,9 +3694,13 @@ mod tests {
 
     #[tokio::test]
     async fn ladder_games_are_rated_listed_and_ranked() {
-        let addr = spawn_server().await;
+        let node = Arc::new(crate::node::test_node());
+        let addr = spawn_node(Arc::clone(&node)).await;
         let mut winner = login(addr, "Fenix", "pw", 601).await;
         let mut loser = login(addr, "Tassadar", "pw", 602).await;
+        for name in ["Fenix", "Tassadar"] {
+            give_normal_wins(&node, name, 10).await;
+        }
         // Fenix hosts, Tassadar joins, and the game starts.
         send_frame(&mut winner, &start_adv_frame("duel")).await;
         let _ = recv_frame(&mut winner).await;
@@ -3669,7 +3746,7 @@ mod tests {
         let enter = recv_frame(&mut winner).await;
         let mut r = enter.reader();
         r.cstr(64).unwrap();
-        assert_eq!(r.cstr(128).unwrap(), b"PXES 1016 1 1 0 0 1016 0 0 PXES");
+        assert_eq!(r.cstr(128).unwrap(), b"PXES 1016 1 11 0 0 1016 0 0 PXES", "ten earned before the ladder, and one since");
     }
 
     #[test]
