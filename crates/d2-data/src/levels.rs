@@ -52,6 +52,27 @@ pub struct LevelDef {
     pub sub_waypoint: i32,
     /// `SubShrine`: the `LvlSub.txt` group its shrines come from, -1 for none.
     pub sub_shrine: i32,
+    /// What monsters its rooms spawn.
+    pub monsters: LevelMonsters,
+}
+
+/// A level's `Levels.txt` monster columns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LevelMonsters {
+    /// `NumMon`: monster types a game picks for the level.
+    pub types: i32,
+    /// `rangedspawn`: the first type picked should be ranged.
+    pub ranged_first: bool,
+    /// `MonDen`, per difficulty: spawn density, in 100000ths per 3×3-subtile slot.
+    pub density: [i32; 3],
+    /// `MonUMin`/`MonUMax`, per difficulty: unique packs.
+    pub uniques: [(i32, i32); 3],
+    /// `mon1`..`mon10`: Normal's candidates (`MonStats.txt` ids).
+    pub normal: Vec<String>,
+    /// `nmon1`..`nmon10`: Nightmare's and Hell's.
+    pub nightmare: Vec<String>,
+    /// `umon1`..`umon10`: unique pack leaders on Normal.
+    pub unique: Vec<String>,
 }
 
 /// All levels, by id.
@@ -75,6 +96,9 @@ impl Levels {
         let mut by_id: Vec<Option<LevelDef>> = Vec::new();
         for row in t.rows() {
             let int = |c: &str| row.int(c).unwrap_or(0) as i32;
+            let names = |prefix: &str| -> Vec<String> {
+                (1..=25).filter_map(|i| row.get(&format!("{prefix}{i}"))).filter(|n| !n.is_empty()).map(str::to_string).collect()
+            };
             let id = int("Id");
             if id <= 0 {
                 continue; // the Null row
@@ -100,6 +124,19 @@ impl Levels {
                 sub_theme: row.int("SubTheme").map_or(-1, |v| v as i32),
                 sub_waypoint: row.int("SubWaypoint").map_or(-1, |v| v as i32),
                 sub_shrine: row.int("SubShrine").map_or(-1, |v| v as i32),
+                monsters: LevelMonsters {
+                    types: int("NumMon"),
+                    ranged_first: int("rangedspawn") != 0,
+                    density: [int("MonDen"), int("MonDen(N)"), int("MonDen(H)")],
+                    uniques: [
+                        (int("MonUMin"), int("MonUMax")),
+                        (int("MonUMin(N)"), int("MonUMax(N)")),
+                        (int("MonUMin(H)"), int("MonUMax(H)")),
+                    ],
+                    normal: names("mon"),
+                    nightmare: names("nmon"),
+                    unique: names("umon"),
+                },
             };
             let at = id as usize;
             if by_id.len() <= at {

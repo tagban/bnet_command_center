@@ -31,12 +31,41 @@ pub struct MonsterClass {
     pub interact: bool,
     /// `MonStats.txt` `npc` (flag bit 8).
     pub npc: bool,
+    /// How the class spawns in a level's rooms.
+    pub spawn: SpawnRules,
+}
+
+/// The `MonStats.txt` columns room population reads, class names resolved to class ids (-1 for
+/// none).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpawnRules {
+    /// `isSpawn`: may be picked for a level's roster.
+    pub is_spawn: bool,
+    /// `Rarity`: its weight in the roster pick.
+    pub rarity: i32,
+    /// `rangedtype`: counts as ranged for a `rangedspawn` level's first pick.
+    pub ranged: bool,
+    /// `MinGrp`/`MaxGrp`: how many of it a spawn places.
+    pub group: (i32, i32),
+    /// `PartyMin`/`PartyMax`: how many minions come with each.
+    pub party: (i32, i32),
+    /// `minion1`/`minion2`.
+    pub minions: [i32; 2],
+    /// `spawn`: the class it can be replaced by when placed, with `placespawn`.
+    pub spawn: i32,
+    /// `placespawn`.
+    pub place_spawn: bool,
+    /// `sparsePopulate`: percent chance a placement goes ahead.
+    pub sparse: i32,
+    /// `BaseId`.
+    pub base: i32,
 }
 
 /// Monster classes by id (`hcIdx`).
 #[derive(Debug, Clone, Default)]
 pub struct Monsters {
     by_class: HashMap<i32, MonsterClass>,
+    by_name: HashMap<String, i32>,
 }
 
 impl Monsters {
@@ -67,6 +96,11 @@ impl Monsters {
                 Some((row.get("Id")?.to_ascii_lowercase(), (row.int("critter").unwrap_or(0) != 0, components)))
             })
             .collect();
+        let by_name: HashMap<String, i32> = monstats
+            .rows()
+            .filter_map(|row| Some((row.get("Id")?.to_ascii_lowercase(), i32::try_from(row.int("hcIdx")?).ok()?)))
+            .collect();
+        let class_of = |name: Option<&str>| name.and_then(|n| by_name.get(&n.to_ascii_lowercase()).copied()).unwrap_or(-1);
         let by_class = monstats
             .rows()
             .filter_map(|row| {
@@ -74,10 +108,29 @@ impl Monsters {
                 let id = row.get("Id")?.to_string();
                 let &(critter, components) = display.get(&row.get("MonStatsEx")?.to_ascii_lowercase())?;
                 let flag = |c: &str| row.int(c).unwrap_or(0) != 0;
-                Some((class, MonsterClass { id, critter, components, interact: flag("interact"), npc: flag("npc") }))
+                let int = |c: &str| row.int(c).unwrap_or(0) as i32;
+                let spawn = SpawnRules {
+                    is_spawn: flag("isSpawn"),
+                    rarity: int("Rarity"),
+                    ranged: flag("rangedtype"),
+                    group: (int("MinGrp"), int("MaxGrp")),
+                    party: (int("PartyMin"), int("PartyMax")),
+                    minions: [class_of(row.get("minion1")), class_of(row.get("minion2"))],
+                    spawn: class_of(row.get("spawn")),
+                    place_spawn: flag("placespawn"),
+                    sparse: int("sparsePopulate"),
+                    base: class_of(row.get("BaseId")),
+                };
+                Some((class, MonsterClass { id, critter, components, interact: flag("interact"), npc: flag("npc"), spawn }))
             })
             .collect();
-        Ok(Self { by_class })
+        Ok(Self { by_class, by_name })
+    }
+
+    /// A class id by `MonStats.txt` `Id`, any case.
+    #[must_use]
+    pub fn class_named(&self, name: &str) -> Option<i32> {
+        self.by_name.get(&name.to_ascii_lowercase()).copied()
     }
 
     /// A class by id.
@@ -107,5 +160,6 @@ mod tests {
         assert_eq!(guard.components[..8], [0, 1, 0, 0, 0, 0, 2, 0], "TR one variant, LH two");
         assert!(m.get(8).unwrap().critter);
         assert!(m.get(9).is_none(), "no display row, no class");
+        assert_eq!(m.class_named("HEN"), Some(8));
     }
 }

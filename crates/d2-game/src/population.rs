@@ -16,6 +16,9 @@ use std::collections::HashMap;
 use d2_drlg::preset::{PlacedUnit, PresetLevel, UnitClass};
 use d2_drlg::rng::Seed;
 use d2_drlg::world::RoomId;
+use d2_drlg::Coords;
+
+use crate::spawn::{Group, Regions};
 
 /// Engine unit types (`unit+0x00`).
 pub mod unit_type {
@@ -178,6 +181,17 @@ pub struct Population {
     last_guid: [u32; 6],
     /// The rooms populated so far.
     rooms: HashMap<RoomId, Vec<Spawned>>,
+    /// Every level's monster roster, when rooms spawn monsters.
+    regions: Option<Regions>,
+}
+
+/// A room that spawns its level's monsters as it is populated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonsterRoom {
+    /// The room, in tiles.
+    pub area: Coords,
+    /// How many rooms its level has.
+    pub level_rooms: usize,
 }
 
 impl Population {
@@ -185,7 +199,65 @@ impl Population {
     #[must_use]
     pub fn new(game_seed: u32) -> Self {
         let control = Seed::new(Seed::new(game_seed, 0x29A).roll(), 0x29A);
-        Self { seed: Seed::new(game_seed, 0x29A), control, last_guid: [0; 6], rooms: HashMap::new() }
+        Self { seed: Seed::new(game_seed, 0x29A), control, last_guid: [0; 6], rooms: HashMap::new(), regions: None }
+    }
+
+    /// Let rooms spawn their levels' monsters, with rosters picked for `difficulty` from the
+    /// game seed ([`Regions::build`]).
+    #[must_use]
+    pub fn with_monsters(mut self, data: &GameData, game_seed: u32, difficulty: u8) -> Self {
+        self.regions = Some(Regions::build(data, game_seed, difficulty));
+        self
+    }
+
+    /// A monster spawned from the game seed: its guid, look and seed.
+    fn monster(&mut self, data: &GameData, class: i32, x: i32, y: i32) -> Option<(Spawned, Seed)> {
+        let m = data.monsters().get(class).filter(|m| !m.critter)?;
+        let (guid, mut seed) = self.allocate(unit_type::MONSTER);
+        let (x, y) = (u16::try_from(x).ok()?, u16::try_from(y).ok()?);
+        let components = roll_components(&mut seed, &m.components);
+        let unit = Spawned::Monster {
+            guid,
+            class: class as u16,
+            x,
+            y,
+            mode: PRESET_MONSTER_MODE,
+            life: FULL_LIFE,
+            components,
+            variants: m.components,
+        };
+        Some((unit, seed))
+    }
+
+    /// A group from the room's roll (`SPAWN_SpawnMonsterWithMinions`, `0x0054DF80`): its first
+    /// member, `MinGrp..=MaxGrp - 1` more beside it on the first's seed, and each member's
+    /// `PartyMin..=PartyMax` minions on its own.
+    fn spawn_group(&mut self, data: &GameData, group: Group, units: &mut Vec<Spawned>) {
+        let near = |seed: &mut Seed, v: i32| v + seed.pick(7) as i32 - 3;
+        let Some((first, mut seed)) = self.monster(data, group.class, group.x, group.y) else { return };
+        let extra = seed.pick((group.size.1 - group.size.0 + 1).max(1) as u32) as i32 + group.size.0 - 1;
+        let mut members = vec![(first, seed)];
+        for _ in 0..extra {
+            let (x, y) = (near(&mut members[0].1, group.x), near(&mut members[0].1, group.y));
+            if let Some(member) = self.monster(data, group.class, x, y) {
+                members.push(member);
+            }
+        }
+        for (member, mut seed) in members {
+            let Spawned::Monster { x, y, .. } = member else { continue };
+            units.push(member);
+            if group.minions[0] < 0 || group.party.1 <= 0 {
+                continue;
+            }
+            let count = group.party.0 + seed.pick((group.party.1 - group.party.0 + 1).max(1) as u32) as i32;
+            for _ in 0..count {
+                let class = if group.minions[1] >= 0 && seed.pick(2) == 1 { group.minions[1] } else { group.minions[0] };
+                let (mx, my) = (near(&mut seed, i32::from(x)), near(&mut seed, i32::from(y)));
+                if let Some((minion, _)) = self.monster(data, class, mx, my) {
+                    units.push(minion);
+                }
+            }
+        }
     }
 
     /// Take the next guid for a unit type (`0x00552EE0`, which skips 0 on wrapping).
@@ -283,9 +355,17 @@ impl Population {
         false
     }
 
-    /// Populate `room` of level `level_id` from the units standing in it, unless it already is
-    /// (`0x005559A0`), and return its units.
-    pub fn activate<'u>(&mut self, data: &GameData, level_id: i32, room: RoomId, placed: impl IntoIterator<Item = &'u PlacedUnit>) -> Activated<'_> {
+    /// Populate `room` of level `level_id` from the units standing in it (`0x005559A0`) and, for
+    /// a [`MonsterRoom`], its level's monsters ([`Regions::spawn_room`]), unless it already is;
+    /// return its units.
+    pub fn activate<'u>(
+        &mut self,
+        data: &GameData,
+        level_id: i32,
+        room: RoomId,
+        placed: impl IntoIterator<Item = &'u PlacedUnit>,
+        monsters: Option<MonsterRoom>,
+    ) -> Activated<'_> {
         let mut not_ported = Vec::new();
         if !self.rooms.contains_key(&room) {
             let placed: Vec<&PlacedUnit> = placed.into_iter().collect();
@@ -348,6 +428,19 @@ impl Population {
                         None => not_ported.push(format!("monster {class} ({name}) at ({x}, {y}): no MonStats2 row")),
                     },
                     other => not_ported.push(format!("{other:?} at ({x}, {y})")),
+                }
+            }
+            if let (Some(spot), Some(mut regions)) = (monsters, self.regions.take()) {
+                let s = 5;
+                let area = (spot.area.x * s, spot.area.y * s, spot.area.w * s, spot.area.h * s);
+                let mut room_seed = Seed::new(self.control.roll(), 0x29A);
+                let groups = regions.spawn_room(data, level_id, area, spot.level_rooms, &mut self.seed, &mut room_seed);
+                self.regions = Some(regions);
+                for group in groups {
+                    if group.unique {
+                        not_ported.push(format!("unique pack of monster {} spawned as a plain group", group.class));
+                    }
+                    self.spawn_group(data, group, &mut units);
                 }
             }
             self.rooms.insert(room, units);
@@ -421,7 +514,7 @@ mod tests {
         let room = |index| RoomId { level: 1, index };
         let mut pop = Population::new(0x1234);
         assert!(pop.units(room(0)).is_none());
-        let first = pop.activate(&data, 1, room(0), level.units_in(0));
+        let first = pop.activate(&data, 1, room(0), level.units_in(0), None);
         assert_eq!(first.not_ported.len(), 1, "{:?}", first.not_ported);
         let units = first.units.to_vec();
         assert_eq!(units.len(), 4, "torch, waypoint, two guards; no hen");
@@ -435,13 +528,13 @@ mod tests {
 
         assert!(matches!(pop.find(unit_type::MONSTER, 2), Some((r, Spawned::Monster { x: 514, .. })) if r == room(0)));
         assert!(pop.find(unit_type::OBJECT, 9).is_none() && pop.find(unit_type::PLAYER, 1).is_none());
-        let again = pop.activate(&data, 1, room(0), level.units_in(0));
+        let again = pop.activate(&data, 1, room(0), level.units_in(0), None);
         assert_eq!((again.units.to_vec(), again.not_ported.len()), (units, 0), "populated once");
-        let second = pop.activate(&data, 1, room(1), level.units_in(1));
+        let second = pop.activate(&data, 1, room(1), level.units_in(1), None);
         assert!(matches!(second.units, [Spawned::Object { guid: 3, class: 3, mode: 0, .. }]), "guids carry on across rooms");
         assert!(pop.set_object_mode(3, 1) && !pop.set_object_mode(3, 1) && !pop.set_object_mode(99, 1));
         assert!(matches!(pop.units(room(1)), Some([Spawned::Object { mode: 1, .. }])));
-        assert!(pop.activate(&data, 1, room(7), level.units_in(7)).units.is_empty());
+        assert!(pop.activate(&data, 1, room(7), level.units_in(7), None).units.is_empty());
     }
 
     /// A shrine is spawned with its type in the interaction byte: a health one from the health
@@ -463,7 +556,7 @@ mod tests {
         let units = [at(1, 505), at(2, 506), at(2, 507), at(2, 508)];
         for seed in 0..50 {
             let mut pop = Population::new(seed);
-            let got = pop.activate(&data, 2, RoomId { level: 2, index: 0 }, units.iter());
+            let got = pop.activate(&data, 2, RoomId { level: 2, index: 0 }, units.iter(), None);
             assert!(got.not_ported.is_empty());
             let types: Vec<u8> = got.units.iter().map(|u| match u { Spawned::Object { interaction, mode: 0, .. } => *interaction, _ => 99 }).collect();
             assert_eq!(types[0], 3, "the well is the health shrine");
@@ -504,7 +597,7 @@ mod tests {
         let mut objects = Vec::new();
         let mut monsters = Vec::new();
         for near in level.rooms_near(room) {
-            let a = pop.activate(&data, 1, RoomId { level: 1, index: near }, level.units_in(near));
+            let a = pop.activate(&data, 1, RoomId { level: 1, index: near }, level.units_in(near), None);
             assert!(a.not_ported.is_empty(), "{:?}", a.not_ported);
             for u in a.units {
                 match *u {
@@ -551,7 +644,7 @@ mod tests {
             for level in world.levels().iter().filter(|l| (2..=7).contains(&l.id)) {
                 for index in 0..level.rooms.len() {
                     let room = RoomId { level: level.id, index };
-                    let got = pop.activate(&data, level.id, room, world.units_in(room));
+                    let got = pop.activate(&data, level.id, room, world.units_in(room), None);
                     assert!(got.not_ported.is_empty(), "seed {seed:#x} {room:?}: {:?}", got.not_ported);
                     for unit in got.units {
                         if let Spawned::Object { class, interaction, .. } = *unit {
@@ -567,6 +660,54 @@ mod tests {
             }
             assert_eq!(waypoints, 4, "seed {seed:#x}");
             assert!(shrines >= 20, "seed {seed:#x}: {shrines} shrines");
+        }
+    }
+
+    /// With the operator's install and `Game.exe`: walking every open room of Act I's wilderness,
+    /// each level fills with its own roster's monsters and their minions, in numbers like the
+    /// game's.
+    #[test]
+    fn with_a_real_install_the_wilderness_fills_with_monsters() {
+        let (Ok(dir), Ok(exe)) = (std::env::var("BNETCC_D2_DATA_DIR"), std::env::var("BNETCC_D2_GAME_EXE")) else {
+            return;
+        };
+        let data = GameData::load(&dir).unwrap();
+        let engine = d2_data::engine::EngineData::from_game_exe(&std::fs::read(exe).unwrap()).unwrap();
+        for seed in [1u32, 0x1234_5678, 0xBEEF] {
+            let act = d2_drlg::act::Act::build(data.levels(), 0, 0, seed);
+            let town = PresetLevel::build(&data, &engine, &act, 1).unwrap();
+            let world = d2_drlg::world::World::build(&data, &engine, &act, Some(&town));
+            let mut pop = Population::new(seed).with_monsters(&data, seed, 0);
+            for level in world.levels().iter().filter(|l| (2..=7).contains(&l.id)) {
+                let roster: Vec<i32> = pop.regions.as_ref().unwrap().level(level.id).unwrap().roster().iter().map(|r| r.0).collect();
+                let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+                for index in 0..level.rooms.len() {
+                    if (4..=27).contains(&level.pieces[index]) {
+                        continue;
+                    }
+                    let room = RoomId { level: level.id, index };
+                    let spot = MonsterRoom { area: level.rooms[index], level_rooms: level.rooms.len() };
+                    let got = pop.activate(&data, level.id, room, world.units_in(room), Some(spot));
+                    for unit in got.units {
+                        if let Spawned::Monster { class, x, y, .. } = *unit {
+                            let m = data.monsters().get(i32::from(class)).unwrap();
+                            let def = &data.levels().get(level.id).unwrap().monsters;
+                            let leaders: Vec<i32> = roster.iter().copied().chain(def.unique.iter().filter_map(|n| data.monsters().class_named(n))).collect();
+                            let allowed = leaders.iter().any(|&l| {
+                                let r = data.monsters().get(l).unwrap().spawn;
+                                l == i32::from(class) || r.minions.contains(&i32::from(class)) || r.spawn == i32::from(class)
+                            });
+                            assert!(allowed, "level {}: {} is no roster class, minion or replacement", level.id, m.id);
+                            let r = level.rooms[index];
+                            assert!((i32::from(x) - r.x * 5).abs() < 60 && (i32::from(y) - r.y * 5).abs() < 60, "near its room");
+                            *counts.entry(m.id.clone()).or_default() += 1;
+                        }
+                    }
+                }
+                let total: usize = counts.values().sum();
+                eprintln!("seed {seed:#x} level {}: {total} monsters {counts:?}", level.id);
+                assert!((10..400).contains(&total), "seed {seed:#x} level {}: {total}", level.id);
+            }
         }
     }
 

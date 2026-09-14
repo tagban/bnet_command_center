@@ -28,7 +28,7 @@ use d2_drlg::act::Act;
 use d2_drlg::preset::PresetLevel;
 use d2_drlg::world::{RoomId, World};
 use d2_game::clock::ActClock;
-use d2_game::population::{unit_type, waypoint_spawn, Population, Spawned, SUBCLASS_WAYPOINT};
+use d2_game::population::{unit_type, waypoint_spawn, MonsterRoom, Population, Spawned, SUBCLASS_WAYPOINT};
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -206,7 +206,7 @@ impl GameServer {
         let (Towns::FromInstall(engine), Some(data)) = (&self.towns, &self.rules) else {
             #[cfg(test)]
             if let Towns::Fixed(town) = &self.towns {
-                let level = d2_drlg::world::WorldLevel { id: town.level_id, area: town.area, rooms: town.rooms.clone(), units: town.units.clone() };
+                let level = d2_drlg::world::WorldLevel { id: town.level_id, area: town.area, rooms: town.rooms.clone(), units: town.units.clone(), pieces: Vec::new() };
                 return (FALLBACK_MAP_SEED, Some(town.clone()), Some(World::from_levels(vec![level])));
             }
             return (FALLBACK_MAP_SEED, None, None);
@@ -316,7 +316,14 @@ impl GameServer {
                 staged: Vec::new(),
                 connected: Vec::new(),
                 map_seed,
-                population: world.is_some().then(|| Population::new(rand::thread_rng().gen())),
+                population: world.is_some().then(|| {
+                    let seed = rand::thread_rng().gen();
+                    let population = Population::new(seed);
+                    match &self.rules {
+                        Some(rules) => population.with_monsters(rules, seed, difficulty),
+                        None => population,
+                    }
+                }),
                 spawn,
                 town,
                 world,
@@ -496,7 +503,14 @@ impl GameServer {
             let (Some(rules), Some(population)) = (&self.rules, &mut game.population) else {
                 continue;
             };
-            let activated = population.activate(rules, id.level, id, world.units_in(id));
+            let monsters = world.levels().iter().find(|l| l.id == id.level).and_then(|level| {
+                // Until collision is ported, a cliff or border piece has no free ground to put a
+                // monster on: Act I's wild and cliff borders, cliff caves and river edges.
+                let piece = level.pieces.get(id.index).copied().unwrap_or(0);
+                (!d2_game::population::is_town(id.level) && !(4..=27).contains(&piece))
+                    .then_some(MonsterRoom { area: room, level_rooms: level.rooms.len() })
+            });
+            let activated = population.activate(rules, id.level, id, world.units_in(id), monsters);
             for skipped in &activated.not_ported {
                 debug!(game_id, ?room, unit = %skipped, "map unit not spawned: not ported");
             }
@@ -1367,7 +1381,7 @@ pub(crate) mod tests {
             let game = g.by_id.get_mut(&id).unwrap();
             let mut levels = game.world.take().unwrap().levels().to_vec();
             let waypoint = PlacedUnit { class: UnitClass::Object(3), x: 5779, y: 4499, path: Vec::new() };
-            levels.push(WorldLevel { id: 3, area: plains, rooms: vec![plains], units: vec![waypoint] });
+            levels.push(WorldLevel { id: 3, area: plains, rooms: vec![plains], units: vec![waypoint], pieces: vec![0] });
             game.world = Some(World::from_levels(levels));
         }
         let room = RoomId { level: 3, index: 0 };

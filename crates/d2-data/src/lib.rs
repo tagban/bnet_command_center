@@ -383,5 +383,9 @@ mod tests {
         assert_eq!(data.objects().get(2).unwrap().parm0, 3, "a shrine: boost or magic");
         assert_eq!(data.shrines().get(1).map(|s| s.effect_class), Some(4), "Refill is a boost");
         assert_eq!(data.shrines().of_class(1), (16..=22).collect::<Vec<_>>(), "the magic shrines");
+        let moor = &data.levels().get(2).unwrap().monsters;
+        assert_eq!((moor.types, moor.density[0], moor.normal.as_slice()), (3, 520, &["zombie1".to_string(), "fallen1".into(), "quillrat1".into()][..]));
+        let shaman = data.monsters().get(data.monsters().class_named("fallenshaman1").unwrap()).unwrap().spawn;
+        assert_eq!((shaman.party, shaman.minions[0]), ((2, 6), 19), "a shaman brings two to six fallen");
     }
 }

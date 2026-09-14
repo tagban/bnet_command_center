@@ -10,3 +10,4 @@
 
 pub mod clock;
 pub mod population;
+pub mod spawn;
