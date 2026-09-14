@@ -145,6 +145,9 @@ impl SessionState {
                     | sid::LOGONREALMEX
                     | sid::NETGAMEPORT
                     | sid::WARCRAFTGENERAL
+                    // StarCraft / Warcraft II ladder standings, from the chat screen.
+                    | sid::GETLADDERDATA
+                    | sid::FINDLADDERUSER
             ),
             Self::Chatting | Self::InChannel => matches!(
                 id,
@@ -169,6 +172,9 @@ impl SessionState {
                     | sid::LOGONREALMEX
                     | sid::NETGAMEPORT
                     | sid::WARCRAFTGENERAL
+                    // StarCraft / Warcraft II ladder standings, from the chat screen.
+                    | sid::GETLADDERDATA
+                    | sid::FINDLADDERUSER
             ),
             Self::Closing => false,
         }

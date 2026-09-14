@@ -634,6 +634,23 @@ impl Node {
         self.storage.record_game(account_id, product, outcome).await
     }
 
+    /// Record one ladder or Iron Man game; the account's new rating.
+    pub async fn record_ladder_game(
+        &self,
+        account_id: bnetcc_core::AccountId,
+        product: &str,
+        league: bnetcc_core::ladder::League,
+        outcome: crate::storage::GameOutcome,
+        opponent: u32,
+    ) -> Result<u32, String> {
+        self.storage.record_ladder_game(account_id, product, league, outcome, opponent).await
+    }
+
+    /// Every account's record in a product's ladder league.
+    pub async fn ladder_rows(&self, product: &str, league: bnetcc_core::ladder::League) -> Vec<bnetcc_core::ladder::LadderRow> {
+        self.storage.ladder_rows(product, league).await
+    }
+
     /// Read the given attribute keys for an account by name, filtered to what any peer may
     /// read (records, profile, non-secret system keys). Safe to return to a client.
     pub async fn read_readable_attrs(

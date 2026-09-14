@@ -186,6 +186,12 @@ pub mod sid {
     /// per-account win/loss records and the ladder. Wire format still being decoded — see
     /// `Bncs::game_result`.
     pub const GAMERESULT: u8 = 0x2C;
+    /// StarCraft / Warcraft II ladder standings: `(u32)` product, league, sort method,
+    /// starting rank, count (≤ 20); the reply echoes the five and lists the ranks.
+    pub const GETLADDERDATA: u8 = 0x2E;
+    /// A player's 0-based ladder rank: `(u32)` product, league, sort method, `(string)` name;
+    /// the reply is `(u32)` rank, `0xFFFFFFFF` when unranked.
+    pub const FINDLADDERUSER: u8 = 0x2F;
     /// Legacy logon: CD-key check for the old flow.
     pub const CDKEY: u8 = 0x30;
     /// Legacy logon: CD-key check, hashed form (War2 BNE and later old clients use this

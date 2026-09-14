@@ -67,6 +67,16 @@ impl GameOutcome {
         }
     }
 
+    /// What `Record\<product>\<n>\last game result` holds after this outcome.
+    const fn result_word(self) -> &'static str {
+        match self {
+            Self::Win => "WIN",
+            Self::Loss => "LOSS",
+            Self::Draw => "DRAW",
+            Self::Disconnect => "DISCONNECT",
+        }
+    }
+
     /// The `Record\<product>\0\<leaf>` counter this outcome increments.
     const fn leaf(self) -> &'static str {
         match self {
@@ -141,6 +151,22 @@ enum Command {
         product: String,
         outcome: GameOutcome,
         resp: oneshot::Sender<Result<u64, String>>,
+    },
+    /// Record a ladder (or Iron Man) game: its counter, the new rating against opponents rated
+    /// `opponent`, the high rating, and the last game and its result. Replies the new rating.
+    RecordLadderGame {
+        account_id: AccountId,
+        product: String,
+        league: bnetcc_core::ladder::League,
+        outcome: GameOutcome,
+        opponent: u32,
+        resp: oneshot::Sender<Result<u32, String>>,
+    },
+    /// Every account's record in a product's league (the ladder standings' raw rows).
+    LadderRows {
+        product: String,
+        league: bnetcc_core::ladder::League,
+        resp: oneshot::Sender<Vec<bnetcc_core::ladder::LadderRow>>,
     },
     /// Read requested attribute keys for an account by name, already filtered to what an
     /// *other* party may read (records, profile, non-secret system keys) — never secrets.
@@ -276,6 +302,32 @@ impl StorageHandle {
             return Err("storage actor is gone".into());
         }
         rx.await.unwrap_or_else(|_| Err("storage actor is gone".into()))
+    }
+
+    /// Record a ladder game for an account; the new rating.
+    pub async fn record_ladder_game(
+        &self,
+        account_id: AccountId,
+        product: &str,
+        league: bnetcc_core::ladder::League,
+        outcome: GameOutcome,
+        opponent: u32,
+    ) -> Result<u32, String> {
+        let (resp, rx) = oneshot::channel();
+        let product = product.to_string();
+        if self.0.send(Command::RecordLadderGame { account_id, product, league, outcome, opponent, resp }).is_err() {
+            return Err("storage actor is gone".into());
+        }
+        rx.await.unwrap_or_else(|_| Err("storage actor is gone".into()))
+    }
+
+    /// Every account's record in a product's league.
+    pub async fn ladder_rows(&self, product: &str, league: bnetcc_core::ladder::League) -> Vec<bnetcc_core::ladder::LadderRow> {
+        let (resp, rx) = oneshot::channel();
+        if self.0.send(Command::LadderRows { product: product.to_string(), league, resp }).is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
     }
 
     /// Read the given keys for an account by name, filtered to what any peer may read. Safe
@@ -499,6 +551,68 @@ pub fn spawn(mut backend: Box<dyn Storage + Send>) -> StorageHandle {
                         .map_err(|e: StorageError| e.to_string());
                         let _ = resp.send(result);
                     }
+                    Command::RecordLadderGame { account_id, product, league, outcome, opponent, resp } => {
+                        use bnetcc_core::ladder::{rating_after, Outcome, START_RATING};
+                        let n = league.index();
+                        let key = |leaf: &str| AttrKey::new(&format!(r"Record\{product}\{n}\{leaf}"));
+                        let keys = [key(outcome.leaf()), key("rating"), key("high rating")];
+                        let result = (|| {
+                            let current = backend.attrs_get(account_id, &keys)?;
+                            let number = |k: &AttrKey| current.get(k).and_then(|v| v.parse::<u64>().ok());
+                            let count = number(&keys[0]).unwrap_or(0).saturating_add(1);
+                            let rating = number(&keys[1]).map_or(START_RATING, |r| r as u32);
+                            let played = match outcome {
+                                GameOutcome::Win => Outcome::Win,
+                                GameOutcome::Loss => Outcome::Loss,
+                                GameOutcome::Draw => Outcome::Draw,
+                                GameOutcome::Disconnect => Outcome::Disconnect,
+                            };
+                            let next = rating_after(rating, opponent, played);
+                            let high = number(&keys[2]).map_or(START_RATING, |r| r as u32).max(next);
+                            let now = now_secs();
+                            let mut put = AttrMap::new();
+                            put.insert(keys[0].clone(), count.to_string());
+                            put.insert(keys[1].clone(), next.to_string());
+                            put.insert(keys[2].clone(), high.to_string());
+                            put.insert(key("last game"), now.to_string());
+                            put.insert(key("last game result"), outcome.result_word().to_string());
+                            backend.attrs_put(account_id, put)?;
+                            Ok::<u32, StorageError>(next)
+                        })()
+                        .map_err(|e: StorageError| e.to_string());
+                        let _ = resp.send(result);
+                    }
+                    Command::LadderRows { product, league, resp } => {
+                        use bnetcc_core::ladder::{LadderRow, START_RATING};
+                        let n = league.index();
+                        let leaves = ["wins", "losses", "disconnects", "rating", "high rating", "last game"];
+                        let keys: Vec<AttrKey> = leaves.iter().map(|leaf| AttrKey::new(&format!(r"Record\{product}\{n}\{leaf}"))).collect();
+                        let mut rows = Vec::new();
+                        let mut offset = 0u64;
+                        while let Ok(page) = backend.list_accounts(offset, 500) {
+                            if page.is_empty() {
+                                break;
+                            }
+                            offset += page.len() as u64;
+                            for account in page {
+                                let Ok(attrs) = backend.attrs_get(account.id, &keys) else { continue };
+                                let get = |i: usize| attrs.get(&keys[i]).and_then(|v| v.parse::<u64>().ok());
+                                let row = LadderRow {
+                                    name: account.name,
+                                    wins: get(0).unwrap_or(0) as u32,
+                                    losses: get(1).unwrap_or(0) as u32,
+                                    disconnects: get(2).unwrap_or(0) as u32,
+                                    rating: get(3).map_or(START_RATING, |r| r as u32),
+                                    high_rating: get(4).map_or(START_RATING, |r| r as u32),
+                                    last_game: get(5).unwrap_or(0),
+                                };
+                                if row.games() > 0 {
+                                    rows.push(row);
+                                }
+                            }
+                        }
+                        let _ = resp.send(rows);
+                    }
                     Command::ListUsers { offset, limit, resp } => {
                         let users = backend
                             .list_accounts(offset, limit)
@@ -663,6 +777,29 @@ mod tests {
         h.delete_user(acct.id).await.expect("delete");
         assert!(h.account_by_name("Zealot").await.is_none());
         assert!(h.list_users(0, 10).await.iter().all(|u| u.id != acct.id));
+    }
+
+    #[tokio::test]
+    async fn ladder_games_rate_and_list_by_league() {
+        use bnetcc_core::ladder::League;
+        let h = spawn(Box::new(MemoryStorage::new()));
+        let a = h.create_account("Raynor", Credential::Xsha1 { digest: [1u8; 20] }).await.unwrap();
+        let b = h.create_account("Kerrigan", Credential::Xsha1 { digest: [1u8; 20] }).await.unwrap();
+        h.create_account("Idle", Credential::Xsha1 { digest: [1u8; 20] }).await.unwrap();
+        assert_eq!(h.record_ladder_game(a.id, "STAR", League::Ladder, GameOutcome::Win, 1000).await, Ok(1016));
+        assert_eq!(h.record_ladder_game(a.id, "STAR", League::Ladder, GameOutcome::Loss, 1000).await, Ok(999));
+        h.record_ladder_game(b.id, "STAR", League::IronMan, GameOutcome::Disconnect, 1000).await.unwrap();
+
+        let ladder = h.ladder_rows("STAR", League::Ladder).await;
+        assert_eq!(ladder.len(), 1, "only players with ladder games: {ladder:?}");
+        let r = &ladder[0];
+        assert_eq!((r.name.as_str(), r.wins, r.losses, r.rating, r.high_rating), ("Raynor", 1, 1, 999, 1016));
+        assert!(r.last_game > 0);
+        let iron = h.ladder_rows("STAR", League::IronMan).await;
+        assert_eq!((iron[0].name.as_str(), iron[0].disconnects, iron[0].rating), ("Kerrigan", 1, 984));
+        assert!(h.ladder_rows("SEXP", League::Ladder).await.is_empty(), "ladders are per product");
+        let normal = h.read_readable_attrs("Raynor", vec![AttrKey::new(r"Record\STAR\1\last game result")]).await;
+        assert_eq!(normal.values().next().map(String::as_str), Some("LOSS"));
     }
 
     #[tokio::test]
