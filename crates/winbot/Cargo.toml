@@ -1,0 +1,22 @@
+[package]
+name = "bnetcc-winbot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Win bot for testing a Command Center server's game records and ladder: two accounts play each other and one surrenders"
+
+[[bin]]
+name = "winbot"
+path = "src/main.rs"
+
+[dependencies]
+bnetcc-crypto = { path = "../bnetcc-crypto" }
+bnetcc-proto = { path = "../bnetcc-proto" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
