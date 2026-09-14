@@ -53,6 +53,11 @@ pub const START_RATING: u32 = 1000;
 pub const K_FACTOR: f64 = 32.0;
 /// Normal-game wins classic Battle.net required before ladder play (not enforced).
 pub const LADDER_MIN_WINS: u32 = 10;
+/// How long a game must last for its result to count, ladder or not: longer than two minutes
+/// (tagban, 2026-09-14). A player who surrenders or leaves a counted game loses it, and the other
+/// side, reporting its win, wins it.
+pub const MIN_GAME_LENGTH: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// The lowest rank a ladder lists: ranks run from 1, the best, to this; everyone below is
 /// unranked. Classic Battle.net went to 5,000; this server will not see that many players
 /// (tagban, 2026-09-14). Every ladder — StarCraft, Warcraft II, Diablo II, WarCraft III — uses it.

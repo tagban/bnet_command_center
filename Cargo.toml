@@ -13,6 +13,7 @@ members = [
     "crates/d2-data",
     "crates/d2-drlg",
     "crates/d2-game",
+    "crates/winbot",
 ]
 
 [workspace.package]

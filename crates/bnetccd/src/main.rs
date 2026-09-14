@@ -273,6 +273,7 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
             files_dir,
             admins: cfg.admins.clone(),
             auto_op_private: cfg.channels.auto_op_private,
+            min_game_length: bnetcc_core::ladder::MIN_GAME_LENGTH,
             channel_rules: cfg.channel_rules()?,
             cd_key_uniqueness: cfg.limits.cd_key_uniqueness,
             channel_caps: node::ChannelCaps {
