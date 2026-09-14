@@ -185,7 +185,9 @@ client ── (login connection) SID_ENTERCHAT "Tyrael", "bncc,Tyrael"
   a random 64-bit handle into an in-memory ticket table (`Node::mint_realm_ticket`). A ticket
   lives as long as the login connection that minted it — the client reconnects to the realm
   with the same data after each game.
-- **The portrait** is 33 bytes: see `bnetcc_proto::d2` for the byte table.
+- **The portrait** is 33 bytes: see `bnetcc_proto::d2` for the byte table. Its equipment bytes
+  are graphics values, not items; the server writes a map for chat bots,
+  [`d2-equipment.json`](D2-EQUIPMENT-FILE.md), into the BNFTP files directory at startup.
 
 Wire layouts that matter and are easy to get wrong:
 
@@ -207,6 +209,8 @@ realm = true                          # offer the closed realm (never in warnet 
 description = "Diablo II closed realm"
 address = ""                          # public host/IP for internet players
 max_characters = 18
+data_dir = ""                         # your 1.14d install: Game.exe and the MPQs
+equipment_file = "d2-equipment.json"  # written into [files] dir for bots; "" disables
 ```
 
 The realm's *name* is `server.realm`.

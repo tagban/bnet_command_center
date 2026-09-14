@@ -14,17 +14,22 @@ use std::sync::Arc;
 use d2_formats::excel::Table;
 use d2_formats::mpq::{self, ArchiveSet, DATA_ARCHIVES};
 
+pub mod appearance;
 pub mod engine;
+pub mod items;
 pub mod levels;
 pub mod lvlsub;
 pub mod monsters;
 pub mod presets;
 pub mod stat;
+pub mod strings;
 
+use items::{Code, Items};
 use levels::Levels;
 use lvlsub::LvlSubs;
 use monsters::Monsters;
 use presets::{LvlPrests, MonPresets, Objects, Shrines};
+use strings::Strings;
 
 /// Classes in `charstats.txt` order, which is the engine's class id.
 pub const CLASSES: [&str; 7] = ["Amazon", "Sorceress", "Necromancer", "Paladin", "Barbarian", "Druid", "Assassin"];
@@ -94,6 +99,9 @@ pub struct GameData {
     monsters: Monsters,
     objects: Objects,
     shrines: Shrines,
+    items: Items,
+    /// `ArmType.txt`'s tokens, by body armour weight.
+    armor_types: Vec<Code>,
     /// The install's archives, kept open for map files; `None` when built from tables.
     archives: Option<Arc<ArchiveSet>>,
 }
@@ -122,6 +130,8 @@ impl GameData {
         data.monsters = Monsters::from_tables(&monstats, &read("monstats2.txt")?)?;
         data.objects = Objects::from_table(&read("objects.txt")?);
         data.shrines = Shrines::from_table(&read("shrines.txt")?);
+        data.items = Items::from_tables(&read("itemtypes.txt")?, &read("weapons.txt")?, &read("armor.txt")?, &read("misc.txt")?)?;
+        data.armor_types = read("armtype.txt")?.rows().filter_map(|r| r.get("Token").map(items::code)).collect();
         data.archives = Some(Arc::new(archives));
         Ok(data)
     }
@@ -137,6 +147,42 @@ impl GameData {
             Some(a) => Ok(a.read(member)?),
             None => Ok(None),
         }
+    }
+
+    /// A language's string tables, e.g. `"eng"`; tables the install lacks are left out.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Mpq`] if a table is there but cannot be read, [`Error::BadTable`] if it does not
+    /// parse.
+    pub fn strings(&self, language: &str) -> Result<Strings, Error> {
+        let mut tables = Vec::new();
+        for name in strings::TABLES {
+            if let Some(bytes) = self.read_file(&format!("data\\local\\lng\\{language}\\{name}"))? {
+                let table = d2_formats::tbl::StringTable::parse(&bytes)
+                    .ok_or(Error::BadTable { table: name, problem: "not a string table".into() })?;
+                tables.push(table);
+            }
+        }
+        Ok(Strings::from_tables(tables))
+    }
+
+    /// `Weapons.txt`, `Armor.txt` and `Misc.txt`, with `ItemTypes.txt`.
+    #[must_use]
+    pub fn items(&self) -> &Items {
+        &self.items
+    }
+
+    /// `ArmType.txt`'s tokens (`lit`, `med`, `hvy`), by body armour weight.
+    #[must_use]
+    pub fn armor_types(&self) -> &[Code] {
+        &self.armor_types
+    }
+
+    /// Replace the item tables — for building rules from tables in tests.
+    pub fn set_items(&mut self, items: Items, armor_types: Vec<Code>) {
+        self.items = items;
+        self.armor_types = armor_types;
     }
 
     /// `LvlPrest.txt`.
@@ -245,6 +291,8 @@ impl GameData {
             monsters: Monsters::default(),
             objects: Objects::default(),
             shrines: Shrines::default(),
+            items: Items::default(),
+            armor_types: Vec::new(),
             archives: None,
         })
     }

@@ -215,6 +215,11 @@ data_dir = ""
 # Blizzard's join sequence and stands in the Rogue Encampment — no stats, NPCs or actions. Needs
 # data_dir. Every game packet is logged. See docs/D2GS-114D-WIRE.md.
 game_server_probe = false
+# With data_dir and [files] dir both set, the server writes this file into the files directory at
+# startup: a JSON map from the equipment bytes of a realm character's chat statstring (helm, body
+# armour, weapons, shield) to the items they show, for chat bots to download over BNFTP like
+# icons.bni. Built from your install; rewritten only when it changes. Empty disables it.
+equipment_file = "d2-equipment.json"
 
 [admins]
 # Accounts treated as Battle.net Administrators (sysops). They carry the admin flag and

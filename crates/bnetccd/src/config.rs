@@ -74,6 +74,10 @@ pub struct Diablo2Config {
     /// handshake test on port 4000 (`crate::d2gs`): a joining client gets Blizzard's join
     /// sequence and stands in the Rogue Encampment with no stats, NPCs or actions. Needs `data_dir`.
     pub game_server_probe: bool,
+    /// File name, in `[files] dir`, of the map from a realm character's statstring equipment
+    /// bytes to the items they show (`crate::d2_equipment`), built from `data_dir` at startup for
+    /// chat bots to fetch over BNFTP. Needs both directories; empty disables it.
+    pub equipment_file: String,
 }
 
 impl Default for Diablo2Config {
@@ -85,6 +89,7 @@ impl Default for Diablo2Config {
             max_characters: 18,
             data_dir: String::new(),
             game_server_probe: false,
+            equipment_file: "d2-equipment.json".into(),
         }
     }
 }

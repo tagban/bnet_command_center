@@ -4,6 +4,7 @@
 
 mod admin;
 mod config;
+mod d2_equipment;
 mod d2gs;
 mod discord;
 mod moderation;
@@ -45,6 +46,11 @@ struct Args {
     /// Validate the configuration and exit without binding anything.
     #[arg(long)]
     check: bool,
+
+    /// Write the Diablo II equipment map (`diablo2.equipment_file`) built from
+    /// `diablo2.data_dir` to this path and exit.
+    #[arg(long, value_name = "PATH")]
+    write_d2_equipment: Option<PathBuf>,
 }
 
 fn main() -> std::process::ExitCode {
@@ -76,6 +82,19 @@ fn main() -> std::process::ExitCode {
     if args.check {
         info!("configuration is valid");
         return std::process::ExitCode::SUCCESS;
+    }
+
+    if let Some(path) = &args.write_d2_equipment {
+        return match d2_equipment::write(&cfg.diablo2.data_dir, path) {
+            Ok(_) => {
+                info!(path = %path.display(), "wrote the Diablo II equipment map");
+                std::process::ExitCode::SUCCESS
+            }
+            Err(e) => {
+                error!("{e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
@@ -156,6 +175,10 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
     };
     if let Some(dir) = &files_dir {
         info!(dir = %dir.display(), "serving operator-supplied files over BNFTP");
+        let d2 = &cfg.diablo2;
+        if !d2.data_dir.trim().is_empty() && !d2.equipment_file.is_empty() {
+            tokio::spawn(d2_equipment::publish(d2.data_dir.clone(), dir.clone(), d2.equipment_file.clone()));
+        }
     }
 
     // UDP :6112 for the login-time UDP check that lets classic clients host/join games.

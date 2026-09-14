@@ -60,6 +60,10 @@ mod address {
     /// `gaWallNeighborOrientTable`: a road edge cell's tile orientation by its eight
     /// neighbours (`DRLGOUTROOM_ComputeWallOrientations`, `0x00680B10`).
     pub const OUTDOOR_EDGE_ORIENTATIONS: u32 = 0x006F_2700;
+    /// The graphics codes a save's appearance bytes were first laid out for, `{code, item type}`
+    /// by slot; the graphics table builder keeps weapons and armour out of each other's slots
+    /// with it (`0x0063D710`).
+    pub const RESERVED_GRAPHICS: u32 = 0x0074_4CA8;
     /// `VS_FIXEDFILEINFO` 1.14.3.71.
     pub const FILE_VERSION: (u32, u32) = (0x0001_000E, 0x0003_0047);
 }
@@ -82,6 +86,9 @@ pub struct EngineData {
     pub day_periods: [DayPeriod; 6],
     /// What the wilderness generator looks up.
     pub outdoor: OutdoorTables,
+    /// The graphics slots appearance bytes were first laid out for, `(code, item type)` by
+    /// slot — what [`crate::appearance::Graphics::build`] reads.
+    pub reserved_graphics: Vec<(crate::items::Code, i32)>,
 }
 
 /// The outdoor (wilderness) generator's lookup tables.
@@ -166,6 +173,12 @@ impl EngineData {
         image.i32s(address::DAY_PERIODS, &mut periods).ok_or_else(|| out_of_range("day periods"))?;
         let day_periods: [DayPeriod; 6] = std::array::from_fn(|i| DayPeriod { angle: periods[i * 3], phase: periods[i * 3 + 1] });
         let outdoor = OutdoorTables::read(&image).ok_or_else(|| out_of_range("outdoor tables"))?;
+        let reserved_graphics: Vec<(crate::items::Code, i32)> = image
+            .bytes(address::RESERVED_GRAPHICS, crate::appearance::SLOTS * 8)
+            .ok_or_else(|| out_of_range("reserved graphics"))?
+            .chunks_exact(8)
+            .map(|e| ([e[0], e[1], e[2], e[3]], i32::from_le_bytes([e[4], e[5], e[6], e[7]])))
+            .collect();
 
         // GAMELOGON 37, ENTERGAME 1, ping 13; GameFlags 8, LoadAct 12, AssignPlayer 26.
         let sizes_ok = client_packet_sizes[0x68] == 37
@@ -186,10 +199,21 @@ impl EngineData {
             && outdoor.road_flags.iter().all(|r| r[5] > 0 && r[5] & (r[5] - 1) == 0)
             && outdoor.path_directions.iter().all(|d| (0..8).contains(d))
             && outdoor.path_deltas[16..].iter().all(|d| (-1..=1).contains(d));
-        if !sizes_ok || !presets_ok || !clock_ok || !outdoor_ok {
+        // The body armour weights, then the first helm.
+        let graphics_ok = reserved_graphics[1] == (*b"lit ", 1) && reserved_graphics[4] == (*b"cap ", 37);
+        if !sizes_ok || !presets_ok || !clock_ok || !outdoor_ok || !graphics_ok {
             return Err(bad("tables do not look like 1.14d's".into()));
         }
-        Ok(Self { huffman_code_lengths, client_packet_sizes, server_packet_sizes, preset_objects, clock_speeds, day_periods, outdoor })
+        Ok(Self {
+            huffman_code_lengths,
+            client_packet_sizes,
+            server_packet_sizes,
+            preset_objects,
+            clock_speeds,
+            day_periods,
+            outdoor,
+            reserved_graphics,
+        })
     }
 
     /// The object class a DS1 preset object (unit type 2) becomes: ids below 150 go through the

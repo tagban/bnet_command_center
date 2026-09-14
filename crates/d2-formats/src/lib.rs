@@ -16,3 +16,4 @@ pub mod excel;
 pub mod mpq;
 pub mod pe;
 pub mod pkware;
+pub mod tbl;
