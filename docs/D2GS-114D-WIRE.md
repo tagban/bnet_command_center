@@ -681,7 +681,7 @@ On the wire:
   version 10 (101), mode 3 (3 = ground), x 16, y 16, code 32 (`gld `), then — for an item type
   with the gold property — a 1-bit width flag and the amount in 12 or 32 bits. The client does
   not read the category for action 0; we send 0.
-- **C→S `0x16`** (13): `[container u32][item guid u32][to cursor u32]`. For gold we remove the pile
+- **C→S `0x16`** (13): `[unit type u32][item guid u32][to cursor u32]`. For gold we remove the pile
   for everyone holding its room (`0x0A` type 4), tell the picker its gold as the engine does
   (`0x53E9B0`: a gain of 1–254 is `0x19 [gain]`, else stat 14 by `0x1D`–`0x1F`) and save.
 - Piles stay in the game: a room coming near sends its piles without the drop flag, a room left
@@ -690,8 +690,12 @@ On the wire:
 Not done / not confirmed: items other than gold (the TC rolls them; quality, affixes, inventory
 placement and the `.d2s` item list are next), the engine's free-spot search for each drop
 (`0x555DA0` → `0x64E810`, mask `0x3E01`; piles go on and beside the corpse), the second player
-count, and what the engine does with gold beyond the purse (10,000 a level; the remainder is put
-back as a smaller pile).
+count. Pickup (`0x16` is `[unit type u32][guid u32][to cursor u32]`, handler `0x54AAD0` →
+`0x548B00` type 4, as `0x13`): within 5 subtiles and unblocked the engine picks up (`0x563560`
+auto-place, `0x55CF50` to cursor), else walks the player there; we do not check range. Gold
+(`0x55C850`) takes what the purse holds (level × 10,000, `0x622E70`) and drops the rest as a new
+pile by the player (`0x55B030` → `0x55A090`, free-spot search from the player's position); ours
+goes on the player's subtile.
 
 ## 6. Server packet builders (opcode → function)
 

@@ -166,7 +166,8 @@ pub mod cs {
     pub const ADD_STAT_POINT: u8 = 0x3A;
     /// Leave the corpse and restart in town, after "You have died" (1 byte).
     pub const RESPAWN: u8 = 0x41;
-    /// Pick an item up: `[container u32][item guid u32][to cursor u32]` (13 bytes).
+    /// Pick an item up: `[unit type u32][item guid u32][to cursor u32]` (13 bytes; engine
+    /// handler `0x0054AAD0`, then `0x00548B00` as for `0x13`).
     pub const PICK_UP_ITEM: u8 = 0x16;
     /// Travel by waypoint: `[waypoint guid u32][level u16][u16]` (9 bytes; engine handler
     /// `0x0054C5D0`).
