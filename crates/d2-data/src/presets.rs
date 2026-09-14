@@ -25,6 +25,14 @@ pub struct LvlPrest {
     pub scan: bool,
     /// `Pops`: pop-out regions (roofs) the map marks.
     pub pops: i32,
+    /// `Dt1Mask`: which of the level type's tile files (`LvlTypes.txt` columns) its rooms load.
+    pub dt1_mask: u32,
+    /// `FillBlanks`: an empty floor cell inside a room gets the blank tile.
+    pub fill_blanks: bool,
+    /// `KillEdge`: rooms leave out the map's far edge.
+    pub kill_edge: bool,
+    /// `Outdoors`.
+    pub outdoors: bool,
     /// `File1`..`File6` as written, blanks included, so a file index points at its column.
     pub file_slots: Vec<String>,
     /// `File1`..`File6`, relative to `data\global\tiles`, blanks and `0` dropped.
@@ -59,6 +67,10 @@ impl LvlPrests {
                 file_count: row.int("Files").unwrap_or(0) as i32,
                 scan: row.int("Scan").unwrap_or(0) != 0,
                 pops: row.int("Pops").unwrap_or(0) as i32,
+                dt1_mask: row.int("Dt1Mask").unwrap_or(0) as u32,
+                fill_blanks: row.int("FillBlanks").unwrap_or(0) != 0,
+                kill_edge: row.int("KillEdge").unwrap_or(0) != 0,
+                outdoors: row.int("Outdoors").unwrap_or(0) != 0,
                 file_slots: (1..=6).map(|i| row.get(&format!("File{i}")).unwrap_or_default().to_string()).collect(),
                 files: (1..=6)
                     .filter_map(|i| row.get(&format!("File{i}")))

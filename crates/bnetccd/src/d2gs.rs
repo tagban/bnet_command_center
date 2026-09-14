@@ -25,6 +25,7 @@ use bnetcc_storage::Character;
 use d2_data::engine::EngineData;
 use d2_data::{stat, GameData};
 use d2_drlg::act::Act;
+use d2_drlg::collision::TileSources;
 use d2_drlg::preset::PresetLevel;
 use d2_drlg::world::{RoomId, World};
 use d2_game::clock::ActClock;
@@ -92,6 +93,8 @@ pub struct GameServer {
     /// The engine's day periods and clock speed, from `Game.exe`; without them games stay at
     /// the start of the day.
     day: Option<([d2_data::engine::DayPeriod; 6], i32)>,
+    /// Tile libraries and maps read from the install, parsed once for every game.
+    tile_sources: TileSources,
     games: Mutex<Games>,
 }
 
@@ -164,7 +167,7 @@ impl GameServer {
     /// A game server with no games.
     #[must_use]
     pub fn new(tables: EngineTables, rules: Option<GameData>) -> Self {
-        Self { tables, rules, towns: Towns::None, speed_scale: 1.0, day: None, games: Mutex::new(Games::default()) }
+        Self { tables, rules, towns: Towns::None, speed_scale: 1.0, day: None, tile_sources: TileSources::new(), games: Mutex::new(Games::default()) }
     }
 
     /// Build each new game's town from its own map seed with these engine tables (the rules
@@ -206,7 +209,14 @@ impl GameServer {
         let (Towns::FromInstall(engine), Some(data)) = (&self.towns, &self.rules) else {
             #[cfg(test)]
             if let Towns::Fixed(town) = &self.towns {
-                let level = d2_drlg::world::WorldLevel { id: town.level_id, area: town.area, rooms: town.rooms.clone(), units: town.units.clone(), pieces: Vec::new() };
+                let level = d2_drlg::world::WorldLevel {
+                    id: town.level_id,
+                    area: town.area,
+                    rooms: town.rooms.clone(),
+                    units: town.units.clone(),
+                    pieces: Vec::new(),
+                    collision: Vec::new(),
+                };
                 return (FALLBACK_MAP_SEED, Some(town.clone()), Some(World::from_levels(vec![level])));
             }
             return (FALLBACK_MAP_SEED, None, None);
@@ -214,7 +224,7 @@ impl GameServer {
         let build = |seed: u32| {
             let act = Act::build(data.levels(), 0, difficulty, seed);
             PresetLevel::build(data, engine, &act, i32::from(TOWN_AREA)).map(|town| {
-                let world = World::build(data, engine, &act, Some(&town));
+                let world = World::build(data, engine, &act, Some(&town), &self.tile_sources);
                 for (level, why) in world.unbuilt() {
                     warn!(map_seed = %format!("{seed:#010x}"), level, error = %why, "level not generated; players will not see it");
                 }
@@ -1381,7 +1391,7 @@ pub(crate) mod tests {
             let game = g.by_id.get_mut(&id).unwrap();
             let mut levels = game.world.take().unwrap().levels().to_vec();
             let waypoint = PlacedUnit { class: UnitClass::Object(3), x: 5779, y: 4499, path: Vec::new() };
-            levels.push(WorldLevel { id: 3, area: plains, rooms: vec![plains], units: vec![waypoint], pieces: vec![0] });
+            levels.push(WorldLevel { id: 3, area: plains, rooms: vec![plains], units: vec![waypoint], pieces: vec![0], collision: Vec::new() });
             game.world = Some(World::from_levels(levels));
         }
         let room = RoomId { level: 3, index: 0 };

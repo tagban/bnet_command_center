@@ -82,6 +82,16 @@ mod address {
     /// Which of a sprite file's directions a unit facing index draws, one row of 32 per
     /// direction count (row `log2(count) + 1`), read by `0x00600C70`.
     pub const FILE_DIRECTIONS: u32 = 0x006E_3A20;
+    /// `DRLGPRESET_FindPresetTypeIndex` (`0x0066D960`): 37 `{level, first row, last row}`.
+    pub const PRESET_TILE_LEVELS: u32 = 0x006E_EFC8;
+    /// Its rows, `{main, orientation, sub flag, class, unit type, x offset, y offset}`.
+    pub const PRESET_TILE_ROWS: u32 = 0x006E_F188;
+    /// `gaWarpTileOffsetX/Y`: the four lit warp floor tiles' offsets, `x, y` pairs (`0x0066E360`).
+    pub const WARP_TILE_OFFSETS: u32 = 0x006E_F554;
+    /// `gnRoomTileMappingTransitionByType`: `[row * 7 + held tile type]` (`0x0066E740`).
+    pub const TILE_MAPPING_TRANSITIONS: u32 = 0x006E_F574;
+    /// `gnRoomTileMappingByTypeAndLayer`: a seam cell's tile type to a transition row.
+    pub const TILE_MAPPING_BY_TYPE: u32 = 0x006E_F620;
     /// `VS_FIXEDFILEINFO` 1.14.3.71.
     pub const FILE_VERSION: (u32, u32) = (0x0001_000E, 0x0003_0047);
 }
@@ -109,6 +119,24 @@ pub struct EngineData {
     pub reserved_graphics: Vec<(crate::items::Code, i32)>,
     /// What the front end draws characters with.
     pub front_end: FrontEndTables,
+    /// What a room's tiles are built with.
+    pub tiles: TileTables,
+}
+
+/// The room tile builder's tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TileTables {
+    /// Levels whose preset wall tiles place units: `{level, first row, last row}` of
+    /// [`Self::preset_rows`].
+    pub preset_levels: [[i32; 3]; 37],
+    /// `{main, orientation, sub flag, class, unit type, x offset, y offset}`.
+    pub preset_rows: [[i32; 7]; 34],
+    /// The four lit warp floor tiles, `(x, y)` from the warp's corner.
+    pub warp_tile_offsets: [(i32, i32); 4],
+    /// The tile type a seam cell's existing tile becomes: `[row * 7 + its type]`.
+    pub mapping_transitions: [i32; 43],
+    /// A visiting cell's tile type to a row of [`Self::mapping_transitions`]; -1 keep, -2 none.
+    pub mapping_by_type: [i32; 20],
 }
 
 /// The front end's character-drawing tables.
@@ -222,6 +250,7 @@ impl EngineData {
             .map(|e| ([e[0], e[1], e[2], e[3]], i32::from_le_bytes([e[4], e[5], e[6], e[7]])))
             .collect();
         let front_end = FrontEndTables::read(&image).ok_or_else(|| out_of_range("front-end tables"))?;
+        let tiles = TileTables::read(&image).ok_or_else(|| out_of_range("room tile tables"))?;
 
         // GAMELOGON 37, ENTERGAME 1, ping 13; GameFlags 8, LoadAct 12, AssignPlayer 26.
         let sizes_ok = client_packet_sizes[0x68] == 37
@@ -251,7 +280,14 @@ impl EngineData {
             && front_end.weapon_classes.get(1) == Some(b"hth ")
             && front_end.file_directions[5][0] == 4
             && front_end.file_directions[4][..8] == [4, 5, 6, 7, 0, 2, 1, 3];
-        if !sizes_ok || !presets_ok || !clock_ok || !outdoor_ok || !graphics_ok {
+        // The Barracks' rows come first; the lit warp tiles fill a 2×2 block; a floor seam keeps
+        // its type.
+        let tiles_ok = tiles.preset_levels[0] == [28, 0, 3]
+            && tiles.preset_levels.iter().all(|l| (0..=l[2]).contains(&l[1]) && l[2] < 34)
+            && tiles.warp_tile_offsets == [(0, 0), (1, 0), (0, 1), (1, 1)]
+            && tiles.mapping_by_type[0] == -1
+            && tiles.mapping_transitions[42] == 7;
+        if !sizes_ok || !presets_ok || !clock_ok || !outdoor_ok || !graphics_ok || !tiles_ok {
             return Err(bad("tables do not look like 1.14d's".into()));
         }
         Ok(Self {
@@ -264,6 +300,7 @@ impl EngineData {
             outdoor,
             reserved_graphics,
             front_end,
+            tiles,
         })
     }
 
@@ -321,6 +358,28 @@ impl FrontEndTables {
             file_directions.push(ints);
         }
         Some(Self { graphics, classes, modes, components, weapon_classes, item_weapon_classes, hand_classes, file_directions })
+    }
+}
+
+impl TileTables {
+    fn read(image: &Image) -> Option<Self> {
+        let mut levels = [0i32; 37 * 3];
+        image.i32s(address::PRESET_TILE_LEVELS, &mut levels)?;
+        let mut rows = [0i32; 34 * 7];
+        image.i32s(address::PRESET_TILE_ROWS, &mut rows)?;
+        let mut offsets = [0i32; 8];
+        image.i32s(address::WARP_TILE_OFFSETS, &mut offsets)?;
+        let mut mapping_transitions = [0i32; 43];
+        image.i32s(address::TILE_MAPPING_TRANSITIONS, &mut mapping_transitions)?;
+        let mut mapping_by_type = [0i32; 20];
+        image.i32s(address::TILE_MAPPING_BY_TYPE, &mut mapping_by_type)?;
+        Some(Self {
+            preset_levels: std::array::from_fn(|i| std::array::from_fn(|c| levels[i * 3 + c])),
+            preset_rows: std::array::from_fn(|i| std::array::from_fn(|c| rows[i * 7 + c])),
+            warp_tile_offsets: std::array::from_fn(|i| (offsets[i * 2], offsets[i * 2 + 1])),
+            mapping_transitions,
+            mapping_by_type,
+        })
     }
 }
 

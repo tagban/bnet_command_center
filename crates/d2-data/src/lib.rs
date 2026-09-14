@@ -24,6 +24,7 @@ pub mod monsters;
 pub mod presets;
 pub mod stat;
 pub mod strings;
+pub mod tiles;
 
 use items::{Code, Items};
 use levels::Levels;
@@ -31,6 +32,7 @@ use lvlsub::LvlSubs;
 use monsters::Monsters;
 use presets::{LvlPrests, MonPresets, Objects, Shrines};
 use strings::Strings;
+use tiles::{LvlTypes, LvlWarps};
 
 /// Classes in `charstats.txt` order, which is the engine's class id.
 pub const CLASSES: [&str; 7] = ["Amazon", "Sorceress", "Necromancer", "Paladin", "Barbarian", "Druid", "Assassin"];
@@ -96,6 +98,8 @@ pub struct GameData {
     levels: Levels,
     lvl_prests: LvlPrests,
     lvl_subs: LvlSubs,
+    lvl_types: LvlTypes,
+    lvl_warps: LvlWarps,
     mon_presets: MonPresets,
     monsters: Monsters,
     objects: Objects,
@@ -125,6 +129,8 @@ impl GameData {
         data.levels = Levels::from_table(&read("levels.txt")?)?;
         data.lvl_prests = LvlPrests::from_table(&read("lvlprest.txt")?)?;
         data.lvl_subs = LvlSubs::from_table(&read("lvlsub.txt")?)?;
+        data.lvl_types = LvlTypes::from_table(&read("lvltypes.txt")?)?;
+        data.lvl_warps = LvlWarps::from_table(&read("lvlwarp.txt")?)?;
         let monstats = read("monstats.txt")?;
         data.mon_presets =
             MonPresets::from_tables(&read("monpreset.txt")?, &monstats, &read("superuniques.txt")?, &read("monplace.txt")?)?;
@@ -196,6 +202,18 @@ impl GameData {
     #[must_use]
     pub fn lvl_subs(&self) -> &LvlSubs {
         &self.lvl_subs
+    }
+
+    /// `LvlTypes.txt`.
+    #[must_use]
+    pub fn lvl_types(&self) -> &LvlTypes {
+        &self.lvl_types
+    }
+
+    /// `LvlWarp.txt`.
+    #[must_use]
+    pub fn lvl_warps(&self) -> &LvlWarps {
+        &self.lvl_warps
     }
 
     /// `MonPreset.txt`, resolved.
@@ -288,6 +306,8 @@ impl GameData {
             levels: Levels::default(),
             lvl_prests: LvlPrests::default(),
             lvl_subs: LvlSubs::default(),
+            lvl_types: LvlTypes::default(),
+            lvl_warps: LvlWarps::default(),
             mon_presets: MonPresets::default(),
             monsters: Monsters::default(),
             objects: Objects::default(),

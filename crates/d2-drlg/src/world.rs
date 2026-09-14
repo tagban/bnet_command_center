@@ -15,6 +15,9 @@
 //!   pointing into a void would make it dereference null, so the voids matter and the tiles do
 //!   not.
 //!
+//! A wilderness level also keeps each room's collision map ([`crate::collision`]), which says where
+//! units may stand and walk.
+//!
 //! Rooms of different levels are near when their gap is under 6 tiles on both axes, as within a
 //! level. The engine links cross-level rooms only through a room's visibility slots
 //! (`DRLGROOMEX_LinkNearRoomsByVis`, `0x0066C220`), so two levels placed edge to edge without a
@@ -28,6 +31,7 @@ use d2_data::GameData;
 use d2_formats::ds1::UnitKind;
 
 use crate::act::Act;
+use crate::collision::{RoomCollision, TileSources};
 use crate::outdoor::Act1Outdoors;
 use crate::preset::{PlacedUnit, PresetLevel, UnitClass, ROOM_TILES, SUBTILES};
 use crate::Coords;
@@ -55,6 +59,8 @@ pub struct WorldLevel {
     /// The preset piece each room is part of (`LvlPrest.txt` `Def`), 0 for a plain wilderness
     /// cell; empty when not known (preset levels).
     pub pieces: Vec<i32>,
+    /// Each room's collision map, in [`WorldLevel::rooms`] order; empty when not built.
+    pub collision: Vec<RoomCollision>,
 }
 
 /// The walkable levels of an act.
@@ -126,11 +132,11 @@ pub fn reorder_near<T>(list: &mut [T], coords: impl Fn(&T) -> Coords) {
 impl World {
     /// The walkable levels of `act`: every level its placement walk laid out and every
     /// preset or wilderness level depending on one, with the town's rooms taken from `town` and
-    /// the wilderness generated for the act's seed. Maze levels (reached through warps), levels
-    /// overlapping one already taken and levels that cannot be generated (see
-    /// [`World::unbuilt`]) are left out.
+    /// the wilderness generated for the act's seed, its rooms' tiles read through `sources`.
+    /// Maze levels (reached through warps), levels overlapping one already taken and levels that
+    /// cannot be generated (see [`World::unbuilt`]) are left out.
     #[must_use]
-    pub fn build(data: &GameData, engine: &EngineData, act: &Act, town: Option<&PresetLevel>) -> Self {
+    pub fn build(data: &GameData, engine: &EngineData, act: &Act, town: Option<&PresetLevel>, sources: &TileSources) -> Self {
         let levels = data.levels();
         let placed = act.placed_levels();
         let mut ids = placed.clone();
@@ -151,27 +157,26 @@ impl World {
             if area.w <= 0 || area.h <= 0 || world.levels.iter().any(|l| overlaps(l.area, area)) {
                 continue;
             }
-            let (rooms, units, pieces) = match (town, def.drlg_type, &outdoors) {
-                (Some(t), _, _) if t.level_id == id => (t.rooms.clone(), t.units.clone(), Vec::new()),
-                (_, DrlgType::Wilderness, Some(Ok(outdoors))) => match outdoors.generate(id) {
-                    Ok(level) => {
-                        let mut units = Vec::new();
-                        for room in &level.rooms {
-                            match outdoors.room_units(&level, room) {
-                                Ok(placed) => units.extend(placed.into_iter().map(|u| PlacedUnit {
-                                    class: match u.kind {
-                                        UnitKind::Object => UnitClass::Object(u.class),
-                                        UnitKind::Monster => UnitClass::Other { kind: 1, id: u.class },
-                                        UnitKind::Other(kind) => UnitClass::Other { kind, id: u.class },
-                                    },
-                                    x: u.x,
-                                    y: u.y,
-                                    path: Vec::new(),
-                                })),
-                                Err(e) => world.unbuilt.push((id, format!("room {:?}: {e}", room.area))),
-                            }
-                        }
-                        (level.rooms.iter().map(|r| r.area).collect(), units, level.rooms.iter().map(|r| r.preset).collect())
+            let (rooms, units, pieces, collision) = match (town, def.drlg_type, &outdoors) {
+                (Some(t), _, _) if t.level_id == id => (t.rooms.clone(), t.units.clone(), Vec::new(), Vec::new()),
+                (_, DrlgType::Wilderness, Some(Ok(outdoors))) => match outdoors.generate(id).and_then(|l| outdoors.build_rooms(sources, &l).map(|b| (l, b))) {
+                    Ok((level, built)) => {
+                        let units = built
+                            .units
+                            .iter()
+                            .flatten()
+                            .map(|u| PlacedUnit {
+                                class: match u.kind {
+                                    UnitKind::Object => UnitClass::Object(u.class),
+                                    UnitKind::Monster => UnitClass::Other { kind: 1, id: u.class },
+                                    UnitKind::Other(kind) => UnitClass::Other { kind, id: u.class },
+                                },
+                                x: u.x,
+                                y: u.y,
+                                path: Vec::new(),
+                            })
+                            .collect();
+                        (level.rooms.iter().map(|r| r.area).collect(), units, level.rooms.iter().map(|r| r.preset).collect(), built.collision)
                     }
                     Err(e) => {
                         world.unbuilt.push((id, e.to_string()));
@@ -186,9 +191,9 @@ impl World {
                     world.unbuilt.push((id, format!("act {} wilderness is not ported", act.act + 1)));
                     continue;
                 }
-                _ => (grid_rooms(area, def.drlg_type), Vec::new(), Vec::new()),
+                _ => (grid_rooms(area, def.drlg_type), Vec::new(), Vec::new(), Vec::new()),
             };
-            world.levels.push(WorldLevel { id, area, rooms, units, pieces });
+            world.levels.push(WorldLevel { id, area, rooms, units, pieces, collision });
         }
         world
     }
@@ -220,6 +225,14 @@ impl World {
 
     fn level(&self, id: i32) -> Option<&WorldLevel> {
         self.levels.iter().find(|l| l.id == id)
+    }
+
+    /// The collision flags at a world subtile ([`crate::collision`] bits), `None` where no room
+    /// has a map.
+    #[must_use]
+    pub fn collision_at(&self, x: i32, y: i32) -> Option<u8> {
+        let id = self.room_at(x, y)?;
+        self.level(id.level)?.collision.get(id.index)?.at(x, y)
     }
 
     /// The units standing in a room, in the order its level lists them.
@@ -291,8 +304,8 @@ mod tests {
         let town = Coords { x: 100, y: 100, w: 16, h: 8 };
         let moor = Coords { x: 96, y: 108, w: 24, h: 16 };
         World::from_levels(vec![
-            WorldLevel { id: 1, area: town, rooms: grid_rooms(town, DrlgType::Preset), units: Vec::new(), pieces: Vec::new() },
-            WorldLevel { id: 2, area: moor, rooms: grid_rooms(moor, DrlgType::Wilderness), units: Vec::new(), pieces: Vec::new() },
+            WorldLevel { id: 1, area: town, rooms: grid_rooms(town, DrlgType::Preset), units: Vec::new(), pieces: Vec::new(), collision: Vec::new() },
+            WorldLevel { id: 2, area: moor, rooms: grid_rooms(moor, DrlgType::Wilderness), units: Vec::new(), pieces: Vec::new(), collision: Vec::new() },
         ])
     }
 
@@ -309,7 +322,7 @@ mod tests {
         for seed in [1u32, 2, 0x1234_5678, 0xBEEF_F00D] {
             let act = Act::build(data.levels(), 0, 0, seed);
             let town = PresetLevel::build(&data, &engine, &act, 1).unwrap();
-            let world = World::build(&data, &engine, &act, Some(&town));
+            let world = World::build(&data, &engine, &act, Some(&town), &TileSources::new());
             assert!(world.unbuilt().is_empty(), "seed {seed:#x}: {:?}", world.unbuilt());
             let ids: Vec<i32> = world.levels().iter().map(|l| l.id).collect();
             for id in [1, 2, 3, 4, 5, 6, 7, 17, 26] {
@@ -345,7 +358,7 @@ mod tests {
             let text = std::fs::read_to_string(golden.join(file)).unwrap();
             let act = Act::build(data.levels(), 0, 0, seed);
             let town = PresetLevel::build(&data, &engine, &act, 1).unwrap();
-            let world = World::build(&data, &engine, &act, Some(&town));
+            let world = World::build(&data, &engine, &act, Some(&town), &TileSources::new());
             for line in text.lines() {
                 let Some((level, _)) = number(line, "\"levelId\":", 0) else { continue };
                 let Some(ours) = world.levels().iter().find(|l| l.id == level) else { continue };

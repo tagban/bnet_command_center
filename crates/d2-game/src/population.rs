@@ -638,7 +638,7 @@ mod tests {
         for seed in [1u32, 0x1234_5678, 0xBEEF] {
             let act = d2_drlg::act::Act::build(data.levels(), 0, 0, seed);
             let town = PresetLevel::build(&data, &engine, &act, 1).unwrap();
-            let world = d2_drlg::world::World::build(&data, &engine, &act, Some(&town));
+            let world = d2_drlg::world::World::build(&data, &engine, &act, Some(&town), &d2_drlg::collision::TileSources::new());
             let mut pop = Population::new(seed);
             let (mut shrines, mut waypoints) = (0, 0);
             for level in world.levels().iter().filter(|l| (2..=7).contains(&l.id)) {
@@ -676,7 +676,7 @@ mod tests {
         for seed in [1u32, 0x1234_5678, 0xBEEF] {
             let act = d2_drlg::act::Act::build(data.levels(), 0, 0, seed);
             let town = PresetLevel::build(&data, &engine, &act, 1).unwrap();
-            let world = d2_drlg::world::World::build(&data, &engine, &act, Some(&town));
+            let world = d2_drlg::world::World::build(&data, &engine, &act, Some(&town), &d2_drlg::collision::TileSources::new());
             let mut pop = Population::new(seed).with_monsters(&data, seed, 0);
             for level in world.levels().iter().filter(|l| (2..=7).contains(&l.id)) {
                 let roster: Vec<i32> = pop.regions.as_ref().unwrap().level(level.id).unwrap().roster().iter().map(|r| r.0).collect();

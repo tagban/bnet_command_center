@@ -14,6 +14,7 @@
 pub mod cof;
 pub mod dcc;
 pub mod ds1;
+pub mod dt1;
 pub mod excel;
 pub mod gif;
 pub mod mpq;
