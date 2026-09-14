@@ -79,6 +79,9 @@ mod address {
     pub const FRONT_END_ITEM_WEAPON_CLASSES: u32 = 0x0072_EF68;
     /// Hand class (a weapon class token index) by that row; row 0 is anything unlisted.
     pub const FRONT_END_HAND_CLASSES: u32 = 0x0072_EF30;
+    /// Which of a sprite file's directions a unit facing index draws, one row of 32 per
+    /// direction count (row `log2(count) + 1`), read by `0x00600C70`.
+    pub const FILE_DIRECTIONS: u32 = 0x006E_3A20;
     /// `VS_FIXEDFILEINFO` 1.14.3.71.
     pub const FILE_VERSION: (u32, u32) = (0x0001_000E, 0x0003_0047);
 }
@@ -125,6 +128,9 @@ pub struct FrontEndTables {
     pub item_weapon_classes: Vec<(crate::items::Code, u32)>,
     /// Hand class by row.
     pub hand_classes: Vec<i32>,
+    /// The file direction for a facing index, by row `log2(directions) + 1` (0..=6) then index
+    /// (`0x00600C70`): for 16 directions, facing 0 is file direction 4, toward the viewer.
+    pub file_directions: Vec<[i32; 32]>,
 }
 
 /// The outdoor (wilderness) generator's lookup tables.
@@ -242,7 +248,9 @@ impl EngineData {
             && front_end.graphics[4] == (*b"cap ", 0, 37)
             && front_end.classes.first() == Some(b"AM  ")
             && front_end.modes.get(5) == Some(b"TN  ")
-            && front_end.weapon_classes.get(1) == Some(b"hth ");
+            && front_end.weapon_classes.get(1) == Some(b"hth ")
+            && front_end.file_directions[5][0] == 4
+            && front_end.file_directions[4][..8] == [4, 5, 6, 7, 0, 2, 1, 3];
         if !sizes_ok || !presets_ok || !clock_ok || !outdoor_ok || !graphics_ok {
             return Err(bad("tables do not look like 1.14d's".into()));
         }
@@ -306,7 +314,13 @@ impl FrontEndTables {
             .chunks_exact(4)
             .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
-        Some(Self { graphics, classes, modes, components, weapon_classes, item_weapon_classes, hand_classes })
+        let mut file_directions = Vec::with_capacity(7);
+        for row in 0..7u32 {
+            let mut ints = [0i32; 32];
+            image.i32s(address::FILE_DIRECTIONS + row * 32 * 4, &mut ints)?;
+            file_directions.push(ints);
+        }
+        Some(Self { graphics, classes, modes, components, weapon_classes, item_weapon_classes, hand_classes, file_directions })
     }
 }
 

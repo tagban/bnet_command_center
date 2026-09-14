@@ -3,8 +3,8 @@
 //!
 //! Built from `diablo2.data_dir` at startup ([`d2_data::character::CharacterArt::pack`]) and
 //! written beside `d2-equipment.json` in the BNFTP files directory. The bundle holds the palette,
-//! the tint maps, one GIF per body-part graphic facing direction 0 (the game's palette, index 0
-//! transparent), and `manifest.json`: where each part sits against the base point, the draw order
+//! the tint maps, one GIF per body-part graphic facing the viewer as the character screen draws
+//! it (the game's palette, index 0 transparent), and `manifest.json`: where each part sits against the base point, the draw order
 //! of every frame, the loop's timing, and the rules that take a portrait's bytes to the parts.
 //! `docs/D2-CHARACTER-PACK.md` is the format for bot authors.
 
@@ -111,7 +111,7 @@ pub fn manifest(pack: &Pack) -> Value {
         "format": FORMAT,
         "version": FORMAT_VERSION,
         "game": "Diablo II 1.14d",
-        "about": "The character-select screen's animations as layers facing direction 0, from the server's own install. See rules.",
+        "about": "The character-select screen's animations as layers, facing the viewer as that screen draws them, from the server's own install. See rules.",
         "rules": RULES,
         "direction": 0,
         "tick_ms": TICK_MS,

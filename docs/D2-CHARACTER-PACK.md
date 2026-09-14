@@ -19,13 +19,13 @@ operator's install changes. A bot can offer it as an opt-in ("D2 layout") and fe
 | `manifest.json` | `format` = `bnetcc-d2-characters`, `version` = 1, the rules below, and the tables they use. |
 | `palette.bin` | 256 RGB triples — the game's palette. Every GIF carries the same table. |
 | `tints.bin` | 8 × 21 × 256 bytes: map for transform `t` (1..8) and colour `c` (0..20) at `((t - 1) × 21 + c) × 256`, palette index → palette index. |
-| `parts/<class>/<name>.gif` | One body-part graphic facing direction 0: every frame, full size, palette index 0 transparent. |
+| `parts/<class>/<name>.gif` | One body-part graphic, facing the viewer as the character screen draws it: every frame, full size, palette index 0 transparent. |
 
 Manifest tables:
 
 | Key | Meaning |
 |---|---|
-| `direction`, `tick_ms` | 0 (the character screen's facing) and 40 (milliseconds per tick). |
+| `direction`, `tick_ms` | 0 (the character screen's facing index; `order` is indexed by it, and the parts were taken from the file direction it maps to) and 40 (milliseconds per tick). |
 | `classes`, `modes`, `components`, `weapon_classes` | Token lists the rules index: `classes[0]` = `AM` … `[6]` = `AI`; `components` = `HD TR LG RA LA RH LH SH S1…S8`; `weapon_classes[1]` = `hth`, then `1ht 2ht 1hs 2hs bow xbw stf 1js 1jt 1ss 1st ht1 ht2`. |
 | `hand_pairs` | 15 × 15: weapon class for `[right hand class][left hand class]`; 0 = impossible. |
 | `slots` | 256 entries, by graphics value: `code`, `hand`, `two_handed`, `reserved_hand`, `armor`, `helm`. The same values `d2-equipment.json` uses. |
@@ -67,7 +67,10 @@ them.
 From the 1.14d `Game.exe`, reproduced in `d2_data::character` (addresses in its comments): the
 character screen builds its figure from the portrait (`0x005066C0`), picks the stance
 (`0x00439210`), the weapon class (`0x00504AF0`), the part files (`0x00503740`) and the tints
-(`0x005038D0`), and draws the COF's layers each frame (`0x00503BA0`). The animation files are DCCs
+(`0x005038D0`), and draws the COF's layers each frame (`0x00503BA0`). Its facing index 0 selects
+the COF's draw-order row 0, but each sprite file's frames through a direction table
+(`0x00600C70`): in the 16-direction character files that is direction 4, straight toward the
+viewer. The animation files are DCCs
 and COFs from the operator's MPQs, decoded by `d2_formats::dcc` (written from Bilian Belchev's DCC
 format description, with one correction — a cell's encoding-type bit is present only when its pixel
 mask is non-zero) and `d2_formats::cof`.

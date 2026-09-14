@@ -21,7 +21,9 @@
 //!   overflowed), 3 and 4 have no maps, colours past 20 are untinted (`0x005038D0`). The maps are
 //!   `data\global\items\palette\{grey,grey2,gold,brown,greybrown,invgrey,invgrey2,invgreybrown}.dat`,
 //!   21 of 256 bytes each (`0x00505550`).
-//! - **Frames.** Direction 0, layers in the COF's order for each frame. A counter in 256ths of a
+//! - **Frames.** Facing 0, layers in the COF's order for each frame. The COF's draw order is
+//!   indexed by the facing itself; a part's frames come from the file direction the facing maps
+//!   to (`0x00600C70`) — for the 16-direction character files, direction 4, toward the viewer. A counter in 256ths of a
 //!   frame advances by the COF's speed each drawn frame and restarts when it reaches the last
 //!   frame, so the last frame is never shown.
 
@@ -386,11 +388,20 @@ impl CharacterArt {
         Look { class, mode, weapon_class, parts, tints }
     }
 
+    /// The file direction a facing index draws in a sprite file with `directions` directions
+    /// (`0x00600C70`).
+    #[must_use]
+    pub fn file_direction(&self, directions: usize, facing: usize) -> usize {
+        let row = if directions == 0 { 0 } else { directions.trailing_zeros() as usize + 1 };
+        let index = self.tables.file_directions.get(row).and_then(|r| r.get(facing % 32)).copied().unwrap_or(0);
+        usize::try_from(index).ok().filter(|&i| i < directions.max(1)).unwrap_or(0)
+    }
+
     fn token(codes: &[Code], index: usize) -> String {
         codes.get(index).map_or_else(String::new, |c| String::from_utf8_lossy(c).trim_end_matches([' ', '\0']).to_string())
     }
 
-    /// Draw an appearance: the character screen's animation, facing direction 0.
+    /// Draw an appearance: the character screen's animation, facing the viewer.
     ///
     /// # Errors
     ///
@@ -419,8 +430,8 @@ impl CharacterArt {
             );
             let Some(bytes) = self.archives.read(&name)? else { continue };
             let file = Dcc::parse(&bytes).map_err(|e| Error::Dcc(name.clone(), e))?;
-            let index = direction * file.directions() / cof.directions.max(1);
-            let decoded = file.direction(index).map_err(|e| Error::Dcc(name.clone(), e))?;
+            let facing = direction * file.directions() / cof.directions.max(1);
+            let decoded = file.direction(self.file_direction(file.directions(), facing)).map_err(|e| Error::Dcc(name.clone(), e))?;
             let tint = look.tints[c].map(|(t, colour)| t * COLOURS + colour);
             parts.insert(layer.component, (decoded, tint));
         }
@@ -495,7 +506,7 @@ pub struct PackAnimation {
     pub order: Vec<Vec<u8>>,
 }
 
-/// One part's frames facing direction 0.
+/// One part's frames, facing the viewer as the character screen draws it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackPart {
     /// `<class><component><code><mode><layer weapon class>`, upper case, e.g. `BAHDCAPTNHTH`.
@@ -559,7 +570,7 @@ pub struct Pack {
 }
 
 impl CharacterArt {
-    /// Collect every animation and part the character screen can draw, facing direction 0.
+    /// Collect every animation and part the character screen can draw, facing the viewer.
     ///
     /// # Errors
     ///
@@ -602,7 +613,8 @@ impl CharacterArt {
                             let path = format!("data\\global\\chars\\{class}\\{component}\\{name}.dcc");
                             let Some(bytes) = self.archives.read(&path)? else { continue };
                             let file = Dcc::parse(&bytes).map_err(|e| Error::Dcc(path.clone(), e))?;
-                            let d = file.direction(0).map_err(|e| Error::Dcc(path.clone(), e))?;
+                            let facing = self.file_direction(file.directions(), 0);
+                            let d = file.direction(facing).map_err(|e| Error::Dcc(path.clone(), e))?;
                             if d.width == 0 || d.frames.is_empty() {
                                 continue;
                             }
@@ -825,6 +837,9 @@ mod tests {
         let mut a = Appearance { class: 4, status: 0x20, graphics: [0xFF; 16], tints: [0xFF; 16] };
         let look = art.look(&a);
         assert_eq!((look.class, look.mode, look.weapon_class), (4, MODE_TOWN_NEUTRAL, HAND_TO_HAND));
+        assert_eq!(art.file_direction(16, 0), 4, "the screen's facing is file direction 4, toward the viewer");
+        assert_eq!(art.file_direction(8, 0), 4);
+        assert_eq!(art.file_direction(1, 0), 0);
         let naked = art.render(&a).unwrap();
         assert_eq!(naked.frames.len(), 15);
         assert!(naked.frames.iter().all(|f| f.iter().any(|&p| p != 0)));
