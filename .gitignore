@@ -11,3 +11,7 @@ node.key
 /verify.log
 /.claude/
 /files/
+
+# bnet.cc ladder pages: the site's own settings and pushed standings
+web/bnet.cc/ladder-config.php
+web/bnet.cc/data/
