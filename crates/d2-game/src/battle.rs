@@ -18,6 +18,9 @@
 //! - Whether a hit makes the victim flinch (`0x0057CB00`): never below a sixteenth of its maximum
 //!   life for physical damage, always from a quarter.
 //! - Animation lengths and hit frames come from `animdata.d2`.
+//! - Stamina (`0x0057F240`, `0x00580500`): running outside a town spends `RunDrain × 2` 256ths a
+//!   frame; standing gains a 256th of the maximum a frame, walking half that, and swinging or
+//!   running nothing. On Battle.net the server does this and tells the client.
 //! - The packets' shapes and pacing are from a recorded retail fight (bnemu
 //!   `docs/d2/re/combat.md`): a kill is `DYING`, then `DEAD` one death animation later; a
 //!   monster's walk glides at a fixed speed whatever its class.
@@ -71,6 +74,8 @@ pub const PLAYER_REACH: i32 = 6;
 const MAX_CATCH_UP: u64 = 5 * FRAMES_PER_SECOND;
 /// Unarmed damage.
 const FIST_DAMAGE: (i32, i32) = (1, 2);
+/// Least frames between two stamina updates to a client.
+const VITALS_EVERY: u64 = 5;
 /// Player animation tokens by class.
 const CLASS_TOKENS: [&str; 7] = ["AM", "SO", "NE", "PA", "BA", "DZ", "AI"];
 
@@ -262,6 +267,18 @@ pub fn life_byte(life: i32, max: i32) -> u8 {
     (i64::from(life) * 128 / i64::from(max)).clamp(1, 128) as u8
 }
 
+/// How a player is moving, for stamina.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Motion {
+    /// Standing still.
+    #[default]
+    Standing,
+    /// Walking.
+    Walking,
+    /// Running.
+    Running,
+}
+
 /// A player in the fight. Life, mana and stamina are 256ths, as the engine keeps them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Hero {
@@ -284,6 +301,11 @@ struct Hero {
     attack_frames: u64,
     hit_frame: u64,
     dying_frames: u64,
+    motion: Motion,
+    run_drain: i32,
+    /// Whole stamina the client was last told, and when.
+    told_stamina: u16,
+    told_at: u64,
 }
 
 impl Hero {
@@ -295,9 +317,31 @@ impl Hero {
         self.attributes[usize::from(stat::DEXTERITY)] / 4
     }
 
-    fn vitals(&self, name: &str) -> Event {
+    /// Its life, mana and stamina for its client, noting what was told when.
+    fn vitals(&mut self, name: &str, now: u64) -> Event {
         let whole = |v: i32| (v.max(0) >> 8).min(0x7FFF) as u16;
+        (self.told_stamina, self.told_at) = (whole(self.stamina), now);
         Event::PlayerVitals { player: name.to_string(), life: whole(self.life), mana: whole(self.mana), stamina: whole(self.stamina) }
+    }
+
+    /// One frame of stamina (`0x0057F240` drain, `0x00580500` regeneration).
+    fn stamina_step(&mut self, now: u64) {
+        let in_town = self.at.is_some_and(|(_, _, level)| crate::population::is_town(level));
+        let swinging = now < self.swing_until;
+        let shift = match self.motion {
+            Motion::Running if !in_town => {
+                self.stamina = (self.stamina - (self.run_drain * 2).max(1)).max(0);
+                return;
+            }
+            _ if swinging => return,
+            Motion::Standing => 8,
+            Motion::Running => 9,
+            Motion::Walking if in_town || self.stamina >= 0x100 => 9,
+            Motion::Walking => return,
+        };
+        if self.stamina < self.max_stamina {
+            self.stamina = (self.stamina + (self.max_stamina >> shift)).min(self.max_stamina);
+        }
     }
 }
 
@@ -484,6 +528,10 @@ impl Battle {
             attack_frames,
             hit_frame: hit_frames(data, token, "A1", "hth", attack_frames / 2),
             dying_frames: anim_frames(data, token, "DT", "hth", 28),
+            motion: Motion::Standing,
+            run_drain: data.class(class).map_or(20, |c| c.run_drain),
+            told_stamina: (get(stat::STAMINA) >> 8) as u16,
+            told_at: 0,
         };
         self.heroes.insert(name.to_string(), hero);
     }
@@ -491,6 +539,13 @@ impl Battle {
     /// A player left.
     pub fn remove_player(&mut self, name: &str) {
         self.heroes.remove(name);
+    }
+
+    /// How a player is moving.
+    pub fn set_motion(&mut self, name: &str, motion: Motion) {
+        if let Some(h) = self.heroes.get_mut(name) {
+            h.motion = motion;
+        }
     }
 
     /// Where a player stands — world subtiles and level — and the rooms its client holds.
@@ -558,7 +613,7 @@ impl Battle {
         h.mana = h.max_mana;
         h.stamina = h.max_stamina;
         h.swing_until = self.frame;
-        vec![h.vitals(name)]
+        vec![h.vitals(name, self.frame)]
     }
 
     /// Run the battle up to `frame`, walking monsters on `open` ground.
@@ -591,6 +646,17 @@ impl Battle {
         let guids: Vec<u32> = self.monsters.keys().copied().collect();
         for guid in guids {
             self.monster_step(guid, open, events);
+        }
+        for (name, h) in &mut self.heroes {
+            if h.dead {
+                continue;
+            }
+            h.stamina_step(now);
+            let whole = (h.stamina >> 8) as u16;
+            let at_end = whole == 0 || h.stamina == h.max_stamina;
+            if whole != h.told_stamina && (now >= h.told_at + VITALS_EVERY || at_end) {
+                events.push(h.vitals(name, now));
+            }
         }
     }
 
@@ -839,17 +905,18 @@ impl Battle {
         let max_life = h.max_life >> 8;
         let flinch = flinches(&mut self.seed, damage, max_life);
         let dying_frames = h.dying_frames;
+        let now = self.frame;
         let h = self.heroes.get_mut(target).expect("checked");
         h.life -= damage << 8;
         let player = target.to_string();
         if h.life > 0 {
-            events.push(h.vitals(target));
+            events.push(h.vitals(target, now));
             events.push(Event::PlayerReaction { player, event: if flinch { reaction::GET_HIT } else { reaction::HIT_SOUND } });
             return;
         }
         h.life = 0;
         h.dead = true;
-        events.push(h.vitals(target));
+        events.push(h.vitals(target, now));
         events.push(Event::PlayerReaction { player: player.clone(), event: reaction::DYING });
         self.due.entry(self.frame + dying_frames.max(1)).or_default().push(Due::PlayerDead { player });
     }
@@ -922,13 +989,13 @@ mod tests {
 
     /// Made-up tables in the real shapes: one hostile class with 10 life, one friendly.
     fn data() -> GameData {
-        let mut cs = String::from("class\tstr\tdex\tint\tvit\ttot\tstamina\thpadd\tToHitFactor\tLifePerLevel\tStaminaPerLevel\tManaPerLevel\tLifePerVitality\tStaminaPerVitality\tManaPerMagic\tStatPerLevel\r\n");
+        let mut cs = String::from("class\tstr\tdex\tint\tvit\ttot\tstamina\thpadd\tToHitFactor\tLifePerLevel\tStaminaPerLevel\tManaPerLevel\tLifePerVitality\tStaminaPerVitality\tManaPerMagic\tStatPerLevel\tRunDrain\r\n");
         for name in ["Amazon", "Sorceress", "Necromancer", "Paladin", "Barbarian"] {
-            cs.push_str(&format!("{name}\t30\t27\t10\t25\t0\t92\t30\t20\t8\t4\t4\t16\t4\t4\t5\r\n"));
+            cs.push_str(&format!("{name}\t30\t27\t10\t25\t0\t92\t30\t20\t8\t4\t4\t16\t4\t4\t5\t20\r\n"));
         }
         cs.push_str("Expansion\r\n");
         for name in ["Druid", "Assassin"] {
-            cs.push_str(&format!("{name}\t30\t27\t10\t25\t0\t92\t30\t20\t8\t4\t4\t16\t4\t4\t5\r\n"));
+            cs.push_str(&format!("{name}\t30\t27\t10\t25\t0\t92\t30\t20\t8\t4\t4\t16\t4\t4\t5\t20\r\n"));
         }
         let mut exp = String::from("Level\tAmazon\tSorceress\tNecromancer\tPaladin\tBarbarian\tDruid\tAssassin\tExpRatio\r\nMaxLvl\t99\t99\t99\t99\t99\t99\t99\t10\r\n");
         for (level, v) in [(0, 0), (1, 20), (2, 60), (3, 1000)] {
@@ -1029,6 +1096,29 @@ mod tests {
         let revived = b.revive("hero");
         assert!(matches!(revived[..], [Event::PlayerVitals { life, .. }] if life > 0));
         assert!(!b.player_dead("hero"));
+    }
+
+    #[test]
+    fn running_out_of_town_spends_stamina_and_standing_gets_it_back() {
+        let data = data();
+        let mut b = battle(&data);
+        let open = |_: i32, _: i32| true;
+        // Far from the monster, in Blood Moor: 92 stamina, RunDrain 20 → 40/256 a frame.
+        b.place_player("hero", Some((1000, 1000, ROOM.level)), &[]);
+        b.set_motion("hero", Motion::Running);
+        let mut events = b.advance(&data, 125, &open);
+        events.extend(b.advance(&data, 250, &open));
+        let stamina: Vec<u16> = events.iter().filter_map(|e| if let Event::PlayerVitals { stamina, .. } = e { Some(*stamina) } else { None }).collect();
+        assert!(stamina.windows(2).all(|w| w[1] < w[0]), "falling: {stamina:?}");
+        assert_eq!(*stamina.last().unwrap(), (92 * 256 - 250 * 40) / 256, "ten seconds of running");
+        assert!(stamina.len() >= 30 && stamina.len() <= 50, "told every few frames, not every frame: {}", stamina.len());
+        b.set_motion("hero", Motion::Standing);
+        let mut events = b.advance(&data, 350, &open);
+        events.extend(b.advance(&data, 400, &open));
+        assert!(matches!(events.last(), Some(Event::PlayerVitals { stamina: 92, .. })), "full again within six seconds");
+        b.place_player("hero", Some((1000, 1000, 1)), &[]);
+        b.set_motion("hero", Motion::Running);
+        assert!(b.advance(&data, 500, &open).is_empty(), "the camp costs nothing");
     }
 
     #[test]

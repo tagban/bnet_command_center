@@ -641,10 +641,11 @@ impl GameServer {
     /// Run the game's fight up to now — one step per [`SERVER_FRAME`] since the game was
     /// created, whichever connection gets here first — sharing out what it produces, and hand
     /// back what `name`'s client is to be sent.
-    fn battle_step(&self, game_id: u16, name: &str) -> Vec<Vec<u8>> {
+    fn battle_step(&self, game_id: u16, name: &str, motion: battle::Motion) -> Vec<Vec<u8>> {
         let Some(rules) = &self.rules else { return Vec::new() };
         let mut g = self.lock();
         let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
+        game.battle.set_motion(name, motion);
         let due = (game.created.elapsed().as_micros() / SERVER_FRAME.as_micros()) as u64;
         if due > game.battle.frame() {
             let Game { battle, world, positions, views, population, outgoing, .. } = game;
@@ -805,6 +806,15 @@ impl Walker {
         self.target.is_some()
     }
 
+    /// Standing, walking or running, for stamina; `scale` is the server's speed scale.
+    fn motion(&self, scale: f64) -> battle::Motion {
+        match self.target {
+            None => battle::Motion::Standing,
+            Some(_) if self.speed >= RUN_SPEED * scale - 1e-9 => battle::Motion::Running,
+            Some(_) => battle::Motion::Walking,
+        }
+    }
+
     /// Head for `(x, y)`.
     fn go(&mut self, x: f64, y: f64, speed: f64) {
         self.target = Some((x, y));
@@ -891,7 +901,8 @@ async fn run(
                     flush(stream, peer, tables, &mut outbox).await?;
                 }
             }
-            for packet in server.battle_step(p.game_id, &p.character.name) {
+            let motion = walker.as_ref().map_or(battle::Motion::Standing, |w| w.motion(server.speed_scale));
+            for packet in server.battle_step(p.game_id, &p.character.name, motion) {
                 outbox.push(&packet);
             }
             if let (Some((guid, asked)), Some(w)) = (pending_attack, walker.as_mut()) {
@@ -1862,7 +1873,7 @@ pub(crate) mod tests {
                 let game = g.by_id.get_mut(&id).unwrap();
                 game.created = game.created.checked_sub(SERVER_FRAME).unwrap();
             }
-            out.extend(gs.battle_step(id, name));
+            out.extend(gs.battle_step(id, name, battle::Motion::Standing));
         }
         out
     }
