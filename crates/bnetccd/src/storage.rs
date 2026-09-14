@@ -121,6 +121,10 @@ enum Command {
     AllCharacters {
         resp: oneshot::Sender<Vec<Character>>,
     },
+    /// Turn every ladder character into a normal one; how many softcore and hardcore.
+    EndLadderSeason {
+        resp: oneshot::Sender<Result<(u32, u32), String>>,
+    },
     CreateCharacter {
         character: Character,
         resp: oneshot::Sender<Result<(), CreateCharacterError>>,
@@ -418,6 +422,16 @@ impl StorageHandle {
         rx.await.unwrap_or_default()
     }
 
+    /// End the ladder season for every character: each ladder character's status, in the realm
+    /// and in its `.d2s`, loses the ladder bit. How many softcore and hardcore characters changed.
+    pub async fn end_ladder_season(&self) -> Result<(u32, u32), String> {
+        let (resp, rx) = oneshot::channel();
+        if self.0.send(Command::EndLadderSeason { resp }).is_err() {
+            return Err("storage actor is gone".into());
+        }
+        rx.await.unwrap_or_else(|_| Err("storage actor is gone".into()))
+    }
+
     /// A realm character by name (realm-wide, case-insensitive). `None` on failure too.
     pub async fn character_by_name(&self, name: &str) -> Option<Character> {
         let (resp, rx) = oneshot::channel();
@@ -472,6 +486,42 @@ pub fn spawn(mut backend: Box<dyn Storage + Send>) -> StorageHandle {
                     }
                     Command::CharacterByName { name, resp } => {
                         let _ = resp.send(backend.character_by_name(&name).ok().flatten());
+                    }
+                    Command::EndLadderSeason { resp } => {
+                        use bnetcc_proto::d2::status::{HARDCORE, LADDER};
+                        let result = (|| {
+                            let (mut softcore, mut hardcore) = (0u32, 0u32);
+                            let mut offset = 0u64;
+                            loop {
+                                let page = backend.list_accounts(offset, 500)?;
+                                if page.is_empty() {
+                                    break;
+                                }
+                                offset += page.len() as u64;
+                                for account in page {
+                                    for mut character in backend.characters(account.id)? {
+                                        if character.status & LADDER == 0 {
+                                            continue;
+                                        }
+                                        character.status &= !LADDER;
+                                        if let Some(save) = character.save.as_deref().and_then(|b| d2_formats::d2s::Save::parse(b).ok()) {
+                                            let mut save = save;
+                                            save.set_status(save.status() & !LADDER);
+                                            character.save = Some(save.to_bytes());
+                                        }
+                                        backend.update_character(&character)?;
+                                        if character.status & HARDCORE != 0 {
+                                            hardcore += 1;
+                                        } else {
+                                            softcore += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            Ok::<_, StorageError>((softcore, hardcore))
+                        })()
+                        .map_err(|e| e.to_string());
+                        let _ = resp.send(result);
                     }
                     Command::AllCharacters { resp } => {
                         let mut all = Vec::new();
@@ -800,6 +850,28 @@ mod tests {
         assert!(h.ladder_rows("SEXP", League::Ladder).await.is_empty(), "ladders are per product");
         let normal = h.read_readable_attrs("Raynor", vec![AttrKey::new(r"Record\STAR\1\last game result")]).await;
         assert_eq!(normal.values().next().map(String::as_str), Some("LOSS"));
+    }
+
+    #[tokio::test]
+    async fn ending_the_season_takes_every_character_off_the_ladder() {
+        use bnetcc_proto::d2::status::{EXPANSION, HARDCORE, LADDER};
+        let h = spawn(Box::new(MemoryStorage::new()));
+        let acct = h.create_account("Season", Credential::Xsha1 { digest: [1u8; 20] }).await.unwrap();
+        for (name, status) in [("Soft", LADDER | EXPANSION), ("Hard", LADDER | HARDCORE), ("Plain", EXPANSION)] {
+            let save = d2_formats::d2s::Save::new(name, 1, status, 0, &[(12, 30)]).to_bytes();
+            let c = Character { account: acct.id, name: name.into(), class: 1, status, level: 30, progression: 2, created_at: 0, last_played: 0, save: Some(save) };
+            h.create_character(c).await.unwrap();
+        }
+        assert_eq!(h.end_ladder_season().await, Ok((1, 1)));
+        for c in h.all_characters().await {
+            let save = d2_formats::d2s::Save::parse(c.save.as_deref().unwrap()).unwrap();
+            assert_eq!(c.status & LADDER, 0, "{} is off the ladder", c.name);
+            assert_eq!(save.status() & LADDER, 0, "in its save too");
+            assert_eq!((c.level, save.stat(12)), (30, 30), "and keeps what it has");
+        }
+        let hard = h.character_by_name("Hard").await.unwrap();
+        assert_eq!(hard.status, HARDCORE, "still hardcore");
+        assert_eq!(h.end_ladder_season().await, Ok((0, 0)), "nothing left to convert");
     }
 
     #[tokio::test]

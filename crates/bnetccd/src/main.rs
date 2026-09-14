@@ -13,6 +13,7 @@ mod node;
 mod outbound;
 mod public_status;
 mod realm;
+mod season;
 mod session;
 mod stats_push;
 mod status;
@@ -227,6 +228,13 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
 
     // Staff bans persist to a JSON file next to the account database (in-memory storage keeps
     // them in memory only). Same derivation as the admin panel's `bnetccd-admin/`.
+    // The Diablo II ladder season lives beside them the same way.
+    let d2_season_path = (!cfg.storage.path.is_empty()).then(|| {
+        std::path::Path::new(&cfg.storage.path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("bnetccd-d2-season.json"), |p| p.join("bnetccd-d2-season.json"))
+    });
     let bans_path = if cfg.storage.path.is_empty() {
         None
     } else {
@@ -274,6 +282,7 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
             admins: cfg.admins.clone(),
             auto_op_private: cfg.channels.auto_op_private,
             min_game_length: bnetcc_core::ladder::MIN_GAME_LENGTH,
+            d2_season_path,
             channel_rules: cfg.channel_rules()?,
             cd_key_uniqueness: cfg.limits.cd_key_uniqueness,
             channel_caps: node::ChannelCaps {
