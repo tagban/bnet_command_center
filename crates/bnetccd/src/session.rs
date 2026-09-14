@@ -29,6 +29,7 @@ use bnetcc_proto::error::FourCc;
 use bnetcc_proto::line::{decode_line, encode_line, gateway_message};
 use bnetcc_proto::product;
 use bnetcc_proto::statstring;
+use bnetcc_proto::w3general;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -902,6 +903,9 @@ impl Bncs {
             // right after logon). Serving real data is future work (docs/ROADMAP.md).
             sid::FRIENDSLIST => self.friends_list(),
             sid::NEWS_INFO => self.news_info(),
+            // WarCraft III matchmaking, profile and icon requests — the empty answers until
+            // the ladder exists (docs/WARCRAFT3-MATCHMAKING.md).
+            sid::WARCRAFTGENERAL => self.warcraft_general(frame),
             // Keepalive, the UDP detection reply, legacy-logon informational packets, and
             // advertisement telemetry — all accepted but not acted on.
             sid::NULL
@@ -2667,6 +2671,36 @@ impl Bncs {
         self.send(&Frame::new(sid::NEWS_INFO, w.finish()))
     }
 
+    /// `SID_WARCRAFTGENERAL` (0x44). There is no ladder yet, so the requests that have a truthful
+    /// empty answer get it: no tournament (the client polls every ~11 minutes), a profile and a
+    /// clan record with no ladder games, no icons to choose. The map list and searches need
+    /// matchmaking (docs/WARCRAFT3-MATCHMAKING.md §7) and are logged, not answered.
+    fn warcraft_general(&mut self, frame: &Frame) -> Step {
+        if !matches!(self.product, Some(p) if p == product::WAR3 || p == product::W3XP) {
+            return Step::Continue;
+        }
+        let reply = match w3general::parse(&frame.body) {
+            Ok(w3general::Request::Tournament { cookie }) => w3general::no_tournament(cookie),
+            Ok(w3general::Request::UserRecord { cookie, product, .. }) => {
+                w3general::empty_user_record(cookie, w3general::race_records(product))
+            }
+            Ok(w3general::Request::ClanRecord { cookie, product, .. }) => {
+                w3general::empty_clan_record(cookie, w3general::race_records(product))
+            }
+            Ok(w3general::Request::IconList { cookie }) => w3general::empty_icon_list(cookie),
+            Ok(w3general::Request::SetIcon { .. }) => return Step::Continue,
+            Ok(request) => {
+                info!(peer = %self.peer, ?request, "WarCraft III matchmaking request not answered: no ladder yet");
+                return Step::Continue;
+            }
+            Err(e) => {
+                debug!(peer = %self.peer, error = %e, "malformed SID_WARCRAFTGENERAL");
+                return Step::Continue;
+            }
+        };
+        self.send(&Frame::new(sid::WARCRAFTGENERAL, reply))
+    }
+
     /// `SID_GETADVLISTEX` (0x09): return the games this node knows about, filtered the way
     /// a client expects: only its **own product** (a WarCraft III client cannot parse a
     /// StarCraft statstring, nor the reverse), by **exact name** when one is given (this
@@ -3507,6 +3541,26 @@ mod tests {
         // Shown realm-qualified, the way Battle.net has shown WC3 users since launch
         // (Name@Azeroth). This keeps them distinct from any X-SHA-1 account of the same name.
         assert_eq!(enter_chat_name(&mut s).await, "Tagban@bncc");
+    }
+
+    #[tokio::test]
+    async fn warcraft_three_profile_and_tournament_requests_get_empty_answers() {
+        let addr = spawn_server().await;
+        let mut s = wc3_handshake(addr, 510).await;
+        assert_eq!(wc3_create(&mut s, "Grunt", "zugzug").await, nls_status::CREATE_OK);
+        assert_eq!(wc3_logon(&mut s, "Grunt", "zugzug").await, Ok(()));
+        // The map list at logon is not answered yet; the next request's reply is the first.
+        let map_list = [2u8, 1, 0, 0, 0, 1, 0x4c, 0x52, 0x55, 0, 0, 0, 0, 0];
+        send_frame(&mut s, &Frame::new(sid::WARCRAFTGENERAL, map_list.to_vec())).await;
+        // The tournament poll, as the 1.27b client sends it.
+        send_frame(&mut s, &Frame::new(sid::WARCRAFTGENERAL, vec![7, 0x1a, 0, 0, 0])).await;
+        let reply = recv_frame(&mut s).await;
+        assert_eq!((reply.id, reply.body.len(), &reply.body[..6]), (sid::WARCRAFTGENERAL, 25, &[7, 0x1a, 0, 0, 0, 0][..]));
+        let mut profile = Writer::with_capacity(16);
+        profile.u8(w3general::sub::USER_RECORD).u32(4).cstr(b"Grunt").fourcc(product::W3XP);
+        send_frame(&mut s, &Frame::new(sid::WARCRAFTGENERAL, profile.finish())).await;
+        let reply = recv_frame(&mut s).await;
+        assert_eq!(reply.body, w3general::empty_user_record(4, 6));
     }
 
     #[tokio::test]

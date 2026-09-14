@@ -77,7 +77,7 @@ whether an unanswered request blocks the UI.
 | 10 | `0x0C SID_JOINCHANNEL` flag `0x01`, product default channel | join | ✅ per-product default channel exists |
 | 11 | `0x65 SID_FRIENDSLIST` | friends list (may be empty) | ✅ empty list |
 | 12 | `0x46 SID_NEWS_INFO` | news (may be empty) | ✅ zero entries |
-| 13 | `0x44 SID_WARCRAFTGENERAL` sub `0x07 WID_TOURNAMENT`, `0x09 WID_ICONLIST`, later `0x04 WID_USERRECORD` (profile), `0x08 WID_CLANRECORD` | per-subcommand replies | ⚠️ unhandled; Atlas also ignores them |
+| 13 | `0x44 SID_WARCRAFTGENERAL` sub `0x02 WID_MAPLIST` (at logon), `0x07 WID_TOURNAMENT` (on entering chat, then every ~11 min), later `0x04 WID_USERRECORD` (profile), `0x08 WID_CLANRECORD`, `0x09 WID_ICONLIST` | per-subcommand replies | ⚠️ tournament/profile/clan/icons get empty answers; map list and search unanswered — `WARCRAFT3-MATCHMAKING.md` |
 | 14 | `0x7D SID_CLANMEMBERLIST`, and we push `0x75 SID_CLANINFO` at login for clan members | clan state | ❌ phase 3 (§5) |
 | 15 | `0x2D SID_GETICONDATA` → BNFTP `icons-WAR3.bni` | file | ✅ (an MPQ, served verbatim) |
 

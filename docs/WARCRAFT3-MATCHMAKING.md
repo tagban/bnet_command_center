@@ -156,6 +156,9 @@ unanswered):
 | Every ~11 minutes in a channel | `07 1a000000`, `07 1b000000`, … | `WID_TOURNAMENT` again, cookie counting up |
 | In a channel (opening Play Game) | `02 02000000 03` + `'\0MAP'`, `'TYPE'`, `'DESC'`, checksum 0 | `WID_MAPLIST` for the three blocks that screen needs |
 
+A `WID_GAMESEARCH` posted as a comment on BNETDocs' C>S page pins the field positions: `00 06000000
+00000000 00 00 3f0a 0000 08 2003ff00 08000000` is cookie 6, a 1v1, map mask `0x0A3F`, and Undead.
+
 No `WID_ICONLIST`, `WID_USERRECORD` or `WID_GAMESEARCH` appeared: the client likely waits for
 the map list before offering them. So the login-time `WID_MAPLIST` reply is the first thing to
 build. **Arranged Teams** uses `0x60 SID_GAMEPLAYERSEARCH` (C>S request, S>C the list of friends
@@ -273,7 +276,7 @@ What is missing: the §3.2 "match found" message, every §3.3 route message layo
 
 | Phase | What | Needs | Done when |
 |---|---|---|---|
-| 0 | `0x44` answers from BNETDocs layouts: `WID_TOURNAMENT` (none), `WID_ICONLIST` (tiers, nothing unlocked), `WID_USERRECORD`/`WID_CLANRECORD` (zeros), `WID_SETICON` (stored) | nothing | the 11-minute `WID_TOURNAMENT` polls get answers and the login stays clean |
+| 0 | `0x44` answers from BNETDocs layouts: `WID_TOURNAMENT` (none), `WID_ICONLIST` (nothing), `WID_USERRECORD`/`WID_CLANRECORD` (zeros), `WID_SETICON` (accepted) — **built** (`bnetcc_proto::w3general`, `Session::warcraft_general`), awaiting a client test | nothing | the 11-minute `WID_TOURNAMENT` polls get answers and the login stays clean |
 | 1 | `WID_MAPLIST` blocks from config (URLs, map paths, types, descriptions, ladder links), answering the login-time request for all five | compression confirmed (a capture, or try zlib against the client) | "problem receiving required matchmaking data" is gone; Play Game shows types and maps with thumbs |
 | 2 | `ladder::war3` rules + storage + profile records from storage + web page | the Charts 2/3 reading (§2.4) | tests from §2's tables; profile shows real records |
 | 3 | Matchmaker + `WID_GAMESEARCH`/`WID_CANCELSEARCH` + "match found" | §5 capture | two clients get matched and sent to the route port |
