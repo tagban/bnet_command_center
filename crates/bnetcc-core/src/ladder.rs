@@ -12,6 +12,8 @@
 //! on the ladder, [`LADDER_MIN_WINS`]) is recorded here but not enforced: how the client is told
 //! no has not been confirmed.
 
+pub mod war3;
+
 /// A game's league, from `SID_GAMERESULT`'s game type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum League {
