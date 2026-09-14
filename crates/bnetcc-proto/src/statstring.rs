@@ -139,7 +139,7 @@ pub fn build_default(product: FourCc) -> Vec<u8> {
 pub struct Record {
     /// Ladder rating; 0 without ladder games.
     pub rating: u32,
-    /// Ladder rank, 1-based; 0 when unranked. ⚠️ 1-based is unconfirmed against a capture.
+    /// Ladder rank, 1 the best; 0 when unranked (below 500, the server's lowest rank).
     pub rank: u32,
     /// Normal-game wins.
     pub wins: u32,

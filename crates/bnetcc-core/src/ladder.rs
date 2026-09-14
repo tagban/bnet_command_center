@@ -53,6 +53,10 @@ pub const START_RATING: u32 = 1000;
 pub const K_FACTOR: f64 = 32.0;
 /// Normal-game wins classic Battle.net required before ladder play (not enforced).
 pub const LADDER_MIN_WINS: u32 = 10;
+/// The lowest rank a ladder lists: ranks run from 1, the best, to this; everyone below is
+/// unranked. Classic Battle.net went to 5,000; this server will not see that many players
+/// (tagban, 2026-09-14). Every ladder — StarCraft, Warcraft II, Diablo II, WarCraft III — uses it.
+pub const MAX_RANK: u32 = 500;
 
 /// How a game went for one player.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,8 +137,8 @@ impl LadderRow {
     }
 }
 
-/// Standings: players with a ladder game, in `sort` order (ties by rating, then name). A
-/// player's 0-based rank is its index.
+/// Standings: players with a ladder game, in `sort` order (ties by rating, then name), the top
+/// [`MAX_RANK`] only. A player's rank is its index + 1; the ladder packets carry the index.
 #[must_use]
 pub fn standings(mut rows: Vec<LadderRow>, sort: SortMethod) -> Vec<LadderRow> {
     rows.retain(|r| r.games() > 0);
@@ -146,10 +150,11 @@ pub fn standings(mut rows: Vec<LadderRow>, sort: SortMethod) -> Vec<LadderRow> {
         };
         key(b).cmp(&key(a)).then(b.rating.cmp(&a.rating)).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
+    rows.truncate(MAX_RANK as usize);
     rows
 }
 
-/// A player's 0-based rank in `standings`, `None` if unranked.
+/// A player's index in `standings` (its rank − 1), `None` if unranked.
 #[must_use]
 pub fn rank_of(standings: &[LadderRow], name: &str) -> Option<u32> {
     standings.iter().position(|r| r.name.eq_ignore_ascii_case(name)).map(|i| i as u32)
@@ -192,5 +197,15 @@ mod tests {
         assert_eq!(by_wins[0].name, "Bob");
         let by_games = standings(rows, SortMethod::Games);
         assert_eq!(by_games.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["Bob", "Zed", "amy"]);
+    }
+
+    #[test]
+    fn nobody_below_rank_500_is_ranked() {
+        let rows: Vec<LadderRow> = (0..600).map(|i| row(&format!("p{i:03}"), 1, 0, 2000 - i)).collect();
+        let ladder = standings(rows, SortMethod::Rating);
+        assert_eq!(ladder.len(), MAX_RANK as usize);
+        assert_eq!(rank_of(&ladder, "p000"), Some(0), "rank 1");
+        assert_eq!(rank_of(&ladder, "p499"), Some(499), "rank 500");
+        assert_eq!(rank_of(&ladder, "p500"), None, "rank 501 is unranked");
     }
 }

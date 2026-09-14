@@ -567,7 +567,8 @@ fn experience_of(character: &Character) -> u32 {
 }
 
 /// The `MCP_REQUESTLADDERDATA` reply for `ladder` from `start`: the ladder characters of that
-/// kind, most experienced first, sixteen at a time (BNETDocs layout). Header `u8` ladder type,
+/// kind, most experienced first, down to rank 500 (`bnetcc_core::ladder::MAX_RANK`), sixteen at a
+/// time (BNETDocs layout). Header `u8` ladder type,
 /// `u16` total payload size, `u16` this chunk's size, `u16` its offset — one chunk here — then
 /// `u32` first entry's rank, `u32` entries, `u32` 16, and per entry `u32` experience low and high
 /// words, `u8` flags (class, `0x08` the asker's own, `0x10` dead, `0x20` hardcore, `0x40`
@@ -585,6 +586,7 @@ pub fn ladder_reply(characters: &[Character], ladder: u8, start: u16, asker: bne
         None => Vec::new(),
     };
     listed.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.level.cmp(&a.0.level)).then_with(|| a.0.name.cmp(&b.0.name)));
+    listed.truncate(bnetcc_core::ladder::MAX_RANK as usize);
     let page: Vec<&(&Character, u32)> = listed.iter().skip(usize::from(start)).take(16).collect();
     let mut payload = Writer::with_capacity(12 + page.len() * 28);
     payload.u32(u32::from(start)).u32(page.len() as u32).u32(16);
@@ -652,5 +654,8 @@ mod tests {
         let barbarians = ladder_reply(&chars, 0x20, 0, 1);
         assert_eq!(u32::from_le_bytes(barbarians[11..15].try_into().unwrap()), 1);
         assert_eq!(u32::from_le_bytes(ladder_reply(&chars, 0x1B, 16, 1)[11..15].try_into().unwrap()), 0, "past the end");
+
+        let crowd: Vec<Character> = (0..510).map(|i| hero(&format!("c{i}"), 7, 4, LADDER | EXPANSION, 10, 100_000 - i)).collect();
+        assert_eq!(u32::from_le_bytes(ladder_reply(&crowd, 0x1B, 496, 1)[11..15].try_into().unwrap()), 4, "ranks 497 to 500, and no further");
     }
 }
