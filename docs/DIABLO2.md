@@ -130,11 +130,15 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
    verified 2026-09-13).
    Shrines and wells stand where they should, with their names (using them does nothing yet;
    verified 2026-09-13). Cold Plains' waypoint is always beside the way in from Blood Moor.
-   Otherwise the areas are empty — no monsters, and cave entrances do not lead anywhere. Walking through a fence can make the server think you are somewhere
+   *Expect monsters:* each area fills with its own kinds as you approach — Blood Moor's
+   zombies, quill rats and packs of fallen, Cold Plains' brutes, dark ones and shamans with
+   their fallen, and so on, 50–160 an area. They stand still where they spawned (some inside
+   trees or rocks: there is no collision yet), cannot be hurt and do not attack. Cave
+   entrances do not lead anywhere. Walking through a fence can make the server think you are somewhere
    you are not (it has no collision).
 4. *Expect nothing else to work:* life/mana/stamina show (level-1 values from
-   `charstats.txt`), NPCs never walk, there is no combat, no shop and no travel to other
-   acts. Esc → Save and Exit returns to chat (verified).
+   `charstats.txt`), NPCs and monsters never move, there is no combat, no shop and no travel
+   to other acts. Esc → Save and Exit returns to chat (verified).
 5. Send the log from the moment you clicked Create Game.
 
 What it shows, in order:

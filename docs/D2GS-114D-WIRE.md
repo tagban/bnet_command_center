@@ -452,6 +452,31 @@ engine's is); operating them is not answered.
 player learns the waypoint either way; only an active one (mode 1 or 2) answers with the menu. The
 test does the same.
 
+### Monsters in the wilderness (2026-09-13)
+
+**Rosters.** At game start `AllocMonsterRegion` (`0x5479C0`) gives each level a region: on one seed
+stream `{game seed, 0x29A}`, level by level in id order, `MONREGION_PopulateMonsterTypes`
+(`0x5475E0`) draws up to `NumMon` (at most 13) distinct classes from `Levels.txt` `mon1..10`
+(`nmon1..10` past Normal), rerolling the first up to 20 times for a `rangedtype` class on a
+`rangedspawn` level, and keeps the `isSpawn` ones with their `Rarity`; `SEED_RollChampionPack`
+(`0x5BDB20`) then rolls champion looks on the same stream (not ported).
+
+**A room's monsters.** When a room is first populated, `MONSTER_SpawnRoomMonsters` (`0x54EC90`)
+takes `MonDen` (clamped to 10000) and walks `(height / 3) × (width / 3)` subtile slots. Each
+steps the game seed; a slot with low word mod 100000 ≤ `MonDen` rolls a class on the room's seed
+(`0x5BDE80`: a pick in the summed rarities, swapped for its `spawn` class when `placespawn` and the
+next roll mod 100 is over 20), then `MONSTERREGION_CheckSpawnDensity` (`0x5BE020`) decides a unique
+pack: short of `MonUMin`, a roll under the share of the level's rooms seen so far; short of
+`MonUMax`, a 6% roll. A plain spawn skips on `sparsePopulate` (a game-seed roll over it), then
+`SPAWN_SpawnMonsterWithMinions` (`0x54DF80`) places the class at a random spot inside the room
+(`0x54DC40`, with a collision probe) and adds `pick(MaxGrp - MinGrp + 1) + MinGrp - 1` more beside
+it (`0x5B2F70`); fallen and scarabs (base classes 19 and 91, `0x54EC40`) spawn one, and every
+monster's creation brings its `minion1`/`minion2` party (`PartyMin..PartyMax`). The test does this
+with random spots and no unique names, champions or wandering monsters; it leaves cliff and border
+pieces (`LvlPrest` 4–27) empty until collision is ported, and sends each monster as the NPCs are
+sent (`0xAC`, `0xAA`, `0x6D`), standing (mode 1) at full life. Act I's wilderness gets 50–160 a
+level (seeds 1, `0x12345678`, `0xBEEF`), from its roster, their minions and replacements only.
+
 ### Talking, the stash and the waypoint (2026-09-13)
 
 `0x13` `[type u32][guid u32]` (handler `0x54AA90`, type ≤ 5) goes to `0x548B00`:
@@ -535,8 +560,9 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
 - Waypoint travel to other acts (`0x53ACC0`), which needs their maps.
 - Movement: paths and collision (`0x64DEA0`, libd2 `path.zig`/`collision.zig`) in place of
   straight lines; cross-level near rooms by visibility slots (`0x66C220`); shrine init (`InitFn`
-  1) and the set pieces' map units (read at room init, not ported), then Blood Moor's monsters and
-  warps; NPC AI walking their DS1 paths (`0x666120`).
+  1) and the set pieces' map units (read at room init, not ported); collision (DT1 tiles) so
+  monsters stand and walk where the game lets them; monster AI, combat and experience; unique
+  packs and champions; NPC AI walking their DS1 paths (`0x666120`).
 - The byte at `0x68`+20 and the `0x6A`/`0x6C`/`0x6E` handlers.
 - A packet capture from the real engine (`docs/D2GS-RUST.md` §2 oracle) would confirm the dump
   faster than reading it; §4 and §6 say where to look in that capture.
