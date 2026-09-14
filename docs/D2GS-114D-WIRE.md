@@ -468,14 +468,31 @@ steps the game seed; a slot with low word mod 100000 ≤ `MonDen` rolls a class 
 next roll mod 100 is over 20), then `MONSTERREGION_CheckSpawnDensity` (`0x5BE020`) decides a unique
 pack: short of `MonUMin`, a roll under the share of the level's rooms seen so far; short of
 `MonUMax`, a 6% roll. A plain spawn skips on `sparsePopulate` (a game-seed roll over it), then
-`SPAWN_SpawnMonsterWithMinions` (`0x54DF80`) places the class at a random spot inside the room
-(`0x54DC40`, with a collision probe) and adds `pick(MaxGrp - MinGrp + 1) + MinGrp - 1` more beside
-it (`0x5B2F70`); fallen and scarabs (base classes 19 and 91, `0x54EC40`) spawn one, and every
-monster's creation brings its `minion1`/`minion2` party (`PartyMin..PartyMax`). The test does this
-with random spots and no unique names, champions or wandering monsters; it leaves cliff and border
-pieces (`LvlPrest` 4–27) empty until collision is ported, and sends each monster as the NPCs are
-sent (`0xAC`, `0xAA`, `0x6D`), standing (mode 1) at full life. Act I's wilderness gets 50–160 a
-level (seeds 1, `0x12345678`, `0xBEEF`), from its roster, their minions and replacements only.
+`SPAWN_SpawnMonsterWithMinions` (`0x54DF80`) places the group before the next slot rolls; fallen and
+scarabs (base classes 19 and 91, `0x54EC40`) spawn one. The test does this with no unique names,
+champions or wandering monsters, and sends each monster as the NPCs are sent (`0xAC`, `0xAA`,
+`0x6D`), standing (mode 1) at full life. Act I's wilderness gets 80–230 a level (seeds 1,
+`0x12345678`, `0xBEEF`), from its roster, their minions and replacements only.
+
+**Where they stand** (2026-09-14, read from the disassembly). `0x54DC40` rolls up to 20 spots on
+the room's seed inside the room inset by a subtile (`0x54DAC0`: `x + 1 + pick(w - 1)`, then y). A
+spot within `sqrt(Levels.txt WarpDist)` subtiles of where players arrive is skipped (`0x54DB50`:
+the level's waypoint tile, `0x66AD80`, and a list at `drlg+0x1E0` not identified yet); the rest
+get a dry-run placement. The placement core `0x5B2A00` searches around a point: `rings` −1 tests
+the point itself, otherwise rings of 3, 6, … `rings × 3` subtiles. Each ring steps the room seed
+once — an even low word enters on the top or bottom edge at `pick(c)` along it, an odd one on a
+side — then two more steps flip the offsets' signs, and it walks `8c` cells turning at the corners.
+A cell must be inside the room (`PtInRect`), pass a few classes' own checks (`0x5FD350`, not
+ported) and be clear in the collision map (`0x64D9B0`: MonStats2 `SizeX` 1 one subtile, 2 a cross,
+3 a 3×3 square; mask by `spawnCol` — blank `0x3C01`, 1 `0x1C0`, 2 `0x3F11`, 3 none). The group's
+first member is placed at the spot (another `rings` −1 probe), then `pick(MaxGrp - MinGrp + 1) +
+MinGrp - 1` more on its seed in rings of 3 around it (`0x5B2F70`). Every member's creation brings
+`rand(PartyMin..=PartyMax)` minions on its own seed (`0x4CC790`), `minion1` and `minion2` in turn,
+in rings of 4 around it (`0x5B2830`, `0x5B23C0`), before the next member. Not ported: the flying
+classes' placement (`spawnCol` 1, `0x5B2700`), objects' and monsters' exact footprints, and the coord
+lists `0x54EC90` really walks (from `0x61AD50`: sub-rects, each with an id at `+0x28` and a flag at
+`+0x20` that skips it; the test uses the whole room). Rooms of a `LvlPrest.txt` piece with `Populate` 0 get no monsters (their rooms carry the
+no-spawn flag, `DRLGROOMEX_AllocRoomExTypePreset`; where the engine tests it is not confirmed).
 
 ### Talking, the stash and the waypoint (2026-09-13)
 
@@ -598,9 +615,9 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
   player (stats, skills, items, states).
 - Shops: `0x38` trade/gamble/repair and the store's items; hirelings; NPC quest messages.
 - Waypoint travel to other acts (`0x53ACC0`), which needs their maps.
-- Collision for the town and other preset levels (the wilderness is done, §5 *Collision*), then
-  monster spots probed against it (`0x54DC40`), walk checks (`0x548EF0`) and paths (`0x64DEA0`,
-  `path.zig`) in place of straight lines; cross-level near rooms by visibility slots (`0x66C220`).
+- Collision for the town and other preset levels (the wilderness is done, §5 *Collision*; monster
+  spots use it), then walk checks (`0x548EF0`) and paths (`0x64DEA0`, `path.zig`) in place of
+  straight lines; cross-level near rooms by visibility slots (`0x66C220`).
 - bnemu (MIT, permission recorded in `docs/LEGAL.md`) has worked combat, monster AI, items and
   vendors to port from; its wilderness collision is approximate, so collision stays on libd2.
 - Monster AI, combat and experience; unique packs and champions; wandering monsters; NPCs
