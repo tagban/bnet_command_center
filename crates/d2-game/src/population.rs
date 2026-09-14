@@ -452,7 +452,8 @@ impl Population {
                     other => not_ported.push(format!("{other:?} at ({x}, {y})")),
                 }
             }
-            if let (Some(spot), Some(mut regions)) = (monsters, self.regions.take()) {
+            // Take the rosters only for a room that spawns: a town room must not drop them.
+            if let Some((spot, mut regions)) = monsters.and_then(|spot| Some((spot, self.regions.take()?))) {
                 let s = 5;
                 let area = (spot.area.x * s, spot.area.y * s, spot.area.w * s, spot.area.h * s);
                 let rect = Rect { left: area.0, top: area.1, right: area.0 + area.2, bottom: area.1 + area.3 };
@@ -704,6 +705,9 @@ mod tests {
             let town = PresetLevel::build(&data, &engine, &act, 1).unwrap();
             let world = d2_drlg::world::World::build(&data, &engine, &act, Some(&town), &d2_drlg::collision::TileSources::new());
             let mut pop = Population::new(seed).with_monsters(&data, seed, 0);
+            // A player starts in town: its rooms spawn no monsters and must leave the rosters.
+            let camp = RoomId { level: 1, index: 0 };
+            pop.activate(&data, 1, camp, world.units_in(camp), None);
             let collision = |x: i32, y: i32| world.collision_at(x, y);
             for level in world.levels().iter().filter(|l| (2..=7).contains(&l.id)) {
                 let roster: Vec<i32> = pop.regions.as_ref().unwrap().level(level.id).unwrap().roster().iter().map(|r| r.0).collect();
