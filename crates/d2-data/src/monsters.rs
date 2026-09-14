@@ -31,6 +31,8 @@ pub struct MonsterClass {
     pub interact: bool,
     /// `MonStats.txt` `npc` (flag bit 8).
     pub npc: bool,
+    /// `MonStats.txt` `Align` (record `+0x4C`): 1 for the player's side, 2 neutral, else hostile.
+    pub align: u8,
     /// `MonStats2.txt` `SizeX` (record `+8`): the shape a spot is tested with — 1 one subtile, 2
     /// a cross, 3 a 3×3 square (`0x0064D9B0`).
     pub size: u8,
@@ -128,7 +130,7 @@ impl Monsters {
                     sparse: int("sparsePopulate"),
                     base: class_of(row.get("BaseId")),
                 };
-                Some((class, MonsterClass { id, critter, components, interact: flag("interact"), npc: flag("npc"), size, spawn_collision, spawn }))
+                Some((class, MonsterClass { id, critter, components, interact: flag("interact"), npc: flag("npc"), align: int("Align") as u8, size, spawn_collision, spawn }))
             })
             .collect();
         Ok(Self { by_class, by_name })
@@ -144,6 +146,19 @@ impl Monsters {
     #[must_use]
     pub fn get(&self, class: i32) -> Option<&MonsterClass> {
         self.by_class.get(&class)
+    }
+}
+
+impl MonsterClass {
+    /// The alignment the engine gives a monster of this class (`0x005B2A00`): `Align` 1 is good
+    /// (2), 2 neutral (1), anything else evil (0).
+    #[must_use]
+    pub fn alignment(&self) -> u8 {
+        match self.align {
+            1 => 2,
+            2 => 1,
+            _ => 0,
+        }
     }
 }
 

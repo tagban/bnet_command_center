@@ -550,7 +550,8 @@ impl GameServer {
                     }
                     Spawned::Monster { guid, class, x, y, mode, life, ref components, ref variants } => {
                         packets.push(d2gs::assign_monster(guid, class, x, y, life, mode, components, variants));
-                        packets.push(d2gs::no_unit_states(unit_type::MONSTER, guid));
+                        let alignment = rules.monsters().get(i32::from(class)).map_or(0, d2_data::monsters::MonsterClass::alignment);
+                        packets.push(d2gs::alignment_state(unit_type::MONSTER, guid, alignment));
                         packets.push(d2gs::monster_standing(guid, x, y, life));
                     }
                 }
@@ -951,6 +952,10 @@ async fn enter_game(
     let (x, y) = p.spawn;
     // Unplaced: at (0, 0) the client creates the unit without looking for a room.
     outbox.push(&d2gs::assign_player(PLAYER_GUID, p.character.class, &p.character.name, 0, 0));
+    // SendUnitToClient's states for a player (0x00570E30): its alignment, good, which the engine
+    // sets as it creates the player (0x005348C0). Without it the client counts the player as evil
+    // like the monsters and will not let either side attack.
+    outbox.push(&d2gs::alignment_state(0, PLAYER_GUID, 2));
     // A fresh game's quests (every quest object starts available) and a new character's flags,
     // all clear: the client halts on entering a new area without them.
     outbox.push(&d2gs::quest_states(&[1; d2gs::QUESTS]));
@@ -1171,20 +1176,21 @@ pub(crate) mod tests {
         let ops: Vec<u8> = packets.iter().map(|p| p[0]).filter(|op| !(0x1D..=0x1F).contains(op)).collect();
         assert_eq!(
             ops,
-            vec![0x59, 0x5E, 0x28, 0x29, 0x0B, 0x23, 0x23, 0x95, 0x03, 0x53, 0x07, 0x15, 0x7E],
+            vec![0x59, 0xAA, 0x5E, 0x28, 0x29, 0x0B, 0x23, 0x23, 0x95, 0x03, 0x53, 0x07, 0x15, 0x7E],
             "the engine's order, one frame"
         );
-        assert_eq!(packets[1], d2gs::quest_states(&[1; d2gs::QUESTS]), "every quest available");
-        let stats: Vec<&[u8]> = packets[5..].iter().copied().take_while(|p| (0x1D..=0x1F).contains(&p[0])).collect();
+        assert_eq!(packets[1], d2gs::alignment_state(0, 1, 2), "the player's alignment: good");
+        assert_eq!(packets[2], d2gs::quest_states(&[1; d2gs::QUESTS]), "every quest available");
+        let stats: Vec<&[u8]> = packets[6..].iter().copied().take_while(|p| (0x1D..=0x1F).contains(&p[0])).collect();
         assert_eq!(stats.len(), 15, "every stat a new character starts with, right after 0x0B");
         assert!(stats.contains(&&[0x1E, stat::MAXHP, 0x00, 50][..]), "max life (20 vit + 30) << 8");
         assert!(stats.contains(&&[0x1D, stat::LEVEL, 1][..]));
         assert_eq!(&packets[0][6..13], b"TestBan", "the character's name in 0x59");
         assert_eq!(&packets[0][22..26], &[0, 0, 0, 0], "0x59 before placement: no position");
-        assert_eq!(packets[4], &[0x0B, 0, 1, 0, 0, 0], "then: that unit is yours");
-        assert_eq!(&packets[5 + 15 + 3][2..6], &FALLBACK_MAP_SEED.to_le_bytes(), "0x03 carries the seed");
-        assert_eq!(packets[5 + 15 + 5], d2gs::load_room(1152, 880, 1), "no town: the fallback seed's spawn room");
-        assert_eq!(&packets[5 + 15 + 6][6..10], &[0xA6, 0x16, 0x3D, 0x11], "placed on its waypoint (5798, 4413)");
+        assert_eq!(packets[5], &[0x0B, 0, 1, 0, 0, 0], "then: that unit is yours");
+        assert_eq!(&packets[6 + 15 + 3][2..6], &FALLBACK_MAP_SEED.to_le_bytes(), "0x03 carries the seed");
+        assert_eq!(packets[6 + 15 + 5], d2gs::load_room(1152, 880, 1), "no town: the fallback seed's spawn room");
+        assert_eq!(&packets[6 + 15 + 6][6..10], &[0xA6, 0x16, 0x3D, 0x11], "placed on its waypoint (5798, 4413)");
         assert_eq!(read_frame(&mut c, huffman).await, vec![0x04]);
 
         let mut ping = vec![0u8; 13];

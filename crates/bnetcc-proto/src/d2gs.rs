@@ -748,6 +748,32 @@ pub fn no_unit_states(unit_type: u8, guid: u32) -> Vec<u8> {
     w.finish()
 }
 
+/// The alignment state (`states.txt` 105) and its stat (`ItemStatCost.txt` 172, `Send Bits` 2).
+pub const ALIGNMENT_STATE: u32 = 0x69;
+const ALIGNMENT_STAT: u32 = 172;
+
+/// `0xAA` for a unit whose only state is its alignment (`0x00570E30`): state 105, then its stat
+/// list — stat 172 with the alignment in 2 bits, ended by `0x1FF` — or, for alignment 0, which
+/// the stat list does not keep, a clear flag; then `0xFF`. The client reads a unit's alignment
+/// only from this state (`0x006259B0`) and will not let two units of the same alignment attack
+/// each other (`0x00650D70`). The engine gives a player 2 (`0x005348C0`) and a monster its
+/// `MonStats.txt` `Align`: 1 → 2, 2 → 1, else 0 (`0x005B2A00` → `0x005543B0`).
+#[must_use]
+pub fn alignment_state(unit_type: u8, guid: u32, alignment: u8) -> Vec<u8> {
+    let mut bits = BitWriter::with_bytes(8);
+    bits.put(ALIGNMENT_STATE, 8);
+    if alignment == 0 {
+        bits.put(0, 1);
+    } else {
+        bits.put(1, 1).put(ALIGNMENT_STAT, 9).put(u32::from(alignment.min(3)), 2).put(0x1FF, 9);
+    }
+    bits.put(0xFF, 8);
+    let body = &bits.bytes[..bits.bytes_used()];
+    let mut w = Writer::with_capacity(7 + body.len());
+    w.u8(sc::UNIT_STATES).u8(unit_type).u32(guid).u8((7 + body.len()) as u8).bytes(body);
+    w.finish()
+}
+
 /// `0x6D`: `[guid u32][x u16][y u16][life u8]` (builder `0x0053BB70`) — what `0x00597E20` sends
 /// for a monster in its neutral mode, standing still.
 #[must_use]
@@ -976,6 +1002,9 @@ mod tests {
         assert_eq!(assign_object(3, 267, 5806, 4444, 0, 0), vec![0x51, 2, 3, 0, 0, 0, 0x0B, 0x01, 0xAE, 0x16, 0x5C, 0x11, 0, 0]);
         assert_eq!(object_state(5, true, 1), vec![0x0E, 2, 5, 0, 0, 0, 3, 1, 1, 0, 0, 0]);
         assert_eq!(no_unit_states(1, 9), vec![0xAA, 1, 9, 0, 0, 0, 8, 0xFF]);
+        // As the retail server sends them: an evil monster, and a good player or town NPC.
+        assert_eq!(alignment_state(1, 9, 0), vec![0xAA, 1, 9, 0, 0, 0, 0x0A, 0x69, 0xFE, 0x01]);
+        assert_eq!(alignment_state(0, 9, 2), vec![0xAA, 0, 9, 0, 0, 0, 0x0C, 0x69, 0x59, 0xF9, 0xFF, 0x1F]);
         assert_eq!(monster_standing(9, 1, 2, 0x80), vec![0x6D, 9, 0, 0, 0, 1, 0, 2, 0, 0x80]);
         assert_eq!((component_bits(0), component_bits(2), component_bits(3), component_bits(4), component_bits(5)), (1, 1, 2, 2, 3));
 
