@@ -24,6 +24,8 @@
 //! passage between them are near here and not in the engine; a client then loads terrain it
 //! cannot reach.
 
+use std::collections::HashMap;
+
 use d2_data::engine::EngineData;
 use d2_data::levels::DrlgType;
 use d2_data::GameData;
@@ -69,6 +71,9 @@ pub struct World {
     levels: Vec<WorldLevel>,
     /// Levels that would be walkable but could not be generated, with why.
     unbuilt: Vec<(i32, String)>,
+    /// Each room by level index and its 8×8 cell from the level's corner: every room starts on
+    /// that grid and is at most a cell wide.
+    cells: HashMap<(usize, i32, i32), usize>,
 }
 
 /// A level's rooms from its rectangle and generator.
@@ -195,7 +200,18 @@ impl World {
             };
             world.levels.push(WorldLevel { id, area, rooms, units, pieces, collision });
         }
+        world.index_cells();
         world
+    }
+
+    fn index_cells(&mut self) {
+        self.cells.clear();
+        for (li, level) in self.levels.iter().enumerate() {
+            for (ri, room) in level.rooms.iter().enumerate() {
+                let cell = ((room.x - level.area.x).div_euclid(ROOM_TILES), (room.y - level.area.y).div_euclid(ROOM_TILES));
+                self.cells.entry((li, cell.0, cell.1)).or_insert(ri);
+            }
+        }
     }
 
     /// What [`World::build`] could not generate — levels it left out, or rooms whose units it
@@ -208,7 +224,9 @@ impl World {
     /// A world from levels already cut into rooms (tests, or a caller with its own generator).
     #[must_use]
     pub fn from_levels(levels: Vec<WorldLevel>) -> Self {
-        Self { levels, unbuilt: Vec::new() }
+        let mut world = Self { levels, unbuilt: Vec::new(), cells: HashMap::new() };
+        world.index_cells();
+        world
     }
 
     /// The levels.
@@ -231,8 +249,8 @@ impl World {
     /// has a map.
     #[must_use]
     pub fn collision_at(&self, x: i32, y: i32) -> Option<u8> {
-        let id = self.room_at(x, y)?;
-        self.level(id.level)?.collision.get(id.index)?.at(x, y)
+        let (li, index) = self.room_index_at(x, y)?;
+        self.levels[li].collision.get(index)?.at(x, y)
     }
 
     /// The units standing in a room, in the order its level lists them.
@@ -249,11 +267,18 @@ impl World {
     /// The room holding a world subtile position.
     #[must_use]
     pub fn room_at(&self, x: i32, y: i32) -> Option<RoomId> {
+        let (li, index) = self.room_index_at(x, y)?;
+        Some(RoomId { level: self.levels[li].id, index })
+    }
+
+    fn room_index_at(&self, x: i32, y: i32) -> Option<(usize, usize)> {
         let (tx, ty) = (x.div_euclid(SUBTILES), y.div_euclid(SUBTILES));
         let inside = |c: &Coords| tx >= c.x && tx < c.x + c.w && ty >= c.y && ty < c.y + c.h;
-        let level = self.levels.iter().find(|l| inside(&l.area))?;
-        let index = level.rooms.iter().position(inside)?;
-        Some(RoomId { level: level.id, index })
+        let li = self.levels.iter().position(|l| inside(&l.area))?;
+        let level = &self.levels[li];
+        let cell = ((tx - level.area.x).div_euclid(ROOM_TILES), (ty - level.area.y).div_euclid(ROOM_TILES));
+        let index = self.cells.get(&(li, cell.0, cell.1)).copied().filter(|&i| inside(&level.rooms[i]))?;
+        Some((li, index))
     }
 
     /// The rooms near a room: its level's, reordered as the engine does, then other levels'.

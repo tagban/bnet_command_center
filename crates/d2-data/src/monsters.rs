@@ -31,6 +31,12 @@ pub struct MonsterClass {
     pub interact: bool,
     /// `MonStats.txt` `npc` (flag bit 8).
     pub npc: bool,
+    /// `MonStats2.txt` `SizeX` (record `+8`): the shape a spot is tested with — 1 one subtile, 2
+    /// a cross, 3 a 3×3 square (`0x0064D9B0`).
+    pub size: u8,
+    /// `MonStats2.txt` `spawnCol` (record `+0xA`): which collision bits keep it from standing
+    /// somewhere (`0x005B2A00`).
+    pub spawn_collision: u8,
     /// How the class spawns in a level's rooms.
     pub spawn: SpawnRules,
 }
@@ -85,7 +91,7 @@ impl Monsters {
                 return Err(Error::BadTable { table, problem: format!("no {column} column") });
             }
         }
-        let display: HashMap<String, (bool, [u8; 16])> = monstats2
+        let display: HashMap<String, (bool, [u8; 16], u8, u8)> = monstats2
             .rows()
             .filter_map(|row| {
                 let mut components = [0u8; 16];
@@ -93,7 +99,8 @@ impl Monsters {
                     let variants = row.get(column).map_or(0, |v| v.split(',').filter(|s| !s.trim().is_empty()).count());
                     *count = u8::try_from(variants).unwrap_or(u8::MAX);
                 }
-                Some((row.get("Id")?.to_ascii_lowercase(), (row.int("critter").unwrap_or(0) != 0, components)))
+                let byte = |c: &str| u8::try_from(row.int(c).unwrap_or(0)).unwrap_or(0);
+                Some((row.get("Id")?.to_ascii_lowercase(), (row.int("critter").unwrap_or(0) != 0, components, byte("SizeX"), byte("spawnCol"))))
             })
             .collect();
         let by_name: HashMap<String, i32> = monstats
@@ -106,7 +113,7 @@ impl Monsters {
             .filter_map(|row| {
                 let class = i32::try_from(row.int("hcIdx")?).ok()?;
                 let id = row.get("Id")?.to_string();
-                let &(critter, components) = display.get(&row.get("MonStatsEx")?.to_ascii_lowercase())?;
+                let &(critter, components, size, spawn_collision) = display.get(&row.get("MonStatsEx")?.to_ascii_lowercase())?;
                 let flag = |c: &str| row.int(c).unwrap_or(0) != 0;
                 let int = |c: &str| row.int(c).unwrap_or(0) as i32;
                 let spawn = SpawnRules {
@@ -121,7 +128,7 @@ impl Monsters {
                     sparse: int("sparsePopulate"),
                     base: class_of(row.get("BaseId")),
                 };
-                Some((class, MonsterClass { id, critter, components, interact: flag("interact"), npc: flag("npc"), spawn }))
+                Some((class, MonsterClass { id, critter, components, interact: flag("interact"), npc: flag("npc"), size, spawn_collision, spawn }))
             })
             .collect();
         Ok(Self { by_class, by_name })

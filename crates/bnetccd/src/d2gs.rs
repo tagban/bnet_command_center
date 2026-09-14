@@ -513,12 +513,16 @@ impl GameServer {
             let (Some(rules), Some(population)) = (&self.rules, &mut game.population) else {
                 continue;
             };
+            let collision = |x: i32, y: i32| world.collision_at(x, y);
             let monsters = world.levels().iter().find(|l| l.id == id.level).and_then(|level| {
-                // Until collision is ported, a cliff or border piece has no free ground to put a
-                // monster on: Act I's wild and cliff borders, cliff caves and river edges.
+                // A piece whose LvlPrest.txt row does not populate is flagged no-spawn
+                // (DRLGROOMEX_AllocRoomExTypePreset); its rooms get no monsters.
                 let piece = level.pieces.get(id.index).copied().unwrap_or(0);
-                (!d2_game::population::is_town(id.level) && !(4..=27).contains(&piece))
-                    .then_some(MonsterRoom { area: room, level_rooms: level.rooms.len() })
+                let populates = piece == 0 || rules.lvl_prests().by_def(piece).is_some_and(|r| r.populate);
+                let def = rules.levels().get(id.level)?;
+                let arrival = d2_game::population::arrival(rules, &level.units).map(|spot| (spot, def.warp_dist));
+                (!d2_game::population::is_town(id.level) && populates)
+                    .then_some(MonsterRoom { area: room, level_rooms: level.rooms.len(), collision: &collision, arrival })
             });
             let activated = population.activate(rules, id.level, id, world.units_in(id), monsters);
             for skipped in &activated.not_ported {

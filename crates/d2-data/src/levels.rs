@@ -52,6 +52,9 @@ pub struct LevelDef {
     pub sub_waypoint: i32,
     /// `SubShrine`: the `LvlSub.txt` group its shrines come from, -1 for none.
     pub sub_shrine: i32,
+    /// `WarpDist`: monsters do not spawn closer than its square root, in subtiles, to where
+    /// players arrive (`0x0054DB50`).
+    pub warp_dist: i32,
     /// What monsters its rooms spawn.
     pub monsters: LevelMonsters,
 }
@@ -124,6 +127,7 @@ impl Levels {
                 sub_theme: row.int("SubTheme").map_or(-1, |v| v as i32),
                 sub_waypoint: row.int("SubWaypoint").map_or(-1, |v| v as i32),
                 sub_shrine: row.int("SubShrine").map_or(-1, |v| v as i32),
+                warp_dist: int("WarpDist"),
                 monsters: LevelMonsters {
                     types: int("NumMon"),
                     ranged_first: int("rangedspawn") != 0,

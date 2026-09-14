@@ -18,7 +18,7 @@ use d2_drlg::rng::Seed;
 use d2_drlg::world::RoomId;
 use d2_drlg::Coords;
 
-use crate::spawn::{Group, Regions};
+use crate::spawn::{collision_mask, find_spot, probe, rand_range, Ground, Group, Rect, Regions};
 
 /// Engine unit types (`unit+0x00`).
 pub mod unit_type {
@@ -185,13 +185,40 @@ pub struct Population {
     regions: Option<Regions>,
 }
 
+/// The state a room's spawns share while it fills.
+struct Placing<'g, 't> {
+    game: &'g mut Seed,
+    room: &'g mut Seed,
+    ground: &'g mut Ground<'t>,
+    rect: Rect,
+    arrival: Option<((i32, i32), i32)>,
+}
+
 /// A room that spawns its level's monsters as it is populated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MonsterRoom {
+#[derive(Clone, Copy)]
+pub struct MonsterRoom<'a> {
     /// The room, in tiles.
     pub area: Coords,
     /// How many rooms its level has.
     pub level_rooms: usize,
+    /// Collision flags by world subtile, `None` where no room has a map.
+    pub collision: &'a dyn Fn(i32, i32) -> Option<u8>,
+    /// Where players arrive in the level — its waypoint's tile corner, in world subtiles
+    /// ([`arrival`]) — and `Levels.txt` `WarpDist`: spawns stay farther away than its square
+    /// root.
+    pub arrival: Option<((i32, i32), i32)>,
+}
+
+/// Where a level's players arrive, as monster spawns keep away from it (`0x0054DB50`): its first
+/// waypoint's tile corner (`0x0066AD80`), in world subtiles.
+#[must_use]
+pub fn arrival(data: &GameData, units: &[PlacedUnit]) -> Option<(i32, i32)> {
+    units.iter().find_map(|u| match u.class {
+        UnitClass::Object(class) if class <= 0x23C && data.objects().get(class).is_some_and(|o| o.sub_class & SUBCLASS_WAYPOINT != 0) => {
+            Some((u.x.div_euclid(5) * 5, u.y.div_euclid(5) * 5))
+        }
+        _ => None,
+    })
 }
 
 impl Population {
@@ -210,53 +237,48 @@ impl Population {
         self
     }
 
-    /// A monster spawned from the game seed: its guid, look and seed.
-    fn monster(&mut self, data: &GameData, class: i32, x: i32, y: i32) -> Option<(Spawned, Seed)> {
+    /// `0x005B2A00`: place a monster of `class` where [`probe`] finds room around (`x`, `y`) —
+    /// `rings` below 0 for that spot — take its guid and seed from the game seed, roll its look,
+    /// and unless `minions` is false bring its `PartyMin..=PartyMax` minions, `minion1` and
+    /// `minion2` in turn, each in rings of 4 around it (`0x005B2830`). Returns where it stands and
+    /// its seed.
+    #[allow(clippy::too_many_arguments)]
+    fn create(&mut self, data: &GameData, class: i32, at: (i32, i32), rings: i32, place: &mut Placing<'_, '_>, units: &mut Vec<Spawned>, minions: bool) -> Option<(i32, i32, Seed)> {
         let m = data.monsters().get(class).filter(|m| !m.critter)?;
-        let (guid, mut seed) = self.allocate(unit_type::MONSTER);
-        let (x, y) = (u16::try_from(x).ok()?, u16::try_from(y).ok()?);
+        let (x, y) = probe(place.room, place.ground, place.rect, at.0, at.1, rings, m.size, collision_mask(m.spawn_collision))?;
+        let (ux, uy) = (u16::try_from(x).ok()?, u16::try_from(y).ok()?);
+        let seed = Seed::new(place.game.roll(), 0x29A);
+        let guid = self.next_guid(unit_type::MONSTER);
+        let mut seed = seed;
         let components = roll_components(&mut seed, &m.components);
-        let unit = Spawned::Monster {
-            guid,
-            class: class as u16,
-            x,
-            y,
-            mode: PRESET_MONSTER_MODE,
-            life: FULL_LIFE,
-            components,
-            variants: m.components,
-        };
-        Some((unit, seed))
-    }
-
-    /// A group from the room's roll (`SPAWN_SpawnMonsterWithMinions`, `0x0054DF80`): its first
-    /// member, `MinGrp..=MaxGrp - 1` more beside it on the first's seed, and each member's
-    /// `PartyMin..=PartyMax` minions on its own.
-    fn spawn_group(&mut self, data: &GameData, group: Group, units: &mut Vec<Spawned>) {
-        let near = |seed: &mut Seed, v: i32| v + seed.pick(7) as i32 - 3;
-        let Some((first, mut seed)) = self.monster(data, group.class, group.x, group.y) else { return };
-        let extra = seed.pick((group.size.1 - group.size.0 + 1).max(1) as u32) as i32 + group.size.0 - 1;
-        let mut members = vec![(first, seed)];
-        for _ in 0..extra {
-            let (x, y) = (near(&mut members[0].1, group.x), near(&mut members[0].1, group.y));
-            if let Some(member) = self.monster(data, group.class, x, y) {
-                members.push(member);
+        units.push(Spawned::Monster { guid, class: class as u16, x: ux, y: uy, mode: PRESET_MONSTER_MODE, life: FULL_LIFE, components, variants: m.components });
+        place.ground.occupy(x, y, m.size);
+        let rules = m.spawn;
+        if minions && rules.minions[0] >= 0 {
+            let count = rand_range(&mut seed, rules.party.0, rules.party.1);
+            let alternates = usize::from(rules.minions[1] >= 0);
+            let mut which = 0;
+            for _ in 0..count.max(0) {
+                self.create(data, rules.minions[which], (x, y), 4, place, units, false);
+                which = if which + 1 > alternates { 0 } else { which + 1 };
             }
         }
-        for (member, mut seed) in members {
-            let Spawned::Monster { x, y, .. } = member else { continue };
-            units.push(member);
-            if group.minions[0] < 0 || group.party.1 <= 0 {
-                continue;
-            }
-            let count = group.party.0 + seed.pick((group.party.1 - group.party.0 + 1).max(1) as u32) as i32;
-            for _ in 0..count {
-                let class = if group.minions[1] >= 0 && seed.pick(2) == 1 { group.minions[1] } else { group.minions[0] };
-                let (mx, my) = (near(&mut seed, i32::from(x)), near(&mut seed, i32::from(y)));
-                if let Some((minion, _)) = self.monster(data, class, mx, my) {
-                    units.push(minion);
-                }
-            }
+        Some((x, y, seed))
+    }
+
+    /// `SPAWN_SpawnMonsterWithMinions` (`0x0054DF80`): a spot for the group ([`find_spot`]), its
+    /// first member there, then `MinGrp - 1..=MaxGrp - 1` more (rolled on the first's seed) in
+    /// rings of 3 around it.
+    fn spawn_group(&mut self, data: &GameData, group: Group, place: &mut Placing<'_, '_>, units: &mut Vec<Spawned>) {
+        let Some(m) = data.monsters().get(group.class) else { return };
+        let arrival = place.arrival;
+        let near = move |x: i32, y: i32| arrival.is_some_and(|((ax, ay), dist)| (x - ax) * (x - ax) + (y - ay) * (y - ay) < dist);
+        let Some(spot) = find_spot(place.room, place.ground, place.rect, m.size, collision_mask(m.spawn_collision), &near) else { return };
+        let Some((x, y, mut seed)) = self.create(data, group.class, spot, -1, place, units, true) else { return };
+        let (min, max) = (group.size.0 as u8 - 1, group.size.1 as u8 - 1);
+        let extra = seed.pick(u32::from(max - min) + 1) as i32 + i32::from(min);
+        for _ in 0..extra {
+            self.create(data, group.class, (x, y), 3, place, units, true);
         }
     }
 
@@ -433,15 +455,19 @@ impl Population {
             if let (Some(spot), Some(mut regions)) = (monsters, self.regions.take()) {
                 let s = 5;
                 let area = (spot.area.x * s, spot.area.y * s, spot.area.w * s, spot.area.h * s);
+                let rect = Rect { left: area.0, top: area.1, right: area.0 + area.2, bottom: area.1 + area.3 };
                 let mut room_seed = Seed::new(self.control.roll(), 0x29A);
-                let groups = regions.spawn_room(data, level_id, area, spot.level_rooms, &mut self.seed, &mut room_seed);
-                self.regions = Some(regions);
-                for group in groups {
+                let mut ground = Ground::new(spot.collision);
+                let mut game = self.seed;
+                regions.spawn_room(data, level_id, area, spot.level_rooms, &mut game, &mut room_seed, &mut |group, game, room| {
                     if group.unique {
                         not_ported.push(format!("unique pack of monster {} spawned as a plain group", group.class));
                     }
-                    self.spawn_group(data, group, &mut units);
-                }
+                    let mut place = Placing { game, room, ground: &mut ground, rect, arrival: spot.arrival };
+                    self.spawn_group(data, group, &mut place, &mut units);
+                });
+                self.seed = game;
+                self.regions = Some(regions);
             }
             self.rooms.insert(room, units);
         }
@@ -678,15 +704,19 @@ mod tests {
             let town = PresetLevel::build(&data, &engine, &act, 1).unwrap();
             let world = d2_drlg::world::World::build(&data, &engine, &act, Some(&town), &d2_drlg::collision::TileSources::new());
             let mut pop = Population::new(seed).with_monsters(&data, seed, 0);
+            let collision = |x: i32, y: i32| world.collision_at(x, y);
             for level in world.levels().iter().filter(|l| (2..=7).contains(&l.id)) {
                 let roster: Vec<i32> = pop.regions.as_ref().unwrap().level(level.id).unwrap().roster().iter().map(|r| r.0).collect();
                 let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+                let arrival = arrival(&data, &level.units).map(|spot| (spot, data.levels().get(level.id).unwrap().warp_dist));
+                assert_eq!(arrival.is_some(), (3..=6).contains(&level.id), "level {}: waypoint", level.id);
                 for index in 0..level.rooms.len() {
-                    if (4..=27).contains(&level.pieces[index]) {
+                    let piece = level.pieces[index];
+                    if piece != 0 && !data.lvl_prests().by_def(piece).unwrap().populate {
                         continue;
                     }
                     let room = RoomId { level: level.id, index };
-                    let spot = MonsterRoom { area: level.rooms[index], level_rooms: level.rooms.len() };
+                    let spot = MonsterRoom { area: level.rooms[index], level_rooms: level.rooms.len(), collision: &collision, arrival };
                     let got = pop.activate(&data, level.id, room, world.units_in(room), Some(spot));
                     for unit in got.units {
                         if let Spawned::Monster { class, x, y, .. } = *unit {
@@ -699,7 +729,10 @@ mod tests {
                             });
                             assert!(allowed, "level {}: {} is no roster class, minion or replacement", level.id, m.id);
                             let r = level.rooms[index];
-                            assert!((i32::from(x) - r.x * 5).abs() < 60 && (i32::from(y) - r.y * 5).abs() < 60, "near its room");
+                            let (x, y) = (i32::from(x), i32::from(y));
+                            assert!(x >= r.x * 5 && x < (r.x + r.w) * 5 && y >= r.y * 5 && y < (r.y + r.h) * 5, "inside its room");
+                            let walk = world.collision_at(x, y).unwrap();
+                            assert_eq!(walk & d2_drlg::collision::WALL, 0, "level {}: {} stands on a wall at ({x}, {y})", level.id, m.id);
                             *counts.entry(m.id.clone()).or_default() += 1;
                         }
                     }

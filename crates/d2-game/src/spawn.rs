@@ -12,17 +12,23 @@
 //! subtiles: each steps the game seed, and a slot whose low word mod 100000 is within the
 //! level's `MonDen` spawns. The class is a rarity-weighted roster pick on the room's seed
 //! (`0x005BDE80`), sometimes swapped for its `spawn` class; `MONSTERREGION_CheckSpawnDensity`
-//! (`0x005BE020`) decides whether it leads a unique pack instead. A group
-//! (`SPAWN_SpawnMonsterWithMinions`, `0x0054DF80`) is `MinGrp..=MaxGrp` of the class — just one
-//! for fallen and scarabs, whose minions make their group — at a random spot in the room, and
-//! each member brings `PartyMin..=PartyMax` of its `minion1`.
+//! (`0x005BE020`) decides whether it leads a unique pack instead. Each spawn is placed before
+//! the next slot rolls: a group (`SPAWN_SpawnMonsterWithMinions`, `0x0054DF80`) is
+//! `MinGrp..=MaxGrp` of the class — just one for fallen and scarabs, whose minions make their
+//! group — and each member brings `PartyMin..=PartyMax` minions, `minion1` and `minion2` in turn.
 //!
-//! Not ported: the collision test for where a monster may stand (spots are random), unique pack
-//! leaders' names and mods (they spawn as plain monsters of their class), champions, and
-//! wandering monsters. Ported from libd2 `packages/drlg/src/drlg/monpop.zig` (MIT); the group and
-//! minion counts follow the 1.14d `Game.exe` code at `0x0054DF80`.
+//! Where they stand ([`find_spot`], [`probe`]) follows `0x0054DC40` and `0x005B2A00`: a spot rolled
+//! on the room's seed and tested against the room's collision map with the class's size and
+//! collision mask; the other members search rings of 3 subtiles around the first, minions rings
+//! of 4 around their parent.
+//!
+//! Not ported: unique pack leaders' names and mods (they spawn as plain monsters of their class),
+//! champions, wandering monsters, the flying classes' own placement (`spawnCol` 1, `0x005B2700`),
+//! the few classes with extra checks at their spot (`0x005FD350`), where objects already stand,
+//! and the arrival spots other than the waypoint that spawns keep away from. Ported from libd2
+//! `packages/drlg/src/drlg/monpop.zig` (MIT) and the 1.14d `Game.exe`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use d2_data::GameData;
 use d2_drlg::rng::Seed;
@@ -171,19 +177,29 @@ impl Regions {
         self.by_level.get(&id)
     }
 
-    /// The groups a room of `level` spawns, in order. `area` is the room in world subtiles
+    /// Spawn a room of `level`'s monsters: each slot that spawns is handed to `place` with the
+    /// game and room seeds before the next slot rolls. `area` is the room in world subtiles
     /// `(x, y, width, height)`, `level_rooms` how many rooms the level has, `game` the game seed
     /// the slots step and `room` the room's seed.
-    pub fn spawn_room(&mut self, data: &GameData, level: i32, area: (i32, i32, i32, i32), level_rooms: usize, game: &mut Seed, room: &mut Seed) -> Vec<Group> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_room(
+        &mut self,
+        data: &GameData,
+        level: i32,
+        area: (i32, i32, i32, i32),
+        level_rooms: usize,
+        game: &mut Seed,
+        room: &mut Seed,
+        place: &mut dyn FnMut(Group, &mut Seed, &mut Seed),
+    ) {
         let nightmare_or_hell = self.nightmare_or_hell;
-        let Some(region) = self.by_level.get_mut(&level) else { return Vec::new() };
+        let Some(region) = self.by_level.get_mut(&level) else { return };
         region.rooms_seen += 1;
         let density = region.density.min(10_000);
         if density <= 0 {
-            return Vec::new();
+            return;
         }
-        let (x0, y0, width, height) = area;
-        let mut groups = Vec::new();
+        let (_, _, width, height) = area;
         for _ in 0..(height / 3) * (width / 3) {
             if game.roll() % 100_000 > density as u32 {
                 continue;
@@ -205,30 +221,228 @@ impl Regions {
             if group.0 == 0 || group.1 == 0 || group.0 > group.1 {
                 continue;
             }
-            // SPAWN_FindRandomPositionForMonster (0x0054DC40), inside GetRoomCorners' inset.
-            let x = x0 + 1 + room.pick((width - 1).max(1) as u32) as i32;
-            let y = y0 + 1 + room.pick((height - 1).max(1) as u32) as i32;
-            groups.push(Group { class, x, y, size: group, party: rules.party, minions: rules.minions, unique });
+            place(Group { class, size: group, unique }, game, room);
         }
-        groups
     }
 }
 
-/// One spawn: a group of a class around a spot, with each member's minions.
+/// The collision bits a class may not stand on, by `MonStats2.txt` `spawnCol` (`0x005B2A00`).
+#[must_use]
+pub fn collision_mask(spawn_collision: u8) -> u16 {
+    match spawn_collision {
+        1 => 0x01C0,
+        2 => 0x3F11,
+        3 => 0,
+        _ => 0x3C01,
+    }
+}
+
+/// A rectangle of world subtiles, right and bottom exclusive (`PtInRect`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    /// Left edge.
+    pub left: i32,
+    /// Top edge.
+    pub top: i32,
+    /// One past the right edge.
+    pub right: i32,
+    /// One past the bottom edge.
+    pub bottom: i32,
+}
+
+impl Rect {
+    fn contains(&self, x: i32, y: i32) -> bool {
+        x >= self.left && x < self.right && y >= self.top && y < self.bottom
+    }
+}
+
+/// What a room's spawns stand on: the map's collision and the monsters placed so far.
+pub struct Ground<'a> {
+    terrain: &'a dyn Fn(i32, i32) -> Option<u8>,
+    monsters: HashSet<(i32, i32)>,
+}
+
+/// `COLBIT_MONSTER`.
+const MONSTER_BIT: u16 = 0x100;
+
+impl<'a> Ground<'a> {
+    /// Ground over a collision lookup by world subtile (`None` where no room has a map).
+    #[must_use]
+    pub fn new(terrain: &'a dyn Fn(i32, i32) -> Option<u8>) -> Self {
+        Self { terrain, monsters: HashSet::new() }
+    }
+
+    fn cell(&self, x: i32, y: i32) -> Option<u16> {
+        let terrain = u16::from((self.terrain)(x, y)?);
+        Some(if self.monsters.contains(&(x, y)) { terrain | MONSTER_BIT } else { terrain })
+    }
+
+    fn shape(size: u8) -> &'static [(i32, i32)] {
+        match size {
+            0 | 1 => &[(0, 0)],
+            2 => &[(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)],
+            _ => &[(-1, -1), (0, -1), (1, -1), (-1, 0), (0, 0), (1, 0), (-1, 1), (0, 1), (1, 1)],
+        }
+    }
+
+    /// `0x0064D9B0`: whether any subtile of the shape has a bit of `mask` — or has no map.
+    #[must_use]
+    pub fn blocked(&self, x: i32, y: i32, size: u8, mask: u16) -> bool {
+        if size > 3 {
+            return true;
+        }
+        let mut bits = 0;
+        for &(dx, dy) in Self::shape(size) {
+            match self.cell(x + dx, y + dy) {
+                Some(c) => bits |= c,
+                None => return true,
+            }
+        }
+        bits & mask != 0
+    }
+
+    /// Mark a monster standing at a spot, over the shape it is tested with.
+    pub fn occupy(&mut self, x: i32, y: i32, size: u8) {
+        for &(dx, dy) in Self::shape(size.min(3)) {
+            self.monsters.insert((x + dx, y + dy));
+        }
+    }
+}
+
+/// `0x005B2A00`'s search for where a monster may stand around (`x`, `y`): with `rings` below 0,
+/// that very spot; otherwise square rings 3, 6, … `rings × 3` subtiles out, each entered at a
+/// point rolled on the room's seed and walked around. A spot must be inside `rect` and clear of
+/// `mask` for the class's `size`.
+#[allow(clippy::too_many_arguments)]
+pub fn probe(room: &mut Seed, ground: &Ground<'_>, rect: Rect, x: i32, y: i32, rings: i32, size: u8, mask: u16) -> Option<(i32, i32)> {
+    let (mut c, last) = if rings < 0 { (0, 0) } else { (3, rings * 3) };
+    if last < c {
+        return None;
+    }
+    while c <= last {
+        room.step();
+        let (mut dx, mut dy, mut dir) = if room.low & 1 == 0 {
+            (room.pick(c as u32) as i32, c, (1, 0))
+        } else {
+            (c, room.pick(c as u32) as i32, (0, 1))
+        };
+        room.step();
+        if room.low & 1 != 0 {
+            dx = -dx;
+        }
+        room.step();
+        if room.low & 1 != 0 {
+            dy = -dy;
+        }
+        let (mut px, mut py) = (x + dx, y + dy);
+        let (left, right, top, bottom) = (x - c, x + c, y - c, y + c);
+        let mut steps = if c == 0 { 1 } else { c * 8 };
+        while steps > 0 {
+            if px == left && py == top {
+                dir = (1, 0);
+            }
+            if px == right {
+                if py == top {
+                    dir = (0, 1);
+                }
+                if py == bottom {
+                    dir = (-1, 0);
+                }
+            }
+            if px == left {
+                if py == bottom {
+                    dir = (0, -1);
+                }
+                if py == top && px == right && py == bottom {
+                    dir = (0, 0);
+                }
+            }
+            px += dir.0;
+            py += dir.1;
+            if rect.contains(px, py) && !ground.blocked(px, py, size, mask) {
+                return Some((px, py));
+            }
+            steps -= 1;
+        }
+        c += 3;
+    }
+    None
+}
+
+/// `SPAWN_FindRandomPositionForMonster` (`0x0054DC40`): up to 20 spots rolled inside the room's
+/// inset (`0x0054DAC0`), skipping those `near` an arrival spot, the first a dry-run placement
+/// ([`probe`] at the spot itself) accepts.
+pub fn find_spot(room: &mut Seed, ground: &Ground<'_>, rect: Rect, size: u8, mask: u16, near: &dyn Fn(i32, i32) -> bool) -> Option<(i32, i32)> {
+    let (left, top) = (rect.left + 1, rect.top + 1);
+    let (width, height) = (rect.right - left, rect.bottom - top);
+    for _ in 0..20 {
+        let x = room.pick(width.max(0) as u32) as i32 + left;
+        let y = room.pick(height.max(0) as u32) as i32 + top;
+        if near(x, y) {
+            continue;
+        }
+        if probe(room, ground, rect, x, y, -1, size, mask).is_some() {
+            return Some((x, y));
+        }
+    }
+    None
+}
+
+/// `0x004CC790`: `min` if `max` is not above it, else a pick in `min..=max`.
+pub fn rand_range(seed: &mut Seed, min: i32, max: i32) -> i32 {
+    if min >= max {
+        return min;
+    }
+    seed.pick((max - min + 1) as u32) as i32 + min
+}
+
+/// One spawn: how many of a class to place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Group {
     /// The class.
     pub class: i32,
-    /// Where the first member stands, world subtiles.
-    pub x: i32,
-    /// Where the first member stands, world subtiles.
-    pub y: i32,
     /// `MinGrp`/`MaxGrp` (1 for a single spawn or a unique pack's leader).
     pub size: (i32, i32),
-    /// `PartyMin`/`PartyMax` minions per member.
-    pub party: (i32, i32),
-    /// `minion1`/`minion2`.
-    pub minions: [i32; 2],
     /// A unique pack's leader, spawned as a plain monster of its class.
     pub unique: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_ring_search_finds_the_one_open_subtile() {
+        let open = |x: i32, y: i32| Some(if (x, y) == (106, 97) { 0 } else { 1 });
+        let ground = Ground::new(&open);
+        let rect = Rect { left: 80, top: 80, right: 120, bottom: 120 };
+        let mut room = Seed::new(12345, 0x29A);
+        assert_eq!(probe(&mut room.clone(), &ground, rect, 100, 100, -1, 1, 0x3C01), None, "the spot itself is walled");
+        assert_eq!(probe(&mut room, &ground, rect, 100, 100, 3, 1, 0x3C01), Some((106, 97)), "on the second ring");
+        assert!(ground.blocked(106, 97, 2, 0x3C01), "a cross reaches walled neighbours");
+        assert!(!ground.blocked(106, 96, 1, 0), "no mask, nothing blocks");
+        assert!(ground.blocked(106, 96, 1, 0x3C01));
+    }
+
+    #[test]
+    fn a_spot_probe_costs_three_rolls_and_monsters_block_their_masks() {
+        let open = |_: i32, _: i32| Some(0u8);
+        let mut ground = Ground::new(&open);
+        let rect = Rect { left: 0, top: 0, right: 40, bottom: 40 };
+        let mut room = Seed::new(7, 0x29A);
+        let spot = find_spot(&mut room, &ground, rect, 2, 0x3C01, &|_, _| false).unwrap();
+        let mut expect = Seed::new(7, 0x29A);
+        let x = expect.pick(39) as i32 + 1;
+        let y = expect.pick(39) as i32 + 1;
+        for _ in 0..3 {
+            expect.step();
+        }
+        assert_eq!((spot, room), ((x, y), expect));
+        ground.occupy(x, y, 2);
+        assert!(!ground.blocked(x, y, 1, 0x3C01), "the default mask ignores monsters");
+        assert!(ground.blocked(x, y, 1, 0x3F11));
+        let mut far = Seed::new(7, 0x29A);
+        assert_eq!(find_spot(&mut far, &ground, rect, 1, 0, &|_, _| true), None, "every roll near an arrival");
+        assert_eq!(rand_range(&mut far, 3, 3), 3);
+    }
 }
