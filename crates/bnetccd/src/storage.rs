@@ -207,6 +207,12 @@ fn summarize_attrs(attrs: &AttrMap) -> (u64, u64, Option<u64>, u32) {
 #[derive(Clone)]
 pub struct StorageHandle(sync_mpsc::Sender<Command>);
 
+impl std::fmt::Debug for StorageHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StorageHandle")
+    }
+}
+
 impl StorageHandle {
     /// Look up an account by name, case-insensitively.
     pub async fn account_by_name(&self, name: &str) -> Option<Account> {

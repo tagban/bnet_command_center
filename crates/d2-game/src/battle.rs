@@ -298,6 +298,7 @@ struct Hero {
     max_stamina: i32,
     stat_points: u32,
     skill_points: u32,
+    gold: u32,
     at: Option<(i32, i32, i32)>,
     view: Vec<RoomId>,
     dead: bool,
@@ -524,8 +525,9 @@ impl Battle {
             max_mana: get(stat::MAXMANA) as i32,
             stamina: get(stat::STAMINA) as i32,
             max_stamina: get(stat::MAXSTAMINA) as i32,
-            stat_points: 0,
-            skill_points: 0,
+            stat_points: get(stat::STATPTS),
+            skill_points: get(stat::NEWSKILLS),
+            gold: get(stat::GOLD),
             at: None,
             view: Vec::new(),
             dead: false,
@@ -539,6 +541,38 @@ impl Battle {
             told_at: 0,
         };
         self.heroes.insert(name.to_string(), hero);
+    }
+
+    /// A player's saved stats, ids 0–15 as a `.d2s` keeps them (life, mana and stamina in 256ths;
+    /// a dead player's life as its maximum, as it comes back).
+    #[must_use]
+    pub fn player_stats(&self, name: &str) -> Option<Vec<(u8, u32)>> {
+        let h = self.heroes.get(name)?;
+        let life = if h.dead || h.life <= 0 { h.max_life } else { h.life };
+        let a = |i: u8| h.attributes[usize::from(i)].max(0) as u32;
+        Some(vec![
+            (stat::STRENGTH, a(stat::STRENGTH)),
+            (stat::ENERGY, a(stat::ENERGY)),
+            (stat::DEXTERITY, a(stat::DEXTERITY)),
+            (stat::VITALITY, a(stat::VITALITY)),
+            (stat::STATPTS, h.stat_points),
+            (stat::NEWSKILLS, h.skill_points),
+            (stat::HITPOINTS, life.max(0) as u32),
+            (stat::MAXHP, h.max_life.max(0) as u32),
+            (stat::MANA, h.mana.max(0) as u32),
+            (stat::MAXMANA, h.max_mana.max(0) as u32),
+            (stat::STAMINA, h.stamina.max(0) as u32),
+            (stat::MAXSTAMINA, h.max_stamina.max(0) as u32),
+            (stat::LEVEL, h.level),
+            (stat::EXPERIENCE, h.experience),
+            (stat::GOLD, h.gold),
+        ])
+    }
+
+    /// A player's level.
+    #[must_use]
+    pub fn player_level(&self, name: &str) -> Option<u32> {
+        self.heroes.get(name).map(|h| h.level)
     }
 
     /// A player left.

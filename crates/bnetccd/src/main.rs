@@ -242,7 +242,7 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
     // offers no game infrastructure at all.
     let offer_d2_realm = cfg.diablo2.realm && policy.mode != bnetcc_core::policy::ServerMode::Warnet;
     let d2_game_server = if offer_d2_realm && cfg.diablo2.game_server_probe {
-        d2gs::GameServer::start(&cfg.diablo2.data_dir, cfg.listen.bncs.ip()).await
+        d2gs::GameServer::start(&cfg.diablo2.data_dir, cfg.listen.bncs.ip(), storage.clone()).await
     } else {
         None
     };

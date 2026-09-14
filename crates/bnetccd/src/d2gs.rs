@@ -24,6 +24,7 @@ use bnetcc_proto::d2gs::{self, cs, join_failed, ClientPacketLen, EngineTables, G
 use bnetcc_storage::Character;
 use d2_data::engine::EngineData;
 use d2_data::{stat, GameData};
+use d2_formats::d2s::Save;
 use d2_drlg::act::Act;
 use d2_drlg::collision::TileSources;
 use d2_drlg::preset::PresetLevel;
@@ -101,6 +102,8 @@ pub struct GameServer {
     day: Option<([d2_data::engine::DayPeriod; 6], i32)>,
     /// Tile libraries and maps read from the install, parsed once for every game.
     tile_sources: TileSources,
+    /// Where characters are saved; without it nothing is kept past a game.
+    storage: Option<crate::storage::StorageHandle>,
     games: Mutex<Games>,
 }
 
@@ -183,7 +186,55 @@ impl GameServer {
     /// A game server with no games.
     #[must_use]
     pub fn new(tables: EngineTables, rules: Option<GameData>) -> Self {
-        Self { tables, rules, towns: Towns::None, speed_scale: 1.0, day: None, tile_sources: TileSources::new(), games: Mutex::new(Games::default()) }
+        Self { tables, rules, towns: Towns::None, speed_scale: 1.0, day: None, tile_sources: TileSources::new(), storage: None, games: Mutex::new(Games::default()) }
+    }
+
+    /// Save characters to `storage`.
+    #[must_use]
+    pub fn with_storage(mut self, storage: crate::storage::StorageHandle) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// A player's level in its game's fight.
+    fn player_level(&self, game_id: u16, name: &str) -> Option<u32> {
+        self.lock().by_id.get(&game_id)?.battle.player_level(name)
+    }
+
+    /// The `.d2s` for a player as it stands: its save (or a new character's) with the fight's
+    /// stats, its level and the waypoints learned on this difficulty; and its level.
+    fn character_save(&self, p: &Player) -> Option<(Vec<u8>, u32)> {
+        let stats = self.lock().by_id.get(&p.game_id)?.battle.player_stats(&p.character.name)?;
+        let now = u32::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs()).unwrap_or(0);
+        let mut save = p.save.clone().unwrap_or_else(|| {
+            let created = u32::try_from(p.character.created_at).unwrap_or(now);
+            Save::new(&p.character.name, p.character.class, p.character.status, created, &[])
+        });
+        for &(id, value) in &stats {
+            save.set_stat(u16::from(id), value);
+        }
+        let level = stats.iter().find(|&&(id, _)| id == stat::LEVEL).map_or(1, |&(_, v)| v);
+        save.set_level(u8::try_from(level).unwrap_or(99), now);
+        let d = usize::from(p.difficulty.min(2));
+        save.waypoints[d][2..2 + d2gs::WAYPOINT_FLAG_BYTES].copy_from_slice(&p.waypoints);
+        Some((save.to_bytes(), level))
+    }
+
+    /// Write a player's character to storage: its `.d2s`, and its level for the realm's
+    /// character list. The stored character is read back first, so only these two fields change.
+    async fn save_character(&self, p: &mut Player) {
+        let (Some(storage), Some((bytes, level))) = (&self.storage, self.character_save(p)) else { return };
+        let Some(mut character) = storage.character_by_name(&p.character.name).await else { return };
+        character.save = Some(bytes.clone());
+        character.level = u8::try_from(level).unwrap_or(99);
+        match storage.update_character(character).await {
+            Ok(_) => {
+                info!(character = %p.character.name, level, bytes = bytes.len(), "character saved");
+                p.save = Save::parse(&bytes).ok();
+                p.saved_level = level;
+            }
+            Err(e) => warn!(character = %p.character.name, error = %e, "character not saved"),
+        }
     }
 
     /// Build each new game's town from its own map seed with these engine tables (the rules
@@ -264,7 +315,7 @@ impl GameServer {
     /// Load `Game.exe` and the game rules from `data_dir`, bind the game port on `ip`, and start
     /// serving. `None` (with a warning) if `Game.exe` or the port fails — the realm then keeps
     /// answering "Server Down". Rules that fail to load only cost the player its stats.
-    pub async fn start(data_dir: &str, ip: std::net::IpAddr) -> Option<Arc<Self>> {
+    pub async fn start(data_dir: &str, ip: std::net::IpAddr, storage: crate::storage::StorageHandle) -> Option<Arc<Self>> {
         let path = Path::new(data_dir).join("Game.exe");
         let (tables, engine) = match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|file| {
             let engine = EngineData::from_game_exe(&file).map_err(|e| e.to_string())?;
@@ -294,7 +345,7 @@ impl GameServer {
                 None
             }
         };
-        let server = Arc::new(Self::new(tables, rules).with_engine(engine));
+        let server = Arc::new(Self::new(tables, rules).with_engine(engine).with_storage(storage));
         warn!(
             %addr,
             "Diablo II TEST game server is on: games can be created and joined; Act I's town and \
@@ -418,13 +469,7 @@ impl GameServer {
         let character = game.staged.remove(at);
         game.battle.set_expansion(character.status & status::EXPANSION != 0);
         game.connected.push(character.name.clone());
-        Some(Player {
-            game_id: logon.game_id,
-            character,
-            difficulty: game.difficulty,
-            map_seed: game.map_seed,
-            spawn: game.spawn,
-        })
+        Some(Player::new(logon.game_id, character, game.difficulty, game.map_seed, game.spawn))
     }
 
     /// The room holding `(x, y)` and the rooms near it, if the game has a world and the spot is
@@ -825,6 +870,32 @@ struct Player {
     difficulty: u8,
     map_seed: u32,
     spawn: (u16, u16),
+    /// The character's `.d2s`, if one has been saved and reads as this character's.
+    save: Option<Save>,
+    /// Waypoints learned on this difficulty.
+    waypoints: [u8; d2gs::WAYPOINT_FLAG_BYTES],
+    /// Level when last saved.
+    saved_level: u32,
+}
+
+impl Player {
+    fn new(game_id: u16, character: Character, difficulty: u8, map_seed: u32, spawn: (u16, u16)) -> Self {
+        let save = character.save.as_deref().and_then(|b| Save::parse(b).ok()).filter(|s| s.name().eq_ignore_ascii_case(&character.name) && s.class() == character.class);
+        let mut flags = [0u8; d2gs::WAYPOINT_FLAG_BYTES];
+        if let Some(s) = &save {
+            flags.copy_from_slice(&s.waypoints[usize::from(difficulty.min(2))][2..2 + d2gs::WAYPOINT_FLAG_BYTES]);
+        }
+        let saved_level = save.as_ref().map_or(1, |s| u32::from(s.level()));
+        Self { game_id, character, difficulty, map_seed, spawn, save, waypoints: flags, saved_level }
+    }
+
+    /// The stats the player joins with: its save's, or a new character's.
+    fn join_stats(&self, rules: &GameData) -> Option<Vec<(u8, u32)>> {
+        match &self.save {
+            Some(save) => Some(rules.saved_character_stats(self.character.class, &save.stats)),
+            None => rules.new_character_stats(self.character.class),
+        }
+    }
 }
 
 /// Where the server has a client's player: moved toward the spot it last walked or ran to,
@@ -926,8 +997,9 @@ async fn session(mut stream: TcpStream, peer: SocketAddr, server: &GameServer) -
 
     let mut player: Option<Player> = None;
     let result = run(&mut stream, peer, server, &mut player).await;
-    if let Some(p) = player {
+    if let Some(mut p) = player {
         info!(%peer, character = %p.character.name, "game connection closed");
+        server.save_character(&mut p).await;
         server.leave(p.game_id, &p.character.name);
     }
     result
@@ -947,8 +1019,9 @@ async fn run(
     let mut walker: Option<Walker> = None;
     let mut clock_seen: u64 = 0;
     let mut last_packet = Instant::now();
-    // The player's waypoint flags; a new character's are clear until it touches one.
+    // The player's waypoint flags: its save's, set when it enters the game.
     let mut waypoints = [0u8; d2gs::WAYPOINT_FLAG_BYTES];
+    let mut frames_since_check: u32 = 0;
     let mut frame = tokio::time::interval(SERVER_FRAME);
     frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_step = Instant::now();
@@ -980,6 +1053,15 @@ async fn run(
             for packet in server.battle_step(p.game_id, &p.character.name, motion) {
                 outbox.push(&packet);
             }
+            frames_since_check += 1;
+            if frames_since_check >= 25 {
+                frames_since_check = 0;
+                let level = server.player_level(p.game_id, &p.character.name);
+                if let Some(p) = player.as_mut().filter(|p| level.is_some_and(|l| l != p.saved_level)) {
+                    server.save_character(p).await;
+                }
+            }
+            let Some(p) = player.as_ref() else { continue };
             if let (Some((guid, asked)), Some(w)) = (pending_attack, walker.as_mut()) {
                 match server.battle_monster(p.game_id, guid) {
                     Some((mx, my)) if asked.elapsed() < ATTACK_WAIT => {
@@ -1058,6 +1140,7 @@ async fn run(
                 }
                 (Stage::AwaitEnterGame, cs::ENTER_GAME) => {
                     let p = player.as_ref().expect("logged on");
+                    waypoints = p.waypoints;
                     let joined = enter_game(stream, peer, server, p, &mut outbox).await?;
                     server.set_position(p.game_id, &p.character.name, joined.x, joined.y);
                     server.set_view(p.game_id, &p.character.name, &joined.view);
@@ -1088,13 +1171,17 @@ async fn run(
                     }
                 }
                 (Stage::InGame, cs::INTERACT) => {
-                    let Some(p) = player.as_ref() else { continue };
+                    let Some(p) = player.as_mut() else { continue };
                     let replies = server.interact(p.game_id, u32_at(1), u32_at(5), &mut waypoints);
                     if !replies.is_empty() {
                         for packet in &replies {
                             outbox.push(packet);
                         }
                         flush(stream, peer, tables, &mut outbox).await?;
+                    }
+                    if waypoints != p.waypoints {
+                        p.waypoints = waypoints;
+                        server.save_character(p).await;
                     }
                 }
                 (Stage::InGame, cs::WAYPOINT_TRAVEL) => {
@@ -1283,7 +1370,7 @@ async fn enter_game(
     outbox.push(&d2gs::own_unit(0, PLAYER_GUID));
     // Its stats, one packet each (ClientAddPlayerToGame walks the stat list through 0x548520),
     // as a new character: no .d2s is loaded yet.
-    let stats = server.rules.as_ref().and_then(|r| r.new_character_stats(p.character.class)).unwrap_or_default();
+    let stats = server.rules.as_ref().and_then(|r| p.join_stats(r)).unwrap_or_default();
     for &(id, value) in &stats {
         outbox.push(&d2gs::set_stat(id, value));
     }
@@ -1995,6 +2082,47 @@ pub(crate) mod tests {
         assert!(!again.iter().any(|p| p[0] == 0x6D), "a corpse is not stood up");
     }
 
+    /// A character leaving a game is saved as a `.d2s` holding its stats and its waypoints; the
+    /// next game it joins loads them back, and a save that is not its own is ignored.
+    #[tokio::test]
+    async fn a_character_is_saved_with_its_waypoints_and_joins_with_them() {
+        use bnetcc_storage::memory::MemoryStorage;
+        use bnetcc_storage::model::Credential;
+        let storage = crate::storage::spawn(Box::new(MemoryStorage::new()));
+        let owner = storage.create_account("Owner", Credential::Xsha1 { digest: [1; 20] }).await.unwrap();
+        let mut hero = character("Hero", 4, 0x20);
+        hero.account = owner.id;
+        storage.create_character(hero.clone()).await.unwrap();
+        let gs = GameServer::new(test_tables(), Some(test_rules())).with_storage(storage.clone());
+        let id = gs.create("probe", "", 0).unwrap();
+
+        let mut p = Player::new(id, hero.clone(), 0, 0, (0, 0));
+        assert!(p.save.is_none());
+        let rules = gs.rules.as_ref().unwrap();
+        gs.join_battle(id, "Hero", 4, &p.join_stats(rules).unwrap());
+        p.waypoints[0] = 0b1001;
+        gs.save_character(&mut p).await;
+        let stored = storage.character_by_name("Hero").await.unwrap();
+        let save = Save::parse(stored.save.as_deref().expect("saved")).unwrap();
+        assert_eq!((save.name(), save.class(), save.level()), ("Hero".to_string(), 4, 1));
+        assert_eq!(save.waypoints[0][2], 0b1001);
+        assert_eq!(save.stat(u16::from(stat::MAXHP)), 50 << 8);
+
+        let mut played = save.clone();
+        played.set_stat(u16::from(stat::LEVEL), 2);
+        played.set_stat(u16::from(stat::EXPERIENCE), 600);
+        played.set_level(2, 0);
+        let mut next = stored.clone();
+        next.save = Some(played.to_bytes());
+        let q = Player::new(id, next.clone(), 0, 0, (0, 0));
+        assert_eq!(q.waypoints[0], 0b1001, "the camp and the other waypoint are known");
+        let joined = q.join_stats(rules).unwrap();
+        assert!(joined.contains(&(stat::LEVEL, 2)) && joined.contains(&(stat::EXPERIENCE, 600)), "{joined:?}");
+        assert!(joined.windows(2).all(|w| w[0].0 < w[1].0), "ascending stat order");
+        next.name = "Other".into();
+        assert!(Player::new(id, next, 0, 0, (0, 0)).save.is_none(), "another character's save is not loaded");
+    }
+
     /// A player killed out in a made-up Blood Moor room and releasing (`0x41`) is stood up where it
     /// lies — `0x0D` corpse, `0x95` with life — before the camp's rooms load and `0x15` moves it:
     /// the client does not move a corpse, and halts when its room goes.
@@ -2041,7 +2169,7 @@ pub(crate) mod tests {
         }
         assert!(gs.player_dead(id, "Hero"), "the killer kills");
 
-        let player = Player { game_id: id, character: character("Hero", 4, 0), difficulty: 0, map_seed: FALLBACK_MAP_SEED, spawn: (5808, 4448) };
+        let player = Player::new(id, character("Hero", 4, 0), 0, FALLBACK_MAP_SEED, (5808, 4448));
         let mut walker = Walker { x: 5781.0, y: 4500.0, target: None, speed: 0.0, room: Some(room), view: vec![room] };
         let mut outbox = Outbox::default();
         assert!(respawn(&gs, &player, &mut walker, &mut outbox));

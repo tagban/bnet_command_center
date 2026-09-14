@@ -420,6 +420,23 @@ impl GameData {
         self.experience.get(level).map(|row| row[class])
     }
 
+    /// The stats a player joins with from its saved ones (`.d2s` ids 0–15, life, mana and
+    /// stamina in 256ths), as `(stat, value)` in ascending stat order: those it has, with the
+    /// experience bounds of its level and the rates a new character gets.
+    #[must_use]
+    pub fn saved_character_stats(&self, class: u8, saved: &[(u16, u32)]) -> Vec<(u8, u32)> {
+        let get = |id: u8| saved.iter().find(|&&(s, _)| s == u16::from(id)).map_or(0, |&(_, v)| v);
+        let level = get(stat::LEVEL).max(1);
+        let mut stats: Vec<(u8, u32)> = (0..=stat::GOLD).filter(|&id| get(id) != 0 || id == stat::LEVEL).map(|id| (id, if id == stat::LEVEL { level } else { get(id) })).collect();
+        let last = if level > 1 { self.next_level_experience(class, level as usize - 1).unwrap_or(0) } else { 0 };
+        if last != 0 {
+            stats.push((stat::LASTEXP, last));
+        }
+        stats.push((stat::NEXTEXP, self.next_level_experience(class, level as usize).unwrap_or(0)));
+        stats.extend([(stat::VELOCITY_PERCENT, 100), (stat::ATTACK_RATE, 100), (stat::OTHER_ANIM_RATE, 100)]);
+        stats
+    }
+
     /// The stats a new character starts with, as `(stat, value)` in ascending stat order —
     /// what `0x005706D0` sets when it creates one. Life, mana and stamina are 1/256
     /// fixed-point, as the engine keeps them.
