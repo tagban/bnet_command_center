@@ -3,6 +3,9 @@
 //! reports. Numbers from Blizzard's classic ladder pages as restated in
 //! `docs/WARCRAFT3-MATCHMAKING.md` §2.
 //!
+//! Ranks run 1 to [`super::MAX_RANK`] (500) here, not classic WarCraft III's top 1,000 (tagban,
+//! 2026-09-14).
+//!
 //! ⚠️ **Readings pending tagban's decision** (§2.4 decision (b)):
 //! - Charts 2 and 3 print the same numbers headed "25th level = max" and "35th level = max",
 //!   Chart 4 "45th level = max". Here the heading names the realm's top level the chart is
