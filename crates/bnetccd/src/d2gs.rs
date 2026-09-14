@@ -346,6 +346,21 @@ impl GameServer {
         let map = game.town.as_ref().map_or("none", |t| t.map.as_str());
         let levels: Vec<i32> = game.world.as_ref().map(|w| w.levels().iter().map(|l| l.id).collect()).unwrap_or_default();
         info!(game = %name, id, difficulty, map_seed = %format!("{map_seed:#010x}"), %map, ?spawn, ?levels, "test game created");
+        // Where each scanned piece (cave mouths, tower and graveyard entrances) sits, in world
+        // subtiles at its room's middle — for finding them in the client.
+        if let (Some(world), Some(rules)) = (&game.world, &self.rules) {
+            let entrances: Vec<(i32, i32, i32, i32)> = world
+                .levels()
+                .iter()
+                .flat_map(|l| {
+                    l.pieces.iter().zip(&l.rooms).filter_map(move |(&piece, room)| {
+                        let scanned = piece != 0 && rules.lvl_prests().by_def(piece).is_some_and(|r| r.scan);
+                        scanned.then_some((l.id, piece, room.x * 5 + room.w * 5 / 2, room.y * 5 + room.h * 5 / 2))
+                    })
+                })
+                .collect();
+            info!(game = %name, id, ?entrances, "entrance pieces (level, LvlPrest def, x, y)");
+        }
         Ok(id)
     }
 
