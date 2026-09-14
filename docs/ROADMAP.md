@@ -167,9 +167,10 @@ These are captured so they are not lost; each needs real design work, not just a
       (`SID_GAMERESULT` game type 1/3 → `Record\<product>\1|3\…` with rating, high rating, last
       game), `SID_GETLADDERDATA` 0x2E and `SID_FINDLADDERUSER` 0x2F, record statstrings; the D2
       realm's `MCP_REQUESTLADDERDATA` by experience; WarCraft III ladder rules
-      (`bnetcc_core::ladder::war3`). **Open for tagban:** the SC/W2 rating formula (provisional Elo,
-      start 1000, K 32), whether and how to enforce the 10-win rule, the statstring rank base,
-      and the WC3 readings in `war3`'s module notes.
+      (`bnetcc_core::ladder::war3`). **Decided:** ranks run 1 (best) to 500, everyone below
+      unranked, on every ladder (tagban, 2026-09-14). **Open for tagban:** the SC/W2 rating formula
+      (provisional Elo, start 1000, K 32), whether and how to enforce the 10-win rule, and the
+      WC3 readings in `war3`'s module notes.
       - **Eligibility, as classic Battle.net had it:** StarCraft/Brood War and Warcraft II need
         **10 normal-game wins** before a player may join the ladder (then opt in). Confirm the
         per-product rule and what the client shows when refused before hard-coding it.
