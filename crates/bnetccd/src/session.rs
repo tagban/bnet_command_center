@@ -522,6 +522,9 @@ struct Bncs {
     /// and cleared when the game stops, so re-advertisements (state updates) do not re-count
     /// the game in the hosted-games metric.
     hosting_game: bool,
+    /// The game this session last hosted or joined, and since when — what its
+    /// `SID_GAMERESULT` is timed against.
+    game_seat: Option<GameSeat>,
     /// An NLS logon in flight: set by `SID_AUTH_ACCOUNTLOGON`, consumed by the proof.
     srp: Option<SrpPending>,
     /// The local address this connection arrived on — the realm address a LAN client is
@@ -579,6 +582,7 @@ async fn bncs_session(
         muted_until_ms: 0,
         kill: Arc::new(tokio::sync::Notify::new()),
         hosting_game: false,
+        game_seat: None,
         srp: None,
         local,
         realm_tickets: Vec::new(),
@@ -872,7 +876,9 @@ impl Bncs {
             sid::STARTADVEX3 => self.advertise(frame),
             // A game ended (STOPADV is also sent spuriously on logoff, which is harmless —
             // withdrawing a game the host does not have is a no-op).
-            sid::STOPADV | sid::LEAVEGAME => self.stop_advertising(),
+            sid::STOPADV => self.stop_advertising(true),
+            sid::LEAVEGAME => self.stop_advertising(false),
+            sid::NOTIFYJOIN => self.notify_join(frame),
             sid::NETGAMEPORT => self.net_game_port(frame),
             // Map authentication: a host sends the map's size, SHA-1 and filename to be
             // "authenticated" before the game can start. We approve every map — see the
@@ -909,7 +915,6 @@ impl Bncs {
             sid::NULL
             | sid::PING
             | sid::UDPPINGRESPONSE
-            | sid::NOTIFYJOIN
             | sid::CLICKAD
             | sid::CLIENTID
             | sid::CLIENTID2
@@ -2814,6 +2819,7 @@ impl Bncs {
         // Kept for the (optional) Discord game announcement below, before `name` moves into
         // the ad.
         let game_name = String::from_utf8_lossy(&name).into_owned();
+        let seat_name = name.clone();
         let ad = crate::node::GameAd {
             name,
             password,
@@ -2834,6 +2840,7 @@ impl Bncs {
             // updates while the game is live.
             if !self.hosting_game {
                 self.hosting_game = true;
+                self.game_seat = Some(GameSeat { name: seat_name, since: std::time::Instant::now() });
                 let product = self.product.map_or_else(|| "unknown".to_string(), |p| p.to_string());
                 self.node.record_hosted_game(&product);
                 // Announce to the (optional) separate games webhook, fire-and-forget so a slow
@@ -2857,14 +2864,37 @@ impl Bncs {
         self.send(&Frame::new(sid::STARTADVEX3, w.finish()))
     }
 
-    /// `SID_STOPADV` (0x02) / `SID_LEAVEGAME` (0x1F): the host's game is over. Remove it
-    /// from the directory so it stops appearing in the game list.
-    fn stop_advertising(&mut self) -> Step {
+    /// `SID_STOPADV` (0x02) / `SID_LEAVEGAME` (0x1F): the host's game is no longer open to
+    /// join. Remove it from the directory so it stops appearing in the game list. A host sends
+    /// `SID_STOPADV` when its game starts (BNETDocs), so for a hosted game that is when it
+    /// started: its players' results are timed from then.
+    fn stop_advertising(&mut self, starts: bool) -> Step {
         if let Some(account) = &self.account {
             self.node.withdraw_game(account.id);
         }
+        if starts && self.hosting_game {
+            if let Some(seat) = &mut self.game_seat {
+                seat.since = std::time::Instant::now();
+                self.node.mark_game_started(self.product, &seat.name);
+            }
+        }
         // The game is over; a later STARTADVEX3 starts a new one and counts again.
         self.hosting_game = false;
+        Step::Continue
+    }
+
+    /// `SID_NOTIFYJOIN` (0x22): `(u32)` product, `(u32)` version, `(string)` game name,
+    /// `(string)` password — the client joined a game. No reply.
+    fn notify_join(&mut self, frame: &Frame) -> Step {
+        let mut r = frame.reader();
+        let name = (|| -> Result<Vec<u8>, bnetcc_proto::ProtoError> {
+            let _product = r.u32()?;
+            let _version = r.u32()?;
+            Ok(r.cstr(CHANNEL_NAME_MAX)?.to_vec())
+        })();
+        if let Ok(name) = name {
+            self.game_seat = Some(GameSeat { name, since: std::time::Instant::now() });
+        }
         Step::Continue
     }
 
@@ -2910,6 +2940,12 @@ impl Bncs {
     /// The game type (BNETDocs: 0 normal, 1 ladder, 3 Iron Man) picks the league: a ladder or
     /// Iron Man result goes to `Record\<product>\1\` or `\3\` instead, rated against the
     /// average rating of the game's other players (see `bnetcc_core::ladder`).
+    ///
+    /// Only a game that ran longer than two minutes counts (`Node::min_game_length`), timed
+    /// from its start — its host's `SID_STOPADV` — or, if that was not seen, from when this
+    /// player hosted or joined it. A result from a session that neither hosted nor joined a
+    /// game is not counted. So a player who surrenders a counted game loses it, and the other
+    /// side's own report of its win counts.
     async fn game_result(&mut self, frame: &Frame) -> Step {
         let Some(account) = self.account.clone() else {
             return Step::Continue;
@@ -2935,6 +2971,22 @@ impl Bncs {
             debug!(peer = %self.peer, "malformed SID_GAMERESULT; ignoring");
             return Step::Continue;
         };
+        let Some(seat) = self.game_seat.as_ref() else {
+            info!(peer = %self.peer, account = %account.name, "game result from a session in no game; not counted");
+            return Step::Continue;
+        };
+        let started = self.node.game_started_at(self.product, &seat.name).filter(|&at| at >= seat.since).unwrap_or(seat.since);
+        let lasted = started.elapsed();
+        if !self.node.min_game_length.is_zero() && lasted <= self.node.min_game_length {
+            info!(
+                peer = %self.peer,
+                account = %account.name,
+                game = %String::from_utf8_lossy(&seat.name),
+                seconds = lasted.as_secs(),
+                "game too short to count"
+            );
+            return Step::Continue;
+        }
         let slot = names.iter().position(|n| n.eq_ignore_ascii_case(&account.name));
         let outcome = slot.and_then(|i| results.get(i).copied()).and_then(crate::storage::GameOutcome::from_code);
         let league = bnetcc_core::ladder::League::from_code(game_type);
@@ -3060,6 +3112,14 @@ fn filetime(unix_secs: u64) -> u64 {
         return 0;
     }
     (unix_secs + 11_644_473_600) * 10_000_000
+}
+
+/// A game a session hosted or joined.
+struct GameSeat {
+    /// Its name as advertised or joined.
+    name: Vec<u8>,
+    /// When the session joined it, or when its host started it.
+    since: std::time::Instant,
 }
 
 fn encode(frame: &Frame) -> Option<Wire> {
@@ -3463,6 +3523,69 @@ mod tests {
         s
     }
 
+    /// `SID_NOTIFYJOIN` for a StarCraft: Brood War game called `name`.
+    fn notify_join_frame(name: &str) -> Frame {
+        let mut w = Writer::with_capacity(32);
+        w.fourcc(product::SEXP).u32(0xD3).cstr(name.as_bytes()).cstr(b"");
+        Frame::new(sid::NOTIFYJOIN, w.finish())
+    }
+
+    /// Normal-game wins and losses stored for an account.
+    async fn normal_record(node: &Node, name: &str) -> (u32, u32) {
+        let keys = ["wins", "losses"].map(|leaf| bnetcc_storage::attr::AttrKey::new(&format!(r"Record\SEXP\0\{leaf}")));
+        let attrs = node.read_readable_attrs(name, keys.to_vec()).await;
+        let get = |k: &bnetcc_storage::attr::AttrKey| attrs.get(k).and_then(|v| v.parse().ok()).unwrap_or(0);
+        (get(&keys[0]), get(&keys[1]))
+    }
+
+    /// A game counts only once it has run longer than the minimum (two minutes in production),
+    /// timed from its host's `SID_STOPADV`; a result from a session in no game never counts.
+    /// Past the minimum, the side that surrendered loses and the other wins.
+    #[tokio::test]
+    async fn a_game_counts_only_once_it_has_run_long_enough() {
+        let node = Arc::new(crate::node::test_node_with(|c| c.min_game_length = Duration::from_millis(400)));
+        let addr = spawn_node(Arc::clone(&node)).await;
+        let mut host = login(addr, "Zeratul", "pw", 611).await;
+        let mut guest = login(addr, "Aldaris", "pw", 612).await;
+        let slots = [("Zeratul", 1), ("Aldaris", 2)];
+        // Wait for each connection to have handled what it was sent.
+        async fn settle(s: &mut TcpStream) {
+            send_frame(s, &Frame::new(sid::FINDLADDERUSER, {
+                let mut w = Writer::with_capacity(16);
+                w.fourcc(product::SEXP).u32(1).u32(0).cstr(b"x");
+                w.finish()
+            }))
+            .await;
+            assert_eq!(recv_frame(s).await.id, sid::FINDLADDERUSER);
+        }
+
+        send_frame(&mut guest, &game_result_frame(0, slots)).await;
+        settle(&mut guest).await;
+        assert_eq!(normal_record(&node, "Aldaris").await, (0, 0), "no game joined");
+
+        send_frame(&mut host, &start_adv_frame("quick")).await;
+        let _ = recv_frame(&mut host).await;
+        send_frame(&mut guest, &notify_join_frame("quick")).await;
+        tokio::time::sleep(Duration::from_millis(500)).await; // the lobby does not count
+        send_frame(&mut host, &Frame::empty(sid::STOPADV)).await;
+        settle(&mut host).await;
+        // The guest surrenders at once: too short, for both.
+        send_frame(&mut guest, &game_result_frame(0, slots)).await;
+        send_frame(&mut host, &game_result_frame(0, slots)).await;
+        settle(&mut guest).await;
+        settle(&mut host).await;
+        assert_eq!(normal_record(&node, "Aldaris").await, (0, 0), "under the minimum");
+        assert_eq!(normal_record(&node, "Zeratul").await, (0, 0));
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        send_frame(&mut guest, &game_result_frame(0, slots)).await;
+        send_frame(&mut host, &game_result_frame(0, slots)).await;
+        settle(&mut guest).await;
+        settle(&mut host).await;
+        assert_eq!(normal_record(&node, "Aldaris").await, (0, 1), "the surrender is a loss");
+        assert_eq!(normal_record(&node, "Zeratul").await, (1, 0), "and the other side's win");
+    }
+
     /// A `SID_GAMERESULT` for a two-player game of `game_type` with these per-slot codes.
     fn game_result_frame(game_type: u32, slots: [(&str, u32); 2]) -> Frame {
         let mut w = Writer::with_capacity(64);
@@ -3501,6 +3624,11 @@ mod tests {
         let addr = spawn_server().await;
         let mut winner = login(addr, "Fenix", "pw", 601).await;
         let mut loser = login(addr, "Tassadar", "pw", 602).await;
+        // Fenix hosts, Tassadar joins, and the game starts.
+        send_frame(&mut winner, &start_adv_frame("duel")).await;
+        let _ = recv_frame(&mut winner).await;
+        send_frame(&mut loser, &notify_join_frame("duel")).await;
+        send_frame(&mut winner, &Frame::empty(sid::STOPADV)).await;
         // Each client reports its own slot; a normal game stays off the ladder. The loser
         // reports once the winner's result has landed, so its opponent is rated 1016.
         let slots = [("Fenix", 1), ("Tassadar", 2)];

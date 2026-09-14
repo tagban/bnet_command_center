@@ -265,6 +265,9 @@ pub struct GameAd {
     pub created: std::time::Instant,
 }
 
+/// A game by its host's product and lowercased name.
+type GameKey = (Option<bnetcc_proto::FourCc>, Vec<u8>);
+
 /// A logged-in session, registered so staff moderation can reach it across channels — to
 /// resolve its address for an IP ban, or to force it off for a tag ban.
 struct SessionEntry {
@@ -309,6 +312,11 @@ pub struct Node {
     /// If set, post a one-line announcement to this Discord webhook when a client advertises
     /// a game. A separate webhook from the main status one; `None` disables it.
     pub games_announce_webhook: Option<String>,
+    /// How long a game must have run for its result to count. See [`NodeConfig`].
+    pub min_game_length: std::time::Duration,
+    /// When each game started (its host's `SID_STOPADV`), by product and lowercased name,
+    /// so any of its players' results can be timed. Entries older than a day are dropped.
+    started_games: Mutex<HashMap<GameKey, std::time::Instant>>,
     /// The Diablo II closed realm, if offered. See `crate::realm`.
     pub d2_realm: Option<D2Realm>,
     /// Outstanding realm logons: the handle a client carries from `SID_LOGONREALMEX` to
@@ -396,6 +404,9 @@ pub struct NodeConfig {
     pub udp_socket: Option<Arc<tokio::net::UdpSocket>>,
     /// Where to persist staff bans/mutes. `None` keeps them in memory only (tests).
     pub bans_path: Option<std::path::PathBuf>,
+    /// How long a game must have run for `SID_GAMERESULT` to count it (strictly longer);
+    /// `bnetcc_core::ladder::MIN_GAME_LENGTH` in production, zero counts every game.
+    pub min_game_length: std::time::Duration,
 }
 
 /// The Diablo II closed realm's settings (see `crate::config::Diablo2Config`).
@@ -476,6 +487,8 @@ impl Node {
             realm: cfg.realm,
             wc3_legacy_logon: cfg.wc3_legacy_logon,
             games_announce_webhook: cfg.games_announce_webhook,
+            min_game_length: cfg.min_game_length,
+            started_games: Mutex::new(HashMap::new()),
             d2_realm: cfg.d2_realm,
             realm_tickets: Mutex::new(HashMap::new()),
             channel_caps: cfg.channel_caps,
@@ -1106,6 +1119,20 @@ impl Node {
         inner.games.retain(|_, g| g.host != account);
     }
 
+    /// A game's host started it (`SID_STOPADV`, which a host sends when its game starts).
+    pub fn mark_game_started(&self, product: Option<bnetcc_proto::FourCc>, name: &[u8]) {
+        let now = std::time::Instant::now();
+        let mut started = self.started_games.lock().expect("started games lock");
+        started.retain(|_, at| now.duration_since(*at) < std::time::Duration::from_secs(24 * 3600));
+        started.insert((product, name.to_ascii_lowercase()), now);
+    }
+
+    /// When a game of this name started, if its host said so.
+    #[must_use]
+    pub fn game_started_at(&self, product: Option<bnetcc_proto::FourCc>, name: &[u8]) -> Option<std::time::Instant> {
+        self.started_games.lock().expect("started games lock").get(&(product, name.to_ascii_lowercase())).copied()
+    }
+
     /// Snapshot of the currently advertised games, for `SID_GETADVLISTEX`.
     #[must_use]
     pub fn games(&self) -> Vec<GameAd> {
@@ -1385,6 +1412,8 @@ pub(crate) fn test_node_with(tweak: impl FnOnce(&mut NodeConfig)) -> Node {
         channel_caps: ChannelCaps::default(),
         udp_socket: None,
         bans_path: None,
+        // Tests that are not about the two-minute rule count every game.
+        min_game_length: std::time::Duration::ZERO,
     };
     tweak(&mut cfg);
     Node::new(cfg, storage)
