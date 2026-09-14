@@ -378,6 +378,23 @@ impl Population {
         }
     }
 
+    /// Move a spawned monster into the room it now stands in, if that room has been populated
+    /// (a room not yet in play must still spawn its own units); its room before, if it moved.
+    pub fn move_monster(&mut self, monster: u32, to: RoomId) -> Option<RoomId> {
+        if !self.rooms.contains_key(&to) {
+            return None;
+        }
+        let (&from, index) = self.rooms.iter().find_map(|(room, units)| {
+            units.iter().position(|u| matches!(u, Spawned::Monster { guid, .. } if *guid == monster)).map(|i| (room, i))
+        })?;
+        if from == to {
+            return None;
+        }
+        let unit = self.rooms.get_mut(&from)?.remove(index);
+        self.rooms.get_mut(&to)?.push(unit);
+        Some(from)
+    }
+
     /// Change a spawned object's mode (`0x00624690`); `true` if it changed.
     pub fn set_object_mode(&mut self, object: u32, to: u8) -> bool {
         for unit in self.rooms.values_mut().flatten() {

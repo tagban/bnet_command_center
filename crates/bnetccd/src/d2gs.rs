@@ -491,6 +491,29 @@ impl GameServer {
         view
     }
 
+    /// The waypoint a player travelled to lights up (`0x00547210` spawns it in mode 1 for a pending
+    /// arrival): an unlit one spawned there turns to mode 1, its `0x0E`.
+    fn light_waypoint_at(&self, game_id: u16, x: u16, y: u16) -> Option<Vec<u8>> {
+        let rules = self.rules.as_ref()?;
+        let mut g = self.lock();
+        let game = g.by_id.get_mut(&game_id)?;
+        let world = game.world.as_ref()?;
+        let population = game.population.as_mut()?;
+        let room = world.room_at(i32::from(x), i32::from(y))?;
+        let guid = population.units(room)?.iter().find_map(|u| match *u {
+            Spawned::Object { guid, class, x: ox, y: oy, mode: 0, .. }
+                if rules.objects().get(i32::from(class)).is_some_and(|o| o.operate_fn == 23)
+                    && (i32::from(ox) - i32::from(x)).abs() <= 5
+                    && (i32::from(oy) - i32::from(y)).abs() <= 5 =>
+            {
+                Some(guid)
+            }
+            _ => None,
+        })?;
+        population.set_object_mode(guid, 1);
+        Some(d2gs::object_state(guid, true, 1))
+    }
+
     /// Where a player taking warp tile `guid` arrives: the level and the spot.
     fn warp_arrival(&self, game_id: u16, guid: u32) -> Option<(i32, u16, u16)> {
         let rules = self.rules.as_ref()?;
@@ -634,16 +657,11 @@ impl GameServer {
                     Spawned::Object { guid, class, x, y, mode, interaction } => {
                         packets.push(d2gs::assign_object(guid, class, x, y, mode, interaction));
                     }
-                    Spawned::Monster { guid, class, x, y, mode, life, ref components, ref variants } => {
+                    Spawned::Monster { guid, class, x, y, .. } => {
                         if !d2_game::population::is_town(id.level) {
                             game.battle.add_monster(rules, guid, i32::from(class), id, x, y);
                         }
-                        packets.push(d2gs::assign_monster(guid, class, x, y, life, mode, components, variants));
-                        let alignment = rules.monsters().get(i32::from(class)).map_or(0, d2_data::monsters::MonsterClass::alignment);
-                        packets.push(d2gs::alignment_state(unit_type::MONSTER, guid, alignment));
-                        if mode != battle::DEAD_MODE {
-                            packets.push(d2gs::monster_standing(guid, x, y, life));
-                        }
+                        packets.extend(monster_packets(rules, unit));
                     }
                 }
             }
@@ -737,9 +755,17 @@ impl GameServer {
                 let level = world.as_ref().and_then(|w| w.room_at(x, y)).map(|r| r.level);
                 battle.place_player(player, level.map(|l| (x, y, l)), views.get(player).map_or(&[], Vec::as_slice));
             }
-            let open = |x: i32, y: i32| world.as_ref().and_then(|w| w.collision_at(x, y)).is_some_and(|c| c & d2_game::path::WALL == 0);
-            for event in battle.advance(rules, due, &open) {
-                share_out(event, views, outgoing, population.as_mut());
+            let Some(world) = world.as_ref() else { return Vec::new() };
+            let events = {
+                let populated = population.as_ref();
+                let open = |x: i32, y: i32| {
+                    let room = world.room_at(x, y).filter(|r| populated.is_some_and(|p| p.units(*r).is_some()))?;
+                    world.collision_at(x, y).filter(|c| c & d2_game::path::WALL == 0).map(|_| room.level)
+                };
+                battle.advance(rules, due, &open)
+            };
+            for event in events {
+                share_out(event, rules, world, battle, views, outgoing, population.as_mut());
             }
         }
         game.outgoing.remove(name).unwrap_or_default()
@@ -756,6 +782,11 @@ impl GameServer {
     fn player_attack(&self, game_id: u16, name: &str, guid: u32) -> bool {
         let mut g = self.lock();
         g.by_id.get_mut(&game_id).is_some_and(|game| game.battle.player_attack(name, guid))
+    }
+
+    /// Whether a dead player's death throes are over on its client.
+    fn player_death_settled(&self, game_id: u16, name: &str) -> bool {
+        self.lock().by_id.get(&game_id).is_some_and(|game| game.battle.player_death_settled(name))
     }
 
     /// Whether a player lies dead.
@@ -812,12 +843,47 @@ fn battle_packet(event: &Event, recipient: &str) -> Option<Vec<u8>> {
     })
 }
 
+/// `SendUnitToClient` for a monster: `0xAC`, its alignment state, and `0x6D` unless it is a
+/// corpse.
+fn monster_packets(rules: &GameData, unit: &Spawned) -> Vec<Vec<u8>> {
+    let Spawned::Monster { guid, class, x, y, mode, life, ref components, ref variants } = *unit else { return Vec::new() };
+    let alignment = rules.monsters().get(i32::from(class)).map_or(0, d2_data::monsters::MonsterClass::alignment);
+    let mut packets = vec![d2gs::assign_monster(guid, class, x, y, life, mode, components, variants), d2gs::alignment_state(unit_type::MONSTER, guid, alignment)];
+    if mode != battle::DEAD_MODE {
+        packets.push(d2gs::monster_standing(guid, x, y, life));
+    }
+    packets
+}
+
 /// Queue a fight event's packet for each player it concerns — its own player, or every player
-/// whose client holds the monster's room — and keep the room's population in step.
-fn share_out(event: Event, views: &HashMap<String, Vec<RoomId>>, outgoing: &mut HashMap<String, Vec<Vec<u8>>>, population: Option<&mut Population>) {
+/// whose client holds the monster's room — and keep the room's population in step. A monster
+/// that walks into another room belongs to that room from then on, as the engine moves a unit
+/// between rooms: a client holding only the room it left forgets it, and one holding only the
+/// room it entered is sent it — never a unit in a room the client has not loaded, which halts it
+/// (`0x00465420`, error 316).
+fn share_out(
+    event: Event,
+    rules: &GameData,
+    world: &World,
+    battle: &mut Battle,
+    views: &HashMap<String, Vec<RoomId>>,
+    outgoing: &mut HashMap<String, Vec<Vec<u8>>>,
+    population: Option<&mut Population>,
+) {
     if let Event::MonsterState { guid, x, y, mode, life } = event {
-        if let Some(population) = population {
-            population.update_monster(guid, (x, y), mode, life);
+        let Some(population) = population else { return };
+        population.update_monster(guid, (x, y), mode, life);
+        let Some(to) = world.room_at(i32::from(x), i32::from(y)) else { return };
+        let Some(from) = population.move_monster(guid, to) else { return };
+        battle.set_monster_room(guid, to);
+        let Some((_, unit)) = population.find(unit_type::MONSTER, guid) else { return };
+        for (player, view) in views {
+            let (had, has) = (view.contains(&from), view.contains(&to));
+            if had && !has {
+                outgoing.entry(player.clone()).or_default().push(d2gs::remove_unit(unit_type::MONSTER, guid));
+            } else if has && !had {
+                outgoing.entry(player.clone()).or_default().extend(monster_packets(rules, unit));
+            }
         }
         return;
     }
@@ -976,10 +1042,16 @@ fn respawn(server: &GameServer, p: &Player, w: &mut Walker, outbox: &mut Outbox)
         return false;
     }
     outbox.push(&d2gs::player_reaction(unit_type::PLAYER, PLAYER_GUID, battle::reaction::DEAD, 0, 0));
-    for packet in server.revive(p.game_id, &p.character.name) {
-        outbox.push(&packet);
+    let revived = server.revive(p.game_id, &p.character.name);
+    for packet in &revived {
+        outbox.push(packet);
     }
-    teleport(server, p, w, p.spawn.0, p.spawn.1, outbox)
+    let moved = teleport(server, p, w, p.spawn.0, p.spawn.1, outbox);
+    // Its life once more where it lands, in case the stand-up above came too soon.
+    for packet in &revived {
+        outbox.push(packet);
+    }
+    moved
 }
 
 /// Whether the server's idea of the player stands close enough to a monster at (`x`, `y`) to hit it.
@@ -1027,6 +1099,8 @@ async fn run(
     let mut last_step = Instant::now();
     // A swing at a monster the player is still walking up to: its guid and when it was asked.
     let mut pending_attack: Option<(u32, Instant)> = None;
+    // A release (0x41) waiting for the death throes to end.
+    let mut pending_respawn = false;
 
     loop {
         let limit = if stage == Stage::AwaitLogon { LOGON_TIMEOUT } else { IN_GAME_TIMEOUT };
@@ -1052,6 +1126,13 @@ async fn run(
             let motion = walker.as_ref().map_or(battle::Motion::Standing, |w| w.motion(server.speed_scale));
             for packet in server.battle_step(p.game_id, &p.character.name, motion) {
                 outbox.push(&packet);
+            }
+            if pending_respawn && server.player_death_settled(p.game_id, &p.character.name) {
+                pending_respawn = false;
+                if let Some(w) = walker.as_mut() {
+                    info!(%peer, x = p.spawn.0, y = p.spawn.1, "respawn in town");
+                    respawn(server, p, w, &mut outbox);
+                }
             }
             frames_since_check += 1;
             if frames_since_check >= 25 {
@@ -1193,6 +1274,9 @@ async fn run(
                     };
                     info!(%peer, level, x, y, "waypoint travel");
                     if teleport(server, p, w, x, y, &mut outbox) {
+                        if let Some(packet) = server.light_waypoint_at(p.game_id, x, y) {
+                            outbox.push(&packet);
+                        }
                         flush(stream, peer, tables, &mut outbox).await?;
                     }
                 }
@@ -1235,12 +1319,9 @@ async fn run(
                     flush(stream, peer, tables, &mut outbox).await?;
                 }
                 (Stage::InGame, cs::RESPAWN) => {
-                    let (Some(w), Some(p)) = (walker.as_mut(), player.as_ref()) else { continue };
-                    info!(%peer, x = p.spawn.0, y = p.spawn.1, "respawn in town");
-                    if respawn(server, p, w, &mut outbox) {
-                        pending_attack = None;
-                        flush(stream, peer, tables, &mut outbox).await?;
-                    }
+                    // Done on the next frame the corpse has settled (see `respawn`).
+                    pending_respawn = true;
+                    pending_attack = None;
                 }
                 (Stage::InGame, cs::UPDATE_POSITION) => {
                     // The client's own idea of where its player is (engine `0x0054CD50` re-syncs to
@@ -2178,9 +2259,71 @@ pub(crate) mod tests {
         assert_eq!(sent[1][0], 0x95);
         assert!(sent[1][1] != 0 || sent[1][2] & 0x7F != 0, "with life");
         assert_eq!(sent[2][0], 0x07, "the camp's rooms after");
-        assert_eq!(sent.last().map(|p| p[0]), Some(0x15), "and the move last");
+        let n = sent.len();
+        assert_eq!((sent[n - 2][0], sent[n - 1][0]), (0x15, 0x95), "then the move, and its life again");
         assert!(!gs.player_dead(id, "Hero"));
         assert!(!respawn(&gs, &player, &mut walker, &mut Outbox::default()), "only the dead respawn");
+    }
+
+    /// With the operator's install: a player running across Blood Moor with monsters after it is
+    /// never sent a monster standing outside the rooms its client holds (the client halts), and
+    /// no monster follows it out of the level.
+    #[test]
+    fn with_a_real_install_chasing_monsters_stay_in_loaded_rooms() {
+        let Ok(dir) = std::env::var("BNETCC_D2_DATA_DIR") else {
+            return;
+        };
+        let engine = EngineData::from_game_exe(&std::fs::read(Path::new(&dir).join("Game.exe")).unwrap()).unwrap();
+        let rules = GameData::load(&dir).unwrap();
+        let stats = rules.new_character_stats(4).unwrap();
+        let gs = GameServer::new(test_tables(), Some(rules)).with_engine(engine);
+        let mut checked = 0;
+        for i in 0..3 {
+            let id = gs.create(&format!("chase {i}"), "", 0).unwrap();
+            let (spawn, moor) = {
+                let g = gs.lock();
+                let game = &g.by_id[&id];
+                (game.spawn, game.world.as_ref().unwrap().levels().iter().find(|l| l.id == 2).unwrap().area)
+            };
+            gs.join_battle(id, "Runner", 4, &stats);
+            let mut w = Walker { x: f64::from(spawn.0), y: f64::from(spawn.1), target: None, speed: 0.0, room: None, view: Vec::new() };
+            let (room, near) = gs.near(id, w.x, w.y).unwrap();
+            gs.view_change(id, &[], &near);
+            (w.room, w.view) = (Some(room), near);
+            let far = (f64::from((moor.x + moor.w / 2) * 5), f64::from((moor.y + moor.h / 2) * 5));
+            // Out to the middle of the moor, and back to the camp, slowly enough to be chased.
+            for (tx, ty) in [far, (f64::from(spawn.0), f64::from(spawn.1))] {
+                w.go(tx, ty, WALK_SPEED * 0.6);
+                while w.moving() {
+                    w.step(SERVER_FRAME);
+                    gs.set_position(id, "Runner", w.x, w.y);
+                    let mut sent = Vec::new();
+                    if let Some((room, near)) = gs.near(id, w.x, w.y) {
+                        if w.room != Some(room) {
+                            let view = gs.kept_view(id, room, &near, &w.view);
+                            sent.extend(gs.view_change(id, &w.view, &view));
+                            (w.room, w.view) = (Some(room), view);
+                        }
+                    }
+                    gs.set_view(id, "Runner", &w.view);
+                    if gs.player_dead(id, "Runner") {
+                        gs.revive(id, "Runner");
+                    }
+                    sent.extend(fight_for(&gs, id, "Runner", 1));
+                    let g = gs.lock();
+                    let world = g.by_id[&id].world.as_ref().unwrap();
+                    for p in sent.iter().filter(|p| p[0] == 0xAC) {
+                        let (x, y) = (i32::from(u16::from_le_bytes([p[7], p[8]])), i32::from(u16::from_le_bytes([p[9], p[10]])));
+                        let at = world.room_at(x, y).expect("a monster in no room");
+                        assert!(w.view.contains(&at), "game {i}: monster at ({x}, {y}) in {at:?}, not held by the client");
+                        let guid = u32::from_le_bytes([p[1], p[2], p[3], p[4]]);
+                        assert!(at.level != 1 || g.by_id[&id].battle.monster(guid).is_none(), "game {i}: a fighting monster in the camp");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 20, "only {checked} monsters sent");
     }
 
     /// With the operator's install: Blood Moor's cave mouth comes with its room as a warp unit

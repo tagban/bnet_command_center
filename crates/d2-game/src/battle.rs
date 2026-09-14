@@ -76,6 +76,9 @@ pub const PLAYER_REACH: i32 = 6;
 const MAX_CATCH_UP: u64 = 5 * FRAMES_PER_SECOND;
 /// Unarmed damage.
 const FIST_DAMAGE: (i32, i32) = (1, 2);
+/// Frames past a player's death animation before a release stands it up: the client's corpse
+/// mode follows the animation's end.
+const DEATH_SETTLE_MARGIN: u64 = 15;
 /// Least frames between two stamina updates to a client.
 const VITALS_EVERY: u64 = 5;
 /// Player animation tokens by class.
@@ -302,6 +305,8 @@ struct Hero {
     at: Option<(i32, i32, i32)>,
     view: Vec<RoomId>,
     dead: bool,
+    /// When its death throes are over, once dead.
+    settled_at: u64,
     swing_until: u64,
     attack_frames: u64,
     hit_frame: u64,
@@ -531,6 +536,7 @@ impl Battle {
             at: None,
             view: Vec::new(),
             dead: false,
+            settled_at: 0,
             swing_until: 0,
             attack_frames,
             hit_frame: hit_frames(data, token, "A1", "hth", attack_frames / 2),
@@ -597,6 +603,26 @@ impl Battle {
         }
     }
 
+    /// Whether a dead player's death throes have played out on its client: the release (`0x41`)
+    /// can only stand up a corpse (`0x0045DB20` revives a unit in mode 0x11).
+    #[must_use]
+    pub fn player_death_settled(&self, name: &str) -> bool {
+        self.heroes.get(name).is_some_and(|h| h.dead && self.frame >= h.settled_at)
+    }
+
+    /// Move a monster to the room it now stands in: who sees it follows.
+    pub fn set_monster_room(&mut self, guid: u32, room: RoomId) {
+        if let Some(m) = self.monsters.get_mut(&guid) {
+            m.room = room;
+        }
+    }
+
+    /// The room a monster is in.
+    #[must_use]
+    pub fn monster_room(&self, guid: u32) -> Option<RoomId> {
+        self.monsters.get(&guid).map(|m| m.room)
+    }
+
     /// Whether a player is dead.
     #[must_use]
     pub fn player_dead(&self, name: &str) -> bool {
@@ -655,8 +681,10 @@ impl Battle {
         vec![h.vitals(name, self.frame)]
     }
 
-    /// Run the battle up to `frame`, walking monsters on `open` ground.
-    pub fn advance(&mut self, data: &GameData, frame: u64, open: &dyn Fn(i32, i32) -> bool) -> Vec<Event> {
+    /// Run the battle up to `frame`, walking monsters on `open` ground: the level of a subtile a
+    /// monster may walk on (walkable, in a room that has come into play), `None` where it may not.
+    /// A monster never walks out of its own level.
+    pub fn advance(&mut self, data: &GameData, frame: u64, open: &dyn Fn(i32, i32) -> Option<i32>) -> Vec<Event> {
         let mut events = Vec::new();
         if frame > self.frame + MAX_CATCH_UP {
             self.frame = frame - MAX_CATCH_UP;
@@ -668,7 +696,7 @@ impl Battle {
         events
     }
 
-    fn step(&mut self, data: &GameData, open: &dyn Fn(i32, i32) -> bool, events: &mut Vec<Event>) {
+    fn step(&mut self, data: &GameData, open: &dyn Fn(i32, i32) -> Option<i32>, events: &mut Vec<Event>) {
         let now = self.frame;
         if let Some(due) = self.due.remove(&now) {
             for d in due {
@@ -797,7 +825,7 @@ impl Battle {
             .map(|(_, name)| name.clone())
     }
 
-    fn monster_step(&mut self, guid: u32, open: &dyn Fn(i32, i32) -> bool, events: &mut Vec<Event>) {
+    fn monster_step(&mut self, guid: u32, open: &dyn Fn(i32, i32) -> Option<i32>, events: &mut Vec<Event>) {
         let now = self.frame;
         let Some(m) = self.monsters.get_mut(&guid) else { return };
         // A walk that has run its course ends where it was going.
@@ -874,8 +902,10 @@ impl Battle {
         };
         let Some((hx, hy, _)) = self.heroes.get(&target).and_then(|h| h.at) else { return };
         if path::distance(at, (hx, hy)) <= reach {
-            if m.glide.is_some() {
-                stop(m, guid, now, events);
+            // The swing asserts where the monster stands (0x0045CFB0), so no stop is sent first:
+            // a 0x6D would place it outright.
+            if let Some(glide) = m.glide.take() {
+                (m.x, m.y) = glide_at(&glide, now);
             }
             let (x, y) = m.at();
             events.push(Event::MonsterAttack { room, guid, target: target.clone(), x: x as u16, y: y as u16 });
@@ -900,7 +930,7 @@ impl Battle {
             .flat_map(|(_, other)| [Some(other.at()), other.glide.as_ref().map(|g| (g.to.0.round() as i32, g.to.1.round() as i32))])
             .flatten()
             .collect();
-        let free = |x: i32, y: i32| open(x, y) && !taken.contains(&(x, y));
+        let free = |x: i32, y: i32| open(x, y) == Some(room.level) && !taken.contains(&(x, y));
         let m = self.monsters.get_mut(&guid).expect("present");
         let step = path::find(at, (hx, hy), reach, 12, 3000, &free).and_then(|p| {
             if p.is_empty() {
@@ -955,6 +985,8 @@ impl Battle {
         }
         h.life = 0;
         h.dead = true;
+        // Its client plays the death throes, then settles into the corpse a moment later.
+        h.settled_at = now + dying_frames + DEATH_SETTLE_MARGIN;
         events.push(h.vitals(target, now));
         events.push(Event::PlayerReaction { player: player.clone(), event: reaction::DYING });
         self.due.entry(self.frame + dying_frames.max(1)).or_default().push(Due::PlayerDead { player });
@@ -1084,7 +1116,7 @@ mod tests {
         let data = data();
         let mut b = battle(&data);
         b.place_player("hero", Some((102, 100, ROOM.level)), &[ROOM]);
-        let open = |_: i32, _: i32| true;
+        let open = |_: i32, _: i32| Some(ROOM.level);
         let mut all = Vec::new();
         for _ in 0..60 {
             b.player_attack("hero", 7);
@@ -1111,7 +1143,7 @@ mod tests {
     fn a_monster_chases_swings_and_can_kill() {
         let data = data();
         let mut b = battle(&data);
-        let open = |_: i32, _: i32| true;
+        let open = |_: i32, _: i32| Some(ROOM.level);
         b.place_player("hero", Some((120, 100, ROOM.level)), &[]);
         assert!(b.advance(&data, 50, &open).is_empty(), "a player whose client does not hold the room is not noticed");
         b.place_player("hero", Some((120, 100, ROOM.level)), &[ROOM]);
@@ -1141,7 +1173,7 @@ mod tests {
     fn running_out_of_town_spends_stamina_and_standing_gets_it_back() {
         let data = data();
         let mut b = battle(&data);
-        let open = |_: i32, _: i32| true;
+        let open = |_: i32, _: i32| Some(ROOM.level);
         // Far from the monster, in Blood Moor: 92 stamina, RunDrain 20 → 40/256 a frame.
         b.place_player("hero", Some((1000, 1000, ROOM.level)), &[]);
         b.set_motion("hero", Motion::Running);
@@ -1164,7 +1196,7 @@ mod tests {
     fn a_walled_off_player_is_not_reached() {
         let data = data();
         let mut b = battle(&data);
-        let open = |x: i32, _: i32| x != 110;
+        let open = |x: i32, _: i32| (x != 110).then_some(ROOM.level);
         b.place_player("hero", Some((120, 100, ROOM.level)), &[ROOM]);
         let all = b.advance(&data, 200, &open);
         assert!(!all.iter().any(|e| matches!(e, Event::MonsterAttack { .. })));
