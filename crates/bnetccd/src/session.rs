@@ -1883,6 +1883,7 @@ impl Bncs {
             return Step::Close;
         };
         self.adopt_realm_character(frame, &account).await;
+        self.show_record(&account).await;
         // The unique display name (with any #N), so a duplicate login sees itself correctly.
         let mut w = Writer::with_capacity(64);
         w.cstr(self.display_name.as_bytes())
@@ -1894,6 +1895,36 @@ impl Bncs {
         // Server MOTD, once, at chat entry — not on every channel join. A per-channel MOTD
         // is a separate future feature (see docs/ROADMAP.md).
         self.send(&chat_event(EventId::Info, 0, 0, b"", self.node.motd.as_bytes()))
+    }
+
+    /// A StarCraft or Warcraft II user's statstring shows their record: normal-game wins, and
+    /// the ladder (and Warcraft II Iron Man) rating, rank and high rating once they have
+    /// ladder games. Taken at chat entry and after each reported game, as channel joins show it.
+    async fn show_record(&mut self, account: &Account) {
+        use bnetcc_core::ladder::{rank_of, standings, League, SortMethod};
+        use bnetcc_storage::attr::AttrKey;
+        let Some(product) = self.product.filter(|&p| [product::STAR, product::SEXP, product::JSTR, product::SSHR, product::W2BN].contains(&p)) else {
+            return;
+        };
+        let key = |league: League, leaf: &str| AttrKey::new(&format!(r"Record\{product}\{}\{leaf}", league.index()));
+        let keys = vec![key(League::Normal, "wins"), key(League::Ladder, "rating"), key(League::Ladder, "high rating"), key(League::IronMan, "rating")];
+        let attrs = self.node.read_readable_attrs(&account.name, keys.clone()).await;
+        let number = |i: usize| attrs.get(&keys[i]).and_then(|v| v.parse::<u32>().ok());
+        let mut record = statstring::Record { wins: number(0).unwrap_or(0), ..statstring::Record::default() };
+        let product_name = product.to_string();
+        for (league, rating, rank) in [(League::Ladder, &mut record.rating, &mut record.rank), (League::IronMan, &mut record.iron_rating, &mut record.iron_rank)] {
+            let Some(current) = number(if league == League::Ladder { 1 } else { 3 }) else { continue };
+            if league == League::IronMan && product != product::W2BN {
+                continue;
+            }
+            *rating = current;
+            let ladder = standings(self.node.ladder_rows(&product_name, league).await, SortMethod::Rating);
+            *rank = rank_of(&ladder, &account.name).map_or(0, |r| r + 1);
+        }
+        if record.rating > 0 {
+            record.high_rating = number(2).unwrap_or(record.rating);
+        }
+        self.statstring = statstring::build_starcraft(product, record);
     }
 
     fn join_channel(&mut self, frame: &Frame) -> Step {
@@ -2936,6 +2967,7 @@ impl Bncs {
                 ),
                 Err(e) => warn!(peer = %self.peer, error = %e, "failed to record ladder game"),
             }
+            self.show_record(&account).await;
             return Step::Continue;
         }
         match outcome {
@@ -2957,6 +2989,9 @@ impl Bncs {
                 account = %account.name,
                 "SID_GAMERESULT carried no recordable result for this player"
             ),
+        }
+        if outcome.is_some() {
+            self.show_record(&account).await;
         }
         Step::Continue
     }
@@ -3500,6 +3535,13 @@ mod tests {
         w.u32(product::SEXP.0).u32(3).u32(0).cstr(b"Fenix");
         send_frame(&mut winner, &Frame::new(sid::FINDLADDERUSER, w.finish())).await;
         assert_eq!(recv_frame(&mut winner).await.reader().u32().unwrap(), u32::MAX, "no Iron Man games, no rank");
+
+        // Chat shows the record: normal wins, then the ladder rating, 1-based rank and high.
+        send_frame(&mut winner, &Frame::new(sid::ENTERCHAT, Writer::new().finish())).await;
+        let enter = recv_frame(&mut winner).await;
+        let mut r = enter.reader();
+        r.cstr(64).unwrap();
+        assert_eq!(r.cstr(128).unwrap(), b"PXES 1016 1 1 0 0 1016 0 0 PXES");
     }
 
     #[test]
