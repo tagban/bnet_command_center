@@ -682,7 +682,8 @@ On the wire:
   with the gold property — a 1-bit width flag and the amount in 12 or 32 bits. The client does
   not read the category for action 0; we send 0.
 - **C→S `0x16`** (13): `[container u32][item guid u32][to cursor u32]`. For gold we remove the pile
-  for everyone holding its room (`0x0A` type 4), set stat 14 (`0x1D`–`0x1F`) and save.
+  for everyone holding its room (`0x0A` type 4), tell the picker its gold as the engine does
+  (`0x53E9B0`: a gain of 1–254 is `0x19 [gain]`, else stat 14 by `0x1D`–`0x1F`) and save.
 - Piles stay in the game: a room coming near sends its piles without the drop flag, a room left
   behind sends their `0x0A`s.
 

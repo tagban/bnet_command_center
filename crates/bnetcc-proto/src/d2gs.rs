@@ -61,6 +61,8 @@ pub mod sc {
     pub const ASSIGN_WARP: u8 = 0x09;
     /// Forget a unit (6 bytes).
     pub const REMOVE_UNIT: u8 = 0x0A;
+    /// Add a little gold: `[gain u8]` (2 bytes).
+    pub const ADD_GOLD_BYTE: u8 = 0x19;
     /// An item made, moved or placed where no unit owns it (variable; size at `+2`).
     pub const ITEM_ACTION_WORLD: u8 = 0x9C;
     /// An object's mode changed (12 bytes).
@@ -718,6 +720,16 @@ pub fn ground_gold(guid: u32, x: u16, y: u16, amount: u32, dropping: bool) -> Ve
     bytes
 }
 
+/// A player's gold (stat 14) going from `old` to `new`, as the engine tells its client
+/// (`0x0053E9B0`): a gain of 1–254 is `0x19 [gain]`; anything else sets the stat outright.
+#[must_use]
+pub fn gold_update(old: u32, new: u32) -> Vec<u8> {
+    match new.wrapping_sub(old) {
+        gain @ 1..=254 => vec![sc::ADD_GOLD_BYTE, gain as u8],
+        _ => set_stat(14, new),
+    }
+}
+
 /// Fog's bit buffer (`0x00410EB0`): values packed least significant bit first.
 struct BitWriter {
     bytes: Vec<u8>,
@@ -983,6 +995,15 @@ mod tests {
         l[0] = 1;
         l[0xAF] = 8;
         l
+    }
+
+    #[test]
+    fn gold_updates_add_small_gains_and_set_the_rest() {
+        assert_eq!(gold_update(10, 14), [0x19, 4]);
+        assert_eq!(gold_update(0, 254), [0x19, 254]);
+        assert_eq!(gold_update(0, 255), set_stat(14, 255));
+        assert_eq!(gold_update(100, 40), [0x1D, 14, 40], "a loss sets it");
+        assert_eq!(gold_update(0, 70_000), [0x1F, 14, 0x70, 0x11, 0x01, 0x00]);
     }
 
     #[test]

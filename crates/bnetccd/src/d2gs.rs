@@ -816,7 +816,8 @@ impl GameServer {
     /// A player picks up a gold pile (engine `0x16`): it takes what its purse holds. Its client
     /// gets the pile removed and its new gold (`0x1D`–`0x1F`, stat 14); others near see the pile
     /// go. A remainder is put back as a smaller pile. Items other than gold are not on the ground
-    /// yet; anything else is ignored.
+    /// yet; anything else is ignored. The gold goes as the engine sends it (`0x19` for a small
+    /// gain).
     ///
     /// ⚠️ Range is not checked (the client walks up before it asks), and what the engine does
     /// with a remainder is not confirmed.
@@ -842,7 +843,7 @@ impl GameServer {
             }
         }
         info!(game_id, player = name, guid, taken, total, "gold picked up");
-        gone.push(d2gs::set_stat(stat::GOLD, total));
+        gone.push(d2gs::gold_update(total - taken, total));
         gone
     }
 
@@ -2254,7 +2255,7 @@ pub(crate) mod tests {
         assert_eq!(got[0], d2gs::remove_unit(unit_type::ITEM, pile));
         let gold = gs.lock().by_id[&id].battle.player_stats("Hero").unwrap().iter().find(|s| s.0 == stat::GOLD).unwrap().1;
         assert!((1..=5).contains(&gold), "level 1: 1 + rand(5): {gold}");
-        assert_eq!(got[1], d2gs::set_stat(stat::GOLD, gold));
+        assert_eq!(got[1], [0x19, gold as u8], "a small gain");
         assert!(gs.pick_up(id, "Hero", pile).is_empty(), "once");
         gs.view_change(id, &[room], &[]);
         assert!(!gs.view_change(id, &[], &[room]).iter().any(|p| p[0] == 0x9C), "gone for good");
