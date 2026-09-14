@@ -537,6 +537,46 @@ behind the ticks, so period 1 lasts a single frame and the day restarts at 340°
 The handshake test keeps one clock per game (Act I), steps it by elapsed server frames, and
 sends `0x53` on each report; eclipses are not ported.
 
+### Collision (2026-09-14)
+
+**Where it comes from.** Each room gets a map of `WorldSize × 5` subtiles when it comes into play
+(`DRLGROOM_AllocRoomCollisionGrid`, `0x0064C900`): every floor, wall and roof tile of the room, and
+of the rooms around it whose corner lies inside it, is stamped in (`TileLibrary_AddCollision`,
+`0x0064C4C0`) — its DT1 tile's 25 subtile flag bytes, rows read bottom first, plus bits its draw
+flags carry over the whole tile (`0x02` → `0x10`, `0x40` → `0x01`, `0x80` → `0x04`). A plain
+wilderness cell no floor covers gets `0x05` (solid rock). Bits: `0x01` wall (blocks walking), `0x02`
+blocks sight, `0x04` missile barrier, `0x08` blocks players only, `0x10` preset tile.
+
+**A room's tiles.** A room loads the DT1 files of its level type (`LvlTypes.txt`) that its DT1 mask
+picks by column, then `Blank.dt1`, `InvisWal.dt1` and `Warp.dt1` (`0x0066F240`, read in Ghidra). A
+preset piece's mask is `LvlPrest.txt` `Dt1Mask`; a plain Act I wilderness room's is `0x44103` ORed
+with each terrain row it rolled (`DRLGROOMEX_RollLevelSubstitutionMask`). Its grids are a window
+into the piece's DS1, or, for a plain room, the grass floor with the road edges cut in, then the
+waypoint, shrine and terrain passes (`SubTypeWpShrine` three times) — each stamps the piece's floor,
+first wall layer with its tile types, and a shadow tile per shadow cell, which is a roll. Then
+`DRLGROOMTILE_ProcessTile` (`0x0066E9B0`) makes each cell's tiles: `GetTileLibraryEntry`
+(`0x0066D820`) collects the matching tiles of every file in load order, newest record first within
+a file, and picks by rarity on the room's seed `{nSeed, 0x29A}`. Border cells go through
+`UpdateOrAddTile` (`0x0066E940`): a room built earlier that owns the tile keeps it, and a blank
+floor it owns is re-typed on the owner's seed (`0x0066E740`, tables at `0x006EF574`/`0x006EF620`).
+Lit warps (cave mouths) add a second wall tile and four floor tiles (`0x0066E260`, `0x0066E360`).
+
+**A DS1 quirk.** `Act1\Outdoors\Trees.ds1` counts 14 substitution groups and holds 13; the engine
+reads the missing one as zeros, and without that group the terrain pass rolls differently in every
+room that picks trees.
+
+**Checked.** `d2_drlg::room_tiles` and `d2_drlg::collision` (from libd2 `materialize.zig`,
+`tilegen.zig` and `lib.zig`) reproduce libd2's engine recordings for every Act I wilderness level
+(Blood Moor to Tamoe Highland and the Burial Grounds): all rooms of seven per-subtile captures
+(seeds 1, 2, 17, 18, 777 and two blind holdouts, about 4,100 rooms and 6.5 million subtiles) and
+the per-level checksums of 200 seeds on Normal and on Hell, with no difference in the terrain bits.
+The same room build now gives the world the units its pieces carry — including the objects in the
+terrain maps (`Object.ds1`, `Swamp2.ds1`), which were not spawned before.
+
+Not yet: the towns' and other preset levels' maps, cross-level seams where a neighbouring level's
+preset room reaches into a room (`DRLGROOMEX_LinkNearRoomsByVis`), and using the maps — monster
+spots, walk checks and paths.
+
 ## 6. Server packet builders (opcode → function)
 
 `scripts/d2re/server_send_builders.py <Game.exe>` finds every call to the queue function
@@ -558,9 +598,11 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
   player (stats, skills, items, states).
 - Shops: `0x38` trade/gamble/repair and the store's items; hirelings; NPC quest messages.
 - Waypoint travel to other acts (`0x53ACC0`), which needs their maps.
-- Collision from the DT1 tiles (libd2 `materialize.zig`/`collision.zig`), then paths
-  (`0x64DEA0`, `path.zig`) in place of straight lines, and monsters placed and walking where the
-  game lets them; cross-level near rooms by visibility slots (`0x66C220`).
+- Collision for the town and other preset levels (the wilderness is done, §5 *Collision*), then
+  monster spots probed against it (`0x54DC40`), walk checks (`0x548EF0`) and paths (`0x64DEA0`,
+  `path.zig`) in place of straight lines; cross-level near rooms by visibility slots (`0x66C220`).
+- bnemu (MIT, permission recorded in `docs/LEGAL.md`) has worked combat, monster AI, items and
+  vendors to port from; its wilderness collision is approximate, so collision stays on libd2.
 - Monster AI, combat and experience; unique packs and champions; wandering monsters; NPCs
   walking their DS1 paths (`0x666120`); the set pieces' map units (read at room init).
 - The byte at `0x68`+20 and the `0x6A`/`0x6C`/`0x6E` handlers.
