@@ -558,11 +558,11 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
   player (stats, skills, items, states).
 - Shops: `0x38` trade/gamble/repair and the store's items; hirelings; NPC quest messages.
 - Waypoint travel to other acts (`0x53ACC0`), which needs their maps.
-- Movement: paths and collision (`0x64DEA0`, libd2 `path.zig`/`collision.zig`) in place of
-  straight lines; cross-level near rooms by visibility slots (`0x66C220`); shrine init (`InitFn`
-  1) and the set pieces' map units (read at room init, not ported); collision (DT1 tiles) so
-  monsters stand and walk where the game lets them; monster AI, combat and experience; unique
-  packs and champions; NPC AI walking their DS1 paths (`0x666120`).
+- Collision from the DT1 tiles (libd2 `materialize.zig`/`collision.zig`), then paths
+  (`0x64DEA0`, `path.zig`) in place of straight lines, and monsters placed and walking where the
+  game lets them; cross-level near rooms by visibility slots (`0x66C220`).
+- Monster AI, combat and experience; unique packs and champions; wandering monsters; NPCs
+  walking their DS1 paths (`0x666120`); the set pieces' map units (read at room init).
 - The byte at `0x68`+20 and the `0x6A`/`0x6C`/`0x6E` handlers.
 - A packet capture from the real engine (`docs/D2GS-RUST.md` §2 oracle) would confirm the dump
   faster than reading it; §4 and §6 say where to look in that capture.
