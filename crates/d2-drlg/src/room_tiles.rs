@@ -82,6 +82,35 @@ pub struct RoomTile {
     pub layer: Layer,
 }
 
+/// A warp tile of a room: where a level's exit to another level lies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WarpTile {
+    /// Index of the room in its level's list.
+    pub room: usize,
+    /// The level's vis slot the warp belongs to.
+    pub slot: u8,
+    /// The tile's world subtile corner.
+    pub x: i32,
+    /// The tile's world subtile corner.
+    pub y: i32,
+}
+
+/// A room's warp tiles from the cells its build set up as warps (`(x, y, slot)` from the room's
+/// corner), one per vis slot in `slots`. The engine keeps each slot's tiles on the room's warp
+/// node newest first (`DRLGROOMTILE_SetupWarpTile`, `0x0066E260`); the last one set up is kept.
+#[must_use]
+pub fn warp_tiles(room: usize, area: Coords, cells: &[(i32, i32, u8)], slots: u8) -> Vec<WarpTile> {
+    let mut found: Vec<WarpTile> = Vec::new();
+    for &(x, y, slot) in cells.iter().filter(|&&(_, _, s)| s < 8 && slots >> s & 1 != 0) {
+        let warp = WarpTile { room, slot, x: (area.x + x) * 5, y: (area.y + y) * 5 };
+        match found.iter_mut().find(|w| w.slot == slot) {
+            Some(w) => *w = warp,
+            None => found.push(warp),
+        }
+    }
+    found
+}
+
 /// A grid of cell flags, as `D2DrlgGridStrc` reads it: row by row, a read past a row's end
 /// landing in the next row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,11 +415,13 @@ struct Builder<'a> {
     /// blank floor.
     linked: Vec<(i32, i32, i32, i32, bool)>,
     seams: Option<&'a mut Seams>,
+    /// Cells set up as warps: x, y and vis slot.
+    warp_cells: Vec<(i32, i32, u8)>,
 }
 
 impl<'a> Builder<'a> {
     fn new(library: &'a Library, tables: &'a TileTables, level: i32, rect: Coords, seed: u32, seams: Option<&'a mut Seams>, warps: Option<Warps<'a>>) -> Self {
-        Self { library, tables, level, rect, seed: Seed::new(seed, 0x29A), warps, tiles: Vec::new(), linked: Vec::new(), seams }
+        Self { library, tables, level, rect, seed: Seed::new(seed, 0x29A), warps, tiles: Vec::new(), linked: Vec::new(), seams, warp_cells: Vec::new() }
     }
 
     fn pick(&mut self, tile_type: i32, grid: i32) -> Option<Tile> {
@@ -462,6 +493,7 @@ impl<'a> Builder<'a> {
     /// `DRLGROOMTILE_SetupWarpTile` (`0x0066E260`): a lit warp gets a second wall tile.
     fn setup_warp(&mut self, x: i32, y: i32, grid: i32, tile_type: i32) {
         let Some(node) = self.warp_node(grid) else { return };
+        self.warp_cells.push((x, y, (grid >> 20 & 7) as u8));
         let orientation = grid >> 8 & 0xFF;
         if orientation == 0 || orientation == 4 {
             let wanted = if tile_type == TYPE_WARP_RIGHT { b'r' } else { b'l' };
@@ -484,6 +516,7 @@ impl<'a> Builder<'a> {
     /// `DRLGROOMTILE_InitWarpCacheTiles` (`0x0066E360`): a lit warp's four floor tiles.
     fn warp_floors(&mut self, grid: i32, x: i32, y: i32, tile_type: i32) {
         let Some(node) = self.warp_node(grid) else { return };
+        self.warp_cells.push((x, y, (grid >> 20 & 7) as u8));
         self.set_warp_direction(node, tile_type);
         if !self.node_row(node).is_some_and(|r| r.lit_version) {
             return;
@@ -616,7 +649,12 @@ impl<'a> Builder<'a> {
 
     /// Hand the room's linked tiles to the level and keep the tiles a collision map reads:
     /// floors and walls up to the far edges, roofs inside the room (`0x0064C900`).
-    fn finish(mut self) -> Vec<RoomTile> {
+    fn finish(self) -> Vec<RoomTile> {
+        self.finish_with_warps().0
+    }
+
+    /// The room's tiles and the cells inside it set up as warps.
+    fn finish_with_warps(mut self) -> (Vec<RoomTile>, Vec<(i32, i32, u8)>) {
         if let Some(seams) = self.seams.take() {
             seams.publish(self.library, self.seed, self.rect, &self.linked);
         }
@@ -625,7 +663,8 @@ impl<'a> Builder<'a> {
             let edge = i32::from(t.layer != Layer::Roof);
             t.tile.is_some() && t.x >= 0 && t.y >= 0 && t.x < w + edge && t.y < h + edge
         });
-        self.tiles
+        self.warp_cells.retain(|&(x, y, _)| x >= 0 && y >= 0 && x < w && y < h);
+        (self.tiles, self.warp_cells)
     }
 }
 
@@ -663,6 +702,12 @@ pub struct RoomContext<'a> {
 /// A preset room's tiles (`DRLGPRESET_InitializePresetRoom`, `0x00666AC0`).
 #[must_use]
 pub fn preset_room(ctx: RoomContext<'_>, map: &Ds1, window: PresetWindow) -> Vec<RoomTile> {
+    preset_room_with_warps(ctx, map, window).0
+}
+
+/// A preset room's tiles and the cells it set up as warps (`x`, `y`, vis slot).
+#[must_use]
+pub fn preset_room_with_warps(ctx: RoomContext<'_>, map: &Ds1, window: PresetWindow) -> (Vec<RoomTile>, Vec<(i32, i32, u8)>) {
     let rect = ctx.rect;
     let (ox, oy) = (rect.x - window.origin.0, rect.y - window.origin.1);
     let (w, h) = (rect.w + 1, rect.h + 1);
@@ -699,7 +744,7 @@ pub fn preset_room(ctx: RoomContext<'_>, map: &Ds1, window: PresetWindow) -> Vec
         b.walk(g, types.get(i), false, if i == 0 { kill } else { kill_more });
     }
     b.walk(&shadow, None, false, kill);
-    b.finish()
+    b.finish_with_warps()
 }
 
 /// The substitution passes of a plain wilderness room: its terrain rows and maps.

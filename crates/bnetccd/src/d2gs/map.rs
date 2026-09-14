@@ -202,6 +202,11 @@ impl GameServer {
                 let name = row.name.trim_start_matches("Act 1 - ").to_string();
                 Some(MapMark { name, kind: "entrance", x: room.x * 5 + room.w * 5 / 2, y: room.y * 5 + room.h * 5 / 2 })
             })
+            .chain(level.warps.iter().filter_map(|w| {
+                let (to, _) = world.warp_destination(rules?, level.id, w.slot)?;
+                let name = rules?.levels().get(to).map_or_else(|| format!("level {to}"), level_name);
+                Some(MapMark { name: format!("To {name}"), kind: "entrance", x: w.x, y: w.y })
+            }))
             .collect();
         let marks = level
             .units

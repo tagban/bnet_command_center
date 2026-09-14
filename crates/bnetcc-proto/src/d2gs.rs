@@ -57,6 +57,8 @@ pub mod sc {
     pub const LOAD_ROOM: u8 = 0x07;
     /// Release a room the client loaded (6 bytes).
     pub const UNLOAD_ROOM: u8 = 0x08;
+    /// A warp tile unit (11 bytes).
+    pub const ASSIGN_WARP: u8 = 0x09;
     /// Forget a unit (6 bytes).
     pub const REMOVE_UNIT: u8 = 0x0A;
     /// An object's mode changed (12 bytes).
@@ -650,6 +652,16 @@ pub fn unload_room(tile_x: u16, tile_y: u16, level: u8) -> Vec<u8> {
 pub fn remove_unit(unit_type: u8, guid: u32) -> Vec<u8> {
     let mut w = Writer::with_capacity(6);
     w.u8(sc::REMOVE_UNIT).u8(unit_type).u32(guid);
+    w.finish()
+}
+
+/// `0x09`: `[unit type u8 = 5][guid u32][class u8][x u16][y u16]` — a warp tile unit, which the
+/// client makes clickable (`SendUnitToClient` `0x00571F90` builds it with `0x0053BCD0`; client
+/// handler `0x0045CB90`). `class` is the `LvlWarp.txt` `Id`.
+#[must_use]
+pub fn assign_warp(guid: u32, class: u8, x: u16, y: u16) -> Vec<u8> {
+    let mut w = Writer::with_capacity(11);
+    w.u8(sc::ASSIGN_WARP).u8(5).u32(guid).u8(class).u16(x).u16(y);
     w.finish()
 }
 

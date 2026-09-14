@@ -155,6 +155,8 @@ struct Game {
     battle: Battle,
     /// Packets the fight has for each player, sent on its connection's next frame.
     outgoing: HashMap<String, Vec<Vec<u8>>>,
+    /// Guids of the warp tiles sent so far, by level and index into the level's warps.
+    warp_guids: HashMap<(i32, usize), u32>,
 }
 
 /// Why the realm could not create a game.
@@ -230,6 +232,7 @@ impl GameServer {
                     units: town.units.clone(),
                     pieces: Vec::new(),
                     collision: Vec::new(),
+                    warps: Vec::new(),
                 };
                 return (FALLBACK_MAP_SEED, Some(town.clone()), Some(World::from_levels(vec![level])));
             }
@@ -358,6 +361,7 @@ impl GameServer {
                 views: HashMap::new(),
                 battle: Battle::new(difficulty, rand::thread_rng().gen()),
                 outgoing: HashMap::new(),
+                warp_guids: HashMap::new(),
             },
         );
         let game = &g.by_id[&id];
@@ -442,9 +446,27 @@ impl GameServer {
         view
     }
 
+    /// Where a player taking warp tile `guid` arrives: the level and the spot.
+    fn warp_arrival(&self, game_id: u16, guid: u32) -> Option<(i32, u16, u16)> {
+        let rules = self.rules.as_ref()?;
+        let g = self.lock();
+        let game = g.by_id.get(&game_id)?;
+        let (&(level, index), _) = game.warp_guids.iter().find(|(_, &g)| g == guid)?;
+        let world = game.world.as_ref()?;
+        let warp = world.levels().iter().find(|l| l.id == level)?.warps.get(index)?;
+        let (to, x, y) = world.warp_arrival(rules, level, warp.slot)?;
+        Some((to, u16::try_from(x).ok()?, u16::try_from(y).ok()?))
+    }
+
     /// Where a unit of the game's population stands.
     fn unit_position(&self, game_id: u16, kind: u32, guid: u32) -> Option<(u16, u16)> {
         let g = self.lock();
+        if kind == u32::from(unit_type::WARP) {
+            let game = g.by_id.get(&game_id)?;
+            let (&(level, index), _) = game.warp_guids.iter().find(|(_, &g)| g == guid)?;
+            let warp = game.world.as_ref()?.levels().iter().find(|l| l.id == level)?.warps.get(index)?;
+            return Some((u16::try_from(warp.x).ok()?, u16::try_from(warp.y).ok()?));
+        }
         let population = g.by_id.get(&game_id)?.population.as_ref()?;
         match *population.find(u8::try_from(kind).ok()?, guid)?.1 {
             Spawned::Object { x, y, .. } | Spawned::Monster { x, y, .. } => Some((x, y)),
@@ -580,6 +602,16 @@ impl GameServer {
                     }
                 }
             }
+            // The room's warps that lead somewhere built, after its other units.
+            let Some(level) = world.levels().iter().find(|l| l.id == id.level) else { continue };
+            for (index, warp) in level.warps.iter().enumerate().filter(|(_, w)| w.room == id.index) {
+                if world.warp_destination(rules, id.level, warp.slot).is_none() {
+                    continue;
+                }
+                let Some(class) = rules.levels().get(id.level).and_then(|d| u8::try_from(d.warp[usize::from(warp.slot)]).ok()) else { continue };
+                let guid = *game.warp_guids.entry((id.level, index)).or_insert_with(|| population.next_guid(unit_type::WARP));
+                packets.push(d2gs::assign_warp(guid, class, warp.x as u16, warp.y as u16));
+            }
         }
         for &id in from.iter().filter(|id| !to.contains(id)) {
             let Some(room) = world.room(id) else { continue };
@@ -589,6 +621,13 @@ impl GameServer {
                     Spawned::Monster { .. } => unit_type::MONSTER,
                 };
                 packets.push(d2gs::remove_unit(kind, unit.guid()));
+            }
+            if let Some(level) = world.levels().iter().find(|l| l.id == id.level) {
+                for (index, _) in level.warps.iter().enumerate().filter(|(_, w)| w.room == id.index) {
+                    if let Some(&guid) = game.warp_guids.get(&(id.level, index)) {
+                        packets.push(d2gs::remove_unit(unit_type::WARP, guid));
+                    }
+                }
             }
             packets.push(d2gs::unload_room(room.x as u16, room.y as u16, id.level as u8));
         }
@@ -836,6 +875,25 @@ impl Walker {
     }
 }
 
+/// Move a player to (`x`, `y`) — waypoint travel, a warp, a respawn — the way `0x00554EA0` does:
+/// the room landed in, the room stream, then `0x15` flagged as a warp. `false` if the spot is in
+/// no room.
+fn teleport(server: &GameServer, p: &Player, w: &mut Walker, x: u16, y: u16, outbox: &mut Outbox) -> bool {
+    let Some((room, near)) = server.near(p.game_id, f64::from(x), f64::from(y)) else { return false };
+    let own = server.lock().by_id.get(&p.game_id).and_then(|g| g.world.as_ref()?.room(room));
+    if let Some(r) = own {
+        outbox.push(&d2gs::load_room(r.x as u16, r.y as u16, room.level as u8));
+    }
+    for packet in server.view_change(p.game_id, &w.view, &near) {
+        outbox.push(&packet);
+    }
+    outbox.push(&d2gs::reassign_player(0, PLAYER_GUID, x, y, 1));
+    (w.x, w.y, w.target, w.room, w.view) = (f64::from(x), f64::from(y), None, Some(room), near);
+    server.set_position(p.game_id, &p.character.name, w.x, w.y);
+    server.set_view(p.game_id, &p.character.name, &w.view);
+    true
+}
+
 /// Whether the server's idea of the player stands close enough to a monster at (`x`, `y`) to hit it.
 fn within_reach(w: &Walker, x: u16, y: u16) -> bool {
     d2_game::path::distance((w.x as i32, w.y as i32), (i32::from(x), i32::from(y))) <= battle::PLAYER_REACH
@@ -999,6 +1057,19 @@ async fn run(
                         w.go(f64::from(u16_at(1)), f64::from(u16_at(3)), speed * server.speed_scale);
                     }
                 }
+                (Stage::InGame, cs::INTERACT) if u32_at(1) == u32::from(unit_type::WARP) => {
+                    // A cave mouth or stairs: to the other side (0x005550B0).
+                    let (Some(w), Some(p)) = (walker.as_mut(), player.as_ref()) else { continue };
+                    let Some((level, x, y)) = server.warp_arrival(p.game_id, u32_at(5)) else {
+                        debug!(%peer, guid = u32_at(5), "warp to a level not built");
+                        continue;
+                    };
+                    info!(%peer, level, x, y, "warp");
+                    pending_attack = None;
+                    if teleport(server, p, w, x, y, &mut outbox) {
+                        flush(stream, peer, tables, &mut outbox).await?;
+                    }
+                }
                 (Stage::InGame, cs::INTERACT) => {
                     let Some(p) = player.as_ref() else { continue };
                     let replies = server.interact(p.game_id, u32_at(1), u32_at(5), &mut waypoints);
@@ -1016,21 +1087,10 @@ async fn run(
                         debug!(%peer, level, "waypoint travel refused");
                         continue;
                     };
-                    let Some((room, near)) = server.near(p.game_id, f64::from(x), f64::from(y)) else { continue };
                     info!(%peer, level, x, y, "waypoint travel");
-                    // 0x00554EA0: the room landed in, then the room stream, then 0x15 flagged as a warp.
-                    let own = server.lock().by_id.get(&p.game_id).and_then(|g| g.world.as_ref()?.room(room));
-                    if let Some(r) = own {
-                        outbox.push(&d2gs::load_room(r.x as u16, r.y as u16, room.level as u8));
+                    if teleport(server, p, w, x, y, &mut outbox) {
+                        flush(stream, peer, tables, &mut outbox).await?;
                     }
-                    for packet in server.view_change(p.game_id, &w.view, &near) {
-                        outbox.push(&packet);
-                    }
-                    outbox.push(&d2gs::reassign_player(0, PLAYER_GUID, x, y, 1));
-                    (w.x, w.y, w.target, w.room, w.view) = (f64::from(x), f64::from(y), None, Some(room), near);
-                    server.set_position(p.game_id, &p.character.name, w.x, w.y);
-                    server.set_view(p.game_id, &p.character.name, &w.view);
-                    flush(stream, peer, tables, &mut outbox).await?;
                 }
                 (
                     Stage::InGame,
@@ -1079,20 +1139,11 @@ async fn run(
                         continue;
                     }
                     let (x, y) = p.spawn;
-                    let Some((room, near)) = server.near(p.game_id, f64::from(x), f64::from(y)) else { continue };
                     info!(%peer, x, y, "respawn in town");
-                    let own = server.lock().by_id.get(&p.game_id).and_then(|g| g.world.as_ref()?.room(room));
-                    if let Some(r) = own {
-                        outbox.push(&d2gs::load_room(r.x as u16, r.y as u16, room.level as u8));
+                    if !teleport(server, p, w, x, y, &mut outbox) {
+                        continue;
                     }
-                    for packet in server.view_change(p.game_id, &w.view, &near) {
-                        outbox.push(&packet);
-                    }
-                    outbox.push(&d2gs::reassign_player(0, PLAYER_GUID, x, y, 1));
-                    (w.x, w.y, w.target, w.room, w.view) = (f64::from(x), f64::from(y), None, Some(room), near);
                     pending_attack = None;
-                    server.set_position(p.game_id, &p.character.name, w.x, w.y);
-                    server.set_view(p.game_id, &p.character.name, &w.view);
                     for packet in server.revive(p.game_id, &p.character.name) {
                         outbox.push(&packet);
                     }
@@ -1679,7 +1730,7 @@ pub(crate) mod tests {
             let game = g.by_id.get_mut(&id).unwrap();
             let mut levels = game.world.take().unwrap().levels().to_vec();
             let waypoint = PlacedUnit { class: UnitClass::Object(3), x: 5779, y: 4499, path: Vec::new() };
-            levels.push(WorldLevel { id: 3, area: plains, rooms: vec![plains], units: vec![waypoint], pieces: vec![0], collision: Vec::new() });
+            levels.push(WorldLevel { id: 3, area: plains, rooms: vec![plains], units: vec![waypoint], pieces: vec![0], collision: Vec::new(), warps: Vec::new() });
             game.world = Some(World::from_levels(levels));
         }
         let room = RoomId { level: 3, index: 0 };
@@ -1908,7 +1959,7 @@ pub(crate) mod tests {
             let game = g.by_id.get_mut(&id).unwrap();
             let mut levels = game.world.take().unwrap().levels().to_vec();
             let brute = PlacedUnit { class: UnitClass::Monster(d2_data::presets::PresetMonster::Class { class: 11, name: "brute".into() }), x: 5780, y: 4500, path: Vec::new() };
-            levels.push(WorldLevel { id: 2, area: moor, rooms: vec![moor], units: vec![brute], pieces: vec![0], collision: Vec::new() });
+            levels.push(WorldLevel { id: 2, area: moor, rooms: vec![moor], units: vec![brute], pieces: vec![0], collision: Vec::new(), warps: Vec::new() });
             game.world = Some(World::from_levels(levels));
         }
         let room = RoomId { level: 2, index: 0 };
@@ -1936,6 +1987,43 @@ pub(crate) mod tests {
         let corpse = again.iter().find(|p| p[0] == 0xAC).unwrap();
         assert_eq!(corpse[11], 0, "no life");
         assert!(!again.iter().any(|p| p[0] == 0x6D), "a corpse is not stood up");
+    }
+
+    /// With the operator's install: Blood Moor's cave mouth comes with its room as a warp unit
+    /// (`0x09`); taking it lands in the Den of Evil, whose rooms load with their monsters, and the
+    /// Den's own warp leads back out.
+    #[test]
+    fn with_a_real_install_the_den_of_evil_can_be_entered_and_left() {
+        let Ok(dir) = std::env::var("BNETCC_D2_DATA_DIR") else {
+            return;
+        };
+        let engine = EngineData::from_game_exe(&std::fs::read(Path::new(&dir).join("Game.exe")).unwrap()).unwrap();
+        let gs = GameServer::new(test_tables(), Some(GameData::load(&dir).unwrap())).with_engine(engine);
+        let mut monsters = 0;
+        for i in 0..4 {
+            let id = gs.create(&format!("den {i}"), "", 0).unwrap();
+            let mouth_room = {
+                let g = gs.lock();
+                let moor = g.by_id[&id].world.as_ref().unwrap().levels().iter().find(|l| l.id == 2).unwrap();
+                RoomId { level: 2, index: moor.warps[0].room }
+            };
+            let packets = gs.view_change(id, &[], &[mouth_room]);
+            let warp = packets.iter().find(|p| p[0] == 0x09).unwrap_or_else(|| panic!("game {i}: no warp unit in {packets:02x?}"));
+            assert_eq!((warp.len(), warp[1]), (11, 5));
+            let guid = u32::from_le_bytes([warp[2], warp[3], warp[4], warp[5]]);
+            let (level, x, y) = gs.warp_arrival(id, guid).expect("the cave mouth leads somewhere");
+            assert_eq!(level, 8);
+            let (room, near) = gs.near(id, f64::from(x), f64::from(y)).expect("a Den room");
+            assert_eq!(room.level, 8);
+            let inside = gs.view_change(id, &[mouth_room], &near);
+            assert!(inside.contains(&d2gs::remove_unit(5, guid)), "leaving the mouth's room forgets its warp");
+            assert!(inside.iter().any(|p| p[0] == 0x07 && p[5] == 8), "Den rooms load");
+            let way_out = inside.iter().find(|p| p[0] == 0x09).expect("the Den's way out is in view");
+            let out = u32::from_le_bytes([way_out[2], way_out[3], way_out[4], way_out[5]]);
+            assert_eq!(gs.warp_arrival(id, out).map(|a| a.0), Some(2));
+            monsters += inside.iter().filter(|p| p[0] == 0xAC).count();
+        }
+        assert!(monsters > 0, "the Den's first rooms hold no monsters in four games");
     }
 
     /// With the operator's install: a new character standing among Blood Moor's monsters is

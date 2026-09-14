@@ -28,6 +28,8 @@ pub mod unit_type {
     pub const MONSTER: u8 = 1;
     /// An object.
     pub const OBJECT: u8 = 2;
+    /// A warp tile.
+    pub const WARP: u8 = 5;
 }
 
 /// The mode a map places its monsters in: neutral (`DRLGPRESET_LoadDrlgFile`, `0x00665950`).

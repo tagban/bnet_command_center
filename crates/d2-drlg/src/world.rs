@@ -36,6 +36,7 @@ use crate::act::Act;
 use crate::collision::{RoomCollision, TileSources};
 use crate::outdoor::Act1Outdoors;
 use crate::preset::{PlacedUnit, PresetLevel, UnitClass, ROOM_TILES, SUBTILES};
+use crate::room_tiles::WarpTile;
 use crate::Coords;
 
 /// A room: its level and its index in that level's rooms.
@@ -63,6 +64,8 @@ pub struct WorldLevel {
     pub pieces: Vec<i32>,
     /// Each room's collision map, in [`WorldLevel::rooms`] order; empty when not built.
     pub collision: Vec<RoomCollision>,
+    /// Its warp tiles: the exits to other levels.
+    pub warps: Vec<WarpTile>,
 }
 
 /// The walkable levels of an act.
@@ -162,8 +165,8 @@ impl World {
             if area.w <= 0 || area.h <= 0 || world.levels.iter().any(|l| overlaps(l.area, area)) {
                 continue;
             }
-            let (rooms, units, pieces, collision) = match (town, def.drlg_type, &outdoors) {
-                (Some(t), _, _) if t.level_id == id => (t.rooms.clone(), t.units.clone(), Vec::new(), Vec::new()),
+            let (rooms, units, pieces, collision, warps) = match (town, def.drlg_type, &outdoors) {
+                (Some(t), _, _) if t.level_id == id => (t.rooms.clone(), t.units.clone(), Vec::new(), Vec::new(), Vec::new()),
                 (_, DrlgType::Wilderness, Some(Ok(outdoors))) => match outdoors.generate(id).and_then(|l| outdoors.build_rooms(sources, &l).map(|b| (l, b))) {
                     Ok((level, built)) => {
                         let units = built
@@ -181,7 +184,7 @@ impl World {
                                 path: Vec::new(),
                             })
                             .collect();
-                        (level.rooms.iter().map(|r| r.area).collect(), units, level.rooms.iter().map(|r| r.preset).collect(), built.collision)
+                        (level.rooms.iter().map(|r| r.area).collect(), units, level.rooms.iter().map(|r| r.preset).collect(), built.collision, built.warps)
                     }
                     Err(e) => {
                         world.unbuilt.push((id, e.to_string()));
@@ -196,12 +199,66 @@ impl World {
                     world.unbuilt.push((id, format!("act {} wilderness is not ported", act.act + 1)));
                     continue;
                 }
-                _ => (grid_rooms(area, def.drlg_type), Vec::new(), Vec::new(), Vec::new()),
+                _ => (grid_rooms(area, def.drlg_type), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
             };
-            world.levels.push(WorldLevel { id, area, rooms, units, pieces, collision });
+            world.levels.push(WorldLevel { id, area, rooms, units, pieces, collision, warps });
+        }
+        // The maze levels the walkable ones warp to (Act I's caves).
+        let mut mazes: Vec<i32> = Vec::new();
+        for level in &world.levels {
+            let Some(def) = levels.get(level.id) else { continue };
+            for slot in 0..8 {
+                let to = def.vis[slot];
+                let is_maze = levels.get(to).is_some_and(|d| d.drlg_type == DrlgType::Maze && d.act == act.act);
+                if def.warp[slot] != -1 && is_maze && !mazes.contains(&to) {
+                    mazes.push(to);
+                }
+            }
+        }
+        for id in mazes {
+            let built = crate::maze::generate(data, engine, act.game_seed, act.difficulty, id)
+                .and_then(|level| crate::maze::build_rooms(data, engine, sources, &level).map(|b| (level, b)));
+            match built {
+                Ok((level, built)) if !world.levels.iter().any(|l| overlaps(l.area, level.area)) => {
+                    world.levels.push(WorldLevel {
+                        id,
+                        area: level.area,
+                        rooms: level.rooms.iter().map(|r| r.area).collect(),
+                        units: built.units,
+                        pieces: level.rooms.iter().map(|r| r.def).collect(),
+                        collision: built.collision,
+                        warps: built.warps,
+                    });
+                }
+                Ok(_) => world.unbuilt.push((id, "overlaps another level".into())),
+                Err(crate::maze::Error::NotPorted(_)) => {}
+                Err(e) => world.unbuilt.push((id, e.to_string())),
+            }
         }
         world.index_cells();
         world
+    }
+
+    /// Where a player taking the warp in `level`'s vis slot `slot` ends up: the level, and the
+    /// destination warp tile moved on by that warp's `ExitWalkX`/`ExitWalkY` (`0x005550B0` puts
+    /// the player on the tile, then walks it there).
+    #[must_use]
+    pub fn warp_arrival(&self, data: &GameData, level: i32, slot: u8) -> Option<(i32, i32, i32)> {
+        let (to, tile) = self.warp_destination(data, level, slot)?;
+        let id = *data.levels().get(to)?.warp.get(usize::from(tile.slot))?;
+        let exit = data.lvl_warps().setup(id, b'b').and_then(|r| data.lvl_warps().row(r)).map_or((0, 0), |r| r.exit_walk);
+        Some((to, tile.x + exit.0, tile.y + exit.1))
+    }
+
+    /// Where a warp in `level`'s vis slot `slot` leads: the level it goes to and that level's warp
+    /// tile back, if both levels are in the world.
+    #[must_use]
+    pub fn warp_destination(&self, data: &GameData, level: i32, slot: u8) -> Option<(i32, WarpTile)> {
+        let to = data.levels().get(level)?.vis.get(usize::from(slot)).copied().filter(|&v| v != 0)?;
+        let vis = data.levels().get(to)?.vis;
+        // A level may list the same neighbour in several slots, one per kind of entrance.
+        let target = self.level(to)?;
+        target.warps.iter().find(|w| vis.get(usize::from(w.slot)) == Some(&level)).map(|w| (to, *w))
     }
 
     fn index_cells(&mut self) {
@@ -329,8 +386,8 @@ mod tests {
         let town = Coords { x: 100, y: 100, w: 16, h: 8 };
         let moor = Coords { x: 96, y: 108, w: 24, h: 16 };
         World::from_levels(vec![
-            WorldLevel { id: 1, area: town, rooms: grid_rooms(town, DrlgType::Preset), units: Vec::new(), pieces: Vec::new(), collision: Vec::new() },
-            WorldLevel { id: 2, area: moor, rooms: grid_rooms(moor, DrlgType::Wilderness), units: Vec::new(), pieces: Vec::new(), collision: Vec::new() },
+            WorldLevel { id: 1, area: town, rooms: grid_rooms(town, DrlgType::Preset), units: Vec::new(), pieces: Vec::new(), collision: Vec::new(), warps: Vec::new() },
+            WorldLevel { id: 2, area: moor, rooms: grid_rooms(moor, DrlgType::Wilderness), units: Vec::new(), pieces: Vec::new(), collision: Vec::new(), warps: Vec::new() },
         ])
     }
 
@@ -405,6 +462,42 @@ mod tests {
             }
         }
         assert!(checked > 500, "only {checked} rooms checked");
+    }
+
+    /// With the operator's install: Act I's world holds the maze caves the wilderness warps to,
+    /// and the Den of Evil's way back leads to Blood Moor's cave mouth and back again.
+    #[test]
+    fn with_a_real_install_the_den_of_evil_warps_to_blood_moor_and_back() {
+        let (Ok(dir), Ok(exe)) = (std::env::var("BNETCC_D2_DATA_DIR"), std::env::var("BNETCC_D2_GAME_EXE")) else {
+            return;
+        };
+        let data = d2_data::GameData::load(&dir).unwrap();
+        let engine = d2_data::engine::EngineData::from_game_exe(&std::fs::read(exe).unwrap()).unwrap();
+        for seed in [1u32, 2, 0x1234_5678] {
+            let act = Act::build(data.levels(), 0, 0, seed);
+            let town = PresetLevel::build(&data, &engine, &act, 1).unwrap();
+            let world = World::build(&data, &engine, &act, Some(&town), &TileSources::new());
+            assert!(world.unbuilt().is_empty(), "seed {seed:#x}: {:?}", world.unbuilt());
+            let ids: Vec<i32> = world.levels().iter().map(|l| l.id).collect();
+            for id in [8, 9, 10, 11, 12] {
+                assert!(ids.contains(&id), "seed {seed:#x}: cave {id} missing from {ids:?}");
+            }
+            let den = world.levels().iter().find(|l| l.id == 8).unwrap();
+            let moor = world.levels().iter().find(|l| l.id == 2).unwrap();
+            eprintln!("seed {seed:#x}: Den {:?}, Blood Moor {:?}", den.warps, moor.warps);
+            assert_eq!(den.warps.len(), 1, "one way out of the Den");
+            let (to, mouth) = world.warp_destination(&data, 8, den.warps[0].slot).expect("the Den leads out");
+            assert_eq!(to, 2);
+            assert!(world.room_at(mouth.x, mouth.y).is_some_and(|r| r.level == 2), "{mouth:?}");
+            let (back, inside) = world.warp_destination(&data, 2, mouth.slot).expect("and back in");
+            assert_eq!((back, inside), (8, den.warps[0]));
+            for (from, slot) in [(8, den.warps[0].slot), (2, mouth.slot)] {
+                let (to, x, y) = world.warp_arrival(&data, from, slot).unwrap();
+                let flags = world.collision_at(x, y);
+                eprintln!("  {from} -> {to} at ({x}, {y}): {flags:?}");
+                assert!(world.room_at(x, y).is_some_and(|r| r.level == to) && flags.is_some_and(|f| f & 1 == 0), "{from} -> {to}: ({x}, {y}) {flags:?}");
+            }
+        }
     }
 
     #[test]

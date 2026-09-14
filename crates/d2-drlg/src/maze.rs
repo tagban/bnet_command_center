@@ -22,7 +22,8 @@ use d2_formats::ds1::{Ds1, UnitKind};
 
 use crate::collision::{self, BuiltRoom, RoomCollision, TileSources};
 use crate::rng::{level_seed, Seed};
-use crate::room_tiles::{self, PresetWindow, RoomContext, Seams, Warps};
+use crate::preset::{PlacedUnit, UnitClass};
+use crate::room_tiles::{self, PresetWindow, RoomContext, Seams, WarpTile, Warps};
 use crate::Coords;
 
 /// A cell whose preset is fixed (`HAS_MAP_DS1`, bit 1 of the preset room's flags).
@@ -562,20 +563,49 @@ fn warp_cells(map: &Ds1) -> HashMap<(i32, i32), u8> {
     cells
 }
 
-/// Build a maze level's room tiles and collision maps, in list order.
+/// A maze level's built rooms.
+#[derive(Debug, Clone)]
+pub struct BuiltMaze {
+    /// Each room's collision map, in list order.
+    pub collision: Vec<RoomCollision>,
+    /// Its warp tiles.
+    pub warps: Vec<WarpTile>,
+    /// Its cells' map units in world subtiles.
+    pub units: Vec<PlacedUnit>,
+}
+
+/// Build a maze level's room tiles, collision maps, warp tiles and map units, in list order.
 ///
 /// # Errors
 ///
 /// [`Error::MissingMap`] if a cell's map is missing.
-pub fn collision(data: &GameData, engine: &EngineData, sources: &TileSources, level: &MazeLevel) -> Result<Vec<RoomCollision>, Error> {
+pub fn build_rooms(data: &GameData, engine: &EngineData, sources: &TileSources, level: &MazeLevel) -> Result<BuiltMaze, Error> {
     let def = data.levels().get(level.id).ok_or(Error::NotPorted(level.id))?;
     let types = sources.tiles.level_type(data, def.level_type);
     let mut seams = Seams::new();
     let mut built = Vec::with_capacity(level.rooms.len());
-    for room in &level.rooms {
+    let mut warps = Vec::new();
+    let mut units = Vec::new();
+    let mut cells_seen: Vec<(i32, i32)> = Vec::new();
+    for (index, room) in level.rooms.iter().enumerate() {
         let row = data.lvl_prests().by_def(room.def).ok_or(Error::NoRow("lvlprest.txt", room.def))?;
         let file = row.file_for(room.file).ok_or(Error::NoRow("lvlprest.txt", room.def))?;
         let map = sources.maps.get(data, file).ok_or_else(|| Error::MissingMap(file.to_string()))?;
+        if !cells_seen.contains(&room.origin) {
+            cells_seen.push(room.origin);
+            let (ox, oy) = (room.origin.0 * 5, room.origin.1 * 5);
+            let act = u8::try_from(map.act).unwrap_or(0);
+            units.extend(map.units.iter().map(|u| PlacedUnit {
+                class: match u.kind {
+                    UnitKind::Object => engine.preset_object_class(act, u.id).map_or(UnitClass::Other { kind: 2, id: u.id }, UnitClass::Object),
+                    UnitKind::Monster => data.mon_presets().get(def.act, u.id).cloned().map_or(UnitClass::Other { kind: 1, id: u.id }, UnitClass::Monster),
+                    UnitKind::Other(kind) => UnitClass::Other { kind, id: u.id },
+                },
+                x: ox + u.x,
+                y: oy + u.y,
+                path: Vec::new(),
+            }));
+        }
         let library = types.room(row.dt1_mask);
         let slots = room.warp_slots();
         let nodes = (0..8).rev().filter(|&s| slots >> s & 1 != 0 && def.warp[s] != -1).map(|s| data.lvl_warps().setup(def.warp[s], b'b')).collect();
@@ -590,9 +620,12 @@ pub fn collision(data: &GameData, engine: &EngineData, sources: &TileSources, le
         };
         let size = if row.size.0 == 0 || row.size.1 == 0 { (level.area.w, level.area.h) } else { row.size };
         let window = PresetWindow { origin: room.origin, size, fill_blanks: row.fill_blanks, kill_edge: row.kill_edge };
-        built.push(BuiltRoom { area: room.area, tiles: room_tiles::preset_room(ctx, &map, window), preset: true });
+        let (tiles, cells) = room_tiles::preset_room_with_warps(ctx, &map, window);
+        let usable = (0..8).filter(|&s| def.warp[s] != -1).fold(0u8, |m, s| m | 1 << s);
+        warps.extend(room_tiles::warp_tiles(index, room.area, &cells, slots & usable));
+        built.push(BuiltRoom { area: room.area, tiles, preset: true });
     }
-    Ok(collision::level_collision(level.id, &built, &seams, 0x05))
+    Ok(BuiltMaze { collision: collision::level_collision(level.id, &built, &seams, 0x05), warps, units })
 }
 
 #[cfg(test)]
@@ -653,7 +686,7 @@ mod tests {
             let mut wrong = 0;
             for &id in &CAVES {
                 let level = generate(&data, &engine, seed, difficulty, id).expect("level");
-                let maps = collision(&data, &engine, &sources, &level).expect("rooms");
+                let maps = build_rooms(&data, &engine, &sources, &level).expect("rooms").collision;
                 let (mut bad_cells, mut missing) = (0, 0);
                 for room in &maps {
                     let Some((w, theirs)) = recorded.get(&(id, room.area.x * 5, room.area.y * 5)) else {
@@ -699,7 +732,7 @@ mod tests {
                 for &id in &CAVES {
                     let Some(&theirs) = recorded.get(&(seed, id)) else { continue };
                     let level = generate(&data, &engine, seed, difficulty, id).expect("level");
-                    let ours = collision(&data, &engine, &sources, &level).expect("rooms").iter().fold(0u32, |sum, room| {
+                    let ours = build_rooms(&data, &engine, &sources, &level).expect("rooms").collision.iter().fold(0u32, |sum, room| {
                         let mut h = 0x811C_9DC5;
                         for v in [room.area.x * 5, room.area.y * 5, room.area.w * 5, room.area.h * 5] {
                             fnv(&mut h, v as u32);

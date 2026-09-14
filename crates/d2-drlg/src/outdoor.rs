@@ -149,6 +149,8 @@ pub struct BuiltLevel {
     pub collision: Vec<RoomCollision>,
     /// Each room's units, in placement order.
     pub units: Vec<Vec<RoomUnit>>,
+    /// The warp tiles of its set pieces.
+    pub warps: Vec<room_tiles::WarpTile>,
 }
 
 /// A unit a wilderness room's init places.
@@ -345,7 +347,8 @@ impl<'a> Act1Outdoors<'a> {
         let mut seams = Seams::new();
         let mut built = Vec::with_capacity(level.rooms.len());
         let mut units = Vec::with_capacity(level.rooms.len());
-        for room in &level.rooms {
+        let mut warps = Vec::new();
+        for (index, room) in level.rooms.iter().enumerate() {
             if room.preset != 0 {
                 let row = data.lvl_prests().by_def(room.preset).ok_or(Error::NoPreset(room.preset))?;
                 let file = row.file_for(room.file).ok_or(Error::NoPreset(room.preset))?;
@@ -367,7 +370,9 @@ impl<'a> Act1Outdoors<'a> {
                     warps: Some(Warps { table: data.lvl_warps(), ids: warp_ids, nodes }),
                 };
                 let window = PresetWindow { origin: room.origin, size: row.size, fill_blanks: row.fill_blanks, kill_edge: row.kill_edge };
-                built.push(BuiltRoom { area: room.area, tiles: room_tiles::preset_room(ctx, &map, window), preset: true });
+                let (tiles, cells) = room_tiles::preset_room_with_warps(ctx, &map, window);
+                warps.extend(room_tiles::warp_tiles(index, room.area, &cells, room.warp_slots));
+                built.push(BuiltRoom { area: room.area, tiles, preset: true });
                 units.push(Vec::new());
                 continue;
             }
@@ -426,7 +431,7 @@ impl<'a> Act1Outdoors<'a> {
             built.push(BuiltRoom { area: room.area, tiles, preset: false });
         }
         let void = if def.level_type == 19 { 0x01 } else { 0x05 };
-        Ok(BuiltLevel { collision: collision::level_collision(level.id, &built, &seams, void), units })
+        Ok(BuiltLevel { collision: collision::level_collision(level.id, &built, &seams, void), units, warps })
     }
 
     /// `0x0066FA10`: the map's units strictly inside the group's box, moved to where the box

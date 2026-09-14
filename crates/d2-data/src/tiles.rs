@@ -67,6 +67,9 @@ pub struct LvlWarp {
     pub tiles: i32,
     /// `Direction`: `b`oth, `l`eft or `r`ight, as its byte.
     pub direction: u8,
+    /// `ExitWalkX`/`ExitWalkY`: how far, in subtiles, a player arriving through the warp walks
+    /// on from its tile (`0x005550B0` reads them at `+0x14`/`+0x18`).
+    pub exit_walk: (i32, i32),
 }
 
 /// One `LvlMaze.txt` row: how a maze level grows.
@@ -148,6 +151,7 @@ impl LvlWarps {
                     lit_version: row.int("LitVersion").unwrap_or(0) != 0,
                     tiles: row.int("Tiles").unwrap_or(0) as i32,
                     direction: row.get("Direction").and_then(|d| d.bytes().next()).unwrap_or(0),
+                    exit_walk: (row.int("ExitWalkX").unwrap_or(0) as i32, row.int("ExitWalkY").unwrap_or(0) as i32),
                 })
             })
             .collect();
