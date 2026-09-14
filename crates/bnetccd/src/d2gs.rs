@@ -894,6 +894,23 @@ fn teleport(server: &GameServer, p: &Player, w: &mut Walker, x: u16, y: u16, out
     true
 }
 
+/// After "You have died" (`0x41`): stand the player up where it lies, then take it to the camp's
+/// waypoint. The order matters: the client will not move a player in a death mode (`0x004654C0`
+/// returns for modes 0 and 0x11), so a `0x15` for a corpse leaves it in rooms the move just
+/// unloaded and the client halts (`0x0045D160`, error 1336). `0x0D` event 9 puts the corpse in
+/// mode 0x11 if its death throes are still playing, and `0x95` with life then revives it
+/// (`0x0045DB20`). `false` if the player is not dead or the camp has no room.
+fn respawn(server: &GameServer, p: &Player, w: &mut Walker, outbox: &mut Outbox) -> bool {
+    if !server.player_dead(p.game_id, &p.character.name) || server.near(p.game_id, f64::from(p.spawn.0), f64::from(p.spawn.1)).is_none() {
+        return false;
+    }
+    outbox.push(&d2gs::player_reaction(unit_type::PLAYER, PLAYER_GUID, battle::reaction::DEAD, 0, 0));
+    for packet in server.revive(p.game_id, &p.character.name) {
+        outbox.push(&packet);
+    }
+    teleport(server, p, w, p.spawn.0, p.spawn.1, outbox)
+}
+
 /// Whether the server's idea of the player stands close enough to a monster at (`x`, `y`) to hit it.
 fn within_reach(w: &Walker, x: u16, y: u16) -> bool {
     d2_game::path::distance((w.x as i32, w.y as i32), (i32::from(x), i32::from(y))) <= battle::PLAYER_REACH
@@ -1131,23 +1148,12 @@ async fn run(
                     flush(stream, peer, tables, &mut outbox).await?;
                 }
                 (Stage::InGame, cs::RESPAWN) => {
-                    // After "You have died": back to the camp's waypoint, as waypoint travel moves
-                    // a player between levels, then full life — which also stands the client's
-                    // corpse back up (0x0045DB20).
                     let (Some(w), Some(p)) = (walker.as_mut(), player.as_ref()) else { continue };
-                    if !server.player_dead(p.game_id, &p.character.name) {
-                        continue;
+                    info!(%peer, x = p.spawn.0, y = p.spawn.1, "respawn in town");
+                    if respawn(server, p, w, &mut outbox) {
+                        pending_attack = None;
+                        flush(stream, peer, tables, &mut outbox).await?;
                     }
-                    let (x, y) = p.spawn;
-                    info!(%peer, x, y, "respawn in town");
-                    if !teleport(server, p, w, x, y, &mut outbox) {
-                        continue;
-                    }
-                    pending_attack = None;
-                    for packet in server.revive(p.game_id, &p.character.name) {
-                        outbox.push(&packet);
-                    }
-                    flush(stream, peer, tables, &mut outbox).await?;
                 }
                 (Stage::InGame, cs::UPDATE_POSITION) => {
                     // The client's own idea of where its player is (engine `0x0054CD50` re-syncs to
@@ -1583,7 +1589,7 @@ pub(crate) mod tests {
                 0x04 => 1,
                 0x1D => 3,
                 0x1E => 4,
-                0x23 | 0x95 => 13,
+                0x23 | 0x95 | 0x0D => 13,
                 0x03 => 12,
                 0x53 | 0x6D => 10,
                 0x15 => 11,
@@ -1987,6 +1993,66 @@ pub(crate) mod tests {
         let corpse = again.iter().find(|p| p[0] == 0xAC).unwrap();
         assert_eq!(corpse[11], 0, "no life");
         assert!(!again.iter().any(|p| p[0] == 0x6D), "a corpse is not stood up");
+    }
+
+    /// A player killed out in a made-up Blood Moor room and releasing (`0x41`) is stood up where it
+    /// lies — `0x0D` corpse, `0x95` with life — before the camp's rooms load and `0x15` moves it:
+    /// the client does not move a corpse, and halts when its room goes.
+    #[test]
+    fn a_dead_player_is_revived_before_it_is_moved_to_town() {
+        use d2_data::monsters::Monsters;
+        use d2_data::presets::MonPresets;
+        use d2_drlg::preset::{PlacedUnit, UnitClass};
+        use d2_drlg::world::WorldLevel;
+        use d2_drlg::Coords;
+        use d2_formats::excel::Table;
+        let (mut rules, town) = test_town();
+        let monstats = Table::parse(
+            b"Id\thcIdx\tMonStatsEx\tnpc\tinteract\tCode\tLevel\tminHP\tmaxHP\tA1MinD\tA1MaxD\tA1TH\taidel\tVelocity\r\n\
+              guard\t10\tguard\t1\t1\tGU\t1\t1\t1\t0\t0\t0\t5\t1\r\n\
+              killer\t11\tguard\t0\t0\tXX\t50\t1000\t1000\t500\t500\t5000\t1\t8\r\n",
+        );
+        let objects = rules.objects().clone();
+        rules.set_map_tables(MonPresets::default(), Monsters::from_tables(&monstats, &Table::parse(b"Id\r\nguard\r\n")).unwrap(), objects);
+        let monlvl = Table::parse(b"Level\tAC\tTH\tHP\tDM\tXP\r\n0\t100\t100\t100\t100\t100\r\n50\t100\t100\t100\t100\t100\r\n");
+        rules.set_combat_tables(d2_data::monlvl::MonLvls::from_table(&monlvl).unwrap(), Default::default());
+        let stats = rules.new_character_stats(4).unwrap();
+        let gs = GameServer::new(test_tables(), Some(rules)).with_town(town);
+        let id = gs.create("probe", "", 0).unwrap();
+        let moor = Coords { x: 1152, y: 896, w: 8, h: 8 };
+        {
+            let mut g = gs.lock();
+            let game = g.by_id.get_mut(&id).unwrap();
+            let mut levels = game.world.take().unwrap().levels().to_vec();
+            let killer = PlacedUnit { class: UnitClass::Monster(d2_data::presets::PresetMonster::Class { class: 11, name: "killer".into() }), x: 5780, y: 4500, path: Vec::new() };
+            levels.push(WorldLevel { id: 2, area: moor, rooms: vec![moor], units: vec![killer], pieces: vec![0], collision: Vec::new(), warps: Vec::new() });
+            game.world = Some(World::from_levels(levels));
+        }
+        let room = RoomId { level: 2, index: 0 };
+        gs.join_battle(id, "Hero", 4, &stats);
+        gs.set_position(id, "Hero", 5781.0, 4500.0);
+        gs.set_view(id, "Hero", &[room]);
+        gs.view_change(id, &[], &[room]);
+        for _ in 0..40 {
+            if gs.player_dead(id, "Hero") {
+                break;
+            }
+            fight_for(&gs, id, "Hero", 25);
+        }
+        assert!(gs.player_dead(id, "Hero"), "the killer kills");
+
+        let player = Player { game_id: id, character: character("Hero", 4, 0), difficulty: 0, map_seed: FALLBACK_MAP_SEED, spawn: (5808, 4448) };
+        let mut walker = Walker { x: 5781.0, y: 4500.0, target: None, speed: 0.0, room: Some(room), view: vec![room] };
+        let mut outbox = Outbox::default();
+        assert!(respawn(&gs, &player, &mut walker, &mut outbox));
+        let sent = split_packets(&outbox.pending().flatten().copied().collect::<Vec<u8>>());
+        assert_eq!(sent[0], d2gs::player_reaction(0, PLAYER_GUID, battle::reaction::DEAD, 0, 0), "{sent:02x?}");
+        assert_eq!(sent[1][0], 0x95);
+        assert!(sent[1][1] != 0 || sent[1][2] & 0x7F != 0, "with life");
+        assert_eq!(sent[2][0], 0x07, "the camp's rooms after");
+        assert_eq!(sent.last().map(|p| p[0]), Some(0x15), "and the move last");
+        assert!(!gs.player_dead(id, "Hero"));
+        assert!(!respawn(&gs, &player, &mut walker, &mut Outbox::default()), "only the dead respawn");
     }
 
     /// With the operator's install: Blood Moor's cave mouth comes with its room as a warp unit

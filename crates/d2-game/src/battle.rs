@@ -22,8 +22,11 @@
 //!   frame; standing gains a 256th of the maximum a frame, walking half that, and swinging or
 //!   running nothing. On Battle.net the server does this and tells the client.
 //! - The packets' shapes and pacing are from a recorded retail fight (bnemu
-//!   `docs/d2/re/combat.md`): a kill is `DYING`, then `DEAD` one death animation later; a
-//!   monster's walk glides at a fixed speed whatever its class.
+//!   `docs/d2/re/combat.md`): a kill is `DYING`, then `DEAD` one death animation later.
+//! - A walking monster covers `MonStats.txt` `Velocity` sixteenths of a subtile a frame, as a
+//!   player covers its `WalkVelocity` (`0x0064FE40`): the client moves it at its class's speed
+//!   whatever the walk packet's speed field says (a zombie, `Velocity` 1, crawls where a Fallen,
+//!   5, trots).
 //!
 //! Not the engine's: the AI is a plain chase-and-swing loop (the per-class AI routines are not
 //! ported), paths come from [`crate::path`], an unarmed player hits for 1–2, and the experience
@@ -62,9 +65,8 @@ pub const DEAD_MODE: u8 = 12;
 const DEFAULT_AI_DISTANCE: i32 = 35;
 /// A chase is given up past this multiple of the notice distance.
 const LEASH: i32 = 2;
-/// Subtiles a monster covers each frame while walking: the recorded walk speed field (75) glides
-/// about 5.77 subtiles a second.
-const GLIDE_PER_FRAME: f64 = 75.0 / 13.0 / FRAMES_PER_SECOND as f64;
+/// Sixteenths of a subtile a walking monster covers per frame per point of `Velocity`.
+const VELOCITY_UNIT: f64 = 1.0 / 16.0;
 /// How far along its path one walk packet sends a monster.
 const WALK_LEAD: usize = 8;
 /// How close a player must be to hit a monster, subtiles. The server follows a player only
@@ -211,6 +213,8 @@ struct MonsterSheet {
     hit_frame: u64,
     get_hit_frames: u64,
     dying_frames: u64,
+    /// `Velocity`: sixteenths of a subtile a frame while walking.
+    glide: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -470,6 +474,7 @@ impl Battle {
             notice: if c.ai_distance[d] > 0 { c.ai_distance[d] } else { DEFAULT_AI_DISTANCE },
             think: u64::try_from(c.ai_delay[d]).unwrap_or(0).max(1),
             reach: 2 + c.melee_range.max(0),
+            glide: u64::try_from(c.speed.0).unwrap_or(0).max(1),
             attack_frames,
             hit_frame: hit_frames(data, &m.combat.token, "A1", weapon, attack_frames / 2),
             get_hit_frames: anim_frames(data, &m.combat.token, "GH", weapon, 8),
@@ -883,7 +888,7 @@ impl Battle {
         };
         (m.x, m.y) = from;
         let length = (f64::from(tx) - from.0).hypot(f64::from(ty) - from.1);
-        let frames = (length / GLIDE_PER_FRAME).ceil().max(1.0) as u64;
+        let frames = (length / (m.sheet.glide as f64 * VELOCITY_UNIT)).ceil().max(1.0) as u64;
         m.glide = Some(Glide { from, to: (f64::from(tx), f64::from(ty)), start: now, frames });
         m.next_think = now + frames.min(think);
         events.push(Event::MonsterWalk { room, guid, x: tx as u16, y: ty as u16 });
