@@ -698,7 +698,7 @@ Pickup: `0x16` goes through `0x54AAD0` to `0x548B00` with the unit type, as `0x1
 subtiles and unblocked the engine picks the item up (`0x563560` auto-place, `0x55CF50` to cursor),
 else walks the player there; we do not check range. Gold (`0x55C850`) takes what the purse holds
 (level × 10,000, `0x622E70`) and drops the rest as a new pile from the player (`0x55B030` →
-`0x55A090`); ours goes on the player's subtile.
+`0x55A090`, placed the same way).
 
 Not done: items other than gold (the TC rolls them; quality, affixes, inventory placement and the
 `.d2s` item list are next), and the second player count in `NoDrop`.

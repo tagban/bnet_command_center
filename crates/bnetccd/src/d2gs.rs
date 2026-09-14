@@ -819,12 +819,12 @@ impl GameServer {
     /// A player picks up a gold pile (engine `0x16` → `0x548B00` type 4 → `0x563560` →
     /// `0x55C850`): it takes what its purse holds (level × 10,000, `0x622E70`), the pile goes for
     /// everyone near, and its client is told its gold as the engine tells it (`0x19` for a small
-    /// gain). What does not fit is dropped as a new pile where the player stands (`0x55B030`).
+    /// gain). What does not fit is dropped as a new pile from the player (`0x55B030`, placed as
+    /// [`drop_spot`] places drops).
     /// Items other than gold are not on the ground yet; anything else is ignored.
     ///
     /// ⚠️ Range is not checked (the engine picks up within 5 subtiles and walks the player
-    /// closer otherwise; the client walks up before it asks), and the remainder goes on the
-    /// player's own subtile rather than the engine's free-spot search.
+    /// closer otherwise; the client walks up before it asks).
     fn pick_up(&self, game_id: u16, name: &str, guid: u32) -> Vec<Vec<u8>> {
         let mut g = self.lock();
         let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
@@ -843,7 +843,9 @@ impl GameServer {
         info!(game_id, player = name, guid, taken, total, "gold picked up");
         let mut replies = vec![gone, d2gs::gold_update(total - taken, total)];
         let at = game.positions.get(name).copied();
-        let spot = at.and_then(|(x, y)| Some((game.world.as_ref()?.room_at(x, y)?, x, y)));
+        let ground = &game.ground;
+        let occupied = |x: i32, y: i32| ground.values().any(|p| (i32::from(p.x), i32::from(p.y)) == (x, y));
+        let spot = at.and_then(|from| drop_spot(game.world.as_ref()?, &occupied, from));
         if let (Some((room, x, y)), Some(population)) = (spot, game.population.as_mut()) {
             if taken < pile.amount {
                 let left = GroundGold { room, x: x as u16, y: y as u16, amount: pile.amount - taken };
@@ -2341,7 +2343,7 @@ pub(crate) mod tests {
     }
 
     /// A purse holds 10,000 gold a level: picking up more takes what fits and drops the rest as a
-    /// new pile where the player stands, falling, for everyone near.
+    /// new pile from the player, falling, for everyone near.
     #[test]
     fn gold_beyond_the_purse_is_dropped_again_at_the_player() {
         let (rules, town) = test_town();
@@ -2361,8 +2363,8 @@ pub(crate) mod tests {
         let got = gs.pick_up(id, "Hero", 77);
         assert_eq!(got[..2], [d2gs::remove_unit(unit_type::ITEM, 77), vec![0x19, 10]], "10 fit");
         let (left, pile) = gs.lock().by_id[&id].ground.iter().map(|(&g, &p)| (g, p)).next().unwrap();
-        assert_eq!((pile.x, pile.y, pile.amount), (x, y, 15));
-        assert_eq!(got[2], d2gs::ground_gold(left, x, y, 15, true));
+        assert_eq!((pile.x, pile.y, pile.amount), (x + 2, y + 3, 15), "placed as drops are");
+        assert_eq!(got[2], d2gs::ground_gold(left, x + 2, y + 3, 15, true));
         let friend = gs.lock().by_id.get_mut(&id).unwrap().outgoing.remove("Friend").unwrap();
         assert_eq!(friend, [got[0].clone(), got[2].clone()], "the one near sees both");
         assert!(gs.pick_up(id, "Hero", left).is_empty(), "a full purse takes nothing");
