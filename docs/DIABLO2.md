@@ -126,7 +126,8 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
    included up to the black beyond them. Cold Plains, Stony Field, Dark Wood and Black Marsh
    have their waypoint standing on its pad (the big pads with two lit torches), dark: clicking
    it turns it on, and clicking again opens the menu with that area ticked. Choosing another
-   area you have ticked takes you to its waypoint (`waypoint travel level=…` in the log).
+   area you have ticked takes you to its waypoint (`waypoint travel level=…` in the log;
+   verified 2026-09-13).
    Shrines and wells stand where they should, with their names (using them does nothing yet;
    verified 2026-09-13). Cold Plains' waypoint is always beside the way in from Blood Moor.
    Otherwise the areas are empty — no monsters, and cave entrances do not lead anywhere. Walking through a fence can make the server think you are somewhere
