@@ -24,6 +24,8 @@ pub struct LevelDef {
     pub id: i32,
     /// `Name`.
     pub name: String,
+    /// `LevelName`: the string key the client shows, e.g. `Blood Moor`.
+    pub level_name: String,
     /// `Act`, 0-based.
     pub act: u8,
     /// `SizeX`/`SizeY` per difficulty (Normal, Nightmare, Hell), in tiles.
@@ -109,6 +111,7 @@ impl Levels {
             let def = LevelDef {
                 id,
                 name: row.get("Name").unwrap_or_default().to_string(),
+                level_name: row.get("LevelName").unwrap_or_default().to_string(),
                 act: int("Act") as u8,
                 size: [(int("SizeX"), int("SizeY")), (int("SizeX(N)"), int("SizeY(N)")), (int("SizeX(H)"), int("SizeY(H)"))],
                 offset: (int("OffsetX"), int("OffsetY")),

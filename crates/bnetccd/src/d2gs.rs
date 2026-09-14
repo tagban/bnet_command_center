@@ -37,6 +37,8 @@ use tracing::{debug, info, warn};
 
 use crate::session::hex_preview;
 
+pub mod map;
+
 /// Players per game, as the engine allows.
 const MAX_PLAYERS: usize = 8;
 
@@ -141,6 +143,8 @@ struct Game {
     clock_frames: u64,
     /// How many times the clock asked for its clients to be told (`0x53`).
     clock_reports: u64,
+    /// Where each connected player stands, world subtiles, for the admin panel's map.
+    positions: HashMap<String, (i32, i32)>,
 }
 
 /// Why the realm could not create a game.
@@ -340,6 +344,7 @@ impl GameServer {
                 clock: self.day.map(|(periods, speed)| ActClock::new(0, periods, speed)),
                 clock_frames: 0,
                 clock_reports: 0,
+                positions: HashMap::new(),
             },
         );
         let game = &g.by_id[&id];
@@ -590,10 +595,19 @@ impl GameServer {
     }
 
     /// A connected character left; an emptied game goes with it.
+    /// Record where a player stands.
+    fn set_position(&self, game_id: u16, name: &str, x: f64, y: f64) {
+        let mut g = self.lock();
+        if let Some(game) = g.by_id.get_mut(&game_id) {
+            game.positions.insert(name.to_string(), (x as i32, y as i32));
+        }
+    }
+
     fn leave(&self, game_id: u16, name: &str) {
         let mut g = self.lock();
         let Some(game) = g.by_id.get_mut(&game_id) else { return };
         game.connected.retain(|n| !n.eq_ignore_ascii_case(name));
+        game.positions.remove(name);
         if game.connected.is_empty() && game.staged.is_empty() {
             let game = g.by_id.remove(&game_id).expect("present");
             info!(game = %game.name, id = game_id, "test game closed: last player left");
@@ -737,6 +751,7 @@ async fn run(
             let now = Instant::now();
             w.step(now.duration_since(last_step).min(SERVER_FRAME * 5));
             last_step = now;
+            server.set_position(p.game_id, &p.character.name, w.x, w.y);
             if let Some((room, near)) = server.near(p.game_id, w.x, w.y) {
                 if w.room != Some(room) {
                     if w.room.map(|r| r.level) != Some(room.level) {
@@ -793,7 +808,9 @@ async fn run(
                 }
                 (Stage::AwaitEnterGame, cs::ENTER_GAME) => {
                     let p = player.as_ref().expect("logged on");
-                    walker = Some(enter_game(stream, peer, server, p, &mut outbox).await?);
+                    let joined = enter_game(stream, peer, server, p, &mut outbox).await?;
+                    server.set_position(p.game_id, &p.character.name, joined.x, joined.y);
+                    walker = Some(joined);
                     clock_seen = server.clock(p.game_id).map_or(0, |(reports, _)| reports);
                     stage = Stage::InGame;
                 }
@@ -835,13 +852,15 @@ async fn run(
                     }
                     outbox.push(&d2gs::reassign_player(0, PLAYER_GUID, x, y, 1));
                     (w.x, w.y, w.target, w.room, w.view) = (f64::from(x), f64::from(y), None, Some(room), near);
+                    server.set_position(p.game_id, &p.character.name, w.x, w.y);
                     flush(stream, peer, tables, &mut outbox).await?;
                 }
                 (Stage::InGame, cs::UPDATE_POSITION) => {
                     // The client's own idea of where its player is (engine `0x0054CD50` re-syncs to
                     // it): take it, and let the next frame follow it with rooms.
-                    if let Some(w) = walker.as_mut() {
+                    if let (Some(w), Some(p)) = (walker.as_mut(), player.as_ref()) {
                         (w.x, w.y) = (f64::from(u16_at(1)), f64::from(u16_at(3)));
+                        server.set_position(p.game_id, &p.character.name, w.x, w.y);
                         if !w.moving() {
                             w.target = Some((w.x, w.y));
                             last_step = Instant::now();
@@ -1549,6 +1568,59 @@ pub(crate) mod tests {
 
     /// With the operator's install: walking from the waypoint to the middle of Blood Moor, the
     /// server loads Blood Moor's rooms along the way, and every room it drops it had loaded.
+    /// With the operator's install: the admin map describes a game — its levels, Blood Moor's
+    /// collision map with walls, open ground and the Den of Evil's mouth, and the monsters of
+    /// the rooms a player has walked into. With `BNETCC_D2_MAP_DUMP` set to a directory, the
+    /// JSON the page reads is written there for a browser preview.
+    #[test]
+    fn with_a_real_install_the_admin_map_describes_a_game() {
+        let Ok(dir) = std::env::var("BNETCC_D2_DATA_DIR") else {
+            return;
+        };
+        let engine = EngineData::from_game_exe(&std::fs::read(Path::new(&dir).join("Game.exe")).unwrap()).unwrap();
+        let gs = GameServer::new(test_tables(), Some(GameData::load(&dir).unwrap())).with_engine(engine);
+        let id = gs.create("map", "", 0).unwrap();
+        let moor = gs.lock().by_id[&id].world.as_ref().unwrap().levels().iter().find(|l| l.id == 2).unwrap().area;
+        let (x, y) = (f64::from((moor.x + moor.w / 2) * 5), f64::from((moor.y + moor.h / 2) * 5));
+        gs.set_position(id, "Walker", x, y);
+        let (_, near) = gs.near(id, x, y).unwrap();
+        gs.view_change(id, &[], &near);
+
+        let games = gs.map_games();
+        assert_eq!(games.len(), 1);
+        assert_eq!((games[0].players[0].name.as_str(), games[0].players[0].level), ("Walker", Some(2)));
+        assert!(games[0].levels.iter().any(|l| l.id == 2 && l.name == "Blood Moor"), "{:?}", games[0].levels);
+
+        let level = gs.map_level(id, 2).unwrap();
+        let raw: Vec<u8> = {
+            // Undo the base64 to check the grid.
+            let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = Vec::new();
+            for chunk in level.grid.as_bytes().chunks(4) {
+                let n = chunk.iter().filter(|&&c| c != b'=').fold((0u32, 0u32), |(n, k), &c| (n | (alphabet.iter().position(|&a| a == c).unwrap() as u32) << (18 - 6 * k), k + 1));
+                for i in 0..n.1.saturating_sub(1) {
+                    out.push((n.0 >> (16 - 8 * i)) as u8);
+                }
+            }
+            out
+        };
+        assert_eq!(raw.len(), (moor.w * 5 * moor.h * 5) as usize);
+        let walls = raw.iter().filter(|&&c| c != map::NO_MAP && c & 1 != 0).count();
+        let open = raw.iter().filter(|&&c| c != map::NO_MAP && c & 1 == 0).count();
+        assert!(walls > 1000 && open > 10_000, "walls {walls}, open {open}");
+        assert!(level.entrances.iter().any(|e| e.name == "DOE Entrance"), "{:?}", level.entrances);
+
+        let live = gs.map_live(id, 2).unwrap();
+        assert!(live.populated_rooms > 0 && live.populated_rooms <= live.rooms);
+        if let Ok(out) = std::env::var("BNETCC_D2_MAP_DUMP") {
+            let out = Path::new(&out);
+            std::fs::create_dir_all(out.join("d2")).unwrap();
+            std::fs::write(out.join("d2/games.json"), serde_json::to_string(&games).unwrap()).unwrap();
+            std::fs::write(out.join("d2/level.json"), serde_json::to_string(&level).unwrap()).unwrap();
+            std::fs::write(out.join("d2/live.json"), serde_json::to_string(&live).unwrap()).unwrap();
+        }
+    }
+
     #[test]
     fn with_a_real_install_walking_out_of_camp_loads_blood_moor() {
         let Ok(dir) = std::env::var("BNETCC_D2_DATA_DIR") else {

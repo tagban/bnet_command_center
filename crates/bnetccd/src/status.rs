@@ -13,7 +13,8 @@
 //!
 //! Routes: `GET /` dashboard · `GET /status.json` data · `GET|POST /login` ·
 //! `GET|POST /change-password` (forced while `must_change`) · `GET|POST /settings` ·
-//! `POST /logout`.
+//! `POST /logout` · `GET /d2` live Diablo II map, with `GET /d2/games.json`, `/d2/level.json` and
+//! `/d2/live.json` behind it.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -261,6 +262,10 @@ async fn route(req: &Request, peer_ip: IpAddr, panel: &Panel) -> Response {
         ("POST", "/users/flags") => do_user_flags(req, node).await,
         ("POST", "/users/reset") => do_user_reset(req, node).await,
         ("POST", "/users/delete") => do_user_delete(req, node).await,
+        ("GET", "/d2") => html_page(D2_MAP.to_string()),
+        ("GET", "/d2/games.json") => d2_json(node, req, D2Query::Games),
+        ("GET", "/d2/level.json") => d2_json(node, req, D2Query::Level),
+        ("GET", "/d2/live.json") => d2_json(node, req, D2Query::Live),
         _ => text("404 Not Found", "Not found."),
     }
 }
@@ -720,6 +725,35 @@ fn json_response(node: &Node) -> Response {
         body: serde_json::to_string(&node.status_snapshot()).unwrap_or_else(|_| "{}".to_string()),
         set_cookie: None,
         location: None,
+    }
+}
+
+/// The live Diablo II map page (`GET /d2`).
+const D2_MAP: &str = include_str!("d2_map.html");
+
+/// Which map data a `/d2/*.json` request asks for.
+enum D2Query {
+    Games,
+    Level,
+    Live,
+}
+
+/// The live map's data from the game server: every game, a level's collision map and marks
+/// (`?game=&level=`), or what stands in a level now. An empty list when no game server runs.
+fn d2_json(node: &Node, req: &Request, query: D2Query) -> Response {
+    let server = node.d2_realm.as_ref().and_then(|r| r.game_server.as_ref());
+    let number = |key: &str| req.query.get(key).and_then(|v| v.parse::<i64>().ok());
+    let target = number("game").and_then(|g| u16::try_from(g).ok()).zip(number("level").and_then(|l| i32::try_from(l).ok()));
+    let body = match (query, server) {
+        (D2Query::Games, None) => Some("[]".to_string()),
+        (D2Query::Games, Some(gs)) => serde_json::to_string(&gs.map_games()).ok(),
+        (D2Query::Level, Some(gs)) => target.and_then(|(g, l)| gs.map_level(g, l)).and_then(|m| serde_json::to_string(&m).ok()),
+        (D2Query::Live, Some(gs)) => target.and_then(|(g, l)| gs.map_live(g, l)).and_then(|m| serde_json::to_string(&m).ok()),
+        (_, None) => None,
+    };
+    match body {
+        Some(body) => Response { status: "200 OK", content_type: "application/json", body, set_cookie: None, location: None },
+        None => text("404 Not Found", "No such game or level."),
     }
 }
 
@@ -1928,7 +1962,7 @@ const DASHBOARD: &str = r##"<!doctype html>
 <header>
   <h1>BNET Command Center · <span class="name" id="server">…</span></h1>
   <span class="meta" id="meta"></span>
-  <nav><a href="/users">Users</a> · <a href="/settings">Settings</a> · <a href="/help">Help</a> · <a href="/change-password">Password</a></nav>
+  <nav><a href="/d2">D2 map</a> · <a href="/users">Users</a> · <a href="/settings">Settings</a> · <a href="/help">Help</a> · <a href="/change-password">Password</a></nav>
 </header>
 <main>
   <div class="tiles">

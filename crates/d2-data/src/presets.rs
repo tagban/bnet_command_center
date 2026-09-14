@@ -13,6 +13,8 @@ use crate::Error;
 pub struct LvlPrest {
     /// `Def`.
     pub def: i32,
+    /// `Name`, e.g. `Act 1 - DOE Entrance`.
+    pub name: String,
     /// `LevelId` (0 for rows used only by mazes and sub-levels).
     pub level_id: i32,
     /// `Populate`: whether rooms spawn their populate objects.
@@ -61,6 +63,7 @@ impl LvlPrests {
             .rows()
             .map(|row| LvlPrest {
                 def: row.int("Def").unwrap_or(0) as i32,
+                name: row.get("Name").unwrap_or_default().to_string(),
                 level_id: row.int("LevelId").unwrap_or(0) as i32,
                 populate: row.int("Populate").unwrap_or(0) != 0,
                 size: (row.int("SizeX").unwrap_or(0) as i32, row.int("SizeY").unwrap_or(0) as i32),
