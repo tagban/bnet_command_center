@@ -659,6 +659,39 @@ Warps, from the engine:
   unit on the warp cell's corner, gives it the next type-5 guid, and lands the player on the
   destination cell plus `ExitWalk`.
 
+### Gold drops and pickup (2026-09-14)
+
+A dying monster rolls its `MonStats.txt` `TreasureClass1` (the difficulty's column) in
+`d2_data::treasure`, following the resolver `0x55A6D0`:
+- The class is upgraded within its `group` to the highest `level` the monster has reached.
+- `Picks > 0`: each pick draws `rand(NoDrop + ΣProb)` from the unit's seed (`0x6AC690C5` LCG);
+  inside `NoDrop` nothing drops, else the first entry whose running `Prob` passes the draw. A
+  class entry is pushed and resolved in place. `Picks < 0`: entry *i* drops `Prob_i` times.
+  At most 6 drops (the default limit when no output array is passed).
+- `NoDrop` for *n* players (1–8; the game's count averaged with a second count, `0x535790`, not
+  yet identified — solo it is 1): `f = NoDrop/(NoDrop+ΣProb)`, new `NoDrop = ΣProb·fⁿ/(1−fⁿ)`.
+- A gold pick makes a `gld` item whose stat 14 is `ilvl + rand(5·ilvl)`, at least 1 (`0x557AB0`;
+  `ilvl` is the monster's stat 12, set in `0x55A550`), then `× mul >> 8` when the entry carries
+  one (`0x55A6D0` at `0x55AF2F`, the entry's `+0x0A` word).
+
+On the wire:
+- **S→C `0x9C` action 0** (client `0x45EB10` → `0x4C25B0`), `[0x9C][action][size u8][category]
+  [guid u32]`, then the item bits from `+8` read by `0x62A970`: flags 32 (`0x10` identified,
+  `0x2000` just dropped → fall animation and sound, `0x200000` simple, `0x800000` on every item),
+  version 10 (101), mode 3 (3 = ground), x 16, y 16, code 32 (`gld `), then — for an item type
+  with the gold property — a 1-bit width flag and the amount in 12 or 32 bits. The client does
+  not read the category for action 0; we send 0.
+- **C→S `0x16`** (13): `[container u32][item guid u32][to cursor u32]`. For gold we remove the pile
+  for everyone holding its room (`0x0A` type 4), set stat 14 (`0x1D`–`0x1F`) and save.
+- Piles stay in the game: a room coming near sends its piles without the drop flag, a room left
+  behind sends their `0x0A`s.
+
+Not done / not confirmed: items other than gold (the TC rolls them; quality, affixes, inventory
+placement and the `.d2s` item list are next), the engine's free-spot search for each drop
+(`0x555DA0` → `0x64E810`, mask `0x3E01`; piles go on and beside the corpse), the second player
+count, and what the engine does with gold beyond the purse (10,000 a level; the remainder is put
+back as a smaller pile).
+
 ## 6. Server packet builders (opcode → function)
 
 `scripts/d2re/server_send_builders.py <Game.exe>` finds every call to the queue function
@@ -686,8 +719,11 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
 - Where the server allocates warp tile units (§5 *Maze levels and warps*); the preset levels
   behind the caves (Cave Level 2 and the other treasure levels, `DrlgType` 2) and the other acts'
   mazes.
-- Combat (§5 *Fighting*): the per-class AI routines, items and weapons, drops (`0x9C`, bnemu has
-  the item bitstream), skills; saving level and experience to the character.
+- Combat (§5 *Fighting*): the per-class AI routines, items and weapons, skills.
+- Loot (§5 *Gold drops and pickup*): item drops — base item from the TC code (`weap3`/`armo3`
+  type-and-level picks), quality (`0x558640`), the full item body, inventory and belt placement
+  (`0x9C` action 4), the `.d2s` item list; bnemu's `ItemBitstreamEncoder` and captures cover the
+  bodies.
 - bnemu (MIT, permission recorded in `docs/LEGAL.md`) has worked items and vendors to port from;
   its wilderness collision is approximate, so collision stays on libd2.
 - Unique packs and champions; wandering monsters; NPCs walking their DS1 paths (`0x666120`); the
