@@ -171,12 +171,30 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
    healing potions in the belt, a Town Portal and an Identify scroll); characters made before
    2026-09-15 that have been saved keep what they had.
    *Not yet:* the stash and cube, sockets filled, tomes, Town Portal, stamina, antidote and
-   thawing potions, shops, repair, and other players seeing what you wear.
-5. *Expect nothing else to work:* NPCs never move, there is no shop and no travel to other acts.
+   thawing potions, repair, and other players seeing what you wear.
+5. *Expect shops:* talk to Akara, Charsi or Gheed and pick **Trade**. Their goods fill the tabs:
+   Charsi's weapons and armour, Akara's staves, wands, potions, scrolls, tomes and keys, Gheed's
+   mix — some white, some superior, some blue, priced as the game prices them. Right-clicking to
+   buy takes the gold and puts the item in your belt (potions, when there is a free slot) or
+   inventory; weapons and armour leave the vendor's stock, potions and scrolls never run out.
+   Shift and right-click a potion to fill your belt. Selling an item of yours (drop it on the
+   vendor's goods) adds the gold and puts the item in the vendor's stock. A vendor restocks when
+   you open Trade alone more than four minutes after the stock was made. *Not yet:* gambling, repair,
+   hiring, identifying at Cain, and buying scrolls straight into a tome.
+6. *Expect skills:* a new level gives a skill point; the skill tree takes it (a skill of your
+   class whose level and required skills you have) and the level shows. Put a skill on a mouse
+   button and use it: Attack and melee skills swing at a monster as Attack does, and missile
+   skills — Fire Bolt, Ice Bolt, Charged Bolt, Fire Ball, Teeth, Magic Arrow and the like —
+   cost their mana, fly, and hurt what they reach for their elemental damage less the monster's
+   resistance (Fire Ball hurts everything around where it lands). What you learned and
+   what is on your buttons is saved. *Not yet:* melee skills' own effects (Bash still hits as
+   Attack), auras, curses, summons, novas, Holy Bolt, cold slowing and poison over time, and other
+   players seeing your casts.
+7. *Expect nothing else to work:* NPCs never move and there is no travel to other acts.
    Esc → Save and Exit returns to chat (verified).
-6. Send the log from the moment you clicked Create Game (`item picked up`, `item moved`,
-   `item dropped`, `item identified`, `potion drunk`, `item move refused` and `no room to pick it
-   up` lines say what the server did with items).
+8. Send the log from the moment you clicked Create Game (`item picked up`, `item moved`,
+   `item dropped`, `item identified`, `potion drunk`, `item move refused`, `no room to pick it
+   up`, `vendor stocked`, `bought`, `sold` and `skill point spent` lines say what the server did).
 
 What it shows, in order:
 

@@ -15,4 +15,6 @@ pub mod inventory;
 pub mod loot;
 pub mod path;
 pub mod population;
+pub mod skills;
 pub mod spawn;
+pub mod store;

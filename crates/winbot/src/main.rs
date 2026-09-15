@@ -16,7 +16,11 @@
 //! winbot --product SEXP                                # normal games, forever
 //! winbot --product W2BN --ladder --games 10            # ten ladder games
 //! winbot --product STAR --surrender second --length 90 # games too short to count
+//! winbot --product SEXP --stay                          # sit in the channel, no games
 //! ```
+//!
+//! `--wait` keeps both accounts in their channel that many seconds before the first game, and
+//! `--stay` keeps them there until stopped without playing — to look at them from another client.
 //!
 //! WarCraft III (`WAR3`, `W3XP`) logs in and plays the same custom games, but its clients send no
 //! `SID_GAMERESULT`: its ladder records games through anonymous matchmaking and the route
@@ -72,6 +76,12 @@ struct Cli {
     /// The channel the accounts wait in between games.
     #[arg(long, default_value = "Win Bots")]
     channel: String,
+    /// Seconds both accounts sit in the channel before the first game.
+    #[arg(long, default_value_t = 0)]
+    wait: u64,
+    /// Sit in the channel until stopped, playing no games.
+    #[arg(long)]
+    stay: bool,
 }
 
 /// Who gives up each game.
@@ -125,6 +135,14 @@ async fn run(cli: &Cli) -> Result<(), Error> {
         warn!(length = cli.length, "games of two minutes or less do not count");
     }
 
+    if cli.stay || cli.wait > 0 {
+        let wait = if cli.stay { Duration::from_secs(u64::from(u32::MAX)) } else { Duration::from_secs(cli.wait) };
+        info!(channel = %cli.channel, seconds = cli.wait, stay = cli.stay, "sitting in the channel");
+        let (ra, rb) = tokio::join!(a.idle(wait), b.idle(wait));
+        ra?;
+        rb?;
+    }
+
     let tag = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() % 100_000);
     let mut count = 0u32;
     let mut next_name = || {
@@ -134,10 +152,21 @@ async fn run(cli: &Cli) -> Result<(), Error> {
 
     // The ladder takes ten normal-game wins: earn them first.
     if league != 0 && !warcraft3 {
+        let mut stalled = 0;
+        let mut last = None;
         loop {
             let (a_wins, b_wins) = (normal_wins(&mut a).await?, normal_wins(&mut b).await?);
             if a_wins >= LADDER_MIN_WINS && b_wins >= LADDER_MIN_WINS {
                 break;
+            }
+            // A server that does not record these games would keep the warm-up going forever.
+            stalled = if last == Some((a_wins, b_wins)) { stalled + 1 } else { 0 };
+            last = Some((a_wins, b_wins));
+            if stalled >= WARM_UP_STALL_GAMES {
+                return Err(Error(format!(
+                    "{WARM_UP_STALL_GAMES} warm-up games in a row changed no record ({} {a_wins} wins, {} {b_wins}): this server is not counting these games",
+                    a.account, b.account
+                )));
             }
             if cli.length <= 120 {
                 return Err(Error(format!(
@@ -167,6 +196,9 @@ async fn run(cli: &Cli) -> Result<(), Error> {
 
 /// Normal-game wins a StarCraft or Warcraft II player needs before the ladder.
 const LADDER_MIN_WINS: u32 = 10;
+
+/// Warm-up games in a row that may leave both records as they were before the bot gives up.
+const WARM_UP_STALL_GAMES: u32 = 3;
 
 /// One game: `a` hosts `name`, `b` joins, the host starts it, and after `--length` one side
 /// surrenders. `kind` is the advertised game type, ladder field and result game type.

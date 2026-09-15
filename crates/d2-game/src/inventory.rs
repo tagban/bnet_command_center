@@ -170,53 +170,11 @@ impl Inventory {
         (0..BELT_SLOTS).find(|&slot| !self.items.iter().any(|h| h.place == Place::Belt(slot)))
     }
 
-    /// How snugly a `size` item sits at (`col`, `row`) (`0x0063B340`): the occupied cells and grid
-    /// edges along its four sides, or 255 when every side is closed.
-    fn snugness(&self, col: u8, row: u8, (w, h): (u8, u8)) -> u32 {
-        let side = |cells: &mut dyn Iterator<Item = (u8, u8)>| cells.filter(|&(c, r)| self.occupied(c, r)).count() as u32;
-        let left = if col == 0 { u32::from(h) } else { side(&mut (row..row + h).map(|r| (col - 1, r))) };
-        let right = if col + w >= GRID_WIDTH { u32::from(h) } else { side(&mut (row..row + h).map(|r| (col + w, r))) };
-        let top = if row == 0 { u32::from(w) } else { side(&mut (col..col + w).map(|c| (c, row - 1))) };
-        let bottom = if row + h >= GRID_HEIGHT { u32::from(w) } else { side(&mut (col..col + w).map(|c| (c, row + h))) };
-        let score = left + right + top + bottom;
-        if score >= 2 * (u32::from(w) + u32::from(h)) {
-            255
-        } else {
-            score
-        }
-    }
-
-    /// Where the engine puts a `size` item in a player's inventory (`0x0063B850`): of the free
-    /// spots it fits, the snuggest, the first found winning a tie and a fully enclosed one ending the
-    /// search. A one-row item is looked for column by column from the right, each from the bottom
-    /// up (`0x0063B490`); others row by row from the top, each from the left (`0x0063B620`; the
-    /// engine's own passes for 2 × 2 and three-row items, `0x0063B7D0` and `0x0063B790`, are not
-    /// read).
+    /// Where the engine puts a `size` item in a player's inventory ([`free_spot`] on the 10 × 4
+    /// grid).
     #[must_use]
     pub fn grid_spot(&self, size: (u8, u8)) -> Option<(u8, u8)> {
-        let (w, h) = size;
-        if w == 0 || h == 0 || w > GRID_WIDTH || h > GRID_HEIGHT {
-            return None;
-        }
-        let order: Vec<(u8, u8)> = if h == 1 {
-            (0..GRID_WIDTH).rev().flat_map(|c| (0..GRID_HEIGHT).rev().map(move |r| (c, r))).collect()
-        } else {
-            (0..GRID_HEIGHT).flat_map(|r| (0..GRID_WIDTH).map(move |c| (c, r))).collect()
-        };
-        let mut best: Option<((u8, u8), u32)> = None;
-        for (col, row) in order {
-            if col + w > GRID_WIDTH || row + h > GRID_HEIGHT || !self.area_free(col, row, size) {
-                continue;
-            }
-            let score = self.snugness(col, row, size);
-            if best.map_or(score > 0, |(_, b)| score > b) {
-                best = Some(((col, row), score));
-                if score == 255 {
-                    break;
-                }
-            }
-        }
-        best.map(|(spot, _)| spot)
+        free_spot(GRID_WIDTH, GRID_HEIGHT, size, &|c, r| self.occupied(c, r))
     }
 
     /// Where a picked-up item goes: a free belt slot for a beltable `autobelt` item, else the
@@ -230,6 +188,56 @@ impl Inventory {
         }
         self.grid_spot(size).map(|(col, row)| Place::Grid { col, row })
     }
+}
+
+/// How snugly a `size` item sits at (`col`, `row`) in a `width` × `height` grid (`0x0063B340`):
+/// the occupied cells and grid edges along its four sides, or 255 when every side is closed.
+fn snugness(width: u8, height: u8, occupied: &dyn Fn(u8, u8) -> bool, col: u8, row: u8, (w, h): (u8, u8)) -> u32 {
+    let side = |cells: &mut dyn Iterator<Item = (u8, u8)>| cells.filter(|&(c, r)| occupied(c, r)).count() as u32;
+    let left = if col == 0 { u32::from(h) } else { side(&mut (row..row + h).map(|r| (col - 1, r))) };
+    let right = if col + w >= width { u32::from(h) } else { side(&mut (row..row + h).map(|r| (col + w, r))) };
+    let top = if row == 0 { u32::from(w) } else { side(&mut (col..col + w).map(|c| (c, row - 1))) };
+    let bottom = if row + h >= height { u32::from(w) } else { side(&mut (col..col + w).map(|c| (c, row + h))) };
+    let score = left + right + top + bottom;
+    if score >= 2 * (u32::from(w) + u32::from(h)) {
+        255
+    } else {
+        score
+    }
+}
+
+/// Where the engine puts a `size` item in a `width` × `height` grid whose taken cells `occupied`
+/// names (`0x0063B850`) — a player's inventory, or a vendor's store page: of the free spots it
+/// fits, the snuggest, the first found winning a tie and a fully enclosed one ending the search. A
+/// one-row item is looked for column by column from the right, each from the bottom up
+/// (`0x0063B490`); others row by row from the top, each from the left (`0x0063B620`; the engine's
+/// own passes for 2 × 2 and three-row items, `0x0063B7D0` and `0x0063B790`, are not read).
+#[must_use]
+pub fn free_spot(width: u8, height: u8, size: (u8, u8), occupied: &dyn Fn(u8, u8) -> bool) -> Option<(u8, u8)> {
+    let (w, h) = size;
+    if w == 0 || h == 0 || w > width || h > height {
+        return None;
+    }
+    let order: Vec<(u8, u8)> = if h == 1 {
+        (0..width).rev().flat_map(|c| (0..height).rev().map(move |r| (c, r))).collect()
+    } else {
+        (0..height).flat_map(|r| (0..width).map(move |c| (c, r))).collect()
+    };
+    let free = |col: u8, row: u8| (col..col + w).all(|c| (row..row + h).all(|r| !occupied(c, r)));
+    let mut best: Option<((u8, u8), u32)> = None;
+    for (col, row) in order {
+        if col + w > width || row + h > height || !free(col, row) {
+            continue;
+        }
+        let score = snugness(width, height, occupied, col, row, size);
+        if best.map_or(score > 0, |(_, b)| score > b) {
+            best = Some(((col, row), score));
+            if score == 255 {
+                break;
+            }
+        }
+    }
+    best.map(|(spot, _)| spot)
 }
 
 #[cfg(test)]

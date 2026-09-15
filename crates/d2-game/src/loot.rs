@@ -78,6 +78,8 @@ struct Maker<'a> {
     kind: &'a ItemType,
     rng: Seed,
     item: Item,
+    /// Made for a vendor's stock: never ethereal (create flag 2, `0x00559CE0`).
+    for_store: bool,
 }
 
 /// Make an item of `code` for a monster of `level`, with the quality mods its treasure classes gave,
@@ -95,10 +97,32 @@ pub fn make(data: &GameData, code: Code, level: i32, mods: QualityMods, making: 
     }
     let mut item = Item::new(code, making.version, level.clamp(1, 99) as u8, Location::Ground { x: 0, y: 0 });
     item.seed = seed;
-    let mut m = Maker { data, making, class, def, kind, rng: Seed::new(seed, 666), item };
+    let mut m = Maker { data, making, class, def, kind, rng: Seed::new(seed, 666), item, for_store: false };
     m.base();
     let quality = m.roll_quality(mods);
     m.generate(quality, made_uniques)?;
+    Some(m.item)
+}
+
+/// An item of `code` for a vendor's stock (`0x00576330` → `0x00559CE0`): item level `level`,
+/// `quality` given (1 low, 2 normal, 3 superior, 4 magic) and its routine's fallbacks, sockets and
+/// the automagic affix, never ethereal; identified. A simple item (`compactsave`) is made as it is.
+/// `None` for a code the tables lack.
+#[must_use]
+pub fn make_for_store(data: &GameData, code: Code, level: i32, quality: u8, making: Making, seed: u32) -> Option<Item> {
+    let items = data.items();
+    let class = items.class_of(&code)?;
+    let def = items.get(class)?;
+    let kind = items.types().get(def.item_type)?;
+    let mut item = Item::new(code, making.version, level.clamp(1, 99) as u8, Location::Ground { x: 0, y: 0 });
+    item.seed = seed;
+    if def.compact {
+        return Some(item);
+    }
+    let mut m = Maker { data, making, class, def, kind, rng: Seed::new(seed, 666), item, for_store: true };
+    m.base();
+    m.generate(quality, &mut HashSet::new())?;
+    m.item.flags |= flags::IDENTIFIED;
     Some(m.item)
 }
 
@@ -118,7 +142,7 @@ pub fn starter(data: &GameData, code: Code, version: u16, skill: Option<i32>, se
         return Some(item);
     }
     let making = Making { version, difficulty: 0, ladder: false, magic_find: 0 };
-    let mut m = Maker { data, making, class, def, kind, rng: Seed::new(seed, 666), item };
+    let mut m = Maker { data, making, class, def, kind, rng: Seed::new(seed, 666), item, for_store: false };
     m.base();
     m.item.durability = m.item.max_durability;
     if def.stackable {
@@ -635,7 +659,7 @@ impl Maker<'_> {
 
     /// Ethereal, one time in twenty, in a Lord of Destruction game (`0x00556CA0`).
     fn ethereal(&mut self) {
-        if !(self.is("weap") || self.is("armo")) || !self.has_durability() || matches!(self.quality(), 1 | 5) || self.def.quest {
+        if self.for_store || !(self.is("weap") || self.is("armo")) || !self.has_durability() || matches!(self.quality(), 1 | 5) || self.def.quest {
             return;
         }
         if self.rand(100) < 5 {
@@ -1316,7 +1340,7 @@ mod tests {
         let def = data.items().get(class).unwrap();
         let kind = data.items().types().get(def.item_type).unwrap();
         let item = Item::new(code("hax"), 2, 10, Location::Ground { x: 0, y: 0 });
-        let mut m = Maker { data: &data, making: CLASSIC, class, def, kind, rng: Seed::new(1, 666), item };
+        let mut m = Maker { data: &data, making: CLASSIC, class, def, kind, rng: Seed::new(1, 666), item, for_store: false };
         m.apply(&Mod { code: "dmg-max".into(), param: 0, min: 2, max: 2 }, List::Own);
         m.apply(&Mod { code: "dmg%".into(), param: 0, min: 10, max: 10 }, List::Own);
         assert_eq!(m.item.stats.iter().find(|s| s.id == 22).map(|s| s.value), Some(3), "10% of 6 is nothing: a point of maximum damage instead");

@@ -851,6 +851,110 @@ made normal at item level 1 (`0x534C70`), flagged `0x20000`, whole durability, a
 class's `StartSkill` a point on the first; beltable ones into the belt, those with a location worn,
 the rest into the inventory as pickups place them.
 
+### Vendors: stock, prices, buying and selling (2026-09-15)
+
+**Opening.** After talking (`0x2F`), the menu's Trade sends `0x38 [action u32 1][npc guid u32]
+[u32]` (13, `0x54BCA0` → `0x579D60`). Classes that trade: 147 Gheed, 148 Akara, 154 Charsi, 177
+Drognan, 178 Fara, 199 Elzix, 202 Lysander, 252 Asheara, 253 Hratli, 254 Alkor, 255 Ormus, 257
+Halbu, 405 Jamella, 511 Larzuk, 512 Anya, 513 Malah (gamble, action 2: 147, 199, 254, 405, 512,
+514). `0x579430` → `0x578B30` makes the stock once per NPC (`0x576980`), again when the store was
+flagged stale and the opener is the only one talking to the NPC (`0x537230` flags it after
+240,000 ms), then marks every stock item with unit flag 4, which the per-frame pass sends as `0x9C`
+action `0x0B` (`0x53EF30`; removal is flag `0x10`, action `0x0C`). The client (`0x4C3C00`) puts
+each into the NPC it is interacting with (`0x7C0D25`), at the column, row and page in its bits
+(page + 1 in the three-bit field). Closing sends `0x30 [unit type][npc]` (9).
+
+**Stock tables.** The store record (`0x44` bytes per NPC, `game+0x1D24`) copies its vendor's lists
+built by `0x536D50`: every `spawnable` item whose vendor `Max` (`+0x157+v`) or `MagicMax`
+(`+0x179+v`) is set, `PermStoreItem` (`+0x1A4`) ones into a code list, the rest into 12-byte
+entries `[Min][Max][MagicMin][MagicMax][code u32][MagicLvl]`. The vendor index `v` is not the
+column order: `Min` columns sit at `+0x146` Akara, Gheed, Charsi, Fara, Lysander, Drognan, Hralti,
+Alkor, Ormus, Elzix, Asheara, Cain, Halbu, Jamella, Malah, Larzuk, Drehya. NPC → index and act:
+table `0x731188` and the switch in `0x536070`.
+
+**Stock** (`0x576980`). Store level `L` = player level + 5, capped in normal at 12/20/28/36/45 by
+act (`0x576890`). Per entry with item level (`+0xFD`) ≤ `L`: `n = rand[Min, Max+1)` when `L < 25`
+(else 0) — then skipped if the item is LoD-only in a classic game — `n` items of quality
+(`0x576900`) `L<5`: roll%100 > 90 low; `L<10`: > 85 superior; else > 74 superior; normal
+otherwise. If `bitfield1 & 1` and `MagicLvl ≤ L`: `rand[MagicMin, MagicMax + e)` magic items, `e`
+1, or `rand[1,3)+1` when `L ≥ 25`. More than 32 failures stop the normal loop. Then one normal
+item of every always-stocked code, arrows and bolts at their full stack. Each item (`0x576330`):
+in nightmare/hell with player level > 25, `r = rand(100000)`: NM `r < L·64+4000` → `ubercode`, else
+`NightmareUpgrade`; hell `r < L·16+1000` (LoD) → `ultracode`, else `r < L·128+5000` → `ubercode`,
+then `HellUpgrade` over either. Made by `0x559CE0` with create flag 2 (never ethereal); a low
+quality `Cracked` is made again (five tries). Page from the type's `StorePage` (`0x62E880`), placed
+as a pickup is in the NPC's 10 × 10 grid, a full page 1 spilling to 2; stackable repairable items
+full, durability full (`0x5761C0`); flagged identified.
+
+**Prices** (`0x62FDC0` → `0x62EFB0(player, item, difficulty, quest flags, npc class, mode)`, mode
+0 buy, 1 sell, 2 gamble, 3 repair). Starter items 1. Base: ear `level × cost`; body part `cost +
+monster level × 8`; tome `CostPerCharge × quantity + cost`; quiver type `cost × quantity / 1024`
+(repair `maxstack × cost / 1024`); else `cost`, with the divisor `maxstack` for stackables. Armour
+`cost × defence / maxac`. Not magic: staff skills (`0x62EDD0`, stat 107 by skill: `(cost mult ×
+price / 1024 + cost add) × (2·level − 1)`, sell `/4096`). Identified: the automagic affix's
+`multiply`/`add` term, then by quality — low: `−price/2`; superior/tempered: stat costs
+(`0x628E70`); magic: prefix and suffix terms then stat costs; set/unique: their `cost mult`/`cost
+add`; rare/crafted: all six affixes then stat costs — each term over the divisor, then staff skills
+for magic and better. Stat costs walk the item's full stat list (base stats as `0x557AB0` sets
+them: armour 31, 20, 67, 72, 73; weapons 70, 72, 73, 21–24, 159/160, 68): `Multiply × price ×
+value / 1024 + Add`, skill stats (encode 1) with the skill's `cost mult`/`cost add`, encode 2/3 by
+the packed level, sell at `/4096` for skills. Sockets add half each filling's cost. Selling,
+ethereal `/4`, class items `/4`, a broken ethereal item 0. Then `Npc.txt` (`0x656900`, record
+`0x4C`): `sell mult` (`+4`) on the buy price, `buy mult` (`+8`) on the sell price, `rep mult`
+(`+0xC`), quest-flag multipliers, `× quantity` (a repairable stack sells `maxstack × p − (maxstack −
+qty) × repair`), sell capped at `max buy` by difficulty (`+0x40`), less the player's
+reduced-prices percentage.
+
+**Buying** `0x32 [npc][item][u32: bit 31 fill, low word 0 trade / 2 gamble][cost u32]` (17,
+`0x54BAC0` → `0x577F30` → `0x577830`). Gold is stat 14 + stat 15. The store item is copied
+(`0x55A2A0`); gold taken (`0x576D90`, inventory first); the copy into the belt when `autobelt` or a
+slot is free (`0x628BA0`, `0x55E9B0`), else the inventory (`0x560200`); no room refunds and
+answers 10. Not always stocked (`0x576ED0`, which counts hp4/hp5/mp4/mp5 in NM/hell): removed from
+the store. Fill repeats for always-stocked items until the belt is full (that one goes to the
+inventory). **Selling** `0x33 [npc][item][mode u16][u16][cost]` (17, `0x579510`): the item's mode
+must match; not `0x1000`-flagged; price; unless `Cracked`, broken, an ear, personalised, ethereal
+or always stocked, a mended copy joins the stock and the price is the lower of the two; removed
+(`0x9D` 5 used from a grid); paid through `0x55B060` (what the purse cannot hold is dropped as gold).
+
+**`0x2A`** (15, `0x53D740`): `[0x2A][kind][result][4 bytes left from the stack][item u32][gold
+u32]`, gold after the trade. Bought `4, 0, copy`; sold `3, 1, item`; refusals kind 0 with result 7
+(no such item or cursor busy), 9 (cannot), 10 (no room), 11 (store not open), 12 (not enough
+gold). The client (`0x4B6390`) stores it for the trade screen.
+
+### Skills: learning, choosing and missile casts (2026-09-15)
+
+**Join.** The player's skills go out after its items: `0x94 [count u8][guid u32]` then `[skill
+u16][base level u8]` each (builder `0x53C5D0`; retail lists the common skills 0, 2, 1, 217–220, 4,
+5, 3 first), then `0x23` for the left and right buttons. A `.d2s` keeps the class's 30 skill levels
+(`if`, class skills in id order: Amazon 6, Sorceress 36, Necromancer 66, Paladin 96, Barbarian
+126, Druid 221, Assassin 251) and the button skills at header `0x78` (left) and `0x7C` (right).
+
+**Learning** `0x3B [skill u16]` (3, `0x54BD90`): refused unless the skill is the player's class's
+(`0x56C700`, record `+0xC`), `InGame`, the player's level and attributes meet `reqlevel` and
+`reqstr`/`reqdex`/`reqint`/`reqvit` (`0x6447D0`, `0x644920`, `+0x176`–`+0x17C`), it has each
+`reqskill` (`+0x17E`–`+0x182`) at base level ≥ 1, the base level is under `maxlvl` (`+300`, 20 when
+blank, `0x4AA8B0`) and stat 5 holds `skpoints` (calc `+0x170`, 1 when blank, `0x570080`). Then stat 5
+drops and `0x21 [unit type][0][guid][skill u16][base u8][item bonus u8][unset]` (12, `0x53C4A0`).
+
+**Choosing** `0x3C [skill u16][u16: bit 15 left][item guid u32]` (9, `0x54BE70`): bit 31 of the
+first dword is the left button — it picks the setter `0x622F10` whose getter `0x620190` the left
+packets `0x05`/`0x06` read — and the skill must be one the unit has at level ≥ 1. The reply `0x23
+[unit type][guid][left u8][skill u16][item guid]` (13, `0x53C590`) carries the same bit; the client
+(`0x45DE10`) sets the left skill for a nonzero byte.
+
+**Casting.** `0x05`/`0x08` left and `0x0C`/`0x0F` right at a spot `[x u16][y u16]` (5), `0x06`… on a
+unit (9); no skill id is sent. The skill runs its `anim` mode; on the action frame
+`SkillsSrvDoSkill` (`0x56F640`) pays `max(minmana << 8, (mana + lvlmana·(lvl−1)) << manashift)` from
+stat 8 (`0x56BFE0`) and its do-function shoots `srvmissile`. A missile (`Missiles.txt`, stride
+`0x1A4`) moves `Vel` sixteenths of a subtile a frame (`Vel << 8` as a unit velocity, `0x4CD540`) for
+`Range + LevRange·lvl` frames, ending at walls and on units (`0x5AE1F0`); `pSrvHitFunc` 1 hits every
+unit within `sHitPar1` (Fire Ball: 4). Damage (`0x644D50`/`0x644E40`, physical `0x647D00`):
+`(E + bracket) << HitShift` 256ths, the bracket (`0x644B70`) adding each level's column — levels
+2–8 the first, 9–16 the second, 17–22 the third, 23–28 the fourth, 29 up the fifth — and
+`EDmgSymPerCalc` percent on the elemental part; each part less the target's resistance. Calcs are
+compiled at load (`0x611BD0`) into bytecode run by `0x6C0BC0`: arithmetic, comparisons, `?:`,
+`min`/`max`, `lvl`, `par1`–`8`, `lnXY` = `parX + (lvl−1)·parY`, `dmXY`, `skill('Name'.blvl)`.
+
 ## 6. Server packet builders (opcode → function)
 
 `scripts/d2re/server_send_builders.py <Game.exe>` finds every call to the queue function
@@ -870,7 +974,8 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
 
 - Walk the player-state helpers under `SendUnitToClient` to the exact packet list for one's own
   player (stats, skills, items, states).
-- Shops: `0x38` trade/gamble/repair and the store's items; hirelings; NPC quest messages.
+- Shops (§5 *Vendors*): gambling, repair (`0x35`), Cain's identify (`0x34`), hirelings (`0x36`),
+  scrolls into tomes and arrows onto a worn quiver when bought; NPC quest messages.
 - Waypoint travel to other acts (`0x53ACC0`), which needs their maps.
 - Collision for the town and other preset levels (the wilderness and Act I's maze caves are done),
   then walk checks (`0x548EF0`) and paths (`0x64DEA0`, `path.zig`) in place of straight lines;
@@ -878,11 +983,14 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
 - Where the server allocates warp tile units (§5 *Maze levels and warps*); the preset levels
   behind the caves (Cave Level 2 and the other treasure levels, `DrlgType` 2) and the other acts'
   mazes.
-- Combat (§5 *Fighting*): the per-class AI routines, items and weapons, skills.
+- Combat (§5 *Fighting*): the per-class AI routines; skills beyond missiles (§5 *Skills*): melee
+  skills' own effects, auras, curses, summons, novas and other do-functions, cold and poison
+  effects, item bonuses to skill levels, faster cast rate, and `0x73`/`0x4C`/`0x4D` for other
+  players to see casts.
 - Loot (§5 *Full items*): stacks merging, tomes and Town Portal, belts worn (more rows), the
   stash and cube, socketing, the book skills' charges (`0x22`), other players seeing what is
   worn, requirements from affixes and from what other items add, elemental damage and
-  resistances, Barbarian one-or-two-handed swords, shops and repair.
+  resistances, Barbarian one-or-two-handed swords, repair.
 - bnemu (MIT, permission recorded in `docs/LEGAL.md`) has worked items and vendors to port from;
   its wilderness collision is approximate, so collision stays on libd2.
 - Unique packs and champions; wandering monsters; NPCs walking their DS1 paths (`0x666120`); the

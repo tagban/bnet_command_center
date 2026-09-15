@@ -24,6 +24,7 @@ pub mod item_stats;
 pub mod items;
 pub mod levels;
 pub mod lvlsub;
+pub mod missiles;
 pub mod monlvl;
 pub mod monsters;
 pub mod presets;
@@ -31,6 +32,7 @@ pub mod skills;
 pub mod stat;
 pub mod strings;
 pub mod tiles;
+pub mod trade;
 pub mod treasure;
 
 use items::{Code, Items};
@@ -149,7 +151,12 @@ pub struct GameData {
     item_ratios: item_stats::ItemRatios,
     affixes: affixes::Affixes,
     skills: skills::Skills,
+    missiles: missiles::Missiles,
     treasure: treasure::TreasureClasses,
+    /// `Npc.txt`: vendors' price multipliers.
+    npc_trades: trade::NpcTrades,
+    /// `Books.txt`.
+    books: Vec<trade::Book>,
     /// `ArmType.txt`'s tokens, by body armour weight.
     armor_types: Vec<Code>,
     /// The install's archives, kept open for map files; `None` when built from tables.
@@ -181,6 +188,7 @@ impl GameData {
         data.mon_presets =
             MonPresets::from_tables(&read("monpreset.txt")?, &monstats, &read("superuniques.txt")?, &read("monplace.txt")?)?;
         data.monsters = Monsters::from_tables(&monstats, &read("monstats2.txt")?)?;
+        data.npc_trades = trade::NpcTrades::from_table(&read("npc.txt")?, &data.monsters);
         data.monster_levels = MonLvls::from_table(&read("monlvl.txt")?)?;
         let anim = archives.read("data\\global\\animdata.d2")?.ok_or(Error::MissingTable("animdata.d2"))?;
         data.anim_data = AnimData::parse(&anim).map_err(|e| Error::BadTable { table: "animdata.d2", problem: e.to_string() })?;
@@ -204,6 +212,8 @@ impl GameData {
             &read("sets.txt")?,
         );
         data.skills = skills::Skills::from_table(&read("skills.txt")?);
+        data.missiles = missiles::Missiles::from_table(&read("missiles.txt")?);
+        data.books = trade::books_from_table(&read("books.txt")?);
         data.treasure = treasure::TreasureClasses::from_table(&read("treasureclassex.txt")?)?;
         data.treasure.add_item_classes(&data.items);
         data.archives = Some(Arc::new(archives));
@@ -276,6 +286,24 @@ impl GameData {
         &self.skills
     }
 
+    /// `Npc.txt`: what vendors charge and pay.
+    #[must_use]
+    pub fn npc_trades(&self) -> &trade::NpcTrades {
+        &self.npc_trades
+    }
+
+    /// `Books.txt`, by row.
+    #[must_use]
+    pub fn books(&self) -> &[trade::Book] {
+        &self.books
+    }
+
+    /// Replace the vendor and book tables — for tests.
+    pub fn set_trade_tables(&mut self, npc_trades: trade::NpcTrades, books: Vec<trade::Book>) {
+        self.npc_trades = npc_trades;
+        self.books = books;
+    }
+
     /// What a new character of `class` starts with.
     #[must_use]
     pub fn start_items(&self, class: u8) -> &[StartItem] {
@@ -287,6 +315,17 @@ impl GameData {
     pub fn start_skill(&self, class: u8) -> Option<i32> {
         let name = self.start_skills.get(usize::from(class))?.as_deref()?;
         (0..self.skills.len() as i32).find(|&id| self.skills.get(id).is_some_and(|s| s.name.eq_ignore_ascii_case(name)))
+    }
+
+    /// `Missiles.txt`.
+    #[must_use]
+    pub fn missiles(&self) -> &missiles::Missiles {
+        &self.missiles
+    }
+
+    /// Replace the missile table — for tests.
+    pub fn set_missiles(&mut self, missiles: missiles::Missiles) {
+        self.missiles = missiles;
     }
 
     /// Replace the skills table — for tests.
@@ -515,7 +554,10 @@ impl GameData {
             item_ratios: item_stats::ItemRatios::default(),
             affixes: affixes::Affixes::default(),
             skills: skills::Skills::default(),
+            missiles: missiles::Missiles::default(),
             treasure: treasure::TreasureClasses::default(),
+            npc_trades: trade::NpcTrades::default(),
+            books: Vec::new(),
             armor_types: Vec::new(),
             archives: None,
         })

@@ -53,6 +53,10 @@ pub struct Affix {
     pub itypes: Vec<String>,
     /// `etype1`…`etype5`: item types it never spawns on.
     pub etypes: Vec<String>,
+    /// `multiply` (`+0x88`): what the affix adds to an item's price, in 1024ths of it.
+    pub cost_multiply: i32,
+    /// `add` (`+0x8C`): gold it adds.
+    pub cost_add: i32,
 }
 
 /// A rare name part: its item types.
@@ -114,6 +118,8 @@ pub struct UniqueItem {
     pub code: Code,
     /// `prop1`…`prop12`.
     pub props: Vec<Mod>,
+    /// `cost mult` (`+0x7C`), `cost add` (`+0x80`): what being this unique adds to the price.
+    pub cost: (i32, i32),
 }
 
 /// A `SetItems.txt` row.
@@ -141,6 +147,8 @@ pub struct SetItem {
     pub props: Vec<Mod>,
     /// `aprop1a`/`b` … `aprop5a`/`b`: the bonuses for wearing 2 … 6 pieces.
     pub bonuses: [Vec<Mod>; 5],
+    /// `cost mult` (`+0x38`), `cost add` (`+0x3C`): what being this set item adds to the price.
+    pub cost: (i32, i32),
 }
 
 /// The item-making tables.
@@ -160,6 +168,9 @@ pub struct Affixes {
     pub superior: Vec<Superior>,
     /// `LowQualityItems.txt` rows.
     pub low_quality: usize,
+    /// `LowQualityItems.txt` `Name`s, by row: a vendor stocks no `Cracked` item and takes none
+    /// back into its stock.
+    pub low_quality_names: Vec<String>,
     /// `UniqueItems.txt`.
     pub uniques: Vec<UniqueItem>,
     /// `SetItems.txt`.
@@ -201,6 +212,8 @@ fn affixes(t: &Table) -> Vec<Affix> {
                 mods: mods(&row, &names),
                 itypes: texts(&row, "itype", 7),
                 etypes: texts(&row, "etype", 5),
+                cost_multiply: int("multiply"),
+                cost_add: int("add"),
             }
         })
         .collect()
@@ -289,6 +302,7 @@ impl Affixes {
                     level_req: int("lvl req"),
                     code: code(row.get("code").unwrap_or_default()),
                     props: mods(&row, &unique_props),
+                    cost: (int("cost mult"), int("cost add")),
                 }
             })
             .collect();
@@ -318,6 +332,7 @@ impl Affixes {
                     level_req: int("lvl req"),
                     props: mods(&row, &set_props),
                     bonuses: [bonus(1), bonus(2), bonus(3), bonus(4), bonus(5)],
+                    cost: (int("cost mult"), int("cost add")),
                 }
             })
             .collect();
@@ -329,6 +344,7 @@ impl Affixes {
             rare_suffixes: rare_names(rare_suffix),
             superior,
             low_quality: low_quality.len(),
+            low_quality_names: low_quality.rows().map(|row| row.get("Name").unwrap_or_default().to_string()).collect(),
             uniques,
             set_items,
             properties,
