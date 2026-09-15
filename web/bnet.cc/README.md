@@ -1,7 +1,7 @@
 # bnet.cc ladder pages
 
 These pages show the server's ladders on bnet.cc: StarCraft, Brood War, Warcraft II (standard
-and Iron Man) and Diablo II (with its season), plus a WarCraft III page that stays closed until
+and Iron Man) and Diablo II (with its season), plus a WarCraft III tab that stays closed until
 matchmaking exists. The server pushes its standings to the site, the same way it pushes its
 stats. The site keeps the last copy it received, so the pages still work while the server is
 down.
@@ -16,9 +16,9 @@ browser ──GET  /ladder.php ─▶ ladder.js ──GET /ladder-data.php──
 | `ladder-push.php` | Receives the push. POST only, bearer token, 8 MB cap. Saves the file whole (written beside it, then renamed). |
 | `ladder-data.php` | Serves the latest standings to `ladder.js`. |
 | `ladder.php` | The ladder page: the site's `header.php` and footer around `#ladder`. |
-| `ladder.js`, `ladder.css` | Draw the ladders: game tabs, Iron Man and Diablo II mode/game/class choices, sorting, player search, 50 per page. Every view is a shareable link (`ladder.php?g=d2&m=hardcore&c=barbarian`). |
+| `ladder.js`, `ladder.css` | Draw the ladders: game tabs, Iron Man, Diablo II mode/game/class and WarCraft III game choices, sorting, player search, 50 per page. Every view is a shareable link (`ladder.php?g=d2&m=hardcore&c=barbarian`). |
 | `ladder-header.inc.php`, `ladder-footer.inc.php` | Copies of the bnet.cc header and footer, used only when the site's own are not found. |
-| `war3-ladder.php`, `war3-ladder.css` | The WarCraft III ladder: an iron frame with gold and red lettering in the spirit of the old classic ladder site, drawn in CSS, with no game art. |
+| `war3-ladder.php` | Sends old links to the ladder page's WarCraft III tab (`ladder.php?g=w3`). |
 | `ladder-config.sample.php` | Settings; copy it to `ladder-config.php`. |
 
 ## Installing

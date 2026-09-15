@@ -12,7 +12,7 @@
     { key: 'bw', product: 'SEXP', label: 'Brood War' },
     { key: 'w2', product: 'W2BN', label: 'Warcraft II' },
     { key: 'd2', label: 'Diablo II' },
-    { key: 'w3', label: 'WarCraft III', href: 'war3-ladder.php' }
+    { key: 'w3', label: 'WarCraft III' }
   ];
   var D2_CLASSES = ['Amazon', 'Sorceress', 'Necromancer', 'Paladin', 'Barbarian', 'Druid', 'Assassin'];
 
@@ -78,7 +78,7 @@
       e: q.get('e') === 'classic' ? 'classic' : 'expansion',
       c: (q.get('c') || 'all').toLowerCase()
     };
-    if (!GAMES.some(function (g) { return g.key === s.g && !g.href; })) {
+    if (!GAMES.some(function (g) { return g.key === s.g; })) {
       s.g = 'sc';
     }
     return s;
@@ -97,7 +97,9 @@
     var q = new URLSearchParams();
     q.set('g', next.g);
     if (next.g === 'w2' && next.l === 'ironman') q.set('l', 'ironman');
-    if (next.g === 'd2') {
+    if (next.g === 'w3') {
+      if (next.e !== 'expansion') q.set('e', next.e);
+    } else if (next.g === 'd2') {
       if (next.m !== 'softcore') q.set('m', next.m);
       if (next.e !== 'expansion') q.set('e', next.e);
       if (next.c !== 'all') q.set('c', next.c);
@@ -144,9 +146,6 @@
 
   function gameTabs(state) {
     var tabs = GAMES.map(function (g) {
-      if (g.href) {
-        return el('a', { className: 'ladder-tab', href: g.href, text: g.label });
-      }
       if (g.key === state.g) {
         return el('span', { className: 'ladder-tab ladder-tab-on', text: g.label });
       }
@@ -329,6 +328,39 @@
     return parts;
   }
 
+  // ---- WarCraft III ------------------------------------------------------------------------------
+
+  // Its ladder records games through anonymous matchmaking, which the server has not opened, so
+  // for now the page says so under the ladders it will have.
+  function renderWarcraft3(state) {
+    var tft = state.e !== 'classic';
+    document.title = 'WarCraft III Ladder - bnet.cc';
+    var parts = [el('b', { className: 'header', text: 'WarCraft III Ladder' })];
+    parts.push(el('p', { className: 'ladder-note' }, [
+      'WarCraft III ladder games are found through ',
+      el('span', { className: 'ladder-season', text: 'Play Game' }),
+      ' (anonymous matchmaking), which bnet.cc has not opened yet. Custom games are never recorded. When it opens, players will rank by level and experience, down to rank ' +
+        data.max_rank + '.'
+    ]));
+    parts.push(choices(state, 'Game', [
+      { label: 'The Frozen Throne', changes: { e: 'expansion' }, current: tft },
+      { label: 'Reign of Chaos', changes: { e: 'classic' }, current: !tft }
+    ]));
+    var types = ['Solo', 'Random Team', 'Arranged Team', 'Free for All'];
+    var row = [el('span', { className: 'ladder-label', text: 'Ladder:' })];
+    types.forEach(function (t, i) {
+      if (i > 0) row.push(el('span', { className: 'ladder-sep', text: '|' }));
+      row.push(el('span', { className: i === 0 ? 'ladder-current' : 'ladder-dim', text: t }));
+    });
+    parts.push(el('div', { className: 'ladder-choices' }, row));
+    parts.push(el('div', { className: 'ladder-gap' }));
+    parts.push(table([
+      { label: 'Rank', num: true }, { label: 'Player' }, { label: 'Level', num: true }, { label: 'Experience', num: true },
+      { label: 'W', num: true }, { label: 'L', num: true }, { label: 'Win %', num: true }
+    ], [el('tr', { className: 'ladder-row' }, [el('td', { colspan: '7', className: 'ladder-dim', text: 'No games have been played on the WarCraft III ladder yet.' })])]));
+    return parts;
+  }
+
   // ---- the page ----------------------------------------------------------------------------------
 
   function render() {
@@ -339,7 +371,7 @@
       return;
     }
     var game = GAMES.filter(function (g) { return g.key === state.g; })[0];
-    var parts = state.g === 'd2' ? renderDiablo(state) : renderRated(state, game);
+    var parts = state.g === 'd2' ? renderDiablo(state) : state.g === 'w3' ? renderWarcraft3(state) : renderRated(state, game);
     parts.forEach(function (p) { root.appendChild(p); });
     root.appendChild(el('p', { className: 'ladder-stamp', text: 'Standings from ' + data.server_name + ', ' + ago(data.generated) + '.' }));
   }
