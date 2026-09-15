@@ -267,6 +267,10 @@ pub struct ItemDef {
     pub two_handed: bool,
     /// `belt`: the `Belts.txt` row a belt uses.
     pub belt: i32,
+    /// `hasinv`: the item can have sockets (`+0x137`).
+    pub has_inv: bool,
+    /// `magic lvl`: added to the item level for its affix level (`+0x140`).
+    pub magic_level: i32,
 }
 
 /// Every item, in class id order.
@@ -350,6 +354,8 @@ impl Items {
                     auto_prefix: int("auto prefix"),
                     two_handed: int("2handed") != 0,
                     belt: int("belt"),
+                    has_inv: int("hasinv") != 0,
+                    magic_level: int("magic lvl"),
                 }
             }));
         }

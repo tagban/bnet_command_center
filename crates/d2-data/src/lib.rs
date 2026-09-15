@@ -15,6 +15,7 @@ use d2_formats::animdata::AnimData;
 use d2_formats::excel::Table;
 use d2_formats::mpq::{self, ArchiveSet, DATA_ARCHIVES};
 
+pub mod affixes;
 pub mod appearance;
 pub mod character;
 pub mod engine;
@@ -129,6 +130,7 @@ pub struct GameData {
     items: Items,
     item_stats: item_stats::ItemStats,
     item_ratios: item_stats::ItemRatios,
+    affixes: affixes::Affixes,
     treasure: treasure::TreasureClasses,
     /// `ArmType.txt`'s tokens, by body armour weight.
     armor_types: Vec<Code>,
@@ -170,6 +172,18 @@ impl GameData {
         data.armor_types = read("armtype.txt")?.rows().filter_map(|r| r.get("Token").map(items::code)).collect();
         data.item_stats = item_stats::ItemStats::from_table(&read("itemstatcost.txt")?)?;
         data.item_ratios = item_stats::ItemRatios::from_table(&read("itemratio.txt")?);
+        data.affixes = affixes::Affixes::from_tables(
+            &read("magicprefix.txt")?,
+            &read("magicsuffix.txt")?,
+            &read("automagic.txt")?,
+            &read("rareprefix.txt")?,
+            &read("raresuffix.txt")?,
+            &read("properties.txt")?,
+            &read("qualityitems.txt")?,
+            &read("lowqualityitems.txt")?,
+            &read("uniqueitems.txt")?,
+            &read("setitems.txt")?,
+        );
         data.treasure = treasure::TreasureClasses::from_table(&read("treasureclassex.txt")?)?;
         data.treasure.add_item_classes(&data.items);
         data.archives = Some(Arc::new(archives));
@@ -223,6 +237,17 @@ impl GameData {
     #[must_use]
     pub fn item_ratios(&self) -> &item_stats::ItemRatios {
         &self.item_ratios
+    }
+
+    /// The affix, property, unique and set tables.
+    #[must_use]
+    pub fn affixes(&self) -> &affixes::Affixes {
+        &self.affixes
+    }
+
+    /// Replace the affix tables — for tests.
+    pub fn set_affixes(&mut self, affixes: affixes::Affixes) {
+        self.affixes = affixes;
     }
 
     /// Replace the item stat and ratio tables — for tests.
@@ -431,6 +456,7 @@ impl GameData {
             items: Items::default(),
             item_stats: item_stats::ItemStats::default(),
             item_ratios: item_stats::ItemRatios::default(),
+            affixes: affixes::Affixes::default(),
             treasure: treasure::TreasureClasses::default(),
             armor_types: Vec::new(),
             archives: None,
