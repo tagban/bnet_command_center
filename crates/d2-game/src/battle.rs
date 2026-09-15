@@ -51,6 +51,7 @@ use d2_drlg::world::RoomId;
 
 use crate::gear::Gear;
 use crate::path;
+use crate::skills;
 
 /// Engine frames a second.
 pub const FRAMES_PER_SECOND: u64 = 25;
@@ -231,6 +232,15 @@ pub enum Event {
         /// The item level: the monster's level.
         level: i32,
     },
+    /// `0x21`: a player's base level in a skill.
+    SkillLevel {
+        /// The player.
+        player: String,
+        /// `Skills.txt` id.
+        skill: u16,
+        /// Base level.
+        level: u8,
+    },
     /// `0x1D`–`0x1F`: one of a player's stats.
     PlayerStat {
         /// The player.
@@ -261,6 +271,10 @@ struct MonsterSheet {
     glide: u64,
     /// `TreasureClass1` for the difficulty.
     treasure: String,
+    /// `MonStats2.txt` `SizeX`: how wide a target it is for a missile.
+    size: i32,
+    /// Resistances for the difficulty: physical, magic, fire, lightning, cold, poison.
+    resistances: [i32; 6],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -433,6 +447,10 @@ struct Hero {
     gear: Gear,
     /// The life, mana and stamina (256ths) its gear adds to its maximums, kept out of its save.
     gear_vitals: (i32, i32, i32),
+    /// Base levels of the skills it has, by id.
+    skills: BTreeMap<i32, u8>,
+    /// The skills on its left and right mouse buttons.
+    hands: [i32; 2],
 }
 
 impl Hero {
@@ -486,8 +504,47 @@ impl Hero {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Due {
-    PlayerHit { player: String, guid: u32 },
-    PlayerDead { player: String },
+    Hit { player: String, guid: u32 },
+    Dead { player: String },
+    Cast { player: String, skill: i32, aim: Aim },
+}
+
+/// Where a player aims a skill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aim {
+    /// At a unit: a monster's guid.
+    Unit(u32),
+    /// At a spot, world subtiles.
+    At(u16, u16),
+}
+
+/// What a player's skill packet came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillUse {
+    /// A swing: walk up to the monster and [`Battle::player_attack`] it.
+    Swing,
+    /// A cast has started.
+    Cast,
+    /// Nothing: busy, short of mana, in town, or a skill this port does not do yet.
+    Refused,
+}
+
+/// A missile in flight, as the server moves it (`0x005AE1F0`): a straight line at its speed, ending
+/// against a wall, when its range runs out, or on the first monster it reaches.
+#[derive(Debug, Clone, PartialEq)]
+struct Flight {
+    player: String,
+    skill: i32,
+    level: i32,
+    at: (f64, f64),
+    step: (f64, f64),
+    level_id: i32,
+    frames_left: i32,
+    /// `pSrvHitFunc` 1: what it hits and every monster within this many subtiles.
+    splash: Option<i32>,
+    /// A `pSrvHitFunc` other than 0 and 1 (Holy Bolt's undead-only hit, and the rest): not ported,
+    /// so it hurts nothing.
+    inert: bool,
 }
 
 /// One game's fighting.
@@ -500,6 +557,7 @@ pub struct Battle {
     monsters: BTreeMap<u32, Monster>,
     heroes: BTreeMap<String, Hero>,
     due: BTreeMap<u64, Vec<Due>>,
+    flights: Vec<Flight>,
 }
 
 /// The chance to hit, percent (`0x0057D9B0`).
@@ -558,6 +616,7 @@ impl Battle {
             monsters: BTreeMap::new(),
             heroes: BTreeMap::new(),
             due: BTreeMap::new(),
+            flights: Vec::new(),
         }
     }
 
@@ -615,6 +674,8 @@ impl Battle {
             get_hit_frames: anim_frames(data, &m.combat.token, "GH", weapon, 8),
             dying_frames: anim_frames(data, &m.combat.token, "DT", weapon, 20),
             treasure: c.treasure[d].clone(),
+            size: i32::from(m.size).max(1),
+            resistances: c.resistances[d],
         };
         let think = sheet.think;
         self.monsters.insert(
@@ -679,6 +740,8 @@ impl Battle {
             mana_recovery: Recovery::default(),
             gear: Gear::default(),
             gear_vitals: (0, 0, 0),
+            skills: skills::COMMON_SKILLS.iter().map(|&id| (id, 1)).collect(),
+            hands: [0, 0],
         };
         self.heroes.insert(name.to_string(), hero);
     }
@@ -804,8 +867,184 @@ impl Battle {
             return false;
         }
         h.swing_until = self.frame + h.attack_frames;
-        self.due.entry(self.frame + h.hit_frame.max(1)).or_default().push(Due::PlayerHit { player: name.to_string(), guid });
+        self.due.entry(self.frame + h.hit_frame.max(1)).or_default().push(Due::Hit { player: name.to_string(), guid });
         true
+    }
+
+    /// A player's skills from its save: base levels by id (the common skills are always there at
+    /// least at level 1) and the skills on its left and right mouse buttons.
+    pub fn set_player_skills(&mut self, name: &str, learned: &BTreeMap<i32, u8>, hands: [i32; 2]) {
+        let Some(h) = self.heroes.get_mut(name) else { return };
+        for (&id, &level) in learned {
+            let base = h.skills.entry(id).or_insert(0);
+            *base = (*base).max(level);
+        }
+        h.hands = hands.map(|id| if h.skills.get(&id).is_some_and(|&l| l > 0) { id } else { 0 });
+    }
+
+    /// A player's skills: base levels by id, and the skills on its left and right mouse buttons.
+    #[must_use]
+    pub fn player_skills(&self, name: &str) -> Option<(BTreeMap<i32, u8>, [i32; 2])> {
+        self.heroes.get(name).map(|h| (h.skills.clone(), h.hands))
+    }
+
+    /// A player puts a point into skill `id` (`0x3B`, § [`skills`]): its new base level (`0x21`)
+    /// and its unspent points; nothing when it may not.
+    pub fn learn_skill(&mut self, data: &GameData, name: &str, id: i32) -> Vec<Event> {
+        let Some(h) = self.heroes.get_mut(name).filter(|h| !h.dead) else { return Vec::new() };
+        let a = |which: u8| h.attribute(which);
+        let learner = skills::Learner { class: h.class, level: h.level, attributes: [a(stat::STRENGTH), a(stat::DEXTERITY), a(stat::ENERGY), a(stat::VITALITY)], points: h.skill_points };
+        let Some(cost) = skills::learn_cost(data, learner, &h.skills, id) else { return Vec::new() };
+        let (Ok(skill), Some(_)) = (u16::try_from(id), data.skills().get(id)) else { return Vec::new() };
+        h.skill_points -= cost;
+        let level = h.skills.entry(id).or_insert(0);
+        *level += 1;
+        let player = name.to_string();
+        vec![
+            Event::SkillLevel { player: player.clone(), skill, level: *level },
+            Event::PlayerStat { player, stat: stat::NEWSKILLS, value: h.skill_points },
+        ]
+    }
+
+    /// A player puts skill `id` on its left or right mouse button (`0x3C`, `0x0054BE70`): a skill it
+    /// has; whether it did.
+    pub fn select_skill(&mut self, name: &str, id: i32, left: bool) -> bool {
+        let Some(h) = self.heroes.get_mut(name) else { return false };
+        if !h.skills.get(&id).is_some_and(|&l| l > 0) {
+            return false;
+        }
+        h.hands[usize::from(!left)] = id;
+        true
+    }
+
+    /// A player uses the skill on one of its mouse buttons at `aim` (`0x05`–`0x11`). Attack and the
+    /// melee skills swing (their own effects are not ported: they hit as Attack does); a skill that
+    /// shoots missiles starts its cast animation, paid for and loosed on the animation's action
+    /// frame ([`Battle::advance`]). Anything else is refused.
+    pub fn player_skill(&mut self, data: &GameData, name: &str, left: bool, aim: Aim) -> SkillUse {
+        let frame = self.frame;
+        let Some(h) = self.heroes.get_mut(name).filter(|h| !h.dead) else { return SkillUse::Refused };
+        let id = h.hands[usize::from(!left)];
+        let Some(skill) = data.skills().get(id) else { return SkillUse::Refused };
+        if skill.missile.is_none() && skill.missile_a.is_none() {
+            let melee = id == 0 || matches!(skill.range.as_str(), "h2h" | "both");
+            return if melee && matches!(aim, Aim::Unit(_)) { SkillUse::Swing } else { SkillUse::Refused };
+        }
+        let in_town = h.at.is_some_and(|(_, _, level)| crate::population::is_town(level));
+        let level = i32::from(h.skills.get(&id).copied().unwrap_or(0));
+        if frame < h.swing_until || (in_town && !skill.in_town) || level < 1 || h.mana < skills::mana_cost(skill, level) {
+            return SkillUse::Refused;
+        }
+        let token = CLASS_TOKENS[usize::from(h.class.min(6))];
+        let class = h.gear.weapon.map_or_else(|| "hth".to_string(), |w| d2_data::items::code_str(&w.class));
+        let frames = anim_frames(data, token, &skill.anim, &class, 16);
+        let action = hit_frames(data, token, &skill.anim, &class, frames / 2);
+        h.swing_until = frame + frames;
+        self.due.entry(frame + action.max(1)).or_default().push(Due::Cast { player: name.to_string(), skill: id, aim });
+        SkillUse::Cast
+    }
+
+    /// A cast's action frame (`0x0056F640`): the mana is paid and the skill's missiles loosed from
+    /// the player toward its aim — `srvmissile` once, `srvmissilea` as many times as `calc1` gives,
+    /// fanned out.
+    fn player_cast(&mut self, data: &GameData, player: &str, id: i32, aim: Aim, events: &mut Vec<Event>) {
+        let now = self.frame;
+        let Some(skill) = data.skills().get(id) else { return };
+        let target = match aim {
+            Aim::Unit(guid) => self.monsters.get(&guid).map(|m| position(m, now)),
+            Aim::At(x, y) => Some((i32::from(x), i32::from(y))),
+        };
+        let Some(h) = self.heroes.get_mut(player).filter(|h| !h.dead) else { return };
+        let (Some((hx, hy, level_id)), Some((tx, ty))) = (h.at, target) else { return };
+        let level = i32::from(h.skills.get(&id).copied().unwrap_or(0)).max(1);
+        let cost = skills::mana_cost(skill, level);
+        if h.mana < cost {
+            return;
+        }
+        h.mana -= cost;
+        events.push(h.vitals(player, now));
+        let (name, count) = match (&skill.missile, &skill.missile_a) {
+            (Some(one), _) => (one, 1),
+            (None, Some(many)) => {
+                let ctx = skills::CalcContext { data, skill, level, skills: &h.skills };
+                (many, skills::eval(&skill.calcs[0], &ctx).unwrap_or(1).clamp(1, 24))
+            }
+            (None, None) => return,
+        };
+        let Some(missile) = data.missiles().id(name).and_then(|m| data.missiles().get(m)) else { return };
+        let (dx, dy) = (f64::from(tx - hx), f64::from(ty - hy));
+        let length = dx.hypot(dy);
+        let (ux, uy) = if length < 0.5 { (1.0, 0.0) } else { (dx / length, dy / length) };
+        let speed = f64::from(missile.velocity.max(1)) / 16.0;
+        let frames = missile.range.0 + missile.range.1 * level;
+        let splash = (missile.server_hit_func == 1).then(|| missile.server_hit_params[0].max(1));
+        let inert = missile.server_hit_func > 1;
+        for i in 0..count {
+            let turn = (f64::from(i) - f64::from(count - 1) / 2.0) * 0.15;
+            let (sin, cos) = turn.sin_cos();
+            let step = ((ux * cos - uy * sin) * speed, (ux * sin + uy * cos) * speed);
+            self.flights.push(Flight { player: player.to_string(), skill: id, level, at: (f64::from(hx), f64::from(hy)), step, level_id, frames_left: frames.max(1), splash, inert });
+        }
+    }
+
+    /// Move every missile a frame (`0x005AE1F0`): one that meets a wall or ground not in play ends;
+    /// one that reaches a living monster hits it — and, with a splash, every monster near — and ends;
+    /// one out of range ends.
+    fn fly(&mut self, data: &GameData, open: &dyn Fn(i32, i32) -> Option<i32>, events: &mut Vec<Event>) {
+        let now = self.frame;
+        let mut kept = Vec::new();
+        for mut f in std::mem::take(&mut self.flights) {
+            f.at = (f.at.0 + f.step.0, f.at.1 + f.step.1);
+            f.frames_left -= 1;
+            let spot = (f.at.0.round() as i32, f.at.1.round() as i32);
+            if open(spot.0, spot.1) != Some(f.level_id) {
+                continue;
+            }
+            let near = |m: &Monster, within: i32| m.alive() && m.room.level == f.level_id && path::distance(position(m, now), spot) <= within;
+            let struck = self.monsters.iter().find(|(_, m)| near(m, (m.sheet.size + 1) / 2)).map(|(&guid, _)| guid);
+            if let Some(guid) = struck {
+                let victims: Vec<u32> = match f.splash {
+                    Some(radius) => self.monsters.iter().filter(|(_, m)| near(m, radius)).map(|(&g, _)| g).collect(),
+                    None => vec![guid],
+                };
+                for victim in victims.into_iter().filter(|_| !f.inert) {
+                    self.skill_hit(data, &f.player, f.skill, f.level, victim, events);
+                }
+                continue;
+            }
+            if f.frames_left > 0 {
+                kept.push(f);
+            }
+        }
+        self.flights = kept;
+    }
+
+    /// A player's skill hits monster `guid`: its elemental and physical damage rolled, each less
+    /// the monster's resistance to it (none at 100% or more).
+    fn skill_hit(&mut self, data: &GameData, player: &str, id: i32, level: i32, guid: u32, events: &mut Vec<Event>) {
+        let (Some(skill), Some(h), Some(m)) = (data.skills().get(id), self.heroes.get(player), self.monsters.get(&guid)) else { return };
+        let ctx = skills::CalcContext { data, skill, level, skills: &h.skills };
+        let ((elo, ehi), (plo, phi)) = skills::damage(&ctx);
+        let element = match skill.element.as_str() {
+            "mag" => 1,
+            "fire" => 2,
+            "ltng" => 3,
+            "cold" => 4,
+            "pois" => 5,
+            _ => 0,
+        };
+        let resistances = m.sheet.resistances;
+        let mut roll = |lo: i32, hi: i32, resistance: i32| {
+            if hi <= 0 || resistance >= 100 {
+                return 0;
+            }
+            let rolled = lo + if hi > lo { self.seed.pick((hi - lo) as u32) as i32 } else { 0 };
+            rolled * (100 - resistance) / 100
+        };
+        let total = roll(elo, ehi, resistances[element]) + roll(plo, phi, resistances[0]);
+        if total > 0 {
+            self.hurt_monster(data, player, guid, (total >> 8).max(1), events);
+        }
     }
 
     /// Spend a stat point (`0x3A`) on strength, energy, dexterity or vitality.
@@ -878,15 +1117,17 @@ impl Battle {
         for due in ready.into_values() {
             for d in due {
                 match d {
-                    Due::PlayerHit { player, guid } => self.player_hit(data, &player, guid, events),
-                    Due::PlayerDead { player } => {
+                    Due::Hit { player, guid } => self.player_hit(data, &player, guid, events),
+                    Due::Dead { player } => {
                         if self.heroes.get(&player).is_some_and(|h| h.dead) {
                             events.push(Event::PlayerReaction { player, event: reaction::DEAD });
                         }
                     }
+                    Due::Cast { player, skill, aim } => self.player_cast(data, &player, skill, aim, events),
                 }
             }
         }
+        self.fly(data, open, events);
         let guids: Vec<u32> = self.monsters.keys().copied().collect();
         for guid in guids {
             self.monster_step(guid, open, events);
@@ -926,6 +1167,14 @@ impl Battle {
         // `0x0057B420`: the range in 256ths, a roll between its ends, whole points dealt.
         let (lo, hi) = h.gear.damage_range(h.attribute(stat::STRENGTH), h.attribute(stat::DEXTERITY));
         let damage = ((lo + if hi > lo { self.seed.pick((hi - lo) as u32) as i32 } else { 0 }) >> 8).max(1);
+        self.hurt_monster(data, player, guid, damage, events);
+    }
+
+    /// Monster `guid` loses `damage` life to `player`: its life bar, a flinch, or its death with
+    /// the experience and treasure it pays.
+    fn hurt_monster(&mut self, data: &GameData, player: &str, guid: u32, damage: i32, events: &mut Vec<Event>) {
+        let Some(h) = self.heroes.get(player) else { return };
+        let Some(m) = self.monsters.get(&guid).filter(|m| m.alive()) else { return };
         let now = self.frame;
         let experience_gain = experience_for(m.sheet.experience, h.level, m.sheet.level);
         let flinch = flinches(&mut self.seed, damage, m.max_life);
@@ -1288,7 +1537,7 @@ impl Battle {
         h.settled_at = now + dying_frames + DEATH_SETTLE_MARGIN;
         events.push(h.vitals(target, now));
         events.push(Event::PlayerReaction { player: player.clone(), event: reaction::DYING });
-        self.due.entry(self.frame + dying_frames.max(1)).or_default().push(Due::PlayerDead { player });
+        self.due.entry(self.frame + dying_frames.max(1)).or_default().push(Due::Dead { player });
     }
 }
 
@@ -1301,6 +1550,17 @@ fn glide_frames(velocity: u64, length: f64) -> u64 {
 fn glide_at(glide: &Glide, now: u64) -> (f64, f64) {
     let t = if glide.frames == 0 { 1.0 } else { (now.saturating_sub(glide.start) as f64 / glide.frames as f64).min(1.0) };
     (glide.from.0 + (glide.to.0 - glide.from.0) * t, glide.from.1 + (glide.to.1 - glide.from.1) * t)
+}
+
+/// Where a monster is at frame `now`, part way along a walk.
+fn position(m: &Monster, now: u64) -> (i32, i32) {
+    match &m.glide {
+        Some(glide) => {
+            let (x, y) = glide_at(glide, now);
+            (x.round() as i32, y.round() as i32)
+        }
+        None => m.at(),
+    }
 }
 
 /// End a monster's walk where it has got to and say so.
@@ -1321,9 +1581,11 @@ impl Event {
     #[must_use]
     pub fn player(&self) -> Option<&str> {
         match self {
-            Self::PlayerReaction { player, .. } | Self::PlayerVitals { player, .. } | Self::Experience { player, .. } | Self::PlayerStat { player, .. } => {
-                Some(player)
-            }
+            Self::PlayerReaction { player, .. }
+            | Self::PlayerVitals { player, .. }
+            | Self::Experience { player, .. }
+            | Self::PlayerStat { player, .. }
+            | Self::SkillLevel { player, .. } => Some(player),
             _ => None,
         }
     }
@@ -1400,6 +1662,71 @@ mod tests {
         assert!(!b.add_monster(data, 8, 1, ROOM, 100, 100), "a friendly NPC does not fight");
         b.add_player(data, "hero", 4, &data.new_character_stats(4).unwrap());
         b
+    }
+
+    /// A sorceress learns Fire Bolt with her one point, puts it on her right button and casts it at
+    /// a brute ten subtiles off: the mana goes on the action frame, the bolt flies at 1.25 subtiles
+    /// a frame and lands its fire damage, less the brute's resistance. A wall stops a bolt; a
+    /// fire-immune monster takes nothing; Attack swings.
+    #[test]
+    fn a_learned_fire_bolt_flies_and_burns() {
+        let mut data = data();
+        // Attack, 35 rows standing in for the common and Amazon skills, then Fire Bolt at its id, 36.
+        let mut skills = String::from("skill\tcharclass\treqlevel\tmaxlvl\tInGame\tsrvmissile\trange\tanim\tminmana\tmanashift\tmana\tHitShift\tEType\tEMin\tEMax\r\nAttack\t\t1\t\t1\t\tboth\tA1\t\t8\t\t8\t\t\t\r\n");
+        for i in 1..36 {
+            skills += &format!("skill {i}\t\t1\t\t\t\t\t\t\t\t\t\t\t\t\r\n");
+        }
+        skills += "Fire Bolt\tsor\t1\t20\t1\tfirebolt\tnone\tSC\t1\t7\t5\t7\tfire\t6\t12\r\n";
+        data.set_skills(d2_data::skills::Skills::from_table(&Table::parse(skills.as_bytes())));
+        data.set_missiles(d2_data::missiles::Missiles::from_table(&Table::parse(b"Missile\tVel\tRange\tCollideType\tCollideKill\tSkill\r\nfirebolt\t20\t50\t3\t1\tFire Bolt\r\n")));
+        let monstats = Table::parse(
+            b"Id\thcIdx\tMonStatsEx\tCode\tLevel\tminHP\tmaxHP\tExp\tA1MinD\tA1MaxD\tA1TH\taidel\tResFi\r\n\
+              brute\t0\tbrute\tXX\t1\t500\t500\t100\t1\t1\t1\t5\t50\r\n\
+              salamander\t1\tbrute\tXX\t1\t500\t500\t100\t1\t1\t1\t5\t100\r\n",
+        );
+        let monstats2 = Table::parse(b"Id\tSizeX\tBaseW\tMeleeRng\r\nbrute\t1\thth\t0\r\n");
+        data.set_map_tables(MonPresets::default(), Monsters::from_tables(&monstats, &monstats2).unwrap(), Objects::default());
+        let mut b = Battle::new(0, 99);
+        assert!(b.add_monster(&data, 7, 0, ROOM, 110, 100));
+        assert!(b.add_monster(&data, 8, 1, ROOM, 100, 110));
+        let mut stats = data.new_character_stats(1).unwrap();
+        stats.push((stat::NEWSKILLS, 1));
+        b.add_player(&data, "sorc", 1, &stats);
+        b.place_player("sorc", Some((100, 100, ROOM.level)), &[ROOM]);
+        let fire_bolt = data.skills().id("Fire Bolt").unwrap();
+        assert!(!b.select_skill("sorc", fire_bolt, false), "not learned");
+        assert_eq!(b.player_skill(&data, "sorc", false, Aim::Unit(7)), SkillUse::Swing, "Attack is on both buttons");
+        let learned = b.learn_skill(&data, "sorc", fire_bolt);
+        assert_eq!(learned, [Event::SkillLevel { player: "sorc".into(), skill: fire_bolt as u16, level: 1 }, Event::PlayerStat { player: "sorc".into(), stat: stat::NEWSKILLS, value: 0 }]);
+        assert!(b.learn_skill(&data, "sorc", fire_bolt).is_empty(), "no points left");
+        assert!(b.select_skill("sorc", fire_bolt, false));
+        let open = |x: i32, _: i32| (x < 120).then_some(ROOM.level);
+        let mana = |b: &Battle| b.heroes["sorc"].mana;
+        let before = mana(&b);
+        assert_eq!(b.player_skill(&data, "sorc", false, Aim::Unit(7)), SkillUse::Cast);
+        assert_eq!(b.player_skill(&data, "sorc", false, Aim::Unit(7)), SkillUse::Refused, "still casting");
+        let mut events = b.advance(&data, b.frame() + 8, &open);
+        assert_eq!(mana(&b), before - (5 << 7), "2.5 mana on the action frame");
+        events.extend(b.advance(&data, b.frame() + 20, &open));
+        let life = |b: &Battle, guid| b.monsters[&guid].life;
+        let burnt = 500 - life(&b, 7);
+        assert!((1..=3).contains(&burnt), "3–6 fire, half resisted: {burnt}");
+        assert!(events.iter().any(|e| matches!(e, Event::MonsterLife { guid: 7, .. })));
+        assert!(b.flights.is_empty(), "the bolt ended on the brute");
+
+        b.advance(&data, b.frame() + 25, &open);
+        assert_eq!(b.player_skill(&data, "sorc", false, Aim::Unit(8)), SkillUse::Cast);
+        b.advance(&data, b.frame() + 40, &open);
+        assert_eq!(life(&b, 8), 500, "immune to fire");
+
+        b.advance(&data, b.frame() + 25, &open);
+        assert_eq!(b.player_skill(&data, "sorc", false, Aim::At(140, 100)), SkillUse::Cast);
+        b.advance(&data, b.frame() + 60, &open);
+        let (hp7, flights) = (life(&b, 7), b.flights.len());
+        assert!(hp7 < 500 - burnt && flights == 0, "aimed past it, the bolt meets the brute on the way and ends");
+        let mut dry = b.clone();
+        dry.heroes.get_mut("sorc").unwrap().mana = 0;
+        assert_eq!(dry.player_skill(&data, "sorc", false, Aim::Unit(7)), SkillUse::Refused, "no mana");
     }
 
     #[test]

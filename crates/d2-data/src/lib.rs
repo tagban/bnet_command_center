@@ -24,6 +24,7 @@ pub mod item_stats;
 pub mod items;
 pub mod levels;
 pub mod lvlsub;
+pub mod missiles;
 pub mod monlvl;
 pub mod monsters;
 pub mod presets;
@@ -150,6 +151,7 @@ pub struct GameData {
     item_ratios: item_stats::ItemRatios,
     affixes: affixes::Affixes,
     skills: skills::Skills,
+    missiles: missiles::Missiles,
     treasure: treasure::TreasureClasses,
     /// `Npc.txt`: vendors' price multipliers.
     npc_trades: trade::NpcTrades,
@@ -210,6 +212,7 @@ impl GameData {
             &read("sets.txt")?,
         );
         data.skills = skills::Skills::from_table(&read("skills.txt")?);
+        data.missiles = missiles::Missiles::from_table(&read("missiles.txt")?);
         data.books = trade::books_from_table(&read("books.txt")?);
         data.treasure = treasure::TreasureClasses::from_table(&read("treasureclassex.txt")?)?;
         data.treasure.add_item_classes(&data.items);
@@ -312,6 +315,17 @@ impl GameData {
     pub fn start_skill(&self, class: u8) -> Option<i32> {
         let name = self.start_skills.get(usize::from(class))?.as_deref()?;
         (0..self.skills.len() as i32).find(|&id| self.skills.get(id).is_some_and(|s| s.name.eq_ignore_ascii_case(name)))
+    }
+
+    /// `Missiles.txt`.
+    #[must_use]
+    pub fn missiles(&self) -> &missiles::Missiles {
+        &self.missiles
+    }
+
+    /// Replace the missile table — for tests.
+    pub fn set_missiles(&mut self, missiles: missiles::Missiles) {
+        self.missiles = missiles;
     }
 
     /// Replace the skills table — for tests.
@@ -540,6 +554,7 @@ impl GameData {
             item_ratios: item_stats::ItemRatios::default(),
             affixes: affixes::Affixes::default(),
             skills: skills::Skills::default(),
+            missiles: missiles::Missiles::default(),
             treasure: treasure::TreasureClasses::default(),
             npc_trades: trade::NpcTrades::default(),
             books: Vec::new(),

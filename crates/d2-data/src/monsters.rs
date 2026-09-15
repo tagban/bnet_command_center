@@ -77,6 +77,9 @@ pub struct CombatStats {
     pub weapon_class: String,
     /// `TreasureClass1` by difficulty: what it drops.
     pub treasure: [String; 3],
+    /// `ResDm`, `ResMa`, `ResFi`, `ResLi`, `ResCo`, `ResPo` by difficulty: percent resistance to
+    /// physical, magic, fire, lightning, cold and poison damage.
+    pub resistances: [[i32; 6]; 3],
 }
 
 /// The `MonStats.txt` columns room population reads, class names resolved to class ids (-1 for
@@ -189,6 +192,7 @@ impl Monsters {
                     token: row.get("Code").unwrap_or_default().to_string(),
                     weapon_class: weapon_classes.get(&ex).cloned().unwrap_or_else(|| "hth".into()),
                     treasure: ["TreasureClass1", "TreasureClass1(N)", "TreasureClass1(H)"].map(|c| row.get(c).unwrap_or_default().to_string()),
+                    resistances: ["", "(N)", "(H)"].map(|d| ["ResDm", "ResMa", "ResFi", "ResLi", "ResCo", "ResPo"].map(|r| int(&format!("{r}{d}")))),
                 };
                 Some((class, MonsterClass { id, critter, components, interact: flag("interact"), npc: flag("npc"), align: int("Align") as u8, size, spawn_collision, spawn, combat }))
             })

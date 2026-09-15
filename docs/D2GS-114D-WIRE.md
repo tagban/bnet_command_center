@@ -921,6 +921,40 @@ u32]`, gold after the trade. Bought `4, 0, copy`; sold `3, 1, item`; refusals ki
 (no such item or cursor busy), 9 (cannot), 10 (no room), 11 (store not open), 12 (not enough
 gold). The client (`0x4B6390`) stores it for the trade screen.
 
+### Skills: learning, choosing and missile casts (2026-09-15)
+
+**Join.** The player's skills go out after its items: `0x94 [count u8][guid u32]` then `[skill
+u16][base level u8]` each (builder `0x53C5D0`; retail lists the common skills 0, 2, 1, 217–220, 4,
+5, 3 first), then `0x23` for the left and right buttons. A `.d2s` keeps the class's 30 skill levels
+(`if`, class skills in id order: Amazon 6, Sorceress 36, Necromancer 66, Paladin 96, Barbarian
+126, Druid 221, Assassin 251) and the button skills at header `0x78` (left) and `0x7C` (right).
+
+**Learning** `0x3B [skill u16]` (3, `0x54BD90`): refused unless the skill is the player's class's
+(`0x56C700`, record `+0xC`), `InGame`, the player's level and attributes meet `reqlevel` and
+`reqstr`/`reqdex`/`reqint`/`reqvit` (`0x6447D0`, `0x644920`, `+0x176`–`+0x17C`), it has each
+`reqskill` (`+0x17E`–`+0x182`) at base level ≥ 1, the base level is under `maxlvl` (`+300`, 20 when
+blank, `0x4AA8B0`) and stat 5 holds `skpoints` (calc `+0x170`, 1 when blank, `0x570080`). Then stat 5
+drops and `0x21 [unit type][0][guid][skill u16][base u8][item bonus u8][unset]` (12, `0x53C4A0`).
+
+**Choosing** `0x3C [skill u16][u16: bit 15 left][item guid u32]` (9, `0x54BE70`): bit 31 of the
+first dword is the left button — it picks the setter `0x622F10` whose getter `0x620190` the left
+packets `0x05`/`0x06` read — and the skill must be one the unit has at level ≥ 1. The reply `0x23
+[unit type][guid][left u8][skill u16][item guid]` (13, `0x53C590`) carries the same bit; the client
+(`0x45DE10`) sets the left skill for a nonzero byte.
+
+**Casting.** `0x05`/`0x08` left and `0x0C`/`0x0F` right at a spot `[x u16][y u16]` (5), `0x06`… on a
+unit (9); no skill id is sent. The skill runs its `anim` mode; on the action frame
+`SkillsSrvDoSkill` (`0x56F640`) pays `max(minmana << 8, (mana + lvlmana·(lvl−1)) << manashift)` from
+stat 8 (`0x56BFE0`) and its do-function shoots `srvmissile`. A missile (`Missiles.txt`, stride
+`0x1A4`) moves `Vel` sixteenths of a subtile a frame (`Vel << 8` as a unit velocity, `0x4CD540`) for
+`Range + LevRange·lvl` frames, ending at walls and on units (`0x5AE1F0`); `pSrvHitFunc` 1 hits every
+unit within `sHitPar1` (Fire Ball: 4). Damage (`0x644D50`/`0x644E40`, physical `0x647D00`):
+`(E + bracket) << HitShift` 256ths, the bracket (`0x644B70`) adding each level's column — levels
+2–8 the first, 9–16 the second, 17–22 the third, 23–28 the fourth, 29 up the fifth — and
+`EDmgSymPerCalc` percent on the elemental part; each part less the target's resistance. Calcs are
+compiled at load (`0x611BD0`) into bytecode run by `0x6C0BC0`: arithmetic, comparisons, `?:`,
+`min`/`max`, `lvl`, `par1`–`8`, `lnXY` = `parX + (lvl−1)·parY`, `dmXY`, `skill('Name'.blvl)`.
+
 ## 6. Server packet builders (opcode → function)
 
 `scripts/d2re/server_send_builders.py <Game.exe>` finds every call to the queue function
@@ -949,7 +983,10 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
 - Where the server allocates warp tile units (§5 *Maze levels and warps*); the preset levels
   behind the caves (Cave Level 2 and the other treasure levels, `DrlgType` 2) and the other acts'
   mazes.
-- Combat (§5 *Fighting*): the per-class AI routines, items and weapons, skills.
+- Combat (§5 *Fighting*): the per-class AI routines; skills beyond missiles (§5 *Skills*): melee
+  skills' own effects, auras, curses, summons, novas and other do-functions, cold and poison
+  effects, item bonuses to skill levels, faster cast rate, and `0x73`/`0x4C`/`0x4D` for other
+  players to see casts.
 - Loot (§5 *Full items*): stacks merging, tomes and Town Portal, belts worn (more rows), the
   stash and cube, socketing, the book skills' charges (`0x22`), other players seeing what is
   worn, requirements from affixes and from what other items add, elemental damage and

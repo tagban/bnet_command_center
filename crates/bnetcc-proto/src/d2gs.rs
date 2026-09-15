@@ -107,6 +107,10 @@ pub mod sc {
     pub const QUEST_STATES: u8 = 0x5E;
     /// A unit's selected skill on one mouse button (13 bytes).
     pub const SELECT_SKILL: u8 = 0x23;
+    /// A unit's skills and their base levels (6 bytes and 3 a skill).
+    pub const SKILL_LIST: u8 = 0x94;
+    /// A unit's level in one skill (12 bytes).
+    pub const SKILL_LEVEL: u8 = 0x21;
     /// One of the player's own stats, value in a byte (3 bytes).
     pub const SET_STAT_BYTE: u8 = 0x1D;
     /// One of the player's own stats, value in a word (4 bytes).
@@ -168,6 +172,20 @@ pub mod cs {
     pub const RIGHT_SKILL_ON_UNIT_REPEAT: u8 = 0x10;
     /// See [`RIGHT_SKILL_ON_UNIT`].
     pub const RIGHT_SKILL_ON_UNIT_HOLD_REPEAT: u8 = 0x11;
+    /// Use the left skill at a spot: `[x u16][y u16]` (5 bytes; engine handler `0x00549D00`);
+    /// `0x08` carries the same body.
+    pub const LEFT_SKILL_ON_LOCATION: u8 = 0x05;
+    /// See [`LEFT_SKILL_ON_LOCATION`].
+    pub const LEFT_SKILL_ON_LOCATION_HOLD: u8 = 0x08;
+    /// Use the right skill at a spot (`0x00549FC0`); `0x0F` carries the same body.
+    pub const RIGHT_SKILL_ON_LOCATION: u8 = 0x0C;
+    /// See [`RIGHT_SKILL_ON_LOCATION`].
+    pub const RIGHT_SKILL_ON_LOCATION_HOLD: u8 = 0x0F;
+    /// Put a point into a skill: `[skill u16]` (3 bytes; engine handler `0x0054BD90`).
+    pub const ADD_SKILL_POINT: u8 = 0x3B;
+    /// Put a skill on a mouse button: `[skill u16][u16: bit 15 the left button][item guid u32]`
+    /// (9 bytes; engine handler `0x0054BE70`).
+    pub const SELECT_SKILL: u8 = 0x3C;
     /// Interact with a unit: `[type u32][guid u32]` (9 bytes).
     pub const INTERACT: u8 = 0x13;
     /// Spend an attribute point: `[stat u16]` (3 bytes).
@@ -734,12 +752,37 @@ pub fn assign_warp(guid: u32, class: u8, x: u16, y: u16) -> Vec<u8> {
     w.finish()
 }
 
-/// `0x23`: `[unit type u8][guid u32][right-hand u8][skill u16][item guid u32]` (builder
-/// `0x0053C590`); item guid `0xFFFFFFFF` when no item grants the skill.
+/// `0x23`: `[unit type u8][guid u32][left u8][skill u16][item guid u32]` (builder `0x0053C590`);
+/// item guid `0xFFFFFFFF` when no item grants the skill. The hand byte is 1 for the left mouse
+/// button: the select handler (`0x0054BE70`) passes bit 31 of `0x3C`'s skill word, which also
+/// picks the left-skill setter `0x00622F10` whose skill the left-button packets (`0x05`, `0x06`)
+/// use, and the client's handler (`0x0045DE10`) sets the left skill for a nonzero byte.
 #[must_use]
-pub fn select_skill(unit_type: u8, guid: u32, right_hand: bool, skill: u16, item_guid: u32) -> Vec<u8> {
+pub fn select_skill(unit_type: u8, guid: u32, left: bool, skill: u16, item_guid: u32) -> Vec<u8> {
     let mut w = Writer::with_capacity(13);
-    w.u8(sc::SELECT_SKILL).u8(unit_type).u32(guid).u8(right_hand.into()).u16(skill).u32(item_guid);
+    w.u8(sc::SELECT_SKILL).u8(unit_type).u32(guid).u8(left.into()).u16(skill).u32(item_guid);
+    w.finish()
+}
+
+/// `0x94`: a unit's skills and their base levels, `[count u8][guid u32]` then `[skill u16][level
+/// u8]` each (builder `0x0053C5D0`, client `0x0045DD60`).
+#[must_use]
+pub fn skill_list(guid: u32, skills: &[(u16, u8)]) -> Vec<u8> {
+    let skills = &skills[..skills.len().min(255)];
+    let mut w = Writer::with_capacity(6 + 3 * skills.len());
+    w.u8(sc::SKILL_LIST).u8(skills.len() as u8).u32(guid);
+    for &(skill, level) in skills {
+        w.u16(skill).u8(level);
+    }
+    w.finish()
+}
+
+/// `0x21`: a unit's level in a skill, `[unit type u8][u8 0][guid u32][skill u16][base level u8][item
+/// bonus u8]` and a byte the engine leaves unset, sent 0 (12 bytes, builder `0x0053C4A0`).
+#[must_use]
+pub fn skill_level(unit_type: u8, guid: u32, skill: u16, base: u8, bonus: u8) -> Vec<u8> {
+    let mut w = Writer::with_capacity(12);
+    w.u8(sc::SKILL_LEVEL).u8(unit_type).u8(0).u32(guid).u16(skill).u8(base).u8(bonus).u8(0);
     w.finish()
 }
 

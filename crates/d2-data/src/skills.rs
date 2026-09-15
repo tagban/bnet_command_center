@@ -1,5 +1,6 @@
-//! `Skills.txt`: the columns making an item reads — a skill's class, the weapon type it needs,
-//! its required and highest levels. A skill's id is its row.
+//! `Skills.txt`: a skill's class, the weapon type it needs, its requirements, what it costs and
+//! the damage and missiles it deals (the record `0x00613F80` loads, stride `0x23C`). A skill's id
+//! is its row.
 
 use d2_formats::excel::Table;
 
@@ -22,6 +23,58 @@ pub struct Skill {
     pub cost_mult: i32,
     /// `cost add` (`+0x238`): gold a point of it adds.
     pub cost_add: i32,
+    /// `srvdofunc` (`+0x2C`): what doing the skill does on the server (1 attack, 0 none).
+    pub srv_do_func: i32,
+    /// `srvmissile`: the missile it shoots, by `Missiles.txt` name.
+    pub missile: Option<String>,
+    /// `srvmissilea`: the first of the missiles a many-missile skill shoots.
+    pub missile_a: Option<String>,
+    /// `range`: `h2h`, `rng`, `both` or `none`.
+    pub range: String,
+    /// `anim`: the player mode it plays (`A1`, `SC`, …).
+    pub anim: String,
+    /// `passive`.
+    pub passive: bool,
+    /// `InTown` (`+5` bit 0): usable in a town.
+    pub in_town: bool,
+    /// `InGame` (`+5` bit 2): a skill players can learn.
+    pub in_game: bool,
+    /// `reqstr`, `reqdex`, `reqint`, `reqvit` (`+0x176`–`+0x17C`).
+    pub req_attributes: [i32; 4],
+    /// `reqskill1`–`reqskill3` (`+0x17E`–`+0x182`), by name.
+    pub req_skills: Vec<String>,
+    /// `skpoints` (`+0x170`): the points a level costs, as a calc; blank for 1.
+    pub skill_points: String,
+    /// `minmana`, `manashift`, `mana`, `lvlmana` (`+0x186`–`+0x18C`).
+    pub mana: (i32, i32, i32, i32),
+    /// `ToHit`, `LevToHit`.
+    pub to_hit: (i32, i32),
+    /// `HitShift` (`+0x1A4`): damage columns are in `2^HitShift`ths of 256ths.
+    pub hit_shift: i32,
+    /// `SrcDam`: 128ths of the weapon's damage it deals.
+    pub source_damage: i32,
+    /// `MinDam`, `MinLevDam1`–`5` (`+0x1A8`).
+    pub min_damage: (i32, [i32; 5]),
+    /// `MaxDam`, `MaxLevDam1`–`5` (`+0x1AC`).
+    pub max_damage: (i32, [i32; 5]),
+    /// `EType`: `fire`, `ltng`, `cold`, `pois`, `mag`, blank for none.
+    pub element: String,
+    /// `EMin`, `EMinLev1`–`5`.
+    pub element_min: (i32, [i32; 5]),
+    /// `EMax`, `EMaxLev1`–`5`.
+    pub element_max: (i32, [i32; 5]),
+    /// `EDmgSymPerCalc` (`+0x210`): the percent other skills' levels add to its elemental damage,
+    /// as a calc.
+    pub element_synergy: String,
+    /// `Param1`–`Param8`.
+    pub params: [i32; 8],
+    /// `calc1`–`calc4`.
+    pub calcs: [String; 4],
+}
+
+/// A five-column per-level progression: `<prefix>1`…`<prefix>5`.
+fn levels(row: &d2_formats::excel::Row, prefix: &str) -> [i32; 5] {
+    [1, 2, 3, 4, 5].map(|i| row.int(&format!("{prefix}{i}")).unwrap_or(0) as i32)
 }
 
 /// Every skill, by id.
@@ -44,6 +97,29 @@ impl Skills {
                 max_level: row.int("maxlvl").unwrap_or(0) as i32,
                 cost_mult: row.int("cost mult").unwrap_or(0) as i32,
                 cost_add: row.int("cost add").unwrap_or(0) as i32,
+                srv_do_func: row.int("srvdofunc").unwrap_or(0) as i32,
+                missile: row.get("srvmissile").filter(|s| !s.is_empty()).map(str::to_string),
+                missile_a: row.get("srvmissilea").filter(|s| !s.is_empty()).map(str::to_string),
+                range: row.get("range").unwrap_or_default().to_string(),
+                anim: row.get("anim").unwrap_or_default().to_string(),
+                passive: row.int("passive").unwrap_or(0) != 0,
+                in_town: row.int("InTown").unwrap_or(0) != 0,
+                in_game: row.int("InGame").unwrap_or(0) != 0,
+                req_attributes: ["reqstr", "reqdex", "reqint", "reqvit"].map(|c| row.int(c).unwrap_or(0) as i32),
+                req_skills: ["reqskill1", "reqskill2", "reqskill3"].iter().filter_map(|c| row.get(c).filter(|s| !s.is_empty()).map(str::to_string)).collect(),
+                skill_points: row.get("skpoints").unwrap_or_default().to_string(),
+                mana: (row.int("minmana").unwrap_or(0) as i32, row.int("manashift").unwrap_or(0) as i32, row.int("mana").unwrap_or(0) as i32, row.int("lvlmana").unwrap_or(0) as i32),
+                to_hit: (row.int("ToHit").unwrap_or(0) as i32, row.int("LevToHit").unwrap_or(0) as i32),
+                hit_shift: row.int("HitShift").unwrap_or(0) as i32,
+                source_damage: row.int("SrcDam").unwrap_or(0) as i32,
+                min_damage: (row.int("MinDam").unwrap_or(0) as i32, levels(&row, "MinLevDam")),
+                max_damage: (row.int("MaxDam").unwrap_or(0) as i32, levels(&row, "MaxLevDam")),
+                element: row.get("EType").unwrap_or_default().to_string(),
+                element_min: (row.int("EMin").unwrap_or(0) as i32, levels(&row, "EMinLev")),
+                element_max: (row.int("EMax").unwrap_or(0) as i32, levels(&row, "EMaxLev")),
+                element_synergy: row.get("EDmgSymPerCalc").unwrap_or_default().to_string(),
+                params: [1, 2, 3, 4, 5, 6, 7, 8].map(|i| row.int(&format!("Param{i}")).unwrap_or(0) as i32),
+                calcs: [1, 2, 3, 4].map(|i| row.get(&format!("calc{i}")).unwrap_or_default().to_string()),
             })
             .collect();
         Self { rows }
@@ -65,6 +141,12 @@ impl Skills {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    /// A skill's id by name, any case.
+    #[must_use]
+    pub fn id(&self, name: &str) -> Option<i32> {
+        self.rows.iter().position(|s| s.name.eq_ignore_ascii_case(name)).map(|i| i as i32)
     }
 
     /// A class's first skill: the one its item skills count from (`0x006460F0` with index 0).

@@ -13,7 +13,7 @@
 //! one character (`MCP_JOINGAME`), and this module matches the client's `GAMELOGON` against
 //! that staging. The engine tables come from the operator's own `Game.exe`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -260,11 +260,11 @@ impl GameServer {
     /// stats, its level, the waypoints learned on this difficulty and the items it carries (when
     /// they came from its save whole); and its level.
     fn character_save(&self, p: &Player) -> Option<(Vec<u8>, u32)> {
-        let (stats, items) = {
+        let (stats, items, skills) = {
             let g = self.lock();
             let game = g.by_id.get(&p.game_id)?;
             let items = game.carried.get(&p.character.name).filter(|c| c.complete).map(|c| items::save_list(&c.inventory));
-            (game.battle.player_stats(&p.character.name)?, items)
+            (game.battle.player_stats(&p.character.name)?, items, game.battle.player_skills(&p.character.name))
         };
         let now = u32::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs()).unwrap_or(0);
         let mut save = p.save.clone().unwrap_or_else(|| {
@@ -278,6 +278,16 @@ impl GameServer {
         save.set_level(u8::try_from(level).unwrap_or(99), now);
         let d = usize::from(p.difficulty.min(2));
         save.waypoints[d][2..2 + d2gs::WAYPOINT_FLAG_BYTES].copy_from_slice(&p.waypoints);
+        if let (Some((learned, hands)), Some(rules)) = (skills, &self.rules) {
+            for (slot, id) in save.skills.iter_mut().zip(d2_game::skills::class_skills(rules, p.character.class)) {
+                *slot = learned.get(&id).copied().unwrap_or(0);
+            }
+            for (at, hand) in [(0x78, hands[0]), (0x7C, hands[1])] {
+                if let Some(bytes) = save.header.get_mut(at..at + 4) {
+                    bytes.copy_from_slice(&hand.to_le_bytes());
+                }
+            }
+        }
         if let (Some(items), Some(rules)) = (items, &self.rules) {
             // The player's own list is replaced; the corpse's and any mercenary's that follow it stay.
             if let Ok((_, end)) = item_bits::read_save_list(&save.items, rules.items(), rules.item_stats()) {
@@ -1226,6 +1236,67 @@ impl GameServer {
         packets
     }
 
+    /// A joining player's skills from its save — its class's 30 levels (`if`) and the skills on its
+    /// mouse buttons (header `0x78` left, `0x7C` right) — given to the fight, and the packets that
+    /// tell its client: `0x94` with every skill it has, then `0x23` for the left and right buttons.
+    fn join_skills(&self, p: &Player) -> Vec<Vec<u8>> {
+        let Some(rules) = &self.rules else { return Vec::new() };
+        let mut learned = BTreeMap::new();
+        let mut hands = [0, 0];
+        if let Some(save) = &p.save {
+            for (&id, &level) in d2_game::skills::class_skills(rules, p.character.class).iter().zip(&save.skills) {
+                learned.insert(id, level);
+            }
+            let hand = |at: usize| save.header.get(at..at + 4).map_or(0, |b| i32::from_le_bytes(b.try_into().unwrap_or([0; 4])));
+            hands = [hand(0x78), hand(0x7C)];
+        }
+        let mut g = self.lock();
+        let Some(game) = g.by_id.get_mut(&p.game_id) else { return Vec::new() };
+        game.battle.set_player_skills(&p.character.name, &learned, hands);
+        let Some((skills, hands)) = game.battle.player_skills(&p.character.name) else { return Vec::new() };
+        let common = d2_game::skills::COMMON_SKILLS;
+        let listed: Vec<(u16, u8)> = common
+            .iter()
+            .filter_map(|id| skills.get(id).map(|&l| (*id, l)))
+            .chain(skills.iter().filter(|(id, &l)| l > 0 && !common.contains(id)).map(|(&id, &l)| (id, l)))
+            .filter_map(|(id, l)| Some((u16::try_from(id).ok()?, l)))
+            .collect();
+        vec![
+            d2gs::skill_list(PLAYER_GUID, &listed),
+            d2gs::select_skill(unit_type::PLAYER, PLAYER_GUID, true, u16::try_from(hands[0]).unwrap_or(0), u32::MAX),
+            d2gs::select_skill(unit_type::PLAYER, PLAYER_GUID, false, u16::try_from(hands[1]).unwrap_or(0), u32::MAX),
+        ]
+    }
+
+    /// A player puts a point into a skill (`0x3B`): its new level (`0x21`) and unspent points.
+    fn learn_skill(&self, game_id: u16, name: &str, skill: u16) -> Vec<Vec<u8>> {
+        let Some(rules) = &self.rules else { return Vec::new() };
+        let mut g = self.lock();
+        let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
+        let events = game.battle.learn_skill(rules, name, i32::from(skill));
+        if !events.is_empty() {
+            info!(game_id, player = name, skill, "skill point spent");
+        }
+        events.iter().filter_map(|e| battle_packet(e, name)).collect()
+    }
+
+    /// A player puts a skill on a mouse button (`0x3C`): `0x23` back when it has the skill.
+    fn select_skill(&self, game_id: u16, name: &str, skill: u16, left: bool, item: u32) -> Vec<Vec<u8>> {
+        let mut g = self.lock();
+        let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
+        if !game.battle.select_skill(name, i32::from(skill), left) {
+            return Vec::new();
+        }
+        vec![d2gs::select_skill(unit_type::PLAYER, PLAYER_GUID, left, skill, item)]
+    }
+
+    /// A player uses a mouse button's skill ([`Battle::player_skill`]).
+    fn player_skill(&self, game_id: u16, name: &str, left: bool, aim: battle::Aim) -> battle::SkillUse {
+        let Some(rules) = &self.rules else { return battle::SkillUse::Refused };
+        let mut g = self.lock();
+        g.by_id.get_mut(&game_id).map_or(battle::SkillUse::Refused, |game| game.battle.player_skill(rules, name, left, aim))
+    }
+
     /// A player swings at a monster.
     fn player_attack(&self, game_id: u16, name: &str, guid: u32) -> bool {
         let mut g = self.lock();
@@ -1300,6 +1371,7 @@ fn battle_packet(event: &Event, recipient: &str) -> Option<Vec<u8>> {
         Event::PlayerVitals { life, mana, stamina, .. } => d2gs::life_and_position(*life, *mana, *stamina, 0, 0, 0, 0),
         Event::Experience { old, new, .. } => d2gs::experience(*old, *new),
         Event::PlayerStat { stat, value, .. } => d2gs::set_stat(*stat, *value),
+        Event::SkillLevel { skill, level, .. } => d2gs::skill_level(unit_type::PLAYER, PLAYER_GUID, *skill, *level, 0),
     })
 }
 
@@ -2005,20 +2077,25 @@ async fn run(
                 }
                 (
                     Stage::InGame,
-                    cs::LEFT_SKILL_ON_UNIT
+                    op @ (cs::LEFT_SKILL_ON_UNIT
                     | cs::LEFT_SKILL_ON_UNIT_HOLD
                     | cs::LEFT_SKILL_ON_UNIT_REPEAT
                     | cs::LEFT_SKILL_ON_UNIT_HOLD_REPEAT
                     | cs::RIGHT_SKILL_ON_UNIT
                     | cs::RIGHT_SKILL_ON_UNIT_HOLD
                     | cs::RIGHT_SKILL_ON_UNIT_REPEAT
-                    | cs::RIGHT_SKILL_ON_UNIT_HOLD_REPEAT,
+                    | cs::RIGHT_SKILL_ON_UNIT_HOLD_REPEAT),
                 ) => {
-                    // Every character's skills are Attack for now: a swing at the monster, once
-                    // the player is close enough (the engine walks it there, as does the client).
+                    // The button's skill: a missile skill casts where it stands; Attack and melee
+                    // skills swing at the monster once the player is close enough (the engine walks
+                    // it there, as does the client).
                     let (Some(w), Some(p)) = (walker.as_mut(), player.as_ref()) else { continue };
                     let guid = u32_at(5);
                     if u32_at(1) != u32::from(unit_type::MONSTER) {
+                        continue;
+                    }
+                    let left = matches!(op, cs::LEFT_SKILL_ON_UNIT | cs::LEFT_SKILL_ON_UNIT_HOLD | cs::LEFT_SKILL_ON_UNIT_REPEAT | cs::LEFT_SKILL_ON_UNIT_HOLD_REPEAT);
+                    if server.player_skill(p.game_id, &p.character.name, left, battle::Aim::Unit(guid)) != battle::SkillUse::Swing {
                         continue;
                     }
                     let Some((mx, my)) = server.battle_monster(p.game_id, guid) else { continue };
@@ -2031,6 +2108,32 @@ async fn run(
                         }
                         w.go(f64::from(mx), f64::from(my), RUN_SPEED * server.speed_scale);
                         pending_attack = Some((guid, Instant::now()));
+                    }
+                }
+                (Stage::InGame, op @ (cs::LEFT_SKILL_ON_LOCATION | cs::LEFT_SKILL_ON_LOCATION_HOLD | cs::RIGHT_SKILL_ON_LOCATION | cs::RIGHT_SKILL_ON_LOCATION_HOLD)) => {
+                    let Some(p) = player.as_ref() else { continue };
+                    let left = matches!(op, cs::LEFT_SKILL_ON_LOCATION | cs::LEFT_SKILL_ON_LOCATION_HOLD);
+                    server.player_skill(p.game_id, &p.character.name, left, battle::Aim::At(u16_at(1), u16_at(3)));
+                }
+                (Stage::InGame, cs::ADD_SKILL_POINT) => {
+                    let Some(p) = player.as_mut() else { continue };
+                    let replies = server.learn_skill(p.game_id, &p.character.name, u16_at(1));
+                    if !replies.is_empty() {
+                        for packet in &replies {
+                            outbox.push(packet);
+                        }
+                        flush(stream, peer, tables, &mut outbox).await?;
+                        server.save_character(p).await;
+                    }
+                }
+                (Stage::InGame, cs::SELECT_SKILL) => {
+                    let Some(p) = player.as_mut() else { continue };
+                    let replies = server.select_skill(p.game_id, &p.character.name, u16_at(1), u16_at(3) & 0x8000 != 0, u32_at(5));
+                    if !replies.is_empty() {
+                        for packet in &replies {
+                            outbox.push(packet);
+                        }
+                        flush(stream, peer, tables, &mut outbox).await?;
                     }
                 }
                 (Stage::InGame, cs::ADD_STAT_POINT) => {
@@ -2289,8 +2392,9 @@ async fn enter_game(
     for packet in server.join_items(p) {
         outbox.push(&packet);
     }
-    outbox.push(&d2gs::select_skill(0, PLAYER_GUID, true, 0, u32::MAX));
-    outbox.push(&d2gs::select_skill(0, PLAYER_GUID, false, 0, u32::MAX));
+    for packet in server.join_skills(p) {
+        outbox.push(&packet);
+    }
     // Then life, mana and stamina in whole points, before the player has a position (0x548760).
     if !stats.is_empty() {
         let whole = |id: u8| stats.iter().find(|&&(s, _)| s == id).map_or(0, |&(_, v)| (v >> 8) as u16);
@@ -2508,7 +2612,7 @@ pub(crate) mod tests {
         let ops: Vec<u8> = packets.iter().map(|p| p[0]).filter(|op| !(0x1D..=0x1F).contains(op)).collect();
         assert_eq!(
             ops,
-            vec![0x59, 0xAA, 0x5E, 0x28, 0x29, 0x0B, 0x23, 0x23, 0x95, 0x03, 0x53, 0x07, 0x15, 0x7E],
+            vec![0x59, 0xAA, 0x5E, 0x28, 0x29, 0x0B, 0x94, 0x23, 0x23, 0x95, 0x03, 0x53, 0x07, 0x15, 0x7E],
             "the engine's order, one frame"
         );
         assert_eq!(packets[1], d2gs::alignment_state(0, 1, 2), "the player's alignment: good");
@@ -2520,9 +2624,10 @@ pub(crate) mod tests {
         assert_eq!(&packets[0][6..13], b"TestBan", "the character's name in 0x59");
         assert_eq!(&packets[0][22..26], &[0, 0, 0, 0], "0x59 before placement: no position");
         assert_eq!(packets[5], &[0x0B, 0, 1, 0, 0, 0], "then: that unit is yours");
-        assert_eq!(&packets[6 + 15 + 3][2..6], &FALLBACK_MAP_SEED.to_le_bytes(), "0x03 carries the seed");
-        assert_eq!(packets[6 + 15 + 5], d2gs::load_room(1152, 880, 1), "no town: the fallback seed's spawn room");
-        assert_eq!(&packets[6 + 15 + 6][6..10], &[0xA6, 0x16, 0x3D, 0x11], "placed on its waypoint (5798, 4413)");
+        assert_eq!(packets[6 + 15], d2gs::skill_list(1, &d2_game::skills::COMMON_SKILLS.map(|s| (s as u16, 1))), "the common skills");
+        assert_eq!(&packets[6 + 15 + 4][2..6], &FALLBACK_MAP_SEED.to_le_bytes(), "0x03 carries the seed");
+        assert_eq!(packets[6 + 15 + 6], d2gs::load_room(1152, 880, 1), "no town: the fallback seed's spawn room");
+        assert_eq!(&packets[6 + 15 + 7][6..10], &[0xA6, 0x16, 0x3D, 0x11], "placed on its waypoint (5798, 4413)");
         assert_eq!(read_frame(&mut c, huffman).await, vec![0x04]);
 
         let mut ping = vec![0u8; 13];
@@ -2621,6 +2726,7 @@ pub(crate) mod tests {
                 0x27 => 40,
                 0x63 => 21,
                 0x77 => 2,
+                0x94 => 6 + 3 * usize::from(rest[1]),
                 other => panic!("unexpected opcode {other:#04x}"),
             };
             out.push(rest[..size].to_vec());
@@ -3447,6 +3553,56 @@ pub(crate) mod tests {
         assert!(joined.windows(2).all(|w| w[0].0 < w[1].0), "ascending stat order");
         next.name = "Other".into();
         assert!(Player::new(id, next, 0, 0, (0, 0)).save.is_none(), "another character's save is not loaded");
+    }
+
+    /// A new sorceress joins with the common skills (`0x94`) and Attack on both buttons; she spends
+    /// her point on Fire Bolt (`0x21`, points to 0), puts it on her right button (`0x23`), is
+    /// refused a skill she lacks, and her save keeps both — the next game gives them back.
+    #[tokio::test]
+    async fn skills_are_learned_selected_saved_and_brought_back() {
+        use bnetcc_storage::memory::MemoryStorage;
+        use bnetcc_storage::model::Credential;
+        use d2_formats::excel::Table;
+        let storage = crate::storage::spawn(Box::new(MemoryStorage::new()));
+        let owner = storage.create_account("Owner", Credential::Xsha1 { digest: [1; 20] }).await.unwrap();
+        let mut sorc = character("Sorc", 1, 0x20);
+        sorc.account = owner.id;
+        storage.create_character(sorc.clone()).await.unwrap();
+        let mut rules = test_rules();
+        let mut table = String::from("skill\tcharclass\treqlevel\tmaxlvl\tInGame\r\n");
+        for id in 0..40 {
+            let class = if (36..40).contains(&id) { "sor" } else { "" };
+            table += &format!("skill {id}\t{class}\t1\t20\t1\r\n");
+        }
+        rules.set_skills(d2_data::skills::Skills::from_table(&Table::parse(table.as_bytes())));
+        let gs = GameServer::new(test_tables(), Some(rules)).with_storage(storage.clone());
+        let id = gs.create("tower", "", 0).unwrap();
+        let mut p = Player::new(id, sorc.clone(), 0, 0, (0, 0));
+        let mut stats = p.join_stats(gs.rules.as_ref().unwrap()).unwrap();
+        stats.push((stat::NEWSKILLS, 1));
+        gs.join_battle(id, "Sorc", 1, &stats);
+        let joined = gs.join_skills(&p);
+        let common: Vec<(u16, u8)> = d2_game::skills::COMMON_SKILLS.iter().map(|&s| (s as u16, 1)).collect();
+        assert_eq!(joined, [d2gs::skill_list(PLAYER_GUID, &common), d2gs::select_skill(0, PLAYER_GUID, true, 0, u32::MAX), d2gs::select_skill(0, PLAYER_GUID, false, 0, u32::MAX)]);
+
+        assert!(gs.select_skill(id, "Sorc", 36, false, u32::MAX).is_empty(), "not learned yet");
+        assert!(gs.learn_skill(id, "Sorc", 70).is_empty(), "not a sorceress skill");
+        assert_eq!(gs.learn_skill(id, "Sorc", 36), [d2gs::skill_level(0, PLAYER_GUID, 36, 1, 0), d2gs::set_stat(stat::NEWSKILLS, 0)]);
+        assert!(gs.learn_skill(id, "Sorc", 37).is_empty(), "no points left");
+        assert_eq!(gs.select_skill(id, "Sorc", 36, false, u32::MAX), [d2gs::select_skill(0, PLAYER_GUID, false, 36, u32::MAX)]);
+
+        gs.save_character(&mut p).await;
+        let stored = storage.character_by_name("Sorc").await.unwrap();
+        let save = Save::parse(stored.save.as_deref().unwrap()).unwrap();
+        assert_eq!((save.skills[0], save.skills[1], &save.header[0x7C..0x80]), (1, 0, &36u32.to_le_bytes()[..]), "Fire Bolt learned, on the right button");
+        gs.leave(id, "Sorc");
+        let again = gs.create("again", "", 0).unwrap();
+        let q = Player::new(again, stored, 0, 0, (0, 0));
+        gs.join_battle(again, "Sorc", 1, &q.join_stats(gs.rules.as_ref().unwrap()).unwrap());
+        let back = gs.join_skills(&q);
+        let mut listed = common.clone();
+        listed.push((36, 1));
+        assert_eq!(back, [d2gs::skill_list(PLAYER_GUID, &listed), d2gs::select_skill(0, PLAYER_GUID, true, 0, u32::MAX), d2gs::select_skill(0, PLAYER_GUID, false, 36, u32::MAX)]);
     }
 
     /// A player killed out in a made-up Blood Moor room and releasing (`0x41`) is stood up where it
