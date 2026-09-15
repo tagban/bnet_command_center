@@ -30,9 +30,12 @@
 //! - The packets' shapes and pacing are from a recorded retail fight (bnemu
 //!   `docs/d2/re/combat.md`): a kill is `DYING`, then `DEAD` one death animation later.
 //! - A walking monster covers `MonStats.txt` `Velocity` sixteenths of a subtile a frame, as a
-//!   player covers its `WalkVelocity` (`0x0064FE40`): the client moves it at its class's speed
-//!   whatever the walk packet's speed field says (a zombie, `Velocity` 1, crawls where a Fallen,
-//!   5, trots).
+//!   player covers its `WalkVelocity` (`0x0064FE40`), times its velocity percent (stat 67,
+//!   `0x00623F50`: base × percent / 100). The walk packet carries that percent (`0x0053B710` writes
+//!   stat 67) and the client sets the stat from it (`0x004AFF60`), so both sides glide at
+//!   [`WALK_VELOCITY_PERCENT`] of the class speed (a zombie, `Velocity` 1, crawls where a Fallen,
+//!   5, trots). Gliding at the full speed put the server ahead of the client until swings snapped
+//!   monsters forward, or left them off screen still hitting (tagban's Dark Hunters, 2026-09-15).
 //!
 //! Not the engine's: the AI is a plain chase-and-swing loop (the per-class AI routines are not
 //! ported), paths come from [`crate::path`], an unarmed player hits for 1–2, and the experience
@@ -77,6 +80,8 @@ const DEFAULT_AI_DISTANCE: i32 = 35;
 const LEASH: i32 = 2;
 /// Sixteenths of a subtile a walking monster covers per frame per point of `Velocity`.
 const VELOCITY_UNIT: f64 = 1.0 / 16.0;
+/// A walking monster's velocity percent, as retail walk packets carry it (75; runs carry 125).
+pub const WALK_VELOCITY_PERCENT: u16 = 75;
 /// How far along its path one walk packet sends a monster.
 const WALK_LEAD: usize = 8;
 /// How close a player must be to hit a monster, subtiles. The server follows a player only
@@ -1153,7 +1158,7 @@ impl Battle {
         };
         (m.x, m.y) = from;
         let length = (f64::from(tx) - from.0).hypot(f64::from(ty) - from.1);
-        let frames = (length / (m.sheet.glide as f64 * VELOCITY_UNIT)).ceil().max(1.0) as u64;
+        let frames = glide_frames(m.sheet.glide, length);
         m.glide = Some(Glide { from, to: (f64::from(tx), f64::from(ty)), start: now, frames });
         m.next_think = now + frames.min(think);
         events.push(Event::MonsterWalk { room, guid, x: tx as u16, y: ty as u16 });
@@ -1192,6 +1197,12 @@ impl Battle {
         events.push(Event::PlayerReaction { player: player.clone(), event: reaction::DYING });
         self.due.entry(self.frame + dying_frames.max(1)).or_default().push(Due::PlayerDead { player });
     }
+}
+
+/// Frames a monster of `velocity` takes to walk `length` subtiles, at the pace the client glides it.
+fn glide_frames(velocity: u64, length: f64) -> u64 {
+    let per_frame = velocity.max(1) as f64 * VELOCITY_UNIT * f64::from(WALK_VELOCITY_PERCENT) / 100.0;
+    (length / per_frame).ceil().max(1.0) as u64
 }
 
 fn glide_at(glide: &Glide, now: u64) -> (f64, f64) {
@@ -1296,6 +1307,14 @@ mod tests {
         assert!(!b.add_monster(data, 8, 1, ROOM, 100, 100), "a friendly NPC does not fight");
         b.add_player(data, "hero", 4, &data.new_character_stats(4).unwrap());
         b
+    }
+
+    #[test]
+    fn monsters_glide_at_the_speed_their_walk_packet_gives_the_client() {
+        // A Dark Hunter (Velocity 5) at 75%: 5 × 0.75 / 16 of a subtile a frame, 5.86 a second.
+        assert_eq!(glide_frames(5, 8.0), 35);
+        assert_eq!(glide_frames(1, 3.0), 64, "a zombie crawls");
+        assert_eq!(glide_frames(5, 0.1), 1);
     }
 
     #[test]

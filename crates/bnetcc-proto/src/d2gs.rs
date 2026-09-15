@@ -1024,13 +1024,14 @@ pub fn monster_reaction(guid: u32, event: u8, x: u16, y: u16, life: u8, alive: b
     w.finish()
 }
 
-/// `0x67`: `[guid u32][01][x u16][y u16][01][00][0D][speed u16 = 75][05]` — a monster walks to
-/// (`x`, `y`); the client finds its own way there (handler `0x0045CDE0`). The fixed bytes are a
-/// recorded retail monster walk's.
+/// `0x67`: `[guid u32][01][x u16][y u16][01][00][0D][velocity percent u16][05]` — a monster walks
+/// to (`x`, `y`) at its class speed times `percent` / 100; the client finds its own way there
+/// (handler `0x0045CDE0`) and sets the monster's stat 67 to `percent` (`0x004AFF60`). The other
+/// fixed bytes are a recorded retail monster walk's (which carried 75).
 #[must_use]
-pub fn monster_walk(guid: u32, x: u16, y: u16) -> Vec<u8> {
+pub fn monster_walk(guid: u32, x: u16, y: u16, percent: u16) -> Vec<u8> {
     let mut w = Writer::with_capacity(16);
-    w.u8(sc::MONSTER_WALK).u32(guid).u8(1).u16(x).u16(y).u8(1).u8(0).u8(0x0D).u16(75).u8(5);
+    w.u8(sc::MONSTER_WALK).u32(guid).u8(1).u16(x).u16(y).u8(1).u8(0).u8(0x0D).u16(percent).u8(5);
     w.finish()
 }
 
@@ -1361,7 +1362,7 @@ mod tests {
             [0x69, 0xF0, 0x2D, 0xE8, 0xA4, 0x09, 0x47, 0x12, 0x4D, 0x12, 0x14, 0x00]
         );
         assert_eq!(
-            monster_walk(0xDA93_90B7, 0x1282, 0x126F),
+            monster_walk(0xDA93_90B7, 0x1282, 0x126F, 75),
             [0x67, 0xB7, 0x90, 0x93, 0xDA, 0x01, 0x82, 0x12, 0x6F, 0x12, 0x01, 0x00, 0x0D, 0x4B, 0x00, 0x05]
         );
         assert_eq!(

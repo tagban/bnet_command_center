@@ -843,7 +843,7 @@ impl GameServer {
                     Event::ItemDrop { x, y, code, .. } => match simple_item_class(rules, code) {
                         Some(class) => (*x, *y, Loot::Item { class, code: d2_data::items::code(code) }),
                         None => {
-                            debug!(game_id, %code, "treasure item not made: only simple items are");
+                            info!(game_id, %code, "treasure dropped an item not made yet (only potions, scrolls, gems and runes are)");
                             continue;
                         }
                     },
@@ -1057,7 +1057,7 @@ fn battle_packet(event: &Event, recipient: &str) -> Option<Vec<u8>> {
     Some(match event {
         Event::MonsterLife { guid, life, .. } => d2gs::unit_life(unit_type::MONSTER, *guid, *life),
         Event::MonsterReaction { guid, event, x, y, life, alive, .. } => d2gs::monster_reaction(*guid, *event, *x, *y, *life, *alive),
-        Event::MonsterWalk { guid, x, y, .. } => d2gs::monster_walk(*guid, *x, *y),
+        Event::MonsterWalk { guid, x, y, .. } => d2gs::monster_walk(*guid, *x, *y, battle::WALK_VELOCITY_PERCENT),
         Event::MonsterStop { guid, x, y, life, .. } => d2gs::monster_standing(*guid, *x, *y, *life),
         Event::MonsterAttack { guid, target, x, y, .. } if target == recipient => d2gs::monster_attack(*guid, PLAYER_GUID, *x, *y),
         Event::MonsterAttack { .. } | Event::MonsterState { .. } | Event::GoldDrop { .. } | Event::ItemDrop { .. } => return None,
