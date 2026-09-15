@@ -9,14 +9,16 @@ database is needed.
 
 | File | What it is |
 |---|---|
-| `header.php` | The site header, with **News** and **Releases** added to the nav and a page title per page. |
-| `sidebar.php` | The sidebar: Active Projects, then **Latest Releases**, then Server Stats. The status feed is now read at most every 30 seconds, and a down server makes a page wait 3 seconds at most. |
+| `header.php` | The site header, with **News**, **Releases** and **Server** added to the nav and a page title per page. |
+| `sidebar.php` | The sidebar: Active Projects, then **Latest Releases**, then Server Stats, now from the server's push (with players today and a link to the server page). Before the first push arrives it reads the live status feed, at most every 30 seconds and never waiting more than 3. |
 | `footer.php` | Unchanged. |
-| `index.php` | The front page: **Latest News** and **Ladder Leaders**. |
+| `index.php` | The front page: **Latest News**, **Server Activity** and **Ladder Leaders**. |
+| `server.php` | The server page: online now, the last 24 hours and 7 days, players by game, who's online, open games (maps and Diablo II games too), channels, recent ladder games and a daily table. |
+| `server-push.php` | Receives the server's stats push, keeps it, and builds the site's own history from it. |
 | `news.php` | All news, 10 to a page, and each post at `news.php?p=post-title`. |
 | `releases.php` | Each project's recent releases, with the latest release's notes and its download links. |
 | `admin/` | The news admin (`/admin/`): sign in, then write, preview, edit, pin, draft and delete posts. |
-| `widgets/` | `news.php`, `releases.php`, `ladder.php`: boxes to include anywhere. |
+| `widgets/` | `news.php`, `releases.php`, `activity.php`, `ladder.php`: boxes to include anywhere. |
 | `bnetcc/` | Shared code (its `.htaccess` blocks direct access). |
 | `extras.css` | Styles for news, releases and the widgets, on top of the site's own classes. |
 | `site-config.sample.php` | Settings; copy it to `site-config.php`. |
@@ -36,6 +38,30 @@ database is needed.
 3. Open `https://www.bnet.cc/admin/`. With no password set, the page turns a password you choose into
    a hash. Paste it into `ADMIN_PASSWORD_HASH` in `site-config.php`, reload, and sign in as
    `ADMIN_USER`.
+
+## Server data
+
+Every minute the server sends bnet.cc a snapshot of itself: its stats push. `server-push.php` keeps
+the latest one and adds it to the site's own history (five-minute points for eight days, one row per
+day for 180 days, and the most players ever online). So the charts don't reset when the server
+restarts, and the pages still show the last known state, marked Offline, while it is down.
+
+On the server, in `bnetccd.toml` (this replaces the old stats push URL):
+
+```toml
+[stats_push]
+url = "https://www.bnet.cc/server-push.php"
+token = "a long random string"        # the same as SERVER_PUSH_TOKEN in site-config.php
+interval_secs = 60
+include_users = true                  # names in Who's Online; false shows counts only
+```
+
+What the snapshot holds, beyond the totals: players online per game, players seen in the last 24
+hours, games hosted per game in the last 24 hours, public channels (defined `public` or `listed`;
+other channels are only counted), open games with their type and StarCraft/Warcraft II map,
+Diablo II realm games, and the last 30 ladder results with rating changes. A password-protected
+game's name, a private channel's name and anyone's address are never sent. The same data is at
+the server's `http://<server>:6116/status.json`.
 
 ## The news admin
 

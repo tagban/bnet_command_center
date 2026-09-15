@@ -31,5 +31,14 @@ define('GITHUB_TOKEN', '');
 // Minutes to keep GitHub's answer before asking again.
 define('GITHUB_CACHE_MINUTES', 30);
 
-// The server's public status feed, for the sidebar's Server Stats (read at most every 30 seconds).
+// The token the server sends with its stats push ([stats_push] token in bnetccd.toml), for
+// server-push.php. Long and random. The site keeps what it receives and builds its own history
+// from it.
+define('SERVER_PUSH_TOKEN', '');
+
+// The game server's address as players type it, shown on the server pages.
+define('SERVER_ADDRESS', 'us.bnet.cc:6112');
+
+// Before the first push arrives, the sidebar reads the public status feed directly (at most every
+// 30 seconds).
 define('SERVER_STATUS_URL', 'http://us.bnet.cc:6116/status.json');

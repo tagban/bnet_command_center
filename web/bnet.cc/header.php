@@ -11,7 +11,7 @@
         .logo-subtext { font-size: 10px; color: #CCCCCC; letter-spacing: 4px; text-transform: uppercase; margin-top: 2px; text-shadow: 1px 1px 2px #000000; background-color: transparent; }
         #nav-bar { background-image: url('/images/rect.gif'), url('/images/menu-bg.gif'); background-repeat: repeat-x, repeat-x; background-position: 0 center, center center; height: 31px; line-height: 31px; padding: 0; text-align: center; border-bottom: none; overflow: hidden; animation: scrollRects 3s linear infinite; }
         @keyframes scrollRects { from { background-position: 0 center, center center; } to { background-position: 100px center, center center; } }
-        #nav-bar a { margin: 0 14px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #00C0FF; font-weight: bold; text-shadow: 1px 1px 2px #000000; background-color: transparent; }
+        #nav-bar a { margin: 0 10px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #00C0FF; font-weight: bold; text-shadow: 1px 1px 2px #000000; background-color: transparent; }
         #nav-bar a:hover { color: #FFFFFF; text-shadow: 0 0 5px #00C0FF, 1px 1px 2px #000000; }
         #content-container { display: flex; flex: 1; background-color: transparent; }
         #main-content { width: 70%; padding: 20px; background-color: transparent; }
@@ -48,6 +48,7 @@
             <a href="/news.php" class="menu">News</a>
             <a href="/ladder.php" class="menu">Ladder</a>
             <a href="/releases.php" class="menu">Releases</a>
+            <a href="/server.php" class="menu">Server</a>
             <a href="/files.php" class="menu">Files</a>
             <a href="https://discord.gg/dR4djHweh3" class="menu">Discord</a>
             <a href="https://www.bnetdocs.org/">BNETDocs</a>

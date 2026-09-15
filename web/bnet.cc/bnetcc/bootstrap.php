@@ -27,6 +27,8 @@ foreach ([
     'GITHUB_TOKEN' => '',
     'GITHUB_CACHE_MINUTES' => 30,
     'SERVER_STATUS_URL' => 'http://us.bnet.cc:6116/status.json',
+    'SERVER_PUSH_TOKEN' => '',
+    'SERVER_ADDRESS' => 'us.bnet.cc:6112',
 ] as $bnetccName => $bnetccDefault) {
     if (!defined($bnetccName)) {
         define($bnetccName, $bnetccDefault);
