@@ -13,18 +13,19 @@
 //! one character (`MCP_JOINGAME`), and this module matches the client's `GAMELOGON` against
 //! that staging. The engine tables come from the operator's own `Game.exe`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bnetcc_proto::d2::status;
-use bnetcc_proto::d2gs::{self, cs, item_action, item_flags, join_failed, ClientPacketLen, EngineTables, GameLogon, ItemSpot, Outbox};
+use bnetcc_proto::d2gs::{self, cs, item_action, join_failed, ClientPacketLen, EngineTables, GameLogon, Outbox};
 use bnetcc_storage::Character;
 use d2_data::engine::EngineData;
 use d2_data::{stat, GameData};
-use d2_formats::d2s::{Save, SimpleItem};
+use d2_data::item_bits::{self, Item, Location};
+use d2_formats::d2s::Save;
 use d2_drlg::act::Act;
 use d2_drlg::collision::TileSources;
 use d2_drlg::preset::PresetLevel;
@@ -32,6 +33,7 @@ use d2_drlg::world::{RoomId, World};
 use d2_game::battle::{self, Battle, Event};
 use d2_game::clock::ActClock;
 use d2_game::inventory::{Held, Inventory, Place};
+use d2_game::loot;
 use d2_game::population::{unit_type, waypoint_spawn, MonsterRoom, Population, Spawned, SUBCLASS_WAYPOINT};
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -40,6 +42,7 @@ use tracing::{debug, info, warn};
 
 use crate::session::hex_preview;
 
+mod items;
 pub mod map;
 
 /// Players per game, as the engine allows.
@@ -172,12 +175,18 @@ struct Game {
     /// The version every item made in the game carries: 101 in an expansion game, 2 in a classic
     /// one (`0x00530930`).
     item_version: u16,
+    /// A ladder game: ladder-only uniques drop.
+    ladder: bool,
+    /// The uniques made in the game so far, which do not drop again.
+    made_uniques: HashSet<u16>,
+    /// Where made items' seeds come from.
+    item_seeds: d2_drlg::rng::Seed,
     /// Item guids handed out when the game has no population to count them.
     spare_item_guid: u32,
 }
 
 /// Gold or an item on the ground.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct GroundItem {
     room: RoomId,
     x: u16,
@@ -186,24 +195,22 @@ struct GroundItem {
 }
 
 /// What lies on the ground.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Loot {
     /// A gold pile.
     Gold(u32),
-    /// A simple item, by class and code.
-    Item { class: i32, code: [u8; 4] },
+    /// An item, by class.
+    Item { class: i32, item: Box<Item> },
 }
 
 /// A player's items, and whether they came from its save whole: when its `.d2s` holds items the
-/// server cannot read (anything but simple ones) nothing is picked up, used or written back.
+/// server cannot read or place (the stash, the cube, sockets) nothing is picked up, used or
+/// written back.
 #[derive(Debug, Clone, Default)]
 struct Carried {
     inventory: Inventory,
     complete: bool,
 }
-
-/// Belt and inventory flags of a simple item as the engine sends it held.
-const HELD_FLAGS: u32 = item_flags::SIMPLE;
 
 /// Why the realm could not create a game.
 #[derive(Debug, PartialEq, Eq)]
@@ -251,7 +258,7 @@ impl GameServer {
         let (stats, items) = {
             let g = self.lock();
             let game = g.by_id.get(&p.game_id)?;
-            let items = game.carried.get(&p.character.name).filter(|c| c.complete).map(|c| saved_items(&c.inventory));
+            let items = game.carried.get(&p.character.name).filter(|c| c.complete).map(|c| items::save_list(&c.inventory));
             (game.battle.player_stats(&p.character.name)?, items)
         };
         let now = u32::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs()).unwrap_or(0);
@@ -266,8 +273,13 @@ impl GameServer {
         save.set_level(u8::try_from(level).unwrap_or(99), now);
         let d = usize::from(p.difficulty.min(2));
         save.waypoints[d][2..2 + d2gs::WAYPOINT_FLAG_BYTES].copy_from_slice(&p.waypoints);
-        if let Some(items) = items {
-            save.set_simple_items(&items);
+        if let (Some(items), Some(rules)) = (items, &self.rules) {
+            // The player's own list is replaced; the corpse's and any mercenary's that follow it stay.
+            if let Ok((_, end)) = item_bits::read_save_list(&save.items, rules.items(), rules.item_stats()) {
+                let mut list = item_bits::write_save_list(&items, rules.items(), rules.item_stats());
+                list.extend_from_slice(&save.items[end..]);
+                save.items = list;
+            }
         }
         Some((save.to_bytes(), level))
     }
@@ -477,6 +489,9 @@ impl GameServer {
                 ground: HashMap::new(),
                 carried: HashMap::new(),
                 item_version: 101,
+                ladder: false,
+                made_uniques: HashSet::new(),
+                item_seeds: d2_drlg::rng::Seed::new(rand::thread_rng().gen(), 0x29A),
                 spare_item_guid: 0,
             },
         );
@@ -534,6 +549,7 @@ impl GameServer {
         let character = game.staged.remove(at);
         game.battle.set_expansion(character.status & status::EXPANSION != 0);
         game.item_version = if character.status & status::EXPANSION != 0 { 101 } else { 2 };
+        game.ladder = character.status & status::LADDER != 0;
         game.connected.push(character.name.clone());
         Some(Player::new(logon.game_id, character, game.difficulty, game.map_seed, game.spawn))
     }
@@ -848,7 +864,7 @@ impl GameServer {
         game.battle.set_motion(name, motion);
         let due = (game.created.elapsed().as_micros() / SERVER_FRAME.as_micros()) as u64;
         if due > game.battle.frame() {
-            let Game { battle, world, positions, views, population, outgoing, ground, item_version, .. } = game;
+            let Game { battle, world, positions, views, population, outgoing, ground, item_version, ladder, made_uniques, item_seeds, difficulty, .. } = game;
             for (player, &(x, y)) in positions.iter() {
                 let level = world.as_ref().and_then(|w| w.room_at(x, y)).map(|r| r.level);
                 battle.place_player(player, level.map(|l| (x, y, l)), views.get(player).map_or(&[], Vec::as_slice));
@@ -865,13 +881,19 @@ impl GameServer {
             for event in events {
                 let (x, y, what) = match &event {
                     Event::GoldDrop { x, y, amount, .. } => (*x, *y, Loot::Gold(*amount)),
-                    Event::ItemDrop { x, y, code, .. } => match simple_item_class(rules, code) {
-                        Some(class) => (*x, *y, Loot::Item { class, code: d2_data::items::code(code) }),
-                        None => {
-                            info!(game_id, %code, "treasure dropped an item not made yet (only potions, scrolls, gems and runes are)");
-                            continue;
+                    Event::ItemDrop { x, y, code, mods, level, .. } => {
+                        let making = loot::Making { version: *item_version, difficulty: *difficulty, ladder: *ladder, magic_find: 0 };
+                        match make_item(rules, code, *level, *mods, making, made_uniques, item_seeds.roll()) {
+                            Some((class, item)) => {
+                                debug!(game_id, item = %code, quality = item.quality.number(), "item dropped");
+                                (*x, *y, Loot::Item { class, item: Box::new(item) })
+                            }
+                            None => {
+                                info!(game_id, %code, "treasure dropped an item not made (gold piles by code, stacks of simple items)");
+                                continue;
+                            }
                         }
-                    },
+                    }
                     _ => {
                         share_out(event, rules, world, battle, views, outgoing, population.as_mut());
                         continue;
@@ -883,8 +905,8 @@ impl GameServer {
                 let Some((room, x, y)) = drop_spot(world, &taken, (i32::from(x), i32::from(y))) else { continue };
                 let item = GroundItem { room, x: x as u16, y: y as u16, what };
                 let guid = population.next_guid(unit_type::ITEM);
-                ground.insert(guid, item);
                 let packet = ground_packet(rules, guid, &item, true, *item_version);
+                ground.insert(guid, item);
                 for (player, view) in views.iter() {
                     if view.contains(&room) {
                         outgoing.entry(player.clone()).or_default().push(packet.clone());
@@ -902,27 +924,29 @@ impl GameServer {
         (mode != battle::DEAD_MODE).then_some((x, y))
     }
 
-    /// A player picks up what lies on the ground (engine `0x16` → `0x548B00` type 4 → `0x563560`).
+    /// A player picks up what lies on the ground (engine `0x16` → `0x548B00` type 4 → `0x563560`),
+    /// or lifts it onto its cursor when `to_cursor` (`0x0055CF50`).
     ///
     /// Gold (`0x55C850`): it takes what its purse holds (level × 10,000, `0x622E70`), the pile goes
     /// for everyone near, and its client is told its gold as the engine tells it (`0x19` for a small
     /// gain). What does not fit is dropped as a new pile from the player (`0x55B030`, placed as
     /// [`drop_spot`] places drops).
     ///
-    /// A simple item goes where [`Inventory::place_for`] puts it: its unit goes for everyone near
-    /// (`0x0A`) and its client is sent it in the belt (`0x9C` action `0x0E`) or the inventory
-    /// (action 4). With no room it stays where it is.
+    /// An item is worn when [`items::auto_equip`] finds it a free body location, else goes where
+    /// [`Inventory::place_for`] puts it: its unit goes for everyone near (`0x0A`) and its client is
+    /// sent it worn (`0x9D` 6), in the belt (`0x9C` `0x0E`) or in the inventory (`0x9C` 4). With
+    /// no room it stays where it is.
     ///
     /// ⚠️ Range is not checked (the engine picks up within 5 subtiles and walks the player
     /// closer otherwise; the client walks up before it asks).
-    fn pick_up(&self, game_id: u16, name: &str, guid: u32) -> Vec<Vec<u8>> {
+    fn pick_up(&self, game_id: u16, name: &str, guid: u32, to_cursor: bool) -> Vec<Vec<u8>> {
         let Some(rules) = &self.rules else { return Vec::new() };
         let mut g = self.lock();
         let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
         let Some(item) = game.ground.remove(&guid) else { return Vec::new() };
-        let taken = match item.what {
-            Loot::Gold(amount) => take_gold(rules, game, name, guid, amount),
-            Loot::Item { class, code } => take_item(rules, game, name, guid, class, code),
+        let taken = match &item.what {
+            Loot::Gold(amount) => take_gold(rules, game, name, guid, *amount),
+            Loot::Item { class, item: body } => take_item(rules, game, name, guid, *class, body, to_cursor),
         };
         let Some((replies, dropped)) = taken else {
             game.ground.insert(guid, item);
@@ -956,47 +980,174 @@ impl GameServer {
         let mut g = self.lock();
         let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
         let Some(carried) = game.carried.get_mut(name).filter(|c| c.complete) else { return Vec::new() };
-        let Some(held) = carried.inventory.get(guid).copied() else { return Vec::new() };
-        if from_belt != matches!(held.place, Place::Belt(_)) {
+        let Some(held) = carried.inventory.get(guid).cloned() else { return Vec::new() };
+        let in_place = match held.place {
+            Place::Belt(_) => from_belt,
+            Place::Grid { .. } => !from_belt,
+            _ => false,
+        };
+        if !in_place {
             return Vec::new();
         }
         let Some(potion) = rules.items().get(held.class).filter(|d| d.useable).and_then(battle::Potion::of) else {
-            debug!(game_id, player = name, item = %d2_data::items::code_str(&held.code), "item use not ported");
+            debug!(game_id, player = name, item = %d2_data::items::code_str(&held.code()), "item use not ported");
             return Vec::new();
         };
         let Some(changed) = game.battle.drink(name, potion) else { return Vec::new() };
         carried.inventory.remove(guid);
-        info!(game_id, player = name, guid, item = %d2_data::items::code_str(&held.code), "potion drunk");
-        let mut out = vec![held_packet(rules, &held, true)];
+        info!(game_id, player = name, guid, item = %d2_data::items::code_str(&held.code()), "potion drunk");
+        let mut out: Vec<Vec<u8>> = items::held_packet(rules, &held, true).into_iter().collect();
         out.extend(changed.iter().filter_map(|e| battle_packet(e, name)));
         out
     }
 
+    /// A player moves an item it holds, as its client asks (§ [`items`]): the packets its client
+    /// is sent, empty when the move is refused and nothing changes. The server keeps its own copy
+    /// of where everything is and checks each move against it.
+    fn move_item(&self, game_id: u16, name: &str, request: ItemMove) -> Vec<Vec<u8>> {
+        let Some(rules) = &self.rules else { return Vec::new() };
+        let mut g = self.lock();
+        let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
+        let wearer = game.battle.player_requirements(name);
+        let Some(carried) = game.carried.get_mut(name).filter(|c| c.complete) else { return Vec::new() };
+        let inv = &mut carried.inventory;
+        let cursor_is = |inv: &Inventory, guid: u32| inv.at(Place::Cursor).is_some_and(|h| h.guid == guid);
+        let out = match request {
+            ItemMove::Lift { guid } => {
+                let Some(held) = inv.get(guid).filter(|h| matches!(h.place, Place::Grid { .. })).cloned() else { return Vec::new() };
+                if !inv.move_to(guid, Place::Cursor) {
+                    return Vec::new();
+                }
+                vec![items::owned(rules, item_action::REMOVE_FROM_CONTAINER, guid, &items::lifted(&held, held.place))]
+            }
+            ItemMove::Insert { guid, col, row, grid } => {
+                if grid != 0 || !cursor_is(inv, guid) || col > 0xFF || row > 0xFF || !inv.move_to(guid, Place::Grid { col: col as u8, row: row as u8 }) {
+                    return Vec::new();
+                }
+                inv.get(guid).and_then(|h| items::held_packet(rules, h, false)).into_iter().collect()
+            }
+            ItemMove::Equip { guid, body } => {
+                let Some(held) = inv.at(Place::Cursor).filter(|h| h.guid == guid).cloned() else { return Vec::new() };
+                if !items::wearable_at(rules, inv, held.class, body, wearer.map_or(0, |w| w.0)) || !inv.move_to(guid, Place::Body(body)) {
+                    return Vec::new();
+                }
+                let mut item = held.item.clone();
+                item.location = Location::Equipped { body };
+                item.flags |= items::REBUILD;
+                vec![items::owned(rules, item_action::EQUIP, guid, &item)]
+            }
+            ItemMove::Unequip { body } => {
+                let Some(held) = inv.at(Place::Body(body)).cloned() else { return Vec::new() };
+                if inv.at(Place::Cursor).is_some() || !inv.move_to(held.guid, Place::Cursor) {
+                    return Vec::new();
+                }
+                vec![items::owned(rules, item_action::UNEQUIP, held.guid, &items::lifted(&held, held.place))]
+            }
+            ItemMove::SwapEquipped { guid, body } => {
+                let (Some(new), Some(old)) = (inv.at(Place::Cursor).filter(|h| h.guid == guid).cloned(), inv.at(Place::Body(body)).cloned()) else {
+                    return Vec::new();
+                };
+                let mut probe = inv.clone();
+                probe.remove(old.guid);
+                if !items::wearable_at(rules, &probe, new.class, body, wearer.map_or(0, |w| w.0)) {
+                    return Vec::new();
+                }
+                inv.remove(old.guid);
+                inv.move_to(guid, Place::Body(body));
+                let mut lifted = old.clone();
+                lifted.place = Place::Cursor;
+                inv.insert(lifted);
+                let mut out_item = items::lifted(&old, old.place);
+                out_item.flags |= items::SWAPPED_OUT | items::REBUILD;
+                let mut in_item = new.item.clone();
+                in_item.location = Location::Equipped { body };
+                in_item.flags |= items::SWAPPED_IN | items::REBUILD;
+                vec![items::owned(rules, item_action::SWAP_BODY, old.guid, &out_item), items::owned(rules, item_action::SWAP_BODY, guid, &in_item)]
+            }
+            ItemMove::SwapGrid { guid, other, col, row } => {
+                let (Some(new), Some(old)) = (inv.at(Place::Cursor).filter(|h| h.guid == guid).cloned(), inv.get(other).filter(|h| matches!(h.place, Place::Grid { .. })).cloned()) else {
+                    return Vec::new();
+                };
+                let (Ok(col), Ok(row)) = (u8::try_from(col), u8::try_from(row)) else { return Vec::new() };
+                let mut probe = inv.clone();
+                probe.remove(old.guid);
+                probe.remove(guid);
+                let mut placed = new.clone();
+                placed.place = Place::Grid { col, row };
+                if !probe.fits(&placed) {
+                    return Vec::new();
+                }
+                probe.insert(placed.clone());
+                let mut lifted = old.clone();
+                lifted.place = Place::Cursor;
+                probe.insert(lifted);
+                *inv = probe;
+                vec![items::world(rules, item_action::SWAP_IN_CONTAINER, old.guid, &items::lifted(&old, old.place)), items::world(rules, item_action::SWAP_IN_CONTAINER, guid, &placed.placed())]
+            }
+            ItemMove::Belt { guid, slot } => {
+                let Some(held) = inv.at(Place::Cursor).filter(|h| h.guid == guid).cloned() else { return Vec::new() };
+                if held.size != (1, 1) || !rules.items().beltable(held.class) || slot > 0xFF || !inv.move_to(guid, Place::Belt(slot as u8)) {
+                    return Vec::new();
+                }
+                inv.get(guid).and_then(|h| items::held_packet(rules, h, false)).into_iter().collect()
+            }
+            ItemMove::Unbelt { guid } => {
+                let Some(held) = inv.get(guid).filter(|h| matches!(h.place, Place::Belt(_))).cloned() else { return Vec::new() };
+                if !inv.move_to(guid, Place::Cursor) {
+                    return Vec::new();
+                }
+                vec![items::world(rules, item_action::REMOVE_FROM_BELT, guid, &items::lifted(&held, held.place))]
+            }
+            ItemMove::SwapBelt { guid, other } => {
+                let (Some(new), Some(old)) = (inv.at(Place::Cursor).filter(|h| h.guid == guid).cloned(), inv.get(other).filter(|h| matches!(h.place, Place::Belt(_))).cloned()) else {
+                    return Vec::new();
+                };
+                if new.size != (1, 1) || !rules.items().beltable(new.class) {
+                    return Vec::new();
+                }
+                inv.remove(old.guid);
+                inv.move_to(guid, old.place);
+                let mut lifted = old.clone();
+                lifted.place = Place::Cursor;
+                inv.insert(lifted);
+                let mut placed = new.clone();
+                placed.place = old.place;
+                vec![items::world(rules, item_action::SWAP_IN_BELT, old.guid, &items::lifted(&old, old.place)), items::world(rules, item_action::SWAP_IN_BELT, guid, &placed.placed())]
+            }
+            ItemMove::Drop { guid } => return drop_cursor_item(rules, game, name, guid),
+        };
+        info!(game_id, player = name, ?request, "item moved");
+        out
+    }
+
     /// A joining player's items from its save, held in the game, and the packets that give them
-    /// to its client: `0x9C` action 4 for the inventory, action `0x0E` for the belt. A save holding
-    /// anything else is left as it is and the player carries nothing.
+    /// to its client: `0x9C` action 4 for the inventory, action `0x0E` for the belt, `0x9D` 6 worn.
+    /// A save holding anything else (the stash, the cube, socketed items) is left as it is and the
+    /// player carries nothing.
     fn join_items(&self, p: &Player) -> Vec<Vec<u8>> {
         let Some(rules) = &self.rules else { return Vec::new() };
         let mut g = self.lock();
         let Some(game) = g.by_id.get_mut(&p.game_id) else { return Vec::new() };
         let saved = match &p.save {
             None => Some(Vec::new()),
-            Some(save) => save.simple_items().map(|(items, _)| items),
+            Some(save) => match item_bits::read_save_list(&save.items, rules.items(), rules.item_stats()) {
+                Ok((list, _)) => Some(list),
+                Err(why) => {
+                    warn!(character = %p.character.name, ?why, "its saved items do not read");
+                    None
+                }
+            },
         };
         let mut carried = Carried { inventory: Inventory::default(), complete: saved.is_some() };
         for item in saved.unwrap_or_default() {
-            let place = match (item.mode, item.page) {
-                (2, _) => Place::Belt(item.col),
-                (0, 1) => Place::Grid { col: item.col, row: item.row },
-                _ => {
-                    carried.complete = false;
-                    break;
-                }
-            };
-            let Some(class) = rules.items().class_of(&item.code) else {
+            let (Some(place), Some(class)) = (items::saved_place(&item), rules.items().class_of(&item.code)) else {
                 carried.complete = false;
                 break;
             };
+            if item.socketed > 0 {
+                carried.complete = false;
+                break;
+            }
             let size = rules.items().get(class).map_or((1, 1), |d| d.inv_size);
             let guid = match game.population.as_mut() {
                 Some(population) => population.next_guid(unit_type::ITEM),
@@ -1005,16 +1156,16 @@ impl GameServer {
                     game.spare_item_guid
                 }
             };
-            if !carried.inventory.insert(Held { guid, class, code: item.code, version: item.version, size, place }) {
+            if !carried.inventory.insert(Held { guid, class, size, place, item }) {
                 carried.complete = false;
                 break;
             }
         }
         if !carried.complete {
-            warn!(character = %p.character.name, "its saved items are not all simple ones; it carries nothing this game");
+            warn!(character = %p.character.name, "its saved items are not all ones the server places; it carries nothing this game");
             carried.inventory = Inventory::default();
         }
-        let packets = carried.inventory.items().iter().map(|held| held_packet(rules, held, false)).collect();
+        let packets = carried.inventory.items().iter().filter_map(|held| items::held_packet(rules, held, false)).collect();
         game.carried.insert(p.character.name.clone(), carried);
         packets
     }
@@ -1093,8 +1244,9 @@ fn battle_packet(event: &Event, recipient: &str) -> Option<Vec<u8>> {
     })
 }
 
-/// A treasure class's item code as an item the server can make: a simple (`compactsave`) misc
-/// item that is not gold, a quest item or a stack — potions, scrolls, gems, runes.
+/// A treasure class's item code as a simple item the server makes as it is: a simple
+/// (`compactsave`) misc item that is not gold, a quest item or a stack — potions, scrolls, gems,
+/// runes.
 fn simple_item_class(rules: &GameData, code: &str) -> Option<i32> {
     if code.len() > 4 {
         return None;
@@ -1105,59 +1257,90 @@ fn simple_item_class(rules: &GameData, code: &str) -> Option<i32> {
     simple.then_some(class)
 }
 
-/// The `0x9C` category byte of an item: its `component` (`0x00628660`).
-fn item_category(rules: &GameData, class: i32) -> u8 {
-    rules.items().get(class).map_or(16, |d| u8::try_from(d.component).unwrap_or(16))
+/// The item a treasure class's code makes, by class: a simple item as it is, anything else
+/// through [`loot::make`] (weapons, armour, rings and amulets, charms, stacks); `None` for gold
+/// named by code and codes the tables lack.
+fn make_item(rules: &GameData, code: &str, level: i32, mods: d2_data::treasure::QualityMods, making: loot::Making, made_uniques: &mut HashSet<u16>, seed: u32) -> Option<(i32, Item)> {
+    if code.len() > 4 {
+        return None;
+    }
+    let packed = d2_data::items::code(code);
+    let class = rules.items().class_of(&packed)?;
+    if simple_item_class(rules, code).is_some() {
+        return Some((class, Item::new(packed, making.version, level.clamp(1, 99) as u8, Location::Ground { x: 0, y: 0 })));
+    }
+    if &packed == b"gld " {
+        return None;
+    }
+    loot::make(rules, packed, level, mods, making, made_uniques, seed).map(|item| (class, item))
 }
 
-/// `0x9C` action 0 for something on the ground, `dropping` for the fall.
+/// `0x9C` action 0 for something on the ground, `dropping` for the fall; gold as the game's
+/// `version`.
 fn ground_packet(rules: &GameData, guid: u32, item: &GroundItem, dropping: bool, version: u16) -> Vec<u8> {
-    match item.what {
-        Loot::Gold(amount) => d2gs::ground_gold(guid, item.x, item.y, amount, dropping, version),
-        Loot::Item { class, code } => {
-            let flags = item_flags::SIMPLE | if dropping { item_flags::DROPPED } else { 0 };
-            d2gs::item_world(item_action::ADD_TO_GROUND, item_category(rules, class), guid, flags, version, ItemSpot::Ground { x: item.x, y: item.y }, code)
+    match &item.what {
+        Loot::Gold(amount) => d2gs::ground_gold(guid, item.x, item.y, *amount, dropping, version),
+        Loot::Item { item: body, .. } => {
+            let mut shown = (**body).clone();
+            shown.location = Location::Ground { x: item.x, y: item.y };
+            if dropping {
+                shown.flags |= item_bits::flags::DROPPED;
+            }
+            items::world(rules, item_action::ADD_TO_GROUND, guid, &shown)
         }
     }
 }
 
-/// A held item going into its place (`used` false: `0x9C` action `0x0E` for the belt, 4 for the
-/// inventory) or used up out of it (`0x9C` action `0x0F`, `0x9D` action 5, flagged used).
-fn held_packet(rules: &GameData, held: &Held, used: bool) -> Vec<u8> {
-    let category = item_category(rules, held.class);
-    let flags = HELD_FLAGS | if used { item_flags::USED } else { 0 };
-    match (held.place, used) {
-        (Place::Belt(slot), false) => d2gs::item_world(item_action::PUT_IN_BELT, category, held.guid, flags, held.version, ItemSpot::Belt { slot }, held.code),
-        (Place::Belt(slot), true) => d2gs::item_world(item_action::REMOVE_FROM_BELT, category, held.guid, flags, held.version, ItemSpot::Belt { slot }, held.code),
-        (Place::Grid { col, row }, false) => {
-            d2gs::item_world(item_action::PUT_IN_CONTAINER, category, held.guid, flags, held.version, ItemSpot::Stored { col, row, page: 0 }, held.code)
-        }
-        (Place::Grid { col, row }, true) => d2gs::item_owned(
-            item_action::REMOVE_FROM_CONTAINER,
-            category,
-            held.guid,
-            PLAYER_GUID,
-            flags,
-            held.version,
-            ItemSpot::Stored { col, row, page: 0 },
-            held.code,
-        ),
-    }
+/// An item move a client asks for (`0x17`–`0x1F`, `0x23`–`0x25`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemMove {
+    /// `0x19`: out of the inventory onto the cursor.
+    Lift { guid: u32 },
+    /// `0x18`: the cursor item into a grid at a cell.
+    Insert { guid: u32, col: u32, row: u32, grid: u32 },
+    /// `0x1A`: the cursor item worn.
+    Equip { guid: u32, body: u8 },
+    /// `0x1C`: a worn item onto the cursor.
+    Unequip { body: u8 },
+    /// `0x1D`: the cursor item worn in place of the one there, which goes to the cursor.
+    SwapEquipped { guid: u32, body: u8 },
+    /// `0x1F`: the cursor item into the inventory in place of `other`, which goes to the cursor.
+    SwapGrid { guid: u32, other: u32, col: u32, row: u32 },
+    /// `0x23`: the cursor item into a belt slot.
+    Belt { guid: u32, slot: u32 },
+    /// `0x24`: a belt item onto the cursor.
+    Unbelt { guid: u32 },
+    /// `0x25`: the cursor item into the belt in place of `other`, which goes to the cursor.
+    SwapBelt { guid: u32, other: u32 },
+    /// `0x17`: the cursor item dropped.
+    Drop { guid: u32 },
 }
 
-/// A player's items as its `.d2s` lists them.
-fn saved_items(inventory: &Inventory) -> Vec<SimpleItem> {
-    inventory
-        .items()
-        .iter()
-        .map(|h| {
-            let (mode, col, row, page) = match h.place {
-                Place::Belt(slot) => (2, slot, 0, 0),
-                Place::Grid { col, row } => (0, col, row, 1),
-            };
-            SimpleItem { flags: HELD_FLAGS, version: h.version, mode, body: 0, col, row, page, code: h.code }
-        })
-        .collect()
+/// The cursor item dropped at the player's feet (`0x00563C00`: the spot as [`drop_spot`] finds
+/// one from the player, then `0x9C` action 2 — the client plays the fall — for every player
+/// holding the room). Empty when nothing is on the cursor or there is no spot.
+fn drop_cursor_item(rules: &GameData, game: &mut Game, name: &str, guid: u32) -> Vec<Vec<u8>> {
+    let Some(from) = game.positions.get(name).copied() else { return Vec::new() };
+    let Some(world) = game.world.as_ref() else { return Vec::new() };
+    let ground = &game.ground;
+    let taken = |x: i32, y: i32| ground.values().any(|p| (i32::from(p.x), i32::from(p.y)) == (x, y));
+    let Some((room, x, y)) = drop_spot(world, &taken, from) else { return Vec::new() };
+    let Some(carried) = game.carried.get_mut(name).filter(|c| c.complete) else { return Vec::new() };
+    if !carried.inventory.at(Place::Cursor).is_some_and(|h| h.guid == guid) {
+        return Vec::new();
+    }
+    let Some(held) = carried.inventory.remove(guid) else { return Vec::new() };
+    let mut item = held.item;
+    item.location = Location::Ground { x: x as u16, y: y as u16 };
+    let packet = items::world(rules, item_action::DROP_TO_GROUND, guid, &item);
+    info!(player = name, guid, item = %d2_data::items::code_str(&item.code), x, y, "item dropped");
+    game.ground.insert(guid, GroundItem { room, x: x as u16, y: y as u16, what: Loot::Item { class: held.class, item: Box::new(item) } });
+    for (player, view) in &game.views {
+        if player != name && view.contains(&room) {
+            game.outgoing.entry(player.clone()).or_default().push(packet.clone());
+        }
+    }
+    vec![packet]
 }
 
 /// What a pickup sends its player, and what it put back on the ground for everyone else near.
@@ -1178,8 +1361,8 @@ fn take_gold(rules: &GameData, game: &mut Game, name: &str, guid: u32, amount: u
         if let (Some((room, x, y)), Some(population)) = (spot, game.population.as_mut()) {
             let left = GroundItem { room, x: x as u16, y: y as u16, what: Loot::Gold(amount - taken) };
             let new_guid = population.next_guid(unit_type::ITEM);
-            game.ground.insert(new_guid, left);
             let packet = ground_packet(rules, new_guid, &left, true, game.item_version);
+            game.ground.insert(new_guid, left);
             replies.push(packet.clone());
             dropped = Some((room, packet));
         }
@@ -1187,20 +1370,33 @@ fn take_gold(rules: &GameData, game: &mut Game, name: &str, guid: u32, amount: u
     Some((replies, dropped))
 }
 
-/// A simple item (already off the ground) into a player's belt or inventory: the packet that
-/// gives it to its client. `None` when there is no room or its items are not in hand.
-fn take_item(rules: &GameData, game: &mut Game, name: &str, guid: u32, class: i32, code: [u8; 4]) -> Option<Taken> {
+/// An item (already off the ground) onto a player's cursor (`to_cursor`, `0x9C` action 1), or
+/// worn, into its belt or into its inventory: the packet that gives it to its client. `None` when
+/// there is no room or its items are not in hand.
+fn take_item(rules: &GameData, game: &mut Game, name: &str, guid: u32, class: i32, item: &Item, to_cursor: bool) -> Option<Taken> {
     let def = rules.items().get(class)?;
+    let wearer = game.battle.player_requirements(name).map(|(class, level, strength, dexterity)| items::Wearer { class, level, strength, dexterity });
     let carried = game.carried.get_mut(name).filter(|c| c.complete)?;
-    let belts = def.auto_belt && rules.items().beltable(class);
-    let Some(place) = carried.inventory.place_for(def.inv_size, belts) else {
-        info!(player = name, guid, item = %d2_data::items::code_str(&code), "no room to pick it up");
+    let mut item = item.clone();
+    item.flags &= !item_bits::flags::DROPPED;
+    let place = if to_cursor {
+        Some(Place::Cursor).filter(|_| carried.inventory.at(Place::Cursor).is_none())
+    } else {
+        let worn = wearer.and_then(|w| items::auto_equip(rules, &carried.inventory, class, &item, w)).map(Place::Body);
+        worn.or_else(|| carried.inventory.place_for(def.inv_size, def.auto_belt && rules.items().beltable(class)))
+    };
+    let Some(place) = place else {
+        info!(player = name, guid, item = %d2_data::items::code_str(&item.code), "no room to pick it up");
         return None;
     };
-    let held = Held { guid, class, code, version: game.item_version, size: def.inv_size, place };
+    let held = Held { guid, class, size: def.inv_size, place, item };
+    let packet = match place {
+        Place::Cursor => items::world(rules, item_action::GROUND_TO_CURSOR, guid, &held.placed()),
+        _ => items::held_packet(rules, &held, false)?,
+    };
+    info!(player = name, guid, item = %d2_data::items::code_str(&held.code()), quality = held.item.quality.number(), ?place, "item picked up");
     carried.inventory.insert(held).then_some(())?;
-    info!(player = name, guid, item = %d2_data::items::code_str(&code), ?place, "item picked up");
-    Some((vec![held_packet(rules, &held, false)], None))
+    Some((vec![packet], None))
 }
 
 /// `SendUnitToClient` for a monster: `0xAC`, its alignment state, and `0x6D` unless it is a
@@ -1739,7 +1935,7 @@ async fn run(
                 }
                 (Stage::InGame, cs::PICK_UP_ITEM) => {
                     let Some(p) = player.as_mut() else { continue };
-                    let replies = server.pick_up(p.game_id, &p.character.name, u32_at(5));
+                    let replies = server.pick_up(p.game_id, &p.character.name, u32_at(5), u32_at(9) != 0);
                     if !replies.is_empty() {
                         for packet in &replies {
                             outbox.push(packet);
@@ -1758,6 +1954,44 @@ async fn run(
                         flush(stream, peer, tables, &mut outbox).await?;
                         server.save_character(p).await;
                     }
+                }
+                (
+                    Stage::InGame,
+                    op @ (cs::DROP_ITEM
+                    | cs::INSERT_ITEM
+                    | cs::LIFT_ITEM
+                    | cs::EQUIP_ITEM
+                    | cs::UNEQUIP_ITEM
+                    | cs::SWAP_EQUIPPED
+                    | cs::SWAP_GRID_ITEM
+                    | cs::BELT_ITEM
+                    | cs::UNBELT_ITEM
+                    | cs::SWAP_BELT_ITEM),
+                ) => {
+                    let Some(p) = player.as_mut() else { continue };
+                    let body = |at: usize| u8::try_from(u32_at(at)).unwrap_or(0);
+                    let request = match op {
+                        cs::DROP_ITEM => ItemMove::Drop { guid: u32_at(1) },
+                        cs::INSERT_ITEM => ItemMove::Insert { guid: u32_at(1), col: u32_at(5), row: u32_at(9), grid: u32_at(13) },
+                        cs::LIFT_ITEM => ItemMove::Lift { guid: u32_at(1) },
+                        cs::EQUIP_ITEM => ItemMove::Equip { guid: u32_at(1), body: body(5) },
+                        cs::UNEQUIP_ITEM => ItemMove::Unequip { body: u8::try_from(u16_at(1)).unwrap_or(0) },
+                        cs::SWAP_EQUIPPED => ItemMove::SwapEquipped { guid: u32_at(1), body: body(5) },
+                        cs::SWAP_GRID_ITEM => ItemMove::SwapGrid { guid: u32_at(1), other: u32_at(5), col: u32_at(9), row: u32_at(13) },
+                        cs::BELT_ITEM => ItemMove::Belt { guid: u32_at(1), slot: u32_at(5) },
+                        cs::UNBELT_ITEM => ItemMove::Unbelt { guid: u32_at(1) },
+                        _ => ItemMove::SwapBelt { guid: u32_at(1), other: u32_at(5) },
+                    };
+                    let replies = server.move_item(p.game_id, &p.character.name, request);
+                    if replies.is_empty() {
+                        debug!(game_id = p.game_id, player = %p.character.name, ?request, "item move refused");
+                        continue;
+                    }
+                    for packet in &replies {
+                        outbox.push(packet);
+                    }
+                    flush(stream, peer, tables, &mut outbox).await?;
+                    server.save_character(p).await;
                 }
                 (Stage::InGame, cs::NPC_TALK) => {
                     let Some(p) = player.as_ref() else { continue };
@@ -1972,7 +2206,12 @@ async fn flush(stream: &mut TcpStream, peer: SocketAddr, tables: &EngineTables, 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use bnetcc_proto::d2gs::{Huffman, CLIENT_OPCODES, SERVER_OPCODES};
+    use bnetcc_proto::d2gs::{item_flags, Huffman, ItemSpot, CLIENT_OPCODES, SERVER_OPCODES};
+
+    /// A simple item as treasure makes it.
+    fn simple_item(code: &[u8; 4], version: u16) -> Box<Item> {
+        Box::new(Item::new(*code, version, 1, Location::Ground { x: 0, y: 0 }))
+    }
 
     /// Tables shaped like the engine's for the packets the join uses, with a made-up
     /// complete Huffman code (no Blizzard data in tests).
@@ -2075,6 +2314,8 @@ pub(crate) mod tests {
         assert_eq!(out, vec![0x05, 0x7A, 0x09, 0xA5, 0xF0]);
         let size = |op: u8| engine.client_packet_sizes[usize::from(op)];
         assert_eq!((size(cs::PICK_UP_ITEM), size(cs::USE_ITEM), size(cs::USE_BELT_ITEM)), (13, 13, 13), "the item packets' lengths");
+        let moves = [cs::DROP_ITEM, cs::INSERT_ITEM, cs::LIFT_ITEM, cs::EQUIP_ITEM, cs::UNEQUIP_ITEM, cs::SWAP_EQUIPPED, cs::SWAP_GRID_ITEM, cs::BELT_ITEM, cs::UNBELT_ITEM, cs::SWAP_BELT_ITEM];
+        assert_eq!(moves.map(size), [5, 17, 5, 9, 3, 9, 17, 9, 5, 9], "the item move packets' lengths");
     }
 
     #[test]
@@ -2629,12 +2870,12 @@ pub(crate) mod tests {
         assert!(!again.iter().any(|p| p[0] == 0x6D), "a corpse is not stood up");
         assert!(again.iter().any(|p| p[0] == 0x9C && p[4..8] == pile.to_le_bytes() && p[9] & 0x20 == 0), "the pile lies there");
         assert_eq!(gs.unit_position(id, u32::from(unit_type::ITEM), pile), Some((5782, 4503)), "two right and three down");
-        let got = gs.pick_up(id, "Hero", pile);
+        let got = gs.pick_up(id, "Hero", pile, false);
         assert_eq!(got[0], d2gs::remove_unit(unit_type::ITEM, pile));
         let gold = gs.lock().by_id[&id].battle.player_stats("Hero").unwrap().iter().find(|s| s.0 == stat::GOLD).unwrap().1;
         assert!((1..=5).contains(&gold), "level 1: 1 + rand(5): {gold}");
         assert_eq!(got[1], [0x19, gold as u8], "a small gain");
-        assert!(gs.pick_up(id, "Hero", pile).is_empty(), "once");
+        assert!(gs.pick_up(id, "Hero", pile, false).is_empty(), "once");
         gs.view_change(id, &[room], &[]);
         assert!(!gs.view_change(id, &[], &[room]).iter().any(|p| p[0] == 0x9C), "gone for good");
     }
@@ -2682,14 +2923,14 @@ pub(crate) mod tests {
         }
         gs.view_change(id, &[], &[room]);
         gs.lock().by_id.get_mut(&id).unwrap().ground.insert(77, GroundItem { room, x: x + 3, y, what: Loot::Gold(25) });
-        let got = gs.pick_up(id, "Hero", 77);
+        let got = gs.pick_up(id, "Hero", 77, false);
         assert_eq!(got[..2], [d2gs::remove_unit(unit_type::ITEM, 77), vec![0x19, 10]], "10 fit");
-        let (left, pile) = gs.lock().by_id[&id].ground.iter().map(|(&g, &p)| (g, p)).next().unwrap();
+        let (left, pile) = gs.lock().by_id[&id].ground.iter().map(|(&g, p)| (g, p.clone())).next().unwrap();
         assert_eq!((pile.x, pile.y, pile.what), (x + 2, y + 3, Loot::Gold(15)), "placed as drops are");
         assert_eq!(got[2], d2gs::ground_gold(left, x + 2, y + 3, 15, true, 101));
         let friend = gs.lock().by_id.get_mut(&id).unwrap().outgoing.remove("Friend").unwrap();
         assert_eq!(friend, [got[0].clone(), got[2].clone()], "the one near sees both");
-        assert!(gs.pick_up(id, "Hero", left).is_empty(), "a full purse takes nothing");
+        assert!(gs.pick_up(id, "Hero", left, false).is_empty(), "a full purse takes nothing");
     }
 
     /// Made-up item tables in the real shapes: Minor Healing and Mana Potions (belted), a
@@ -2698,9 +2939,9 @@ pub(crate) mod tests {
         use d2_data::items::Items;
         use d2_formats::excel::Table;
         let itemtypes = Table::parse(
-            b"ItemType\tCode\tEquiv1\tBeltable\r\nPotion\tpoti\t\t1\r\nHealing Potion\thpot\tpoti\t1\r\nGem\tgem\t\t0\r\nKey\tkey\t\t0\r\nAxe\taxe\t\t0\r\n",
+            b"ItemType\tCode\tEquiv1\tBeltable\tBodyLoc1\tBodyLoc2\r\nPotion\tpoti\t\t1\t\t\r\nHealing Potion\thpot\tpoti\t1\t\t\r\nGem\tgem\t\t0\t\t\r\nKey\tkey\t\t0\t\t\r\nWeapon\tweap\t\t0\t\t\r\nAxe\taxe\tweap\t0\trarm\tlarm\r\n",
         );
-        let weapons = Table::parse(b"name\tcode\ttype\tcompactsave\tcomponent\r\nHand Axe\thax\taxe\t0\t5\r\n");
+        let weapons = Table::parse(b"name\tcode\ttype\tcompactsave\tcomponent\tinvwidth\tinvheight\tdurability\tmindam\tmaxdam\r\nHand Axe\thax\taxe\t0\t5\t1\t3\t28\t3\t6\r\n");
         let armor = Table::parse(b"name\tcode\ttype\r\n");
         let misc = Table::parse(
             b"name\tcode\ttype\tcomponent\tinvwidth\tinvheight\tcompactsave\tautobelt\tstackable\tuseable\tpSpell\tlen\tstat1\tcalc1\tstat2\tcalc2\r\n\
@@ -2710,7 +2951,83 @@ pub(crate) mod tests {
               Skeleton Key\tkey\tkey\t16\t1\t1\t0\t0\t1\t0\t\t\t\t\t\t\r\n",
         );
         rules.set_items(Items::from_tables(&itemtypes, &weapons, &armor, &misc).unwrap(), Vec::new());
+        let stats = d2_data::item_stats::ItemStats::from_table(&Table::parse(
+            b"Stat\tID\tSave Bits\tSave Add\tSave Param Bits\tValShift\r\narmorclass\t31\t11\t10\t\t\r\ndurability\t72\t8\t0\t\t\r\nmaxdurability\t73\t8\t0\t\t\r\ntohit\t19\t10\t0\t\t\r\nitem_numsockets\t194\t4\t0\t\t\r\n",
+        ))
+        .unwrap();
+        rules.set_item_rules(stats, d2_data::item_stats::ItemRatios::default());
         rules
+    }
+
+    /// A hand axe picked up is worn in the empty right hand; a second, which an Amazon cannot
+    /// hold beside it, goes to the inventory. Lifted, swapped with the worn one, put back, lifted
+    /// and dropped, each move answered with the packet the engine sends; what is worn is saved and
+    /// comes back worn.
+    #[tokio::test]
+    async fn weapons_are_worn_moved_dropped_saved_and_brought_back() {
+        use bnetcc_storage::memory::MemoryStorage;
+        use bnetcc_storage::model::Credential;
+        let storage = crate::storage::spawn(Box::new(MemoryStorage::new()));
+        let owner = storage.create_account("Owner", Credential::Xsha1 { digest: [1; 20] }).await.unwrap();
+        let mut hero = character("Hero", 0, 0x20);
+        hero.account = owner.id;
+        storage.create_character(hero.clone()).await.unwrap();
+        let (rules, town) = test_town();
+        let rules = item_rules(rules);
+        let hax = rules.items().class_of(b"hax ").unwrap();
+        let gs = GameServer::new(test_tables(), Some(rules)).with_town(town).with_storage(storage.clone());
+        let id = gs.create("arms", "", 0).unwrap();
+        let (x, y) = gs.lock().by_id[&id].spawn;
+        let room = gs.lock().by_id[&id].world.as_ref().unwrap().room_at(i32::from(x), i32::from(y)).unwrap();
+        let mut p = Player::new(id, hero.clone(), 0, 0, (x, y));
+        let stats = p.join_stats(gs.rules.as_ref().unwrap()).unwrap();
+        gs.join_battle(id, "Hero", 0, &stats);
+        gs.join_items(&p);
+        gs.set_position(id, "Hero", f64::from(x), f64::from(y));
+        gs.set_view(id, "Hero", &[room]);
+        let rules = gs.rules.clone().unwrap();
+        let read_bits = |packet: &[u8]| {
+            let at = if packet[0] == 0x9D { 13 } else { 8 };
+            item_bits::read(&packet[at..], rules.items(), rules.item_stats(), item_bits::Target::Network).unwrap().0
+        };
+        for guid in [200, 201] {
+            let mut axe = Item::new(*b"hax ", 101, 5, Location::Ground { x: 0, y: 0 });
+            (axe.max_durability, axe.durability) = (28, 20);
+            gs.lock().by_id.get_mut(&id).unwrap().ground.insert(guid, GroundItem { room, x: x + 1, y, what: Loot::Item { class: hax, item: Box::new(axe) } });
+        }
+        let worn = gs.pick_up(id, "Hero", 200, false);
+        assert_eq!((worn[1][0], worn[1][1], worn[1][3]), (0x9D, item_action::EQUIP, 5), "worn, category 5");
+        let item = read_bits(&worn[1]);
+        assert_eq!((item.location, item.durability, item.max_durability), (Location::Equipped { body: 4 }, 20, 28));
+        let carried = gs.pick_up(id, "Hero", 201, false);
+        assert_eq!((carried[1][1], read_bits(&carried[1]).location), (item_action::PUT_IN_CONTAINER, Location::Stored { col: 0, row: 0, page: 0 }));
+
+        let mv = |request| gs.move_item(id, "Hero", request);
+        assert!(mv(ItemMove::Equip { guid: 201, body: 5 }).is_empty(), "not on the cursor");
+        let lifted = mv(ItemMove::Lift { guid: 201 });
+        assert_eq!((lifted[0][1], read_bits(&lifted[0]).location), (item_action::REMOVE_FROM_CONTAINER, Location::Cursor { body: 0, col: 0, row: 0, page: Some(0) }));
+        assert!(mv(ItemMove::Equip { guid: 201, body: 5 }).is_empty(), "no second axe beside the first");
+        assert!(mv(ItemMove::Equip { guid: 201, body: 1 }).is_empty(), "not on the head");
+        let swapped = mv(ItemMove::SwapEquipped { guid: 201, body: 4 });
+        let (out, into) = (read_bits(&swapped[0]), read_bits(&swapped[1]));
+        assert_eq!((swapped[0][1], swapped[1][1]), (item_action::SWAP_BODY, item_action::SWAP_BODY));
+        assert_eq!((out.location, out.flags & 0xC1, into.location, into.flags & 0xC1), (Location::Cursor { body: 4, col: 0, row: 0, page: None }, 0x81, Location::Equipped { body: 4 }, 0x41));
+        let put = mv(ItemMove::Insert { guid: 200, col: 2, row: 0, grid: 0 });
+        assert_eq!((put[0][1], read_bits(&put[0]).location), (item_action::PUT_IN_CONTAINER, Location::Stored { col: 2, row: 0, page: 0 }));
+        assert!(mv(ItemMove::Insert { guid: 200, col: 9, row: 3, grid: 0 }).is_empty(), "no longer on the cursor");
+        mv(ItemMove::Lift { guid: 200 });
+        let dropped = mv(ItemMove::Drop { guid: 200 });
+        assert_eq!((dropped[0][0], dropped[0][1]), (0x9C, item_action::DROP_TO_GROUND));
+        assert!(matches!(read_bits(&dropped[0]).location, Location::Ground { .. }));
+        assert!(gs.lock().by_id[&id].ground.contains_key(&200), "on the ground for anyone");
+
+        gs.save_character(&mut p).await;
+        let stored = storage.character_by_name("Hero").await.unwrap();
+        gs.leave(id, "Hero");
+        let again = gs.create("again", "", 0).unwrap();
+        let back = gs.join_items(&Player::new(again, stored, 0, 0, (x, y)));
+        assert_eq!(back.len(), 1);
+        assert_eq!((back[0][1], read_bits(&back[0]).location), (item_action::EQUIP, Location::Equipped { body: 4 }));
     }
 
     #[test]
@@ -2720,7 +3037,7 @@ pub(crate) mod tests {
         assert!(class("hp1").is_some() && class("rvs").is_some() && class("gcr").is_some());
         assert_eq!((class("key"), class("hax"), class("gld"), class("weap3"), class("hp1x")), (None, None, None, None, None), "stacks, equipment, gold and type picks are not");
         let hp1 = class("hp1").unwrap();
-        let on_ground = GroundItem { room: RoomId { level: 2, index: 0 }, x: 10, y: 20, what: Loot::Item { class: hp1, code: *b"hp1 " } };
+        let on_ground = GroundItem { room: RoomId { level: 2, index: 0 }, x: 10, y: 20, what: Loot::Item { class: hp1, item: simple_item(b"hp1 ", 2) } };
         assert_eq!(
             ground_packet(&rules, 5, &on_ground, true, 2),
             d2gs::item_world(item_action::ADD_TO_GROUND, 16, 5, 0x00A0_2010, 2, ItemSpot::Ground { x: 10, y: 20 }, *b"hp1 ")
@@ -2754,7 +3071,7 @@ pub(crate) mod tests {
         gs.set_position(id, "Hero", f64::from(x), f64::from(y));
         gs.set_view(id, "Hero", &[room]);
         let put = |guid: u32, class: i32, code: &[u8; 4], dx: u16| {
-            gs.lock().by_id.get_mut(&id).unwrap().ground.insert(guid, GroundItem { room, x: x + dx, y, what: Loot::Item { class, code: *code } });
+            gs.lock().by_id.get_mut(&id).unwrap().ground.insert(guid, GroundItem { room, x: x + dx, y, what: Loot::Item { class, item: simple_item(code, 101) } });
         };
         for guid in 100..105 {
             put(guid, hp1, b"hp1 ", (guid - 99) as u16);
@@ -2762,14 +3079,14 @@ pub(crate) mod tests {
         put(105, gcr, b"gcr ", 7);
         let simple = item_flags::SIMPLE;
         for (guid, slot) in (100..104).zip(0u8..) {
-            let got = gs.pick_up(id, "Hero", guid);
+            let got = gs.pick_up(id, "Hero", guid, false);
             assert_eq!(got, [d2gs::remove_unit(unit_type::ITEM, guid), d2gs::item_world(0x0E, 16, guid, simple, 101, ItemSpot::Belt { slot }, *b"hp1 ")]);
         }
-        let fifth = gs.pick_up(id, "Hero", 104);
+        let fifth = gs.pick_up(id, "Hero", 104, false);
         assert_eq!(fifth[1], d2gs::item_world(4, 16, 104, simple, 101, ItemSpot::Stored { col: 9, row: 3, page: 0 }, *b"hp1 "), "the belt is full");
-        let gem = gs.pick_up(id, "Hero", 105);
+        let gem = gs.pick_up(id, "Hero", 105, false);
         assert_eq!(gem[1], d2gs::item_world(4, 16, 105, simple, 101, ItemSpot::Stored { col: 9, row: 2, page: 0 }, *b"gcr "));
-        assert!(gs.pick_up(id, "Hero", 105).is_empty(), "once");
+        assert!(gs.pick_up(id, "Hero", 105, false).is_empty(), "once");
 
         // Drinking: from the belt, and from the inventory by its own packet only.
         assert!(gs.use_item(id, "Hero", 101, false).is_empty(), "a belt potion is not used as an inventory one");
@@ -2781,7 +3098,7 @@ pub(crate) mod tests {
         // A rejuvenation potion picked up takes the free belt slot and tells the client its
         // life and mana when drunk.
         put(106, rvs, b"rvs ", 8);
-        assert_eq!(gs.pick_up(id, "Hero", 106)[1], d2gs::item_world(0x0E, 16, 106, simple, 101, ItemSpot::Belt { slot: 1 }, *b"rvs "));
+        assert_eq!(gs.pick_up(id, "Hero", 106, false)[1], d2gs::item_world(0x0E, 16, 106, simple, 101, ItemSpot::Belt { slot: 1 }, *b"rvs "));
         let drunk = gs.use_item(id, "Hero", 106, true);
         assert_eq!((drunk.len(), drunk[1][0]), (2, 0x95), "{drunk:02x?}");
 
@@ -2789,9 +3106,12 @@ pub(crate) mod tests {
         gs.save_character(&mut p).await;
         let stored = storage.character_by_name("Hero").await.unwrap();
         let save = Save::parse(stored.save.as_deref().unwrap()).unwrap();
-        let (items, _) = save.simple_items().unwrap();
-        let held: Vec<(u8, u8, u8, [u8; 4])> = items.iter().map(|i| (i.mode, i.col, i.page, i.code)).collect();
-        assert_eq!(held, [(2, 0, 0, *b"hp1 "), (2, 2, 0, *b"hp1 "), (2, 3, 0, *b"hp1 "), (0, 9, 1, *b"gcr ")]);
+        let rules = gs.rules.as_ref().unwrap();
+        let (saved, _) = item_bits::read_save_list(&save.items, rules.items(), rules.item_stats()).unwrap();
+        let held: Vec<(Location, [u8; 4])> = saved.iter().map(|i| (i.location, i.code)).collect();
+        let (belt, grid) = (|slot| Location::Belt { slot }, Location::Stored { col: 9, row: 2, page: 0 });
+        assert_eq!(held, [(belt(0), *b"hp1 "), (belt(2), *b"hp1 "), (belt(3), *b"hp1 "), (grid, *b"gcr ")]);
+        assert!(save.items.ends_with(b"JM\0\0jfkf\0"), "the corpse's list and the expansion blocks follow");
         gs.leave(id, "Hero");
         let id = gs.create("again", "", 0).unwrap();
         let q = Player::new(id, stored, 0, 0, (x, y));
@@ -2808,13 +3128,13 @@ pub(crate) mod tests {
             let mut guid = 1000;
             while let Some(place) = carried.inventory.place_for((1, 1), true) {
                 guid += 1;
-                carried.inventory.insert(Held { guid, class: gcr, code: *b"gcr ", version: 101, size: (1, 1), place });
+                carried.inventory.insert(Held { guid, class: gcr, size: (1, 1), place, item: *simple_item(b"gcr ", 101) });
             }
         }
         let (x2, y2) = gs.lock().by_id[&id].spawn;
         let room2 = gs.lock().by_id[&id].world.as_ref().unwrap().room_at(i32::from(x2), i32::from(y2)).unwrap();
-        gs.lock().by_id.get_mut(&id).unwrap().ground.insert(7, GroundItem { room: room2, x: x2, y: y2, what: Loot::Item { class: hp1, code: *b"hp1 " } });
-        assert!(gs.pick_up(id, "Hero", 7).is_empty());
+        gs.lock().by_id.get_mut(&id).unwrap().ground.insert(7, GroundItem { room: room2, x: x2, y: y2, what: Loot::Item { class: hp1, item: simple_item(b"hp1 ", 101) } });
+        assert!(gs.pick_up(id, "Hero", 7, false).is_empty());
         assert!(gs.lock().by_id[&id].ground.contains_key(&7), "still there");
     }
 
@@ -3106,7 +3426,7 @@ pub(crate) mod tests {
         for code in ["hp1", "hp5", "mp1", "mp5", "rvs", "rvl", "yps", "vps", "wms", "isc", "tsc", "gcv", "gfr", "skc", "r01"] {
             let class = simple_item_class(&rules, code).unwrap_or_else(|| panic!("{code} is simple"));
             let def = items.get(class).unwrap();
-            assert_eq!((def.inv_size, item_category(&rules, class)), ((1, 1), 16), "{code}");
+            assert_eq!((def.inv_size, items::category(&rules, &def.code)), ((1, 1), 16), "{code}");
         }
         for code in ["key", "aqv", "cqv", "opl", "rin", "amu", "jew", "cm1", "weap3", "armo6", "gld"] {
             assert_eq!(simple_item_class(&rules, code), None, "{code} is not made");

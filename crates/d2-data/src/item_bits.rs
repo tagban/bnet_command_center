@@ -21,6 +21,8 @@ use crate::items::{Code, Items};
 pub mod flags {
     /// Identified.
     pub const IDENTIFIED: u32 = 0x10;
+    /// On the packet taking out an item used up (`0x00561E70`, `0x0055E000`).
+    pub const USED: u32 = 0x20;
     /// Has sockets: the socket count is written.
     pub const SOCKETED: u32 = 0x800;
     /// Just placed in the world: the client plays the fall.
@@ -72,8 +74,18 @@ pub enum Location {
         /// World subtiles.
         y: u16,
     },
-    /// Mode 4: on the cursor.
-    Cursor,
+    /// Mode 4: on the cursor, keeping the fields of where it came from: the body location it was
+    /// worn at, or the grid spot and page it was lifted from (`0x0053D010` writes the old page).
+    Cursor {
+        /// Body location.
+        body: u8,
+        /// Column.
+        col: u8,
+        /// Row.
+        row: u8,
+        /// Page, `None` when it came from no grid.
+        page: Option<u8>,
+    },
     /// Mode 5: falling to the ground.
     Dropping {
         /// World subtiles.
@@ -94,7 +106,7 @@ impl Location {
             Self::Equipped { .. } => 1,
             Self::Belt { .. } => 2,
             Self::Ground { .. } => 3,
-            Self::Cursor => 4,
+            Self::Cursor { .. } => 4,
             Self::Dropping { .. } => 5,
             Self::Socketed => 6,
         }
@@ -458,6 +470,7 @@ pub fn write(item: &Item, items: &Items, stats: &ItemStats, target: Target) -> V
                 Location::Stored { col, row, page } => (0, col, row, page + 1),
                 Location::Equipped { body } => (body, 0, 0, 0),
                 Location::Belt { slot } => (0, slot, 0, 0),
+                Location::Cursor { body, col, row, page } => (body, col, row, page.map_or(0, |p| p + 1)),
                 _ => (0, 0, 0, 0),
             };
             w.clamped(u32::from(body), 4);
@@ -633,7 +646,7 @@ pub fn read(bytes: &[u8], items: &Items, stats: &ItemStats, target: Target) -> R
             0 => Location::Stored { col, row, page: page.saturating_sub(1) },
             1 => Location::Equipped { body },
             2 => Location::Belt { slot: col },
-            4 => Location::Cursor,
+            4 => Location::Cursor { body, col, row, page: page.checked_sub(1) },
             _ => Location::Socketed,
         }
     };
@@ -770,6 +783,45 @@ fn read_realm(r: &mut Reader) -> Result<Option<(u32, u32)>, ReadError> {
     Ok(Some(pair))
 }
 
+/// A `.d2s` item list (`JM`, a count, the items): what it holds and the bytes it took. The count
+/// leaves out items in sockets, which follow the item holding them.
+///
+/// # Errors
+///
+/// [`ReadError`] as [`read`], [`ReadError::NoMarker`] without the list's `JM`.
+pub fn read_save_list(bytes: &[u8], items: &Items, stats: &ItemStats) -> Result<(Vec<Item>, usize), ReadError> {
+    if bytes.get(..2) != Some(b"JM") {
+        return Err(ReadError::NoMarker);
+    }
+    let count = u16::from_le_bytes([*bytes.get(2).ok_or(ReadError::Truncated)?, *bytes.get(3).ok_or(ReadError::Truncated)?]);
+    let mut at = 4;
+    let mut list = Vec::new();
+    for _ in 0..count {
+        let (item, used) = read(&bytes[at..], items, stats, Target::Save)?;
+        at += used;
+        let socketed = item.socketed;
+        list.push(item);
+        for _ in 0..socketed {
+            let (inside, used) = read(&bytes[at..], items, stats, Target::Save)?;
+            at += used;
+            list.push(inside);
+        }
+    }
+    Ok((list, at))
+}
+
+/// A `.d2s` item list of `list`, items in sockets after the item holding them.
+#[must_use]
+pub fn write_save_list(list: &[Item], items: &Items, stats: &ItemStats) -> Vec<u8> {
+    let count = list.iter().filter(|i| i.location != Location::Socketed).count() as u16;
+    let mut out = b"JM".to_vec();
+    out.extend_from_slice(&count.to_le_bytes());
+    for item in list {
+        out.extend_from_slice(&write(item, items, stats, Target::Save));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,5 +924,9 @@ mod tests {
         let gold = write(&plain, &items, &stats, Target::Network);
         assert_eq!(&gold[..5], &[0x10, 0x20, 0xA0, 0x00, 0x65], "a compact item keeps the simple layout");
         assert_eq!(read(&gold, &items, &stats, Target::Network).unwrap().0.gold, 37);
+        let mut list = write_save_list(&[ring.clone(), Item::new(code("rin"), 101, 5, Location::Stored { col: 2, row: 1, page: 0 })], &items, &stats);
+        list.extend_from_slice(b"JM\0\0");
+        let (read_back, end) = read_save_list(&list, &items, &stats).unwrap();
+        assert_eq!((read_back.len(), read_back[1].location, &list[end..]), (2, Location::Stored { col: 2, row: 1, page: 0 }, &b"JM\0\0"[..]), "the corpse list follows");
     }
 }

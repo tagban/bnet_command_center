@@ -174,6 +174,36 @@ pub mod cs {
     /// Start talking to an NPC whose menu opened: `[unit type u32][guid u32]` (9 bytes; engine
     /// handler `0x0054B930`).
     pub const NPC_TALK: u8 = 0x2F;
+    /// Drop the cursor item: `[item guid u32]` (5 bytes; engine handler `0x0054AB40` →
+    /// `0x00563C00`).
+    pub const DROP_ITEM: u8 = 0x17;
+    /// Put the cursor item into a grid: `[item guid u32][x u32][y u32][grid u32]` (17 bytes; grid 0
+    /// the inventory, 3 the cube, 4 the stash; `0x0054ABB0` → `0x00560200`).
+    pub const INSERT_ITEM: u8 = 0x18;
+    /// Lift an item out of a grid onto the cursor: `[item guid u32]` (5 bytes; `0x0054ACD0` →
+    /// `0x00560420`).
+    pub const LIFT_ITEM: u8 = 0x19;
+    /// Wear the cursor item: `[item guid u32][body location u32]` (9 bytes; `0x0054AD90` →
+    /// `0x005606B0`).
+    pub const EQUIP_ITEM: u8 = 0x1A;
+    /// Take off a worn item onto the cursor: `[body location u16]` (3 bytes; `0x0054AEC0` →
+    /// `0x00560CD0`).
+    pub const UNEQUIP_ITEM: u8 = 0x1C;
+    /// Wear the cursor item in place of a worn one, which goes to the cursor: `[item guid
+    /// u32][body location u32]` (9 bytes; `0x0054AF50` → `0x00560F00`).
+    pub const SWAP_EQUIPPED: u8 = 0x1D;
+    /// Put the cursor item into a grid in place of the item there: `[cursor guid u32][grid item
+    /// guid u32][x u32][y u32]` (17 bytes; `0x0054B0F0` → `0x00561B00`).
+    pub const SWAP_GRID_ITEM: u8 = 0x1F;
+    /// Put the cursor item in the belt: `[item guid u32][slot u32]` (9 bytes; `0x0054B3E0` →
+    /// `0x0055E9B0`).
+    pub const BELT_ITEM: u8 = 0x23;
+    /// Lift a belt item onto the cursor: `[item guid u32]` (5 bytes; `0x0054B450` →
+    /// `0x00562250`).
+    pub const UNBELT_ITEM: u8 = 0x24;
+    /// Put the cursor item in the belt in place of a belt item: `[cursor guid u32][belt item guid
+    /// u32]` (9 bytes; `0x0054B4E0` → `0x0055EB30`).
+    pub const SWAP_BELT_ITEM: u8 = 0x25;
     /// Use an item in the inventory: `[item guid u32][x u32][y u32]` (13 bytes; engine handler
     /// `0x0054B1E0` → `0x0055E170`).
     pub const USE_ITEM: u8 = 0x20;
@@ -711,6 +741,21 @@ pub fn set_stat(stat: u8, value: u32) -> Vec<u8> {
 pub mod item_action {
     /// `0x9C`: made on the ground (`0x004C25B0`).
     pub const ADD_TO_GROUND: u8 = 0x00;
+    /// `0x9C`: from the ground onto the cursor (`0x004C2650`; the item must be in mode 4).
+    pub const GROUND_TO_CURSOR: u8 = 0x01;
+    /// `0x9C`: dropped from the cursor (`0x004C26F0`).
+    pub const DROP_TO_GROUND: u8 = 0x02;
+    /// `0x9D`: worn (`0x004C2E90`).
+    pub const EQUIP: u8 = 0x06;
+    /// `0x9D`: taken off onto the cursor (`0x004C3380`).
+    pub const UNEQUIP: u8 = 0x08;
+    /// `0x9D`: a worn item and the cursor item trade places, one packet each: item flag `0x40` on
+    /// the one worn, `0x80` on the one lifted (`0x004C3920`).
+    pub const SWAP_BODY: u8 = 0x09;
+    /// `0x9C`: the cursor item and a grid item trade places (`0x004C40D0`).
+    pub const SWAP_IN_CONTAINER: u8 = 0x0D;
+    /// `0x9C`: the cursor item and a belt item trade places (`0x004C45C0`).
+    pub const SWAP_IN_BELT: u8 = 0x10;
     /// `0x9C`: into a grid — made there when the client has no such unit (`0x004C2AD0`).
     pub const PUT_IN_CONTAINER: u8 = 0x04;
     /// `0x9C`: into a belt slot (`0x004C4130`).
@@ -805,15 +850,31 @@ pub fn item_owned(action: u8, category: u8, guid: u32, owner: u32, flags: u32, v
 }
 
 fn item_packet(opcode: u8, action: u8, category: u8, guid: u32, owner: Option<u32>, bits: BitWriter) -> Vec<u8> {
+    item_packet_bytes(opcode, action, category, guid, owner, &bits.bytes[..bits.bytes_used()])
+}
+
+fn item_packet_bytes(opcode: u8, action: u8, category: u8, guid: u32, owner: Option<u32>, bits: &[u8]) -> Vec<u8> {
     let mut p = vec![opcode, action, 0, category];
     p.extend_from_slice(&guid.to_le_bytes());
     if let Some(owner) = owner {
         p.push(0);
         p.extend_from_slice(&owner.to_le_bytes());
     }
-    p.extend_from_slice(&bits.bytes[..bits.bytes_used()]);
-    p[2] = p.len() as u8;
+    p.extend_from_slice(bits);
+    p[2] = p.len().min(255) as u8;
     p
+}
+
+/// `0x9C` carrying an item's bits as written elsewhere (a full item's: quality, stats, sockets).
+#[must_use]
+pub fn item_world_bits(action: u8, category: u8, guid: u32, bits: &[u8]) -> Vec<u8> {
+    item_packet_bytes(sc::ITEM_ACTION_WORLD, action, category, guid, None, bits)
+}
+
+/// `0x9D` carrying an item's bits as written elsewhere, for the player owning it.
+#[must_use]
+pub fn item_owned_bits(action: u8, category: u8, guid: u32, owner: u32, bits: &[u8]) -> Vec<u8> {
+    item_packet_bytes(sc::ITEM_ACTION_OWNED, action, category, guid, Some(owner), bits)
 }
 
 /// `0x9C` action 0 for a gold pile at `(x, y)` (flags identified, simple and written, with

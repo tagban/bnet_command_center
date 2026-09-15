@@ -8,6 +8,10 @@
 //! The inventory is 10 × 4. The belt without a belt worn has one row of four slots (the engine
 //! reads the box count from `Belts.txt`; belts are not worn yet, so it is fixed here). Belt slot
 //! `n` is the item's grid column `n`, row 0 (`0x0063AFD0` with grid 1).
+//!
+//! Worn items sit at their body location (1 head … 10 gloves); at most one item is on the cursor.
+
+use d2_data::item_bits::{Item, Location};
 
 /// Inventory columns.
 pub const GRID_WIDTH: u8 = 10;
@@ -15,6 +19,9 @@ pub const GRID_WIDTH: u8 = 10;
 pub const GRID_HEIGHT: u8 = 4;
 /// Belt slots with no belt worn.
 pub const BELT_SLOTS: u8 = 4;
+
+/// Body locations (`BodyLocs.txt`): 1 head … 10 gloves.
+pub const BODY_LOCATIONS: std::ops::RangeInclusive<u8> = 1..=10;
 
 /// Where a held item is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,31 +35,52 @@ pub enum Place {
     },
     /// A belt slot.
     Belt(u8),
+    /// Worn at a body location.
+    Body(u8),
+    /// On the cursor.
+    Cursor,
 }
 
 /// An item a player holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Held {
     /// Its unit guid in the game.
     pub guid: u32,
     /// Its item class (index into the item tables).
     pub class: i32,
-    /// Its code, space-padded.
-    pub code: [u8; 4],
-    /// The item version it was made with (101 in an expansion game, 2 in a classic one).
-    pub version: u16,
     /// Inventory cells, width × height.
     pub size: (u8, u8),
     /// Where it is.
     pub place: Place,
+    /// The item itself: code, version, quality, stats.
+    pub item: Item,
 }
 
 impl Held {
     fn covers(&self, col: u8, row: u8) -> bool {
         match self.place {
             Place::Grid { col: c, row: r } => (c..c + self.size.0).contains(&col) && (r..r + self.size.1).contains(&row),
-            Place::Belt(_) => false,
+            _ => false,
         }
+    }
+
+    /// Its code, space-padded.
+    #[must_use]
+    pub fn code(&self) -> [u8; 4] {
+        self.item.code
+    }
+
+    /// The item with the location its place gives (a cursor item keeps no fields).
+    #[must_use]
+    pub fn placed(&self) -> Item {
+        let mut item = self.item.clone();
+        item.location = match self.place {
+            Place::Grid { col, row } => Location::Stored { col, row, page: 0 },
+            Place::Belt(slot) => Location::Belt { slot },
+            Place::Body(body) => Location::Equipped { body },
+            Place::Cursor => Location::Cursor { body: 0, col: 0, row: 0, page: None },
+        };
+        item
     }
 }
 
@@ -81,18 +109,50 @@ impl Inventory {
         Some(self.items.remove(at))
     }
 
-    /// Put an item where it says, if that place is free and inside; whether it went in.
-    pub fn insert(&mut self, held: Held) -> bool {
-        let fits = match held.place {
+    /// The item at a place: the one worn at a body location, in a belt slot or on the cursor, or
+    /// the one covering a grid cell.
+    #[must_use]
+    pub fn at(&self, place: Place) -> Option<&Held> {
+        match place {
+            Place::Grid { col, row } => self.items.iter().find(|h| h.covers(col, row)),
+            _ => self.items.iter().find(|h| h.place == place),
+        }
+    }
+
+    /// Whether `held` would go where it says: inside, and nothing there.
+    #[must_use]
+    pub fn fits(&self, held: &Held) -> bool {
+        match held.place {
             Place::Grid { col, row } => {
                 col + held.size.0 <= GRID_WIDTH && row + held.size.1 <= GRID_HEIGHT && self.area_free(col, row, held.size)
             }
-            Place::Belt(slot) => slot < BELT_SLOTS && !self.items.iter().any(|h| h.place == Place::Belt(slot)),
-        };
-        if fits && self.get(held.guid).is_none() {
+            Place::Belt(slot) => slot < BELT_SLOTS && self.at(held.place).is_none(),
+            Place::Body(body) => BODY_LOCATIONS.contains(&body) && self.at(held.place).is_none(),
+            Place::Cursor => self.at(Place::Cursor).is_none(),
+        }
+    }
+
+    /// Put an item where it says, if that place is free and inside; whether it went in.
+    pub fn insert(&mut self, held: Held) -> bool {
+        let fits = self.fits(&held) && self.get(held.guid).is_none();
+        if fits {
             self.items.push(held);
         }
         fits
+    }
+
+    /// Move an item to `place` when it fits there; whether it moved.
+    pub fn move_to(&mut self, guid: u32, place: Place) -> bool {
+        let Some(mut held) = self.remove(guid) else { return false };
+        let from = held.place;
+        held.place = place;
+        if self.fits(&held) {
+            self.items.push(held);
+            return true;
+        }
+        held.place = from;
+        self.items.push(held);
+        false
     }
 
     fn occupied(&self, col: u8, row: u8) -> bool {
@@ -177,7 +237,7 @@ mod tests {
     use super::*;
 
     fn held(guid: u32, size: (u8, u8), place: Place) -> Held {
-        Held { guid, class: 0, code: *b"hp1 ", version: 101, size, place }
+        Held { guid, class: 0, size, place, item: Item::new(*b"hp1 ", 101, 1, Location::Cursor { body: 0, col: 0, row: 0, page: None }) }
     }
 
     #[test]
@@ -225,6 +285,19 @@ mod tests {
         inv.remove(2);
         assert_eq!(inv.free_belt_slot(), Some(1));
         assert!(!inv.insert(held(9, (1, 1), Place::Belt(4))), "four slots without a belt");
+    }
+
+    #[test]
+    fn items_move_between_the_grid_the_cursor_and_the_body() {
+        let mut inv = Inventory::default();
+        assert!(inv.insert(held(1, (2, 3), Place::Grid { col: 0, row: 0 })));
+        assert_eq!(inv.at(Place::Grid { col: 1, row: 2 }).map(|h| h.guid), Some(1), "a cell it covers");
+        assert!(inv.move_to(1, Place::Cursor));
+        assert!(inv.at(Place::Grid { col: 1, row: 2 }).is_none());
+        assert!(!inv.insert(held(2, (1, 1), Place::Cursor)), "one item on the cursor");
+        assert!(inv.move_to(1, Place::Body(4)));
+        assert!(!inv.move_to(1, Place::Body(11)), "no such body location");
+        assert_eq!(inv.at(Place::Body(4)).map(|h| h.placed().location), Some(Location::Equipped { body: 4 }));
     }
 
     #[test]

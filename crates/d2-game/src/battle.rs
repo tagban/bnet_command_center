@@ -703,6 +703,13 @@ impl Battle {
         self.heroes.get(name).map(|h| h.level)
     }
 
+    /// What an item's requirements are measured against: a player's class, level, strength and
+    /// dexterity.
+    #[must_use]
+    pub fn player_requirements(&self, name: &str) -> Option<(u8, u32, i32, i32)> {
+        self.heroes.get(name).map(|h| (h.class, h.level, h.attributes[usize::from(stat::STRENGTH)], h.attributes[usize::from(stat::DEXTERITY)]))
+    }
+
     /// A player left.
     pub fn remove_player(&mut self, name: &str) {
         self.heroes.remove(name);
