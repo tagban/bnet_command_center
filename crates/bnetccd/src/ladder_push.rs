@@ -276,7 +276,9 @@ mod tests {
         use bnetcc_storage::model::Credential;
         let node = crate::node::test_node();
         let acct = node.create_account("Raynor", Credential::Xsha1 { digest: [1u8; 20] }).await.unwrap();
-        node.record_ladder_game(acct.id, "W2BN", League::IronMan, crate::storage::GameOutcome::Win, 1000).await.unwrap();
+        node.record_ladder_game(acct.id, "Raynor", "W2BN", League::IronMan, crate::storage::GameOutcome::Win, 1000).await.unwrap();
+        let recent = node.recent_ladder_results();
+        assert_eq!((recent[0].player.as_str(), recent[0].outcome, recent[0].rating, recent[0].change), ("Raynor", "win", 1016, 16));
         let snap = snapshot(&node).await;
         let products: Vec<_> = snap.games.iter().map(|g| (g.product, g.open, g.leagues.len())).collect();
         assert_eq!(products, [("STAR", true, 1), ("SEXP", true, 1), ("W2BN", true, 2), ("WAR3", false, 0), ("W3XP", false, 0)]);
