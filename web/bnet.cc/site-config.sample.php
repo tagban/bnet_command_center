@@ -2,12 +2,12 @@
 // bnet.cc site settings for news, releases and the home-page widgets. Copy this file to
 // site-config.php on the web host and fill it in. Never commit or share the copy.
 
-// Where posts and cached data are kept. Outside the web root is best; PHP must be able to write
-// here. The ladder pages keep their own LADDER_DATA_FILE in ladder-config.php.
+// Where posts, the ladder standings, the server's history and cached data are kept. Outside the web
+// root is best; PHP must be able to write here.
 define('SITE_DATA_DIR', __DIR__ . '/data');
 
-// The site's own template, as in ladder-config.php: header.php opens #main-content, the footer
-// closes it and adds the sidebar.
+// The site's own template: header.php opens #main-content, the footer closes it and adds the
+// sidebar.
 define('SITE_HEADER_FILE', __DIR__ . '/header.php');
 define('SITE_FOOTER_FILE', __DIR__ . '/footer.php');
 
@@ -30,6 +30,10 @@ define('GITHUB_TOKEN', '');
 
 // Minutes to keep GitHub's answer before asking again.
 define('GITHUB_CACHE_MINUTES', 30);
+
+// The token the server sends with its ladder push ([ladder_push] token in bnetccd.toml), for
+// ladder-push.php. Long and random.
+define('LADDER_PUSH_TOKEN', '');
 
 // The token the server sends with its stats push ([stats_push] token in bnetccd.toml), for
 // server-push.php. Long and random. The site keeps what it receives and builds its own history

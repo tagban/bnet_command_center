@@ -3,11 +3,11 @@
 
 declare(strict_types=1);
 
-require __DIR__ . '/ladder-config.php';
+require __DIR__ . '/bnetcc/bootstrap.php';
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-cache');
-$file = LADDER_DATA_FILE;
+$file = (string) LADDER_DATA_FILE;
 if (!is_file($file)) {
     http_response_code(404);
     echo '{"error":"no standings yet"}';

@@ -17,6 +17,10 @@ define('BNETCC_CONFIGURED', is_file($bnetccConfig));
 if (BNETCC_CONFIGURED) {
     require_once $bnetccConfig;
 }
+// The ladder pages' settings once lived in their own file; it is still read if it is there.
+if (is_file(BNETCC_ROOT . '/ladder-config.php')) {
+    require_once BNETCC_ROOT . '/ladder-config.php';
+}
 foreach ([
     'SITE_DATA_DIR' => BNETCC_ROOT . '/data',
     'SITE_HEADER_FILE' => BNETCC_ROOT . '/header.php',
@@ -28,6 +32,7 @@ foreach ([
     'GITHUB_CACHE_MINUTES' => 30,
     'SERVER_STATUS_URL' => 'http://us.bnet.cc:6116/status.json',
     'SERVER_PUSH_TOKEN' => '',
+    'LADDER_PUSH_TOKEN' => '',
     'DOWNLOADS_DIR' => BNETCC_ROOT . '/downloads',
     'DOWNLOADS_URL' => '/downloads',
     'DOWNLOADS_COUNT' => true,
@@ -36,6 +41,9 @@ foreach ([
     if (!defined($bnetccName)) {
         define($bnetccName, $bnetccDefault);
     }
+}
+if (!defined('LADDER_DATA_FILE')) {
+    define('LADDER_DATA_FILE', rtrim((string) SITE_DATA_DIR, '/') . '/ladder.json');
 }
 
 /** Escape text for HTML. */
