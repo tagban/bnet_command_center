@@ -1318,12 +1318,7 @@ impl Bncs {
         self.display_name = self.node.claim_name(&account.name);
         // Register with the moderation directory so staff can reach this session
         // (resolve its IP, or force it off) from any channel.
-        self.node.register_session(
-            &self.display_name,
-            self.peer.ip(),
-            self.out.clone(),
-            Arc::clone(&self.kill),
-        );
+        self.node.register_session(&self.display_name, self.peer.ip(), self.out.clone(), Arc::clone(&self.kill), self.product);
         self.account = Some(account);
     }
 
@@ -1879,7 +1874,7 @@ impl Bncs {
         self.node.unregister_session(&self.display_name);
         self.node.release_name(&self.display_name);
         self.display_name = self.node.claim_name(&chat_name);
-        self.node.register_session(&self.display_name, self.peer.ip(), self.out.clone(), Arc::clone(&self.kill));
+        self.node.register_session(&self.display_name, self.peer.ip(), self.out.clone(), Arc::clone(&self.kill), self.product);
         info!(peer = %self.peer, name = %self.display_name, "entered chat as a realm character");
     }
 
@@ -3030,7 +3025,7 @@ impl Bncs {
             } else {
                 (ratings.iter().map(|&r| u64::from(r)).sum::<u64>() / ratings.len() as u64) as u32
             };
-            match self.node.record_ladder_game(account.id, &product, league, o, opponent).await {
+            match self.node.record_ladder_game(account.id, &account.name, &product, league, o, opponent).await {
                 Ok(rating) => info!(
                     peer = %self.peer,
                     account = %account.name,

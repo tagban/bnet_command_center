@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>bnet.cc - Ladder</title>
+    <title><?= isset($pageTitle) ? htmlspecialchars((string) $pageTitle, ENT_QUOTES, 'UTF-8') . ' - bnet.cc' : 'bnet.cc - Bots &amp; Programs Archive' ?></title>
     <style>
         /* A copy of bnet.cc's header.php look, for when LADDER_HEADER_FILE is not set. */
         body, td, p, div, span { background-color: #000000; margin: 0; padding: 0; color: #CCCCCC; font-family: Arial, Helvetica, sans-serif; font-size: 13px; }
@@ -16,6 +16,11 @@
         #nav-bar a:hover { color: #FFFFFF; text-shadow: 0 0 5px #00C0FF, 1px 1px 2px #000000; }
         #content-container { display: flex; flex: 1; background-color: transparent; }
         #main-content { width: 100%; padding: 20px; box-sizing: border-box; background-color: transparent; }
+        b.header { color: #FFFFFF; font-weight: bold; font-variant: small-caps; font-size: 14px; letter-spacing: 1px; display: block; border-bottom: 1px solid #333333; padding-bottom: 4px; margin-bottom: 10px; margin-top: 15px; background-color: transparent; }
+        .tiny { font-size: 11px; font-weight: normal; color: #FFAC04; background-color: transparent; }
+        .white { color: #FFFFFF; background-color: transparent; }
+        .row { background-color: #161616; border: 1px solid #000000; }
+        .rowAlt { background-color: #252525; border: 1px solid #000000; }
         a { color: #FFAC04; text-decoration: none; font-weight: bold; background-color: transparent; }
         a:hover { color: #ffffff; }
     </style>
@@ -29,10 +34,11 @@
         <div id="nav-bar">
             <a href="/" class="menu">Home</a>
             <a href="https://discord.gg/dR4djHweh3" class="menu">Discord</a>
-            <a href="https://github.com/tagban/invigoration/releases" class="menu">Invigoration 2</a>
-            <a href="https://github.com/tagban/bnet_command_center" class="menu">BNCC Server</a>
-            <a href="/files.php" class="menu">Files</a>
+            <a href="/news.php" class="menu">News</a>
             <a href="/ladder.php" class="menu">Ladder</a>
+            <a href="/releases.php" class="menu">Releases</a>
+            <a href="/files.php" class="menu">Files</a>
             <a href="https://www.bnetdocs.org/">BNETDocs</a>
         </div>
         <div id="content-container">
+            <div id="main-content">

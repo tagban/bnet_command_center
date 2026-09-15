@@ -157,14 +157,15 @@ enum Command {
         resp: oneshot::Sender<Result<u64, String>>,
     },
     /// Record a ladder (or Iron Man) game: its counter, the new rating against opponents rated
-    /// `opponent`, the high rating, and the last game and its result. Replies the new rating.
+    /// `opponent`, the high rating, and the last game and its result. Replies the rating before
+    /// and after.
     RecordLadderGame {
         account_id: AccountId,
         product: String,
         league: bnetcc_core::ladder::League,
         outcome: GameOutcome,
         opponent: u32,
-        resp: oneshot::Sender<Result<u32, String>>,
+        resp: oneshot::Sender<Result<(u32, u32), String>>,
     },
     /// Every account's record in a product's league (the ladder standings' raw rows).
     LadderRows {
@@ -308,7 +309,7 @@ impl StorageHandle {
         rx.await.unwrap_or_else(|_| Err("storage actor is gone".into()))
     }
 
-    /// Record a ladder game for an account; the new rating.
+    /// Record a ladder game for an account; its rating before and after.
     pub async fn record_ladder_game(
         &self,
         account_id: AccountId,
@@ -316,7 +317,7 @@ impl StorageHandle {
         league: bnetcc_core::ladder::League,
         outcome: GameOutcome,
         opponent: u32,
-    ) -> Result<u32, String> {
+    ) -> Result<(u32, u32), String> {
         let (resp, rx) = oneshot::channel();
         let product = product.to_string();
         if self.0.send(Command::RecordLadderGame { account_id, product, league, outcome, opponent, resp }).is_err() {
@@ -627,7 +628,7 @@ pub fn spawn(mut backend: Box<dyn Storage + Send>) -> StorageHandle {
                             put.insert(key("last game"), now.to_string());
                             put.insert(key("last game result"), outcome.result_word().to_string());
                             backend.attrs_put(account_id, put)?;
-                            Ok::<u32, StorageError>(next)
+                            Ok::<(u32, u32), StorageError>((rating, next))
                         })()
                         .map_err(|e: StorageError| e.to_string());
                         let _ = resp.send(result);
@@ -836,8 +837,8 @@ mod tests {
         let a = h.create_account("Raynor", Credential::Xsha1 { digest: [1u8; 20] }).await.unwrap();
         let b = h.create_account("Kerrigan", Credential::Xsha1 { digest: [1u8; 20] }).await.unwrap();
         h.create_account("Idle", Credential::Xsha1 { digest: [1u8; 20] }).await.unwrap();
-        assert_eq!(h.record_ladder_game(a.id, "STAR", League::Ladder, GameOutcome::Win, 1000).await, Ok(1016));
-        assert_eq!(h.record_ladder_game(a.id, "STAR", League::Ladder, GameOutcome::Loss, 1000).await, Ok(999));
+        assert_eq!(h.record_ladder_game(a.id, "STAR", League::Ladder, GameOutcome::Win, 1000).await, Ok((1000, 1016)));
+        assert_eq!(h.record_ladder_game(a.id, "STAR", League::Ladder, GameOutcome::Loss, 1000).await, Ok((1016, 999)));
         h.record_ladder_game(b.id, "STAR", League::IronMan, GameOutcome::Disconnect, 1000).await.unwrap();
 
         let ladder = h.ladder_rows("STAR", League::Ladder).await;

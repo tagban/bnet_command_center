@@ -268,6 +268,28 @@ pub struct GameAd {
 /// A game by its host's product and lowercased name.
 type GameKey = (Option<bnetcc_proto::FourCc>, Vec<u8>);
 
+/// How many recent ladder results the node remembers for the public feed.
+const RECENT_LADDER_RESULTS: usize = 30;
+
+/// One player's reported ladder game, for the public feed.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LadderResult {
+    /// When, seconds since the Unix epoch.
+    pub time: u64,
+    /// Product code.
+    pub product: String,
+    /// `ladder` or `ironman`.
+    pub league: &'static str,
+    /// Account name.
+    pub player: String,
+    /// `win`, `loss`, `draw` or `disconnect`.
+    pub outcome: &'static str,
+    /// Rating after.
+    pub rating: u32,
+    /// Rating change.
+    pub change: i64,
+}
+
 /// A logged-in session, registered so staff moderation can reach it across channels — to
 /// resolve its address for an IP ban, or to force it off for a tag ban.
 struct SessionEntry {
@@ -275,6 +297,8 @@ struct SessionEntry {
     name: String,
     /// The peer address this session connected from.
     ip: IpAddr,
+    /// The game it logged in with; `None` for the chat gateway.
+    product: Option<bnetcc_proto::FourCc>,
     /// Its write side, so a removal notice can be queued before it is cut.
     out: Outbound,
     /// A one-shot signal the read loop selects on; firing it makes the session close
@@ -336,6 +360,10 @@ pub struct Node {
     /// in the last N hours per client" figure. One entry per game session (first advertise);
     /// pruned to the query window and hard-capped so it cannot grow without bound.
     game_log: Mutex<Vec<(String, std::time::Instant)>>,
+    /// The latest ladder results, newest first (see [`LadderResult`]).
+    recent_ladder: Mutex<std::collections::VecDeque<LadderResult>>,
+    /// When each account (by lower-case name) last logged in, for the players-seen count.
+    seen: Mutex<HashMap<String, std::time::Instant>>,
     /// Display names currently in use across the whole node (lowercased). A second login of
     /// an account already online is disambiguated with `#2`, `#3`… so both can coexist.
     active_names: Mutex<HashSet<String>>,
@@ -504,6 +532,8 @@ impl Node {
             started: std::time::Instant::now(),
             active_names: Mutex::new(HashSet::new()),
             game_log: Mutex::new(Vec::new()),
+            recent_ladder: Mutex::new(std::collections::VecDeque::new()),
+            seen: Mutex::new(HashMap::new()),
             inner: Mutex::new(Inner::default()),
             admission: Mutex::new(admission),
             connections: AtomicU64::new(0),
@@ -656,18 +686,44 @@ impl Node {
         self.storage.record_game(account_id, product, outcome).await
     }
 
-    /// Record one ladder or Iron Man game; the account's new rating.
+    /// Record one ladder or Iron Man game for `player`; its new rating. The result joins the
+    /// recent ladder results the public feed shows.
     pub async fn record_ladder_game(
         &self,
         account_id: bnetcc_core::AccountId,
+        player: &str,
         product: &str,
         league: bnetcc_core::ladder::League,
         outcome: crate::storage::GameOutcome,
         opponent: u32,
     ) -> Result<u32, String> {
-        let rating = self.storage.record_ladder_game(account_id, product, league, outcome, opponent).await;
+        let (before, after) = self.storage.record_ladder_game(account_id, product, league, outcome, opponent).await?;
+        {
+            let mut recent = self.recent_ladder.lock().expect("recent ladder lock");
+            recent.push_front(LadderResult {
+                time: crate::now_ms() / 1000,
+                product: product.to_string(),
+                league: if league == bnetcc_core::ladder::League::IronMan { "ironman" } else { "ladder" },
+                player: player.to_string(),
+                outcome: match outcome {
+                    crate::storage::GameOutcome::Win => "win",
+                    crate::storage::GameOutcome::Loss => "loss",
+                    crate::storage::GameOutcome::Draw => "draw",
+                    crate::storage::GameOutcome::Disconnect => "disconnect",
+                },
+                rating: after,
+                change: i64::from(after) - i64::from(before),
+            });
+            recent.truncate(RECENT_LADDER_RESULTS);
+        }
         self.ladder_changed.notify_one();
-        rating
+        Ok(after)
+    }
+
+    /// The latest ladder results, newest first.
+    #[must_use]
+    pub fn recent_ladder_results(&self) -> Vec<LadderResult> {
+        self.recent_ladder.lock().expect("recent ladder lock").iter().cloned().collect()
     }
 
     /// Every account's record in a product's ladder league.
@@ -1248,11 +1304,52 @@ impl Node {
 
     /// Register a logged-in session so staff moderation can reach it later. Pair with
     /// [`Self::unregister_session`] on disconnect.
-    pub fn register_session(&self, display_name: &str, ip: IpAddr, out: Outbound, kill: Arc<Notify>) {
+    pub fn register_session(&self, display_name: &str, ip: IpAddr, out: Outbound, kill: Arc<Notify>, product: Option<bnetcc_proto::FourCc>) {
         self.sessions.lock().expect("sessions lock").insert(
             display_name.to_ascii_lowercase(),
-            SessionEntry { name: display_name.to_string(), ip, out, kill },
+            SessionEntry { name: display_name.to_string(), ip, out, kill, product },
         );
+        // The account behind the name: no `#N`, and a realm character's `Character*Account` is its account.
+        let base = display_name.split('#').next().unwrap_or(display_name);
+        let account = base.rsplit('*').next().unwrap_or(base).to_ascii_lowercase();
+        self.seen.lock().expect("seen lock").insert(account, std::time::Instant::now());
+    }
+
+    /// Logged-in sessions' display names and games, sorted by name.
+    #[must_use]
+    pub fn online_sessions(&self) -> Vec<(String, Option<bnetcc_proto::FourCc>)> {
+        let mut all: Vec<_> = self.sessions.lock().expect("sessions lock").values().map(|e| (e.name.clone(), e.product)).collect();
+        all.sort_by_key(|(n, _)| n.to_ascii_lowercase());
+        all
+    }
+
+    /// Accounts that logged in within `window` (forgetting older ones).
+    #[must_use]
+    pub fn players_seen_since(&self, window: std::time::Duration) -> usize {
+        let mut seen = self.seen.lock().expect("seen lock");
+        seen.retain(|_, at| at.elapsed() < window);
+        seen.len()
+    }
+
+    /// Each channel's display name, occupants and whether it may be shown publicly: a channel
+    /// the operator defined as public or listed.
+    #[must_use]
+    pub fn channel_occupancy(&self) -> Vec<(String, Vec<String>, bool)> {
+        let inner = self.inner.lock().expect("node lock");
+        inner
+            .channels
+            .iter()
+            .map(|(key, c)| {
+                let public = self.channel_rules.get(key).is_some_and(|r| r.public || r.listed);
+                (c.display().to_string(), c.members().iter().map(|m| m.name.clone()).collect(), public)
+            })
+            .collect()
+    }
+
+    /// When the node started, seconds since the Unix epoch.
+    #[must_use]
+    pub fn started_unix(&self) -> u64 {
+        (crate::now_ms() / 1000).saturating_sub(self.uptime_secs())
     }
 
     /// Seconds since the node started, for the status pages.
@@ -1492,6 +1589,62 @@ mod tests {
         assert_eq!(joined.key, b"zealot's hangout");
     }
 
+    /// The public feed shows players per game, public channels by name and the rest counted,
+    /// open games with their type and map (a passworded game's name withheld), and never an
+    /// address.
+    #[test]
+    fn the_public_feed_describes_activity_without_leaking_private_details() {
+        let rules = crate::config::Config::from_toml("[[channels.defined]]\nname = \"Town Square\"\npublic = true\n").unwrap().channel_rules().unwrap();
+        let n = test_node_with(|c| c.channel_rules = rules);
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let sexp = Some(bnetcc_proto::product::SEXP);
+        for (name, product) in [("Raynor", sexp), ("Kerrigan", sexp), ("Thrall@bncc", Some(bnetcc_proto::product::W3XP)), ("Hero*Owner", Some(bnetcc_proto::product::D2XP))] {
+            let (o, _r) = outbound(4);
+            n.register_session(name, ip, o, Arc::new(Notify::new()), product);
+        }
+        let (o1, _r1) = outbound(4);
+        let (o2, _r2) = outbound(4);
+        n.join_channel(b"Town Square", 1, "Raynor", 0, None, Vec::new(), o1).unwrap();
+        n.join_channel(b"secret hideout", 2, "Kerrigan", 0, None, Vec::new(), o2).unwrap();
+        let ad = |name: &[u8], password: &[u8], host: u64, game_type: u16, statstring: &[u8]| GameAd {
+            name: name.to_vec(),
+            password: password.to_vec(),
+            statstring: statstring.to_vec(),
+            game_type,
+            parameter: 0,
+            state: 0,
+            product: sexp,
+            port: 6112,
+            host_ip: "203.0.113.9".parse().unwrap(),
+            host,
+            created: std::time::Instant::now(),
+        };
+        n.advertise_game(ad(b"1v1 me", b"", 1, 0x04, b",,,,1,,,,,,Raynor\rLost Temple\r"));
+        n.advertise_game(ad(b"clan practice", b"pw", 2, 0x0B, b",,,,1,,,,,,Kerrigan\rBig Game Hunters\r"));
+
+        let json: serde_json::Value = serde_json::from_str(&crate::public_status::snapshot_json(&n, true)).unwrap();
+        let products: Vec<(String, u64, u64)> = json["products"].as_array().unwrap().iter().map(|p| (p["product"].as_str().unwrap().to_string(), p["online"].as_u64().unwrap(), p["games_open"].as_u64().unwrap())).collect();
+        assert_eq!(products[0], ("SEXP".to_string(), 2, 2), "{products:?}");
+        assert!(products.contains(&("W3XP".to_string(), 1, 0)) && products.contains(&("D2XP".to_string(), 1, 0)));
+        assert_eq!(json["players_24h"], 4, "Hero*Owner counts as the account Owner");
+        assert_eq!(json["channel_list"], serde_json::json!([{"name": "Town Square", "users": 1}]));
+        assert_eq!(json["other_channels"], serde_json::json!({"channels": 1, "users": 1}), "the private channel is only counted");
+        let games = json["game_list"].as_array().unwrap();
+        let open = games.iter().find(|g| g["private"] == false).unwrap();
+        assert_eq!((open["name"].as_str(), open["kind"].as_str(), open["map"].as_str()), (Some("1v1 me"), Some("One on One"), Some("Lost Temple")));
+        let private = games.iter().find(|g| g["private"] == true).unwrap();
+        assert!(private["name"].is_null(), "a passworded game's name is withheld");
+        let users = json["user_list"].as_array().unwrap();
+        let kerrigan = users.iter().find(|u| u["name"] == "Kerrigan").unwrap();
+        assert!(kerrigan.get("channel").is_none(), "nor which private channel someone is in");
+        assert_eq!(users.iter().find(|u| u["name"] == "Raynor").unwrap()["channel"], "Town Square");
+        assert!(!json.to_string().contains("203.0.113.9"), "no addresses");
+        assert_eq!((json["channels"].as_u64(), json["games"].as_u64(), json["users_online"].as_u64()), (Some(2), Some(2), Some(4)), "the old totals are still there");
+
+        let hidden: serde_json::Value = serde_json::from_str(&crate::public_status::snapshot_json(&n, false)).unwrap();
+        assert!(hidden.get("user_list").is_none() && hidden.get("users").is_none(), "no names unless the operator shows them");
+    }
+
     #[test]
     fn channel_names_are_normalized_so_variants_share_one_channel() {
         let n = node();
@@ -1578,8 +1731,8 @@ mod tests {
         let (o2, mut r2) = outbound(4);
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
         let ip2: IpAddr = "10.0.0.2".parse().unwrap();
-        n.register_session("Bob", ip1, o1, Arc::new(Notify::new()));
-        n.register_session("BNU-Eve", ip2, o2, Arc::new(Notify::new()));
+        n.register_session("Bob", ip1, o1, Arc::new(Notify::new()), None);
+        n.register_session("BNU-Eve", ip2, o2, Arc::new(Notify::new()), None);
 
         // /ipban resolves an online user's address.
         assert_eq!(n.session_ip("bob"), Some(ip1));

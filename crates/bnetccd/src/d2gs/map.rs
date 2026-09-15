@@ -140,6 +140,20 @@ impl GameServer {
             .collect()
     }
 
+    /// Every running game as the public feed shows it: name, whether it has a password,
+    /// difficulty, players connected, seconds since it was made.
+    #[must_use]
+    pub fn public_games(&self) -> Vec<(String, bool, u8, usize, u64)> {
+        let g = self.lock();
+        let mut games: Vec<_> = g
+            .by_id
+            .values()
+            .map(|game| (game.name.clone(), !game.password.is_empty(), game.difficulty, game.connected.len(), game.created.elapsed().as_secs()))
+            .collect();
+        games.sort_by(|a, b| a.4.cmp(&b.4));
+        games
+    }
+
     /// Every running game.
     #[must_use]
     pub fn map_games(&self) -> Vec<MapGame> {

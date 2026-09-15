@@ -10,7 +10,7 @@ define('LADDER_PUSH_TOKEN', '');
 define('LADDER_DATA_FILE', __DIR__ . '/data/ladder.json');
 
 // The site's own page template, so ladder.php looks like the rest of bnet.cc. header.php opens
-// #content-container; the footer file closes it (and may add the sidebar). Leave a name empty to
-// use the ladder page's built-in copy of the bnet.cc header or footer.
+// #main-content; the footer file closes it and adds the sidebar. Leave a name empty to use the
+// built-in copy of the bnet.cc header or footer.
 define('LADDER_HEADER_FILE', __DIR__ . '/header.php');
 define('LADDER_FOOTER_FILE', __DIR__ . '/footer.php');
