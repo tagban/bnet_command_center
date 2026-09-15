@@ -12,13 +12,15 @@ database is needed.
 | `header.php` | The site header, with **News**, **Releases** and **Server** added to the nav and a page title per page. |
 | `sidebar.php` | The sidebar: Active Projects, then **Latest Releases**, then Server Stats, now from the server's push (with players today and a link to the server page). Before the first push arrives it reads the live status feed, at most every 30 seconds and never waiting more than 3. |
 | `footer.php` | Unchanged. |
-| `index.php` | The front page: **Latest News**, **Server Activity** and **Ladder Leaders**. |
+| `index.php` | The front page: **Latest News**, **Server Activity**, **Ladder Leaders** and **Recently Added Files**. |
 | `server.php` | The server page: online now, the last 24 hours and 7 days, players by game, who's online, open games (maps and Diablo II games too), channels, recent ladder games and a daily table. |
 | `server-push.php` | Receives the server's stats push, keeps it, and builds the site's own history from it. |
+| `files.php` | The downloads folder, browsable: categories with counts, Featured, Recently Added, Most Downloaded, folders with breadcrumbs, sortable file lists, and search. Old `files.php?cat=` links keep working. |
+| `download.php` | Counts a download and sends the visitor on to the file. Only files the Files page lists can be reached this way. |
 | `news.php` | All news, 10 to a page, and each post at `news.php?p=post-title`. |
 | `releases.php` | Each project's recent releases, with the latest release's notes and its download links. |
 | `admin/` | The news admin (`/admin/`): sign in, then write, preview, edit, pin, draft and delete posts. |
-| `widgets/` | `news.php`, `releases.php`, `activity.php`, `ladder.php`: boxes to include anywhere. |
+| `widgets/` | `news.php`, `releases.php`, `activity.php`, `ladder.php`, `downloads.php`: boxes to include anywhere. |
 | `bnetcc/` | Shared code (its `.htaccess` blocks direct access). |
 | `extras.css` | Styles for news, releases and the widgets, on top of the site's own classes. |
 | `site-config.sample.php` | Settings; copy it to `site-config.php`. |
@@ -38,6 +40,26 @@ database is needed.
 3. Open `https://www.bnet.cc/admin/`. With no password set, the page turns a password you choose into
    a hash. Paste it into `ADMIN_PASSWORD_HASH` in `site-config.php`, reload, and sign in as
    `ADMIN_USER`.
+
+## Files
+
+The Files page reads `/downloads/` as it stands. Upload a file by FTP into any folder, and it
+appears within two minutes (or press **Refresh the file list** on the admin page). Folders become
+categories, and nested folders become breadcrumbs.
+
+- **Names:** folder names get friendly names on their own (`win` is Windows, `nix` is Linux & Unix,
+  `sc2` is StarCraft II, `wc2` is Warcraft II…). Set any other name on the admin page's **Files**
+  section, or in `DOWNLOADS_NAMES`.
+- **Descriptions:** write them on the admin page, or upload a text file beside the file with the same
+  name plus `.txt` (`RippleChatBot.zip.txt`), or `_about.txt` in a folder. Those text files are not
+  listed as downloads. Descriptions use the news formatting.
+- **Featured:** tick a file on the admin page to list it at the top of the Files page.
+- **Download counts:** links go through `download.php`, which counts each visitor once a day per
+  file, skips obvious bots, and redirects to the file. Set `DOWNLOADS_COUNT` to `false` to link
+  straight to the files.
+- **Not listed:** hidden files (`.htaccess`, `.DS_Store`), anything starting with `_`, index pages
+  and symbolic links. Apache's own directory listing of `/downloads/` can be turned off with
+  `Options -Indexes` in `downloads/.htaccess`; the Files page does not need it.
 
 ## Server data
 

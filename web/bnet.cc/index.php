@@ -10,4 +10,8 @@
 
 <?php include __DIR__ . '/widgets/ladder.php'; ?>
 
+<br>
+
+<?php include __DIR__ . '/widgets/downloads.php'; ?>
+
 <?php include_once('footer.php'); ?>
