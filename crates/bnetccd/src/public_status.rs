@@ -400,6 +400,7 @@ h1 .dot.up { background:var(--ok); }
 .users .u { background:rgba(90,169,230,.12); border:1px solid var(--line); border-radius:6px; padding:2px 8px; font-size:13px; }
 .foot { color:var(--muted); font-size:12px; margin-top:20px; }
 .err { color:#e06a6a; }
+.about { color:var(--muted); font-size:12px; margin-top:28px; border-top:1px solid var(--line); padding-top:14px; }
 </style></head><body>
 <div class="wrap">
   <h1><span class="dot" id="dot"></span><span id="name">Server Status</span></h1>
@@ -417,6 +418,11 @@ h1 .dot.up { background:var(--ok); }
     <div class="list" id="userlist"></div>
   </div>
   <p class="foot" id="foot">Loading…</p>
+  <p class="about">Command Center is an educational server that keeps classic Battle.net games playable on
+  older computers that can no longer connect. On a modern computer, buy <i>Diablo II: Resurrected</i>,
+  <i>Warcraft III: Reforged</i>, <i>StarCraft: Remastered</i> and <i>Warcraft II: Remastered</i> &mdash;
+  they are worth it. Not affiliated with or endorsed by Blizzard Entertainment; Battle.net, Diablo,
+  StarCraft and Warcraft are trademarks or registered trademarks of Blizzard Entertainment, Inc.</p>
 </div>
 <script>
 function fmtUptime(s){

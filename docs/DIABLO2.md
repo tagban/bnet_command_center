@@ -3,6 +3,11 @@
 Status of Diablo II support, how the closed realm is put together, and how to test it with a
 real client.
 
+The Diablo II server is here mainly for older computers — Mac OS 9, Mac OS X 10.4 and earlier —
+that can no longer play on Battle.net because their patches are no longer made. It is
+educational and supports that older architecture; on a modern computer, buy *Diablo II:
+Resurrected* for the true Battle.net experience (see the README's *Purpose*).
+
 | Button in the client | What it is | Status |
 |---|---|---|
 | **Open Battle.net** | BNCS login + chat; characters live on the player's PC; games are peer-to-peer | Login and chat work through the same path as StarCraft |

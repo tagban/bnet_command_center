@@ -5,6 +5,25 @@ one of them is serious enough that you should talk to a lawyer before publishing
 
 ---
 
+## 0. What Command Center is for
+
+Command Center is an **educational** project: a readable, working study of the Classic Battle.net
+protocol. Its purpose is to keep games playable on **older computers and operating systems that
+once played on Battle.net and no longer can** (Mac OS 9, Mac OS X 10.4 and earlier), because the
+patches the live service requires are no longer made for them.
+
+It is not a substitute for Blizzard's games or service. **Anyone with a relatively modern computer
+who wants the true Battle.net experience should buy *Diablo II: Resurrected*, *Warcraft III:
+Reforged*, *StarCraft: Remastered* or *Warcraft II: Remastered*** — they are excellent and worth
+buying. Say this plainly wherever the project describes itself (README, bnet.cc, the default
+message of the day, the public status page).
+
+Command Center is not affiliated with, endorsed by or sponsored by Blizzard Entertainment.
+Battle.net, Diablo, StarCraft and Warcraft are trademarks or registered trademarks of Blizzard
+Entertainment, Inc.
+
+---
+
 ## 1. Source hygiene — what you may read, and what you must not
 
 | Source | License | Verdict |

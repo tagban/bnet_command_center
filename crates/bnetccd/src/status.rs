@@ -1099,7 +1099,7 @@ fn settings_page(admin: &Admin, config_path: &Path, flash: Option<(bool, &str)>)
     // Current config values (from the file), each falling back to the config default so the
     // form is never blank on a fresh install.
     let name = html_escape(&cfg_string(&doc, &["server", "name"], "Command Center"));
-    let motd = html_escape(&cfg_string(&doc, &["server", "motd"], "Welcome to Command Center."));
+    let motd = html_escape(&cfg_string(&doc, &["server", "motd"], "Welcome to Command Center, an educational server for older computers. On a modern computer, buy Diablo II: Resurrected, Warcraft III: Reforged, StarCraft: Remastered or Warcraft II: Remastered."));
     // Server mode <select>.
     let mode = cfg_string(&doc, &["server", "mode"], "gaming");
     let mode_opts = select_options(

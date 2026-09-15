@@ -33,7 +33,7 @@ const DEFAULT_CONFIG: &str = "\
 name = \"Command Center\"
 # gaming | warnet | both
 mode = \"gaming\"
-motd = \"Welcome to Command Center.\"
+motd = \"Welcome to Command Center, an educational server for older computers. On a modern computer, buy Diablo II: Resurrected, Warcraft III: Reforged, StarCraft: Remastered or Warcraft II: Remastered.\"
 
 [listen]
 # BNCS + chat gateway. 0.0.0.0 so clients on other machines can reach this host.

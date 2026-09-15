@@ -24,7 +24,7 @@ name = "Command Center"
 #
 # A hub can narrow this but a node can never widen it.
 mode = "gaming"
-motd = "Welcome to Command Center."
+motd = "Welcome to Command Center, an educational server for older computers. On a modern computer, buy Diablo II: Resurrected, Warcraft III: Reforged, StarCraft: Remastered or Warcraft II: Remastered."
 # Realm name for WarCraft III accounts. WarCraft III logs in with SRP, so its accounts
 # cannot share a password with the other games' accounts; they live in their own
 # namespace and appear as `Name@<realm>` in chat, whispers and bans. Names typed in the

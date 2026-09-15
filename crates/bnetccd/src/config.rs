@@ -554,7 +554,7 @@ impl Default for ServerConfig {
         Self {
             name: "Command Center".into(),
             mode: "gaming".into(),
-            motd: "Welcome to Command Center.".into(),
+            motd: "Welcome to Command Center, an educational server for older computers. On a modern computer, buy Diablo II: Resurrected, Warcraft III: Reforged, StarCraft: Remastered or Warcraft II: Remastered.".into(),
             realm: "bncc".into(),
             wc3_logon: "nls".into(),
         }

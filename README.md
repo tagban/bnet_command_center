@@ -4,6 +4,26 @@
 
 A federated Classic Battle.net server in Rust. **[bnet.cc](https://bnet.cc)**
 
+## Purpose
+
+Command Center is **educational**: a study of how Classic Battle.net worked, written as a server
+anyone can read, build and run. It exists to keep games playable on **older computers and
+operating systems that once played on Battle.net and no longer can** — machines running Mac OS 9,
+or Mac OS X 10.4 or earlier, for which the patches the live service requires are no longer made.
+It supports that older architecture; it is not a replacement for Battle.net.
+
+**If you have a relatively modern computer and want the true Battle.net experience, buy the
+current games.** *Diablo II: Resurrected*, *Warcraft III: Reforged*, *StarCraft: Remastered* and
+*Warcraft II: Remastered* are amazing, well worth buying, and play on the real Battle.net.
+Command Center is not meant for players who can run them.
+
+Command Center ships no Blizzard game files, CD keys or client patches; players connect with their
+own copies of the original games. It is not affiliated with, endorsed by or sponsored by Blizzard
+Entertainment. Battle.net, Diablo, StarCraft and Warcraft are trademarks or registered trademarks
+of Blizzard Entertainment, Inc.
+
+## About the code
+
 Built clean-slate, informed by what PvPGN and BNETDocs Atlas got right and wrong. Two
 roles from one codebase: **`bnetccd`**, the node a community operator runs, and
 **`bnetcc-hub`**, which is authoritative for identity, the channel directory, ladder and
