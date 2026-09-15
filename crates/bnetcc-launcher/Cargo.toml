@@ -1,6 +1,6 @@
 [package]
 name = "bnetcc-launcher"
-description = "First-run setup and launcher for the BNET Command Center server (bnetccd)."
+description = "First-run setup and launcher for the Command Center server (bnetccd)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

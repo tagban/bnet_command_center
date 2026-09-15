@@ -1058,7 +1058,7 @@ fn err_banner(msg: &str) -> String {
 
 fn login_page_with(err: &str) -> String {
     let inner = format!(
-        r#"<h1>BNET Command Center</h1><p class="sub">Admin sign-in</p>{}
+        r#"<h1>Command Center</h1><p class="sub">Admin sign-in</p>{}
 <form method="post" action="/login">
 <label for="pw">Password</label>
 <input id="pw" name="password" type="password" autofocus autocomplete="current-password">
@@ -2009,7 +2009,7 @@ const DASHBOARD: &str = r##"<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BNET Command Center — Status</title>
+<title>Command Center — Status</title>
 <style>
   :root { color-scheme: light dark; --bg:#0f1115; --card:#1a1d24; --fg:#e6e8ec; --muted:#9aa0aa; --accent:#5aa9e6; --line:#2a2e37; }
   * { box-sizing: border-box; }
@@ -2041,7 +2041,7 @@ const DASHBOARD: &str = r##"<!doctype html>
 </head>
 <body>
 <header>
-  <h1>BNET Command Center · <span class="name" id="server">…</span></h1>
+  <h1>Command Center · <span class="name" id="server">…</span></h1>
   <span class="meta" id="meta"></span>
   <nav><a href="/d2">D2 map</a> · <a href="/d2/season">D2 ladder</a> · <a href="/users">Users</a> · <a href="/settings">Settings</a> · <a href="/help">Help</a> · <a href="/change-password">Password</a></nav>
 </header>

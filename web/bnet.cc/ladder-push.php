@@ -1,5 +1,5 @@
 <?php
-// Receives the ladder standings the BNET Command Center server pushes ([ladder_push] url) and
+// Receives the ladder standings the Command Center server pushes ([ladder_push] url) and
 // keeps the latest copy for ladder.php. POST only, bearer token required.
 
 declare(strict_types=1);

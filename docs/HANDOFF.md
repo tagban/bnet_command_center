@@ -12,7 +12,8 @@ access. See §6 for why the cloud session hit a wall there.
 ## 1. What this is
 
 A clean-slate, federated Classic Battle.net server in Rust, replacing PvPGN and BNETDocs
-Atlas. Project name **BNET Command Center**, `bnetcc` in code, `bnet.cc` is the domain.
+Atlas. Project name **Command Center** (earlier BNET Command Center, hence `bnetcc` in code),
+`bnet.cc` is the domain.
 
 | Binary | Role |
 |---|---|

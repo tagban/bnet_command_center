@@ -1,4 +1,4 @@
-# BNET Command Center — Federation
+# Command Center — Federation
 
 There is **no working precedent for this** in the Battle.net emulator ecosystem. PvPGN has
 a fire-and-forget UDP stats beacon to a master list (`tracker.cpp`) — a server *directory*,

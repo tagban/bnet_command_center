@@ -20,7 +20,7 @@ define('ADMIN_PASSWORD_HASH', '');
 // 'public' => false hides the GitHub links for a private repository visitors cannot open.
 define('GITHUB_REPOS', [
     'tagban/invigoration' => ['name' => 'Invigoration 2', 'public' => true],
-    'tagban/bnet_command_center' => ['name' => 'BNET Command Center', 'public' => true],
+    'tagban/bnet_command_center' => ['name' => 'Command Center', 'public' => true],
     'tagban/w3ClassicLoader' => ['name' => 'W3 Classic Loader', 'public' => false],
 ]);
 

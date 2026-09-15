@@ -59,7 +59,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          name="bnet-command-center-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
+          name="command-center-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
           staging="dist/$name"
           bindir="target/${{ matrix.target }}/release"
           mkdir -p "$staging"
@@ -72,7 +72,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = "bnet-command-center-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
+          $name = "command-center-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
           $staging = "dist/$name"
           $bindir = "target/${{ matrix.target }}/release"
           New-Item -ItemType Directory -Force -Path $staging | Out-Null

@@ -1,4 +1,4 @@
-// bnet.cc ladder pages: renders the standings the BNET Command Center server pushes
+// bnet.cc ladder pages: renders the standings the Command Center server pushes
 // (ladder-push.php keeps them, ladder-data.php serves them) into #ladder.
 //
 // Every view is a plain link (?g=sc&p=2 …), so pages can be bookmarked and shared, and the back

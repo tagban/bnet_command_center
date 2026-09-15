@@ -26,7 +26,7 @@ use clap::Parser;
 /// every other field. `deny_unknown_fields` is on in the server, so stale keys are fatal —
 /// only add a key here after confirming it exists there.
 const DEFAULT_CONFIG: &str = "\
-# BNET Command Center — written by bnetcc-launcher on first run.
+# Command Center — written by bnetcc-launcher on first run.
 # Every field has a default; see bnetccd.example.toml for the full reference.
 
 [server]
@@ -66,7 +66,7 @@ const RESTART_EXIT_CODE: i32 = 75;
 #[command(
     name = "bnetcc-launcher",
     version,
-    about = "Set up and launch the BNET Command Center server (bnetccd)."
+    about = "Set up and launch the Command Center server (bnetccd)."
 )]
 struct Args {
     /// Directory to run in — holds the config, database, and admin/ban files. Created if
@@ -180,7 +180,7 @@ fn locate_server(explicit: Option<&Path>) -> Result<PathBuf, String> {
 fn print_banner(data_dir: &Path, config_path: &Path, server: &Path, first_run: bool) {
     let line = "=".repeat(60);
     println!("{line}");
-    println!("  BNET Command Center — launcher v{}", env!("CARGO_PKG_VERSION"));
+    println!("  Command Center — launcher v{}", env!("CARGO_PKG_VERSION"));
     println!("{line}");
     if first_run {
         println!("  First run: wrote a default config.");

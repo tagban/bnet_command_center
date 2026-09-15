@@ -1,4 +1,4 @@
-# BNET Command Center
+# Command Center
 
 [![CI](https://github.com/tagban/bnet_command_center/actions/workflows/ci.yml/badge.svg)](https://github.com/tagban/bnet_command_center/actions/workflows/ci.yml)
 
@@ -9,7 +9,8 @@ roles from one codebase: **`bnetccd`**, the node a community operator runs, and
 **`bnetcc-hub`**, which is authoritative for identity, the channel directory, ladder and
 network-wide bans.
 
-Referred to as **Command Center** in prose, `bnetcc` in code and on the command line.
+Called **Command Center**; `bnetcc`, from its earlier name BNET Command Center, in code and on
+the command line.
 
 | | |
 |---|---|
@@ -107,7 +108,7 @@ version). Each archive holds two executables:
 
 ```sh
 # macOS / Linux — unpack and run
-tar xzf bnet-command-center-*-*.tar.gz && cd bnet-command-center-*/
+tar xzf command-center-*-*.tar.gz && cd command-center-*/
 ./bnetcc-launcher
 ```
 

@@ -14,7 +14,7 @@
 
         <br><br>
         
-<!-- BNET COMMAND CENTER INTEGRATION -->
+<!-- COMMAND CENTER INTEGRATION -->
 <b class="header">Server Stats</b>
 <?php
 require_once __DIR__ . '/bnetcc/server.php';
