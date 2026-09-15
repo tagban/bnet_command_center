@@ -1,4 +1,63 @@
-# bnet.cc ladder pages
+# bnet.cc site additions
+
+News posts, GitHub releases, and ladders for bnet.cc, built into the site's own look: its
+`header.php`, `footer.php` and `sidebar.php` (updated copies are here), its colours and its images.
+Everything is plain PHP with JSON files in a private data folder, and runs on PHP 7.4 or later. No
+database is needed.
+
+## What to upload
+
+| File | What it is |
+|---|---|
+| `header.php` | The site header, with **News** and **Releases** added to the nav and a page title per page. |
+| `sidebar.php` | The sidebar: Active Projects, then **Latest Releases**, then Server Stats. The status feed is now read at most every 30 seconds, and a down server makes a page wait 3 seconds at most. |
+| `footer.php` | Unchanged. |
+| `index.php` | The front page: **Latest News** and **Ladder Leaders**. |
+| `news.php` | All news, 10 to a page, and each post at `news.php?p=post-title`. |
+| `releases.php` | Each project's recent releases, with the latest release's notes and its download links. |
+| `admin/` | The news admin (`/admin/`): sign in, then write, preview, edit, pin, draft and delete posts. |
+| `widgets/` | `news.php`, `releases.php`, `ladder.php`: boxes to include anywhere. |
+| `bnetcc/` | Shared code (its `.htaccess` blocks direct access). |
+| `extras.css` | Styles for news, releases and the widgets, on top of the site's own classes. |
+| `site-config.sample.php` | Settings; copy it to `site-config.php`. |
+| ladder files | See **Ladders** below. |
+
+## Setting up
+
+1. Upload everything above to the site root.
+2. Copy `site-config.sample.php` to `site-config.php` and check:
+   - `SITE_DATA_DIR`: a folder PHP can write, ideally outside the web root. Inside it, the site
+     writes a deny-all `.htaccess` the first time.
+   - `GITHUB_REPOS`: the projects to track. `'public' => false` hides GitHub links for a private
+     repository.
+   - `GITHUB_TOKEN`: needed only for the private W3 Classic Loader. On GitHub, create a
+     **fine-grained token** with read-only **Contents** access to that repository alone, and paste
+     it here yourself.
+3. Open `https://www.bnet.cc/admin/`. With no password set, the page turns a password you choose into
+   a hash. Paste it into `ADMIN_PASSWORD_HASH` in `site-config.php`, reload, and sign in as
+   `ADMIN_USER`.
+
+## The news admin
+
+- Formatting: `**bold**`, `*italic*`, `` `code` ``, `[link text](https://…)`, bare `https://` links,
+  lines starting `- ` for lists, `## ` for headings, and blank lines between paragraphs. Everything
+  else is shown as text; no HTML gets through.
+- Pinned posts stay on top. Drafts are never shown on the site. A published post keeps its address
+  when you edit its title.
+- Security: five wrong passwords from one address lock sign-in for 15 minutes. Every change is a
+  POST carrying a per-session token. The cookie is HTTP-only, `SameSite=Strict`, and Secure over
+  HTTPS. Admin pages are never cached or framed.
+
+## Releases
+
+Releases come from GitHub's API and are kept for `GITHUB_CACHE_MINUTES` (30). One visitor's page
+refreshes them; everyone else is served the saved copy, which is also kept when GitHub is
+unreachable. Unauthenticated, GitHub allows 60 requests an hour from the host, which is plenty for
+three projects every half hour.
+
+---
+
+## Ladders
 
 These pages show the server's ladders on bnet.cc: StarCraft, Brood War, Warcraft II (standard
 and Iron Man) and Diablo II (with its season), plus a WarCraft III tab that stays closed until
@@ -21,21 +80,21 @@ browser ──GET  /ladder.php ─▶ ladder.js ──GET /ladder-data.php──
 | `war3-ladder.php` | Sends old links to the ladder page's WarCraft III tab (`ladder.php?g=w3`). |
 | `ladder-config.sample.php` | Settings; copy it to `ladder-config.php`. |
 
-## Installing
+### Installing the ladders
 
 1. Upload the files to the site's root, next to `header.php`.
 2. Copy `ladder-config.sample.php` to `ladder-config.php` and set:
    - `LADDER_PUSH_TOKEN` to a long random string;
    - `LADDER_DATA_FILE` to a path PHP can write, ideally outside the web root;
    - `LADDER_HEADER_FILE` / `LADDER_FOOTER_FILE` to the site's own template files. `header.php`
-     ends by opening `#content-container`; the footer file must close it, along with the sidebar if
-     there is one. If either is left empty, the built-in copy is used.
+     ends by opening `#main-content`, and `footer.php` closes it through `sidebar.php`. If either is
+     left empty, the built-in copy is used.
 3. If the host runs Apache and pushes come back `401 bad token`, the host is dropping the
    `Authorization` header. Add this to `.htaccess`:
    ```apache
    SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1
    ```
-4. Add a **Ladder** link to the nav bar in `header.php`: `<a href="/ladder.php" class="menu">Ladder</a>`.
+4. The updated `header.php` already has the **Ladder** link.
 5. On the server, in `bnetccd.toml`:
    ```toml
    [ladder_push]
@@ -49,7 +108,7 @@ browser ──GET  /ladder.php ─▶ ladder.js ──GET /ladder-data.php──
 To check the push by hand, the server serves the same JSON on its public status port:
 `http://<server>:6116/ladder.json`.
 
-## What the snapshot holds
+### What the snapshot holds
 
 Only what the games' own ladder screens show anyone: account names on the StarCraft and Warcraft II
 ladders, and character names on the Diablo II ladder (never the account behind a character).

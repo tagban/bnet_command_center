@@ -1,0 +1,35 @@
+/* bnet.cc news, releases and home-page widgets. Built on the site's own classes (b.header, .row,
+   .rowAlt, .tiny, .white); this only adds what those do not cover. */
+.post { margin-bottom: 18px; padding-bottom: 12px; border-bottom: 1px dotted #333333; background-color: transparent; }
+.post-short { margin-bottom: 12px; padding-bottom: 8px; }
+.post-title { font-size: 14px; font-weight: bold; color: #FFFFFF; background-color: transparent; }
+.post-pin { font-size: 9px; text-transform: uppercase; letter-spacing: 1px; color: #00C0FF; border: 1px solid #00C0FF; padding: 0 4px; vertical-align: middle; background-color: transparent; }
+.post-meta { color: #888888; font-size: 11px; margin: 2px 0 8px; background-color: transparent; }
+.post-body, .post-body p, .post-body li { line-height: 1.55; background-color: transparent; }
+.post-body p { margin: 0 0 10px; }
+.post-body .post-h { color: #FFFFFF; font-size: 13px; margin: 12px 0 6px; }
+.post-body .post-list { margin: 0 0 10px 18px; padding: 0; color: #CCCCCC; }
+.post-body code { color: #00C0FF; font-family: Consolas, Menlo, monospace; font-size: 12px; background-color: transparent; }
+.post-excerpt { color: #BBBBBB; line-height: 1.5; background-color: transparent; }
+.post-nav { margin: 6px 0 0; background-color: transparent; }
+.post-empty { color: #888888; background-color: transparent; }
+.post-pager { display: flex; justify-content: space-between; margin-top: 10px; background-color: transparent; }
+.dim { color: #666666; background-color: transparent; }
+
+.rel-project { margin-bottom: 22px; background-color: transparent; }
+.rel-project-name { color: #FFFFFF; font-size: 14px; font-weight: bold; border-bottom: 1px solid #333333; padding-bottom: 3px; margin-bottom: 8px; background-color: transparent; }
+.rel-project-name .tiny { margin-left: 6px; }
+.rel { padding: 6px 0; border-bottom: 1px dotted #262626; background-color: transparent; }
+.rel-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; background-color: transparent; }
+.rel-tag { color: #888888; font-size: 11px; background-color: transparent; }
+.rel-badge { font-size: 9px; text-transform: uppercase; letter-spacing: 1px; color: #00C0FF; border: 1px solid #00C0FF; padding: 0 4px; background-color: transparent; }
+.rel-badge.rel-pre { color: #FFAC04; border-color: #FFAC04; }
+.rel-date { margin-left: auto; color: #888888; font-size: 11px; background-color: transparent; }
+.rel-notes { margin: 6px 0 4px; padding-left: 10px; border-left: 2px solid #333333; }
+.rel-assets { margin: 4px 0 0 18px; padding: 0; background-color: transparent; }
+.rel-assets li { margin: 2px 0; background-color: transparent; }
+
+.rel-widget, .lad-widget { margin-top: 6px; background-color: #343434; }
+.lad-widget .lad-game { background-color: #1a1a1a; color: #FFFFFF; font-weight: bold; padding-top: 6px; }
+.lad-num { text-align: right; white-space: nowrap; }
+.lad-dead { color: #E05050; background-color: transparent; }
