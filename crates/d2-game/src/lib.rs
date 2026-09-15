@@ -10,6 +10,7 @@
 
 pub mod battle;
 pub mod clock;
+pub mod gear;
 pub mod inventory;
 pub mod loot;
 pub mod path;

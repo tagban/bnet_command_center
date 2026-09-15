@@ -287,6 +287,11 @@ pub struct ItemDef {
     pub has_inv: bool,
     /// `magic lvl`: added to the item level for its affix level (`+0x140`).
     pub magic_level: i32,
+    /// `StrBonus`, `DexBonus` (`+0x106`, `+0x108`): hundredths of a percent of damage per point
+    /// of strength or dexterity.
+    pub str_bonus: i32,
+    /// See [`Self::str_bonus`].
+    pub dex_bonus: i32,
 }
 
 /// Every item, in class id order.
@@ -372,6 +377,8 @@ impl Items {
                     belt: int("belt"),
                     has_inv: int("hasinv") != 0,
                     magic_level: int("magic lvl"),
+                    str_bonus: int("StrBonus"),
+                    dex_bonus: int("DexBonus"),
                 }
             }));
         }

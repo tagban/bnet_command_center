@@ -952,6 +952,7 @@ impl GameServer {
             game.ground.insert(guid, item);
             return Vec::new();
         };
+        refresh_gear(rules, game, name);
         // Everyone else near: the unit goes, then what was dropped again.
         let gone = d2gs::remove_unit(unit_type::ITEM, guid);
         let shown = [(item.room, gone.clone())].into_iter().chain(dropped);
@@ -1117,6 +1118,7 @@ impl GameServer {
             ItemMove::Drop { guid } => return drop_cursor_item(rules, game, name, guid),
         };
         info!(game_id, player = name, ?request, "item moved");
+        refresh_gear(rules, game, name);
         out
     }
 
@@ -1167,6 +1169,7 @@ impl GameServer {
         }
         let packets = carried.inventory.items().iter().filter_map(|held| items::held_packet(rules, held, false)).collect();
         game.carried.insert(p.character.name.clone(), carried);
+        refresh_gear(rules, game, &p.character.name);
         packets
     }
 
@@ -1289,6 +1292,22 @@ fn ground_packet(rules: &GameData, guid: u32, item: &GroundItem, dropping: bool,
             items::world(rules, item_action::ADD_TO_GROUND, guid, &shown)
         }
     }
+}
+
+/// Tell the fight what a player's worn items add ([`d2_game::gear`]).
+fn refresh_gear(rules: &GameData, game: &mut Game, name: &str) {
+    let Game { carried, battle, .. } = game;
+    let Some(carried) = carried.get(name) else { return };
+    let worn: Vec<(u8, &Item)> = carried
+        .inventory
+        .items()
+        .iter()
+        .filter_map(|h| match h.place {
+            Place::Body(body) => Some((body, &h.item)),
+            _ => None,
+        })
+        .collect();
+    battle.set_player_gear(rules, name, d2_game::gear::gear(rules, &worn));
 }
 
 /// An item move a client asks for (`0x17`–`0x1F`, `0x23`–`0x25`).

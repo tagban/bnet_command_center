@@ -49,6 +49,7 @@ use d2_data::treasure::{gold_amount, Drop};
 use d2_drlg::rng::Seed;
 use d2_drlg::world::RoomId;
 
+use crate::gear::Gear;
 use crate::path;
 
 /// Engine frames a second.
@@ -90,7 +91,6 @@ pub const PLAYER_REACH: i32 = 6;
 /// How many frames one call may catch up; a game nobody drove for longer skips the rest.
 const MAX_CATCH_UP: u64 = 5 * FRAMES_PER_SECOND;
 /// Unarmed damage.
-const FIST_DAMAGE: (i32, i32) = (1, 2);
 /// Frames past a player's death animation before a release stands it up: the client's corpse
 /// mode follows the animation's end.
 const DEATH_SETTLE_MARGIN: u64 = 15;
@@ -429,15 +429,25 @@ struct Hero {
     told_at: u64,
     healing: Recovery,
     mana_recovery: Recovery,
+    /// What its worn items add.
+    gear: Gear,
+    /// The life, mana and stamina (256ths) its gear adds to its maximums, kept out of its save.
+    gear_vitals: (i32, i32, i32),
 }
 
 impl Hero {
+    /// An attribute with what its items add.
+    fn attribute(&self, which: u8) -> i32 {
+        self.attributes[usize::from(which)] + self.gear.attributes[usize::from(which)]
+    }
+
     fn attack_rating(&self, data: &GameData) -> i32 {
-        (self.attributes[usize::from(stat::DEXTERITY)] - 7) * 5 + data.class(self.class).map_or(0, |c| c.to_hit_factor)
+        let base = (self.attribute(stat::DEXTERITY) - 7) * 5 + data.class(self.class).map_or(0, |c| c.to_hit_factor) + self.gear.to_hit;
+        base + base * self.gear.to_hit_percent / 100
     }
 
     fn defense(&self) -> i32 {
-        self.attributes[usize::from(stat::DEXTERITY)] / 4
+        self.attribute(stat::DEXTERITY) / 4 + self.gear.defense
     }
 
     /// Its life, mana and stamina for its client, noting what was told when.
@@ -667,8 +677,35 @@ impl Battle {
             told_at: 0,
             healing: Recovery::default(),
             mana_recovery: Recovery::default(),
+            gear: Gear::default(),
+            gear_vitals: (0, 0, 0),
         };
         self.heroes.insert(name.to_string(), hero);
+    }
+
+    /// A player's worn items changed: what they add from now on — attributes, maximum life, mana
+    /// and stamina (what is left of each kept no higher than its new maximum), defence, attack
+    /// rating, damage — and the attack animation its weapon class gives.
+    pub fn set_player_gear(&mut self, data: &GameData, name: &str, gear: Gear) {
+        let Some(h) = self.heroes.get_mut(name) else { return };
+        let per_point = data.class(h.class).map_or((0, 0, 0), |c| c.per_point);
+        let vitals = (
+            (gear.life << 8) + ((gear.attributes[usize::from(stat::VITALITY)] * per_point.0) << 6),
+            (gear.mana << 8) + ((gear.attributes[usize::from(stat::ENERGY)] * per_point.2) << 6),
+            (gear.stamina << 8) + ((gear.attributes[usize::from(stat::VITALITY)] * per_point.1) << 6),
+        );
+        h.max_life += vitals.0 - h.gear_vitals.0;
+        h.max_mana += vitals.1 - h.gear_vitals.1;
+        h.max_stamina += vitals.2 - h.gear_vitals.2;
+        h.life = h.life.min(h.max_life);
+        h.mana = h.mana.min(h.max_mana);
+        h.stamina = h.stamina.min(h.max_stamina);
+        h.gear_vitals = vitals;
+        h.gear = gear;
+        let token = CLASS_TOKENS[usize::from(h.class.min(6))];
+        let class = gear.weapon.map_or_else(|| "hth".to_string(), |w| d2_data::items::code_str(&w.class));
+        h.attack_frames = anim_frames(data, token, "A1", &class, 12);
+        h.hit_frame = hit_frames(data, token, "A1", &class, h.attack_frames / 2);
     }
 
     /// A player's saved stats, ids 0–15 as a `.d2s` keeps them (life, mana and stamina in 256ths;
@@ -676,7 +713,8 @@ impl Battle {
     #[must_use]
     pub fn player_stats(&self, name: &str) -> Option<Vec<(u8, u32)>> {
         let h = self.heroes.get(name)?;
-        let life = if h.dead || h.life <= 0 { h.max_life } else { h.life };
+        let (max_life, max_mana, max_stamina) = (h.max_life - h.gear_vitals.0, h.max_mana - h.gear_vitals.1, h.max_stamina - h.gear_vitals.2);
+        let life = if h.dead || h.life <= 0 { max_life } else { h.life };
         let a = |i: u8| h.attributes[usize::from(i)].max(0) as u32;
         Some(vec![
             (stat::STRENGTH, a(stat::STRENGTH)),
@@ -686,11 +724,11 @@ impl Battle {
             (stat::STATPTS, h.stat_points),
             (stat::NEWSKILLS, h.skill_points),
             (stat::HITPOINTS, life.max(0) as u32),
-            (stat::MAXHP, h.max_life.max(0) as u32),
+            (stat::MAXHP, max_life.max(0) as u32),
             (stat::MANA, h.mana.max(0) as u32),
-            (stat::MAXMANA, h.max_mana.max(0) as u32),
+            (stat::MAXMANA, max_mana.max(0) as u32),
             (stat::STAMINA, h.stamina.max(0) as u32),
-            (stat::MAXSTAMINA, h.max_stamina.max(0) as u32),
+            (stat::MAXSTAMINA, max_stamina.max(0) as u32),
             (stat::LEVEL, h.level),
             (stat::EXPERIENCE, h.experience),
             (stat::GOLD, h.gold),
@@ -784,10 +822,17 @@ impl Battle {
             Event::PlayerStat { player: player.clone(), stat: stat::STATPTS, value: h.stat_points },
         ];
         let per = data.class(h.class).map_or((0, 0, 0), |c| c.per_point);
+        let geared = h.gear_vitals;
         let mut grow = |value: &mut i32, max: &mut i32, quarters: i32, current: u8, maximum: u8| {
             *max += quarters << 6;
             *value += quarters << 6;
-            events.push(Event::PlayerStat { player: player.clone(), stat: maximum, value: (*max).max(0) as u32 });
+            // The base stat, as the engine sends it; what items add the client works out itself.
+            let from_gear = match maximum {
+                stat::MAXHP => geared.0,
+                stat::MAXMANA => geared.1,
+                _ => geared.2,
+            };
+            events.push(Event::PlayerStat { player: player.clone(), stat: maximum, value: (*max - from_gear).max(0) as u32 });
             events.push(Event::PlayerStat { player: player.clone(), stat: current, value: (*value).max(0) as u32 });
         };
         if which == stat::VITALITY {
@@ -878,8 +923,9 @@ impl Battle {
         if self.seed.pick(100) as i32 >= chance {
             return;
         }
-        // Unarmed: no weapon, so no strength bonus.
-        let damage = FIST_DAMAGE.0 + self.seed.pick((FIST_DAMAGE.1 - FIST_DAMAGE.0 + 1) as u32) as i32;
+        // `0x0057B420`: the range in 256ths, a roll between its ends, whole points dealt.
+        let (lo, hi) = h.gear.damage_range(h.attribute(stat::STRENGTH), h.attribute(stat::DEXTERITY));
+        let damage = ((lo + if hi > lo { self.seed.pick((hi - lo) as u32) as i32 } else { 0 }) >> 8).max(1);
         let now = self.frame;
         let experience_gain = experience_for(m.sheet.experience, h.level, m.sheet.level);
         let flinch = flinches(&mut self.seed, damage, m.max_life);
@@ -1035,11 +1081,11 @@ impl Battle {
                 (stat::LEVEL, h.level),
                 (stat::STATPTS, h.stat_points),
                 (stat::NEWSKILLS, h.skill_points),
-                (stat::MAXHP, h.max_life as u32),
+                (stat::MAXHP, (h.max_life - h.gear_vitals.0).max(0) as u32),
                 (stat::HITPOINTS, h.life.max(0) as u32),
-                (stat::MAXMANA, h.max_mana as u32),
+                (stat::MAXMANA, (h.max_mana - h.gear_vitals.1).max(0) as u32),
                 (stat::MANA, h.mana.max(0) as u32),
-                (stat::MAXSTAMINA, h.max_stamina as u32),
+                (stat::MAXSTAMINA, (h.max_stamina - h.gear_vitals.2).max(0) as u32),
                 (stat::STAMINA, h.stamina.max(0) as u32),
                 (stat::LASTEXP, data.next_level_experience(h.class, h.level as usize - 1).unwrap_or(0)),
                 (stat::NEXTEXP, data.next_level_experience(h.class, h.level as usize).unwrap_or(0)),
