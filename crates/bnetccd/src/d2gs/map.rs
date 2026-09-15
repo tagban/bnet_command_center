@@ -150,7 +150,7 @@ impl GameServer {
             .values()
             .map(|game| (game.name.clone(), !game.password.is_empty(), game.difficulty, game.connected.len(), game.created.elapsed().as_secs()))
             .collect();
-        games.sort_by(|a, b| a.4.cmp(&b.4));
+        games.sort_by_key(|g| g.4);
         games
     }
 

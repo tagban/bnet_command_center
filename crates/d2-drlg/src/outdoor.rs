@@ -2259,7 +2259,7 @@ pub(crate) mod tests {
                         worst.push((bad, room.area));
                     }
                 }
-                worst.sort_by(|a, b| b.0.cmp(&a.0));
+                worst.sort_by_key(|w| std::cmp::Reverse(w.0));
                 wrong += level_wrong;
                 report.push(format!("level {id}: {} rooms, {missing} not recorded, {level_wrong} cells differ, worst {:?}", maps.len(), &worst[..worst.len().min(4)]));
             }
