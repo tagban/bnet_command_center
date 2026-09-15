@@ -18,6 +18,7 @@ use d2_formats::mpq::{self, ArchiveSet, DATA_ARCHIVES};
 pub mod appearance;
 pub mod character;
 pub mod engine;
+pub mod item_bits;
 pub mod item_stats;
 pub mod items;
 pub mod levels;
