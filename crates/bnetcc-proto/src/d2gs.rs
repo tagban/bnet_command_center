@@ -171,6 +171,9 @@ pub mod cs {
     /// Pick an item up: `[unit type u32][item guid u32][to cursor u32]` (13 bytes; engine
     /// handler `0x0054AAD0`, then `0x00548B00` as for `0x13`).
     pub const PICK_UP_ITEM: u8 = 0x16;
+    /// Start talking to an NPC whose menu opened: `[unit type u32][guid u32]` (9 bytes; engine
+    /// handler `0x0054B930`).
+    pub const NPC_TALK: u8 = 0x2F;
     /// Use an item in the inventory: `[item guid u32][x u32][y u32]` (13 bytes; engine handler
     /// `0x0054B1E0` → `0x0055E170`).
     pub const USE_ITEM: u8 = 0x20;

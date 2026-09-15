@@ -72,6 +72,10 @@ const FALLBACK_SPAWN_ROOM: (u16, u16) = (1152, 880);
 /// Guid of the joining player's unit.
 const PLAYER_GUID: u32 = 1;
 
+/// The NPC classes that heal a player who talks to them (`0x00578E70`): Akara 148, Atma 176, Fara 178,
+/// Ormus 255, Jamella 405 and Malah 513.
+const HEALERS: [u16; 6] = [148, 176, 178, 255, 405, 513];
+
 /// How long a swing at a monster out of reach waits for the player to get there.
 const ATTACK_WAIT: Duration = Duration::from_secs(3);
 
@@ -653,6 +657,27 @@ impl GameServer {
                 _ => Vec::new(),
             },
         }
+    }
+
+    /// A player starts talking to an NPC (`0x2F`, handler `0x0054B930` → `0x00572E60` →
+    /// `0x00578E70`): the healers — Akara, Atma, Fara, Ormus, Jamella and Malah — restore its
+    /// life, mana and stamina, each sent as its stat when it was short (`0x00578D30`). Poison and
+    /// cold, which it also cures, and a hireling's heal are not ported; the engine heals once per
+    /// conversation, which a heal that only fills what is missing makes no difference to.
+    fn npc_talk(&self, game_id: u16, name: &str, kind: u32, guid: u32) -> Vec<Vec<u8>> {
+        let Ok(kind) = u8::try_from(kind) else { return Vec::new() };
+        let mut g = self.lock();
+        let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
+        let Some((_, unit)) = game.population.as_ref().and_then(|p| p.find(kind, guid)) else { return Vec::new() };
+        let Spawned::Monster { class, .. } = *unit else { return Vec::new() };
+        if !HEALERS.contains(&class) {
+            return Vec::new();
+        }
+        let healed = game.battle.heal(name);
+        if !healed.is_empty() {
+            info!(game_id, player = name, npc = class, "healed");
+        }
+        healed.iter().filter_map(|e| battle_packet(e, name)).collect()
     }
 
     /// Where waypoint travel from waypoint `guid` to `level` puts the player (`0x0054C5D0` →
@@ -1732,6 +1757,16 @@ async fn run(
                         }
                         flush(stream, peer, tables, &mut outbox).await?;
                         server.save_character(p).await;
+                    }
+                }
+                (Stage::InGame, cs::NPC_TALK) => {
+                    let Some(p) = player.as_ref() else { continue };
+                    let replies = server.npc_talk(p.game_id, &p.character.name, u32_at(1), u32_at(5));
+                    if !replies.is_empty() {
+                        for packet in &replies {
+                            outbox.push(packet);
+                        }
+                        flush(stream, peer, tables, &mut outbox).await?;
                     }
                 }
                 (Stage::InGame, cs::RESPAWN) => {

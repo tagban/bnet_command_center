@@ -920,6 +920,21 @@ impl Battle {
         }
     }
 
+    /// A healer restores a living player's life, mana and stamina (`0x00578D30`): the stats it
+    /// filled, each as the engine sends it.
+    pub fn heal(&mut self, name: &str) -> Vec<Event> {
+        let Some(h) = self.heroes.get_mut(name).filter(|h| !h.dead) else { return Vec::new() };
+        let mut events = Vec::new();
+        for (value, max, id) in [(&mut h.life, h.max_life, stat::HITPOINTS), (&mut h.mana, h.max_mana, stat::MANA), (&mut h.stamina, h.max_stamina, stat::STAMINA)] {
+            if *value < max {
+                *value = max;
+                events.push(Event::PlayerStat { player: name.to_string(), stat: id, value: max.max(0) as u32 });
+            }
+        }
+        h.told = h.whole();
+        events
+    }
+
     /// A player drinks `potion`: what its client is told at once (a rejuvenation's life and mana);
     /// `None` when the player is not in the fight or is dead, and nothing is used up.
     pub fn drink(&mut self, name: &str, potion: Potion) -> Option<Vec<Event>> {
@@ -998,6 +1013,13 @@ impl Battle {
             h.mana += mana << 6;
             h.stat_points += class.map_or(5, |c| c.stat_per_level.max(0) as u32);
             h.skill_points += 1;
+            // A new level fills life, mana and stamina (`0x00570880`).
+            if h.life > 0 {
+                h.life = h.max_life;
+            }
+            h.mana = h.max_mana;
+            h.stamina = h.max_stamina;
+            h.told = h.whole();
             for (stat, value) in [
                 (stat::LEVEL, h.level),
                 (stat::STATPTS, h.stat_points),
@@ -1354,6 +1376,9 @@ mod tests {
         assert!(all.contains(&Event::PlayerStat { player: "hero".into(), stat: stat::LEVEL, value: 3 }), "100 exp passes 20 and 60");
         assert!(all.contains(&Event::PlayerStat { player: "hero".into(), stat: stat::STATPTS, value: 10 }));
         assert!(!b.player_attack("hero", 7), "a corpse cannot be hit");
+        let stats = b.player_stats("hero").unwrap();
+        let of = |id: u8| stats.iter().find(|s| s.0 == id).unwrap().1;
+        assert_eq!((of(stat::HITPOINTS), of(stat::MANA), of(stat::STAMINA)), (of(stat::MAXHP), of(stat::MAXMANA), of(stat::MAXSTAMINA)), "a new level fills them");
         let points = b.spend_stat_point(&data, "hero", stat::VITALITY);
         assert!(points.contains(&Event::PlayerStat { player: "hero".into(), stat: stat::STATPTS, value: 9 }));
         assert!(points.iter().any(|e| matches!(e, Event::PlayerStat { stat: stat::MAXHP, .. })));
@@ -1501,6 +1526,24 @@ mod tests {
         b.drink("hero", Potion::Rejuvenation { life: 100, mana: 100 });
         assert_eq!((stat_of(&b, stat::HITPOINTS), stat_of(&b, stat::MANA)), (max_life, max_mana), "a full one fills");
         assert_eq!(b.drink("nobody", Potion::Rejuvenation { life: 100, mana: 100 }), None);
+    }
+
+    #[test]
+    fn a_healer_fills_what_is_missing() {
+        let data = data();
+        let mut b = weakened(&data, 4);
+        let max = |b: &Battle, id: u8| b.player_stats("hero").unwrap().iter().find(|s| s.0 == id).unwrap().1;
+        let healed = b.heal("hero");
+        assert_eq!(
+            healed,
+            [
+                Event::PlayerStat { player: "hero".into(), stat: stat::HITPOINTS, value: max(&b, stat::MAXHP) },
+                Event::PlayerStat { player: "hero".into(), stat: stat::MANA, value: max(&b, stat::MAXMANA) },
+            ],
+            "stamina was full"
+        );
+        assert!(b.heal("hero").is_empty(), "nothing left to fill");
+        assert!(b.heal("nobody").is_empty());
     }
 
     #[test]
