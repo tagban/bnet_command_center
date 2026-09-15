@@ -36,6 +36,7 @@ pub mod error;
 pub mod line;
 pub mod mcp;
 pub mod statstring;
+pub mod w3general;
 
 pub use error::{FourCc, ProtoError, Result};
 
