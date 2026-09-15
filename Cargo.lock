@@ -178,6 +178,17 @@ name = "bnetcc-proto"
 version = "0.2.3"
 
 [[package]]
+name = "bnetcc-pvpgn-import"
+version = "0.2.3"
+dependencies = [
+ "bnetcc-crypto",
+ "bnetcc-storage",
+ "bnetcc-storage-sqlite",
+ "clap",
+ "d2-formats",
+]
+
+[[package]]
 name = "bnetcc-smoke"
 version = "0.2.3"
 dependencies = [

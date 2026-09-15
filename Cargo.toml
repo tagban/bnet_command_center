@@ -14,6 +14,7 @@ members = [
     "crates/d2-drlg",
     "crates/d2-game",
     "crates/winbot",
+    "crates/pvpgn-import",
 ]
 
 [workspace.package]
