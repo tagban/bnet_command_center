@@ -149,21 +149,29 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
    *Expect monsters:* each area fills with its own kinds as you approach — Blood Moor's
    zombies, quill rats and packs of fallen, Cold Plains' brutes, dark ones and shamans with
    their fallen, and so on, 50–160 an area. They notice you, come for you and hit; clicking one
-   swings at it (every character fights bare-handed for now), and a kill pays experience.
-4. *Expect loot:* a kill sometimes drops a gold pile, a potion, a scroll, a gem or a rune.
-   Clicking gold adds it to your gold (up to 10,000 a level). Clicking a healing, mana or
-   rejuvenation potion puts it in the first free of the belt's four slots, anything else (and a
-   potion once the belt is full) in the inventory, filling from the right-hand column up; with no
-   room it stays on the ground. Belt keys 1–4, or right-clicking a potion in the inventory,
-   drinks it: life or mana rises over a few seconds (a rejuvenation at once) and the potion is
-   gone. What you carry is saved and is back in your belt and inventory next game.
-   *Not yet:* weapons, armour, rings, amulets, charms, keys and arrows never drop; holding items
-   on the cursor, moving or dropping them, the stash, reading scrolls and stamina, antidote
-   and thawing potions do nothing.
+   swings at it with the weapon you wear (bare-handed without one), and a kill pays experience.
+4. *Expect loot:* a kill sometimes drops a gold pile, a potion, a scroll, a gem, a rune, or a
+   weapon, armour, ring or amulet — white, grey (low quality), superior, blue (magic), yellow
+   (rare), green (set) or gold (unique), magic and better ones unidentified. Clicking gold adds
+   it to your gold (up to 10,000 a level). Clicking a healing, mana or rejuvenation potion puts it
+   in the first free of the belt's four slots; an identified weapon or armour you can use goes
+   straight on when its place is empty; anything else goes in the inventory, filling from the
+   right-hand column up; with no room it stays on the ground. Belt keys 1–4, or right-clicking a
+   potion in the inventory, drinks it. Items can be picked up onto the cursor, moved about the
+   inventory and belt, worn, swapped with what you wear, taken off and dropped. Right-clicking a
+   Scroll of Identify and then clicking an unidentified item identifies it. What you wear
+   counts: a weapon's damage (with strength), armour's defence, and life, mana, attributes and
+   attack rating from magic items. What you carry and wear is saved and is back next game. *A
+   new character* starts with its class's items (a weapon, a buckler for most, four minor
+   healing potions in the belt, a Town Portal and an Identify scroll); characters made before
+   2026-09-15 that have been saved keep what they had.
+   *Not yet:* the stash and cube, sockets filled, tomes, Town Portal, stamina, antidote and
+   thawing potions, shops, repair, and other players seeing what you wear.
 5. *Expect nothing else to work:* NPCs never move, there is no shop and no travel to other acts.
    Esc → Save and Exit returns to chat (verified).
-6. Send the log from the moment you clicked Create Game (`item picked up`, `potion drunk` and
-   `no room to pick it up` lines say what the server did with items).
+6. Send the log from the moment you clicked Create Game (`item picked up`, `item moved`,
+   `item dropped`, `item identified`, `potion drunk`, `item move refused` and `no room to pick it
+   up` lines say what the server did with items).
 
 What it shows, in order:
 

@@ -771,6 +771,86 @@ stored `0x9C` 4, belt `0x9C` `0x0E` (own player only), equipped `0x9D` 6. The cl
 and `0x0E` handlers put the item on `0x7A6A70`, the client's own player, which `0x0B` sets
 (`0x45CC50`); we send the items right after the stats that follow `0x0B`.
 
+### Full items: making, moving, wearing, identifying (2026-09-15)
+
+**Bits.** A full item (writer `0x62FFF0`, reader `0x62CBE0`) goes on after the code: socketed
+items 3, the seed 32 (saves), item level 7, quality 4, a picture 3 behind a bit when the type has
+`VarInvGfx`, an automagic id 11 behind a bit, the quality's ids (magic prefix 11 + suffix 11,
+set/unique 12, rare names 8 + 8 then three prefix/suffix pairs of bit + 11 — the names and single
+ids only when identified in a packet), runeword, personal name, the save's realm bit, armour's
+defence (stat 31's width), maximum and current durability for armour and weapons, a stack's
+quantity 9, sockets, then — in a save or for an identified item — the stat lists ended by
+`0x1FF` (id 9, parameter, value in `ItemStatCost.txt` widths; 17/18, 48/49, 50/51, 52/53,
+54/55/56, 57/58/59 carry their partners). A `.d2s` list is `JM`, a count leaving out socketed
+items, the items. Five retail bodies read and write back byte for byte.
+
+**Making** (`0x55A6D0` per treasure pick). Quality (`0x558640`): the `ItemRatio.txt` row by uber
+and class-specific, `levels = monster level − item level`; each of unique, set, rare (type
+`Rare`), magic: `chance = (ratio − levels / divisor) × 128`, with magic find `× 100 / (100 +
+MF')` (MF' diminishing at 250/500/600 for unique/set/rare), no lower than `Min`, cut by the
+treasure class's mod `× mod / 1024`; it is that quality when nothing is left or `rand(left) <
+128`. Else superior when `(HiQuality − levels / div) × 128 ≤ 0` or its roll is under 128; else
+normal when `(Normal − levels / div) × 128 < 1` or its roll is under 128; else low quality. Type
+rules (`0x557450`): `Normal` types normal; `unique` items unique; `Magic` types at least magic
+(unique for quest items); no rare for types without `Rare`. Base values (`0x557AB0`): armour
+defence `minac + rand(maxac − minac + 1)`, durability max `durability`, current `rand(dur/2) +
+dur/2`; stacks `minstack + rand(maxstack − minstack)`; the picture `rand(VarInvGfx)`. Then the
+quality, falling back: low quality (`0x5C2D40`, a `LowQualityItems` row, a third of the
+durability, three quarters of the defence) → normal; superior (`0x5C2970`, a random
+`QualityItems` row that suits the type, its mods) → normal; magic (`0x5565E0`: a prefix half the
+time, a suffix half the time or always without a prefix; unidentified) → superior → normal; rare
+(`0x5C1BF0`: two names uniform among those whose types suit, then `[3,4,4,5,5,5,6,6][rand & 7]`
+affixes, each side up to three, a coin choosing the side; unidentified) → magic; set (`0x5C25C0`,
+rows for the code by `rarity`, Cow King's only on request) → magic with durability ×2 in LoD;
+unique (`0x5566B0`, rows for the code by `rarity`, ladder rows only in ladder games, once a game
+unless `nolimit`) → rare with durability ×3 in LoD. An affix (`0x5C1560`) is picked by
+`frequency` (× `level` for items with `magic lvl`) among spawnable rows of the game's version whose
+`level..maxlevel` holds the affix level (`magic lvl` added, or `ilvl − qlvl/2`, or `2·ilvl − 99`
+near the top), whose `itypes`/`etypes` suit, whose class suits, `rare` for rare/normal/superior,
+and whose group the item does not have. Staff mods (`0x5C0F90`) give wands, staves and scepters up
+to three class skills by item level. After the quality: ethereal 1 in 20 in LoD (`0x556CA0`),
+sockets for normal and superior items one in three up to the type's `MaxSock` by item level and 3/4/6
+by difficulty, never body armour in classic (`0x556B60`, count `seed % max + 1`), and LoD's
+automagic affix. Properties (`0x65FD70`) run each `Properties.txt` function (table `0x7462F8`),
+the first's value handed to the rest: 1/2 roll, 3/4/8 previous or roll, 5/6 minimum/maximum damage
+onto the stats the weapon uses (21/22 one-handed, 23/24 two-handed, 159/160 thrown; every one off
+weapons), 7 enhanced damage (+1 maximum instead when the percentage adds nothing), 10 skill tab,
+11 skill on event, 13 durability percent, 14 sockets, 15–17 fixed values, 18 by time, 19 charges,
+20 indestructible, 21/22/24 parameters, 23 ethereal.
+
+**Pickup and moves.** A picked-up item is worn when it is identified, its requirements are met,
+it is not a throwing potion and a body location of its type is free and suits it (`0x55D710`);
+else belt or inventory as simple items. `0x16` with `to cursor` lifts it (`0x9C` 1). Client moves
+(sizes from the table): `0x17` drop [item] (5), `0x18` into a grid [item][x][y][grid] (17), `0x19`
+lift [item] (5), `0x1A` wear [item][body] (9), `0x1C` take off [body u16] (3), `0x1D` swap worn
+[item][body] (9), `0x1F` swap in grid [cursor][item][x][y] (17), `0x23` into belt [item][slot] (9),
+`0x24` out of belt [item] (5), `0x25` swap in belt [cursor][item] (9). Each move sets an action
+flag the per-frame pass `0x5973F0` turns into a packet: lifted `0x9D` 5 (the old column, row and
+page kept in its bits, mode 4), put `0x9C` 4, worn `0x9D` 6 (flag 1: rebuild), taken off `0x9D` 8
+(the old body location kept), body swap `0x9D` 9 twice (the lifted one flagged `0x80` first, the
+worn one `0x40`), grid swap `0x9C` `0x0D` twice, belt `0x9C` `0x0E`/`0x0F`/`0x10`, dropped `0x9C` 2
+(`0x563C00`, spot as for drops). The client's handlers (`0x45EB10`, `0x45EC70`) read those
+flags and fields.
+
+**Wearing counts** (`0x57B420`, a player's physical damage): `min/max` from stats 21/22 (23/24
+when two-handed) — the weapon's base with its own enhanced damage (op 13) and flat bonuses —
+plus stat 111, then `× (100 + stat 18/17 + strength × StrBonus/100 + dexterity × DexBonus/100) /
+100` (strength alone for the fist), no lower than −90%, a roll between; `× mul/128`. Defence adds
+each armour's base with its own `ac%` and every flat bonus; attributes, life, mana, stamina and
+attack rating add to the player; an unidentified item's stats count for nothing. Saves and
+`0x1D`–`0x1F` stats keep the base values; the client works out what items add.
+
+**Identify.** Using a Scroll of Identify (`pSpell` 1 from `Books.txt` row 1) readies it: `0x3F
+[SpellIcon 0][scroll guid][book skill u16]` (8, `0x53D220`). The client sends `0x27 [item][scroll]`
+(9, `0x561ED0`): the scroll is used up (`0x9D` 5 used, from the belt `0x9C` `0x0F`), the item
+flagged identified and sent again with flag 1 (`0x9D` `0x15`, `0x4C4C70` rebuilds it). The book
+skill's charge count (`0x22`, `0x55E0D0`) is not sent.
+
+**Starting items** (`0x534F10`): `CharStats.txt` `item1`…`item10` with `loc` and `count`, each
+made normal at item level 1 (`0x534C70`), flagged `0x20000`, whole durability, a full stack, the
+class's `StartSkill` a point on the first; beltable ones into the belt, those with a location worn,
+the rest into the inventory as pickups place them.
+
 ## 6. Server packet builders (opcode → function)
 
 `scripts/d2re/server_send_builders.py <Game.exe>` finds every call to the queue function
@@ -799,10 +879,10 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
   behind the caves (Cave Level 2 and the other treasure levels, `DrlgType` 2) and the other acts'
   mazes.
 - Combat (§5 *Fighting*): the per-class AI routines, items and weapons, skills.
-- Loot (§5 *Simple items*): equipment and magic items — base item from the TC code
-  (`weap3`/`armo3` type-and-level picks), quality (`0x558640`), the full item body
-  (`0x62CBE0`); cursor moves (`0x17`–`0x19`, `0x23`, `0x24`), stacks, tomes, belts worn and the
-  stash; bnemu's `ItemBitstreamEncoder` and captures cover the bodies.
+- Loot (§5 *Full items*): stacks merging, tomes and Town Portal, belts worn (more rows), the
+  stash and cube, socketing, the book skills' charges (`0x22`), other players seeing what is
+  worn, requirements from affixes and from what other items add, elemental damage and
+  resistances, Barbarian one-or-two-handed swords, shops and repair.
 - bnemu (MIT, permission recorded in `docs/LEGAL.md`) has worked items and vendors to port from;
   its wilderness collision is approximate, so collision stays on libd2.
 - Unique packs and champions; wandering monsters; NPCs walking their DS1 paths (`0x666120`); the
