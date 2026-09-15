@@ -39,6 +39,19 @@ define('SERVER_PUSH_TOKEN', '');
 // The game server's address as players type it, shown on the server pages.
 define('SERVER_ADDRESS', 'us.bnet.cc:6112');
 
+// The downloads folder the Files page lists, and its address on the site.
+define('DOWNLOADS_DIR', __DIR__ . '/downloads');
+define('DOWNLOADS_URL', '/downloads');
+
+// Count downloads (once a day per visitor per file) by sending download links through download.php.
+define('DOWNLOADS_COUNT', true);
+
+// Names for folders, by folder name, over the built-in ones (win => Windows, sc2 => StarCraft II, …).
+// A folder's name and description can also be set on the admin page.
+define('DOWNLOADS_NAMES', [
+    // 'Classic Battle.net' => 'Classic Battle.net',
+]);
+
 // Before the first push arrives, the sidebar reads the public status feed directly (at most every
 // 30 seconds).
 define('SERVER_STATUS_URL', 'http://us.bnet.cc:6116/status.json');

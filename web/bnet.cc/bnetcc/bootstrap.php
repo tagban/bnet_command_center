@@ -28,6 +28,9 @@ foreach ([
     'GITHUB_CACHE_MINUTES' => 30,
     'SERVER_STATUS_URL' => 'http://us.bnet.cc:6116/status.json',
     'SERVER_PUSH_TOKEN' => '',
+    'DOWNLOADS_DIR' => BNETCC_ROOT . '/downloads',
+    'DOWNLOADS_URL' => '/downloads',
+    'DOWNLOADS_COUNT' => true,
     'SERVER_ADDRESS' => 'us.bnet.cc:6112',
 ] as $bnetccName => $bnetccDefault) {
     if (!defined($bnetccName)) {

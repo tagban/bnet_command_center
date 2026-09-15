@@ -9,6 +9,7 @@
 declare(strict_types=1);
 
 require dirname(__DIR__) . '/bnetcc/news.php';
+require dirname(__DIR__) . '/bnetcc/downloads.php';
 
 const LOGIN_MAX_FAILURES = 5;
 const LOGIN_WINDOW_SECONDS = 900;
@@ -120,7 +121,7 @@ function page(string $title, string $body): void
         $flash = '<p class="' . ($ok ? 'ok' : 'err') . '">' . h($message) . '</p>';
     }
     $nav = signed_in()
-        ? '<nav><a href="./">Posts</a> · <a href="./?new=1">New post</a> · <a href="../news.php">View news</a> · <form method="post" class="inline">' . csrf_field() . '<input type="hidden" name="action" value="logout"><button class="link">Sign out</button></form></nav>'
+        ? '<nav><a href="./">Posts</a> · <a href="./?new=1">New post</a> · <a href="./?files=1">Files</a> · <a href="../news.php">View news</a> · <form method="post" class="inline">' . csrf_field() . '<input type="hidden" name="action" value="logout"><button class="link">Sign out</button></form></nav>'
         : '<nav><a href="../">bnet.cc</a></nav>';
     echo '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">';
     echo '<title>' . h($title) . ' - bnet.cc admin</title><link rel="stylesheet" href="admin.css"><script src="admin.js" defer></script></head><body>';
@@ -222,6 +223,35 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         }
         go($id !== '' ? 'edit=' . rawurlencode($id) . '&form=1' : 'new=1&form=1');
     }
+    if ($action === 'files_save') {
+        $cat = (string) ($_POST['cat'] ?? '');
+        $index = downloads_index(true);
+        $changes = [];
+        foreach ((array) ($_POST['meta'] ?? []) as $path => $entry) {
+            $path = (string) $path;
+            if (!isset($index['folders'][$path]) && !isset($index['files'][$path])) {
+                continue;
+            }
+            $entry = is_array($entry) ? $entry : [];
+            $changes[$path] = [
+                'title' => isset($index['folders'][$path]) ? mb_substr((string) ($entry['title'] ?? ''), 0, 60) : '',
+                'about' => mb_substr((string) ($entry['about'] ?? ''), 0, 1000),
+                'featured' => isset($index['files'][$path]) && !empty($entry['featured']),
+            ];
+        }
+        try {
+            downloads_save_meta($changes);
+            flash('Saved.');
+        } catch (Throwable $e) {
+            flash('Could not save: check that the data folder is writable.', false);
+        }
+        go('files=1&cat=' . rawurlencode($cat));
+    }
+    if ($action === 'files_rescan') {
+        downloads_index(true);
+        flash('The file list is up to date.');
+        go('files=1&cat=' . rawurlencode((string) ($_POST['cat'] ?? '')));
+    }
     if ($action === 'delete') {
         try {
             flash(news_delete((string) ($_POST['id'] ?? '')) ? 'Post deleted.' : 'That post was already gone.');
@@ -243,6 +273,60 @@ if (!signed_in()) {
     }
     $body .= '<form method="post" class="card">' . csrf_field() . '<input type="hidden" name="action" value="login"><label>Name<input type="text" name="user" autocomplete="username" required></label><label>Password<input type="password" name="password" autocomplete="current-password" required></label><button' . ($locked ? ' disabled' : '') . '>Sign in</button></form>';
     page('Sign in', $body);
+}
+
+if (isset($_GET['files'])) {
+    $index = downloads_index();
+    $meta = downloads_meta();
+    $cat = (string) ($_GET['cat'] ?? '');
+    if (!isset($index['folders'][$cat])) {
+        $cat = '';
+    }
+    $folder = $index['folders'][$cat];
+    $body = '<h1>Files</h1>';
+    if (downloads_root() === '') {
+        $body .= '<p class="err">The downloads folder was not found: check DOWNLOADS_DIR in site-config.php.</p>';
+    }
+    $trail = [];
+    foreach (downloads_trail($cat, $index, $meta) as [$path, $name]) {
+        $trail[] = $path === $cat ? '<b>' . h($name) . '</b>' : '<a href="./?files=1&amp;cat=' . h(rawurlencode($path)) . '">' . h($name) . '</a>';
+    }
+    $body .= '<p class="meta">' . implode(' › ', $trail) . ' · <a href="../files.php' . ($cat !== '' ? '?cat=' . h(rawurlencode($cat)) : '') . '">view on the site</a></p>';
+    $body .= '<p class="help">Files come straight from the downloads folder: upload one and it appears here within two minutes (or press Refresh). Names and descriptions are optional. A description can also be a text file beside the file, named like <code>File.zip.txt</code>, or <code>_about.txt</code> for a folder.</p>';
+    $body .= '<form method="post" class="card wide">' . csrf_field() . '<input type="hidden" name="cat" value="' . h($cat) . '">';
+    if ($cat !== '') {
+        $m = $meta[$cat] ?? [];
+        $body .= '<label>Folder name<input type="text" name="meta[' . h($cat) . '][title]" maxlength="60" placeholder="' . h(downloads_folder_title($cat, [])) . '" value="' . h((string) ($m['title'] ?? '')) . '"></label>';
+        $body .= '<label>Folder description<textarea name="meta[' . h($cat) . '][about]" rows="3" maxlength="1000">' . h((string) ($m['about'] ?? '')) . '</textarea></label>';
+    }
+    if ($folder['folders']) {
+        $body .= '<table class="list"><tr><th>Folder</th><th>Files</th><th>Name on the site</th></tr>';
+        foreach ($folder['folders'] as $path) {
+            $f = $index['folders'][$path];
+            $m = $meta[$path] ?? [];
+            $body .= '<tr><td><a href="./?files=1&amp;cat=' . h(rawurlencode($path)) . '">' . h($f['name']) . '/</a></td><td>' . (int) $f['count'] . '</td>'
+                . '<td><input type="text" name="meta[' . h($path) . '][title]" maxlength="60" placeholder="' . h(downloads_folder_title($path, [])) . '" value="' . h((string) ($m['title'] ?? '')) . '">'
+                . '<input type="hidden" name="meta[' . h($path) . '][about]" value="' . h((string) ($m['about'] ?? '')) . '"></td></tr>';
+        }
+        $body .= '</table><br>';
+    }
+    if ($folder['files']) {
+        $body .= '<table class="list"><tr><th>File</th><th>Description</th><th>Featured</th></tr>';
+        foreach ($folder['files'] as $path) {
+            $path = (string) $path;
+            $f = $index['files'][$path];
+            $m = $meta[$path] ?? [];
+            $body .= '<tr><td>' . h($f['name']) . '<div class="meta">' . h(downloads_size($f['size'])) . ' · ' . h(site_date($f['time'])) . '</div></td>'
+                . '<td><textarea name="meta[' . h($path) . '][about]" rows="2" maxlength="1000" placeholder="' . h((string) ($index['files'][$path]['note'] ?? '')) . '">' . h((string) ($m['about'] ?? '')) . '</textarea></td>'
+                . '<td><input type="checkbox" name="meta[' . h($path) . '][featured]" value="1"' . (!empty($m['featured']) ? ' checked' : '') . '></td></tr>';
+        }
+        $body .= '</table><br>';
+    }
+    if (!$folder['folders'] && !$folder['files']) {
+        $body .= '<p class="meta">This folder is empty.</p>';
+    }
+    $body .= '<div class="buttons"><button name="action" value="files_save">Save</button><button name="action" value="files_rescan" class="secondary">Refresh the file list</button></div></form>';
+    page('Files', $body);
 }
 
 if (isset($_GET['new']) || isset($_GET['edit'])) {
