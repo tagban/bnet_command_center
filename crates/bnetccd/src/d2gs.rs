@@ -1560,7 +1560,7 @@ fn take_item(rules: &GameData, game: &mut Game, name: &str, guid: u32, class: i3
     let mut item = item.clone();
     item.flags &= !item_bits::flags::DROPPED;
     let place = if to_cursor {
-        Some(Place::Cursor).filter(|_| carried.inventory.at(Place::Cursor).is_none())
+        carried.inventory.at(Place::Cursor).is_none().then_some(Place::Cursor)
     } else {
         let worn = wearer.and_then(|w| items::auto_equip(rules, &carried.inventory, class, &item, w)).map(Place::Body);
         worn.or_else(|| carried.inventory.place_for(def.inv_size, def.auto_belt && rules.items().beltable(class)))
