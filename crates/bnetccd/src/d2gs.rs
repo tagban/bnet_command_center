@@ -1365,7 +1365,8 @@ fn battle_packet(event: &Event, recipient: &str) -> Option<Vec<u8>> {
         Event::MonsterReaction { guid, event, x, y, life, alive, .. } => d2gs::monster_reaction(*guid, *event, *x, *y, *life, *alive),
         Event::MonsterWalk { guid, x, y, .. } => d2gs::monster_walk(*guid, *x, *y, battle::WALK_VELOCITY_PERCENT),
         Event::MonsterStop { guid, x, y, life, .. } => d2gs::monster_standing(*guid, *x, *y, *life),
-        Event::MonsterAttack { guid, target, x, y, .. } if target == recipient => d2gs::monster_attack(*guid, PLAYER_GUID, *x, *y),
+        // The fight times every swing by the class's A1 animation, and every fighting class has one.
+        Event::MonsterAttack { guid, target, x, y, .. } if target == recipient => d2gs::monster_attack(*guid, d2gs::monster_event::ATTACK_1, PLAYER_GUID, *x, *y),
         Event::MonsterAttack { .. } | Event::MonsterState { .. } | Event::GoldDrop { .. } | Event::ItemDrop { .. } => return None,
         Event::PlayerReaction { event, .. } => d2gs::player_reaction(unit_type::PLAYER, PLAYER_GUID, *event, 0, 0),
         Event::PlayerVitals { life, mana, stamina, .. } => d2gs::life_and_position(*life, *mana, *stamina, 0, 0, 0, 0),

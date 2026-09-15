@@ -1215,13 +1215,25 @@ pub fn monster_walk(guid: u32, x: u16, y: u16, percent: u16) -> Vec<u8> {
     w.finish()
 }
 
-/// `0x6C`: `[guid u32][10][00][target guid u32][00][x u16][y u16]` (builder `0x0053BAA0`) — a
-/// monster standing at (`x`, `y`) swings at a unit; the client asserts its position (handler
-/// `0x0045CFB0`). The fixed bytes are a recorded retail melee attack's.
+/// Monster animation events, as `0x6C` carries them: the client's monster event handler
+/// (`0x004AFF60`) sets the unit's mode from the table at `0x006DA4D8`, by event.
+pub mod monster_event {
+    /// Mode 4, `A1`: the attack every fighting monster has.
+    pub const ATTACK_1: u8 = 0x0A;
+    /// Mode 5, `A2`: the second attack, which some classes lack (Dark Hunters, the Moon Clan) —
+    /// sent to one of those, the client puts it in a mode it has no animation for and stops
+    /// drawing it.
+    pub const ATTACK_2: u8 = 0x10;
+}
+
+/// `0x6C`: `[guid u32][event u8][00][target guid u32][00][x u16][y u16]` (builder `0x0053BAA0`) —
+/// a monster standing at (`x`, `y`) swings at a unit; the client asserts its position and passes
+/// `event` ([`monster_event`]) to the monster's mode (handler `0x0045CFB0`). The other fixed bytes
+/// are a recorded retail melee attack's (a Fallen's, with [`monster_event::ATTACK_2`]).
 #[must_use]
-pub fn monster_attack(guid: u32, target: u32, x: u16, y: u16) -> Vec<u8> {
+pub fn monster_attack(guid: u32, event: u8, target: u32, x: u16, y: u16) -> Vec<u8> {
     let mut w = Writer::with_capacity(16);
-    w.u8(sc::MONSTER_ATTACK).u32(guid).u8(0x10).u8(0).u32(target).u8(0).u16(x).u16(y);
+    w.u8(sc::MONSTER_ATTACK).u32(guid).u8(event).u8(0).u32(target).u8(0).u16(x).u16(y);
     w.finish()
 }
 
@@ -1546,7 +1558,7 @@ mod tests {
             [0x67, 0xB7, 0x90, 0x93, 0xDA, 0x01, 0x82, 0x12, 0x6F, 0x12, 0x01, 0x00, 0x0D, 0x4B, 0x00, 0x05]
         );
         assert_eq!(
-            monster_attack(0xDA93_90B7, 0x7F0B_15F3, 0x127E, 0x1272),
+            monster_attack(0xDA93_90B7, monster_event::ATTACK_2, 0x7F0B_15F3, 0x127E, 0x1272),
             [0x6C, 0xB7, 0x90, 0x93, 0xDA, 0x10, 0x00, 0xF3, 0x15, 0x0B, 0x7F, 0x00, 0x7E, 0x12, 0x72, 0x12]
         );
         assert_eq!(player_reaction(0, 1, 0x13, 0x1247, 0x124D), [0x0D, 0x00, 0x01, 0x00, 0x00, 0x00, 0x13, 0x47, 0x12, 0x4D, 0x12, 0x03, 0x60]);

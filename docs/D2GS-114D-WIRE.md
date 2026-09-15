@@ -618,8 +618,11 @@ builders confirmed here:
   gain, `0x1C` total (`0x53BDD0`); level-ups as `0x1D`–`0x1F` stats 12, 4, 5, 6–11, 29, 30.
 - Monsters: notice within `aidist` (35 when blank), walk `0x67` `[guid][01][x][y][01][00][0D]
   [75 u16][05]` (handler `0x45CDE0`; the client paths there and glides ≈5.77 subtiles/s whatever the
-  class), attack `0x6C` `[guid][10][00][target][00][x][y]` (`0x53BAA0`; client `0x45CFB0` asserts
-  the attacker's position), `0x6D` to stand.
+  class), attack `0x6C` `[guid][event][00][target][00][x][y]` (`0x53BAA0`; client `0x45CFB0` asserts
+  the attacker's position and hands `event` to the monster handler `0x4AFF60`, whose table
+  `0x6DA4D8` gives the mode: `0A` A1, `10` A2, `04` SC, `0C` S1 …). The retail capture's `10` is a
+  Fallen's A2; a class without A2 (Dark Hunters, the Moon Clan) put in it is no longer drawn, so
+  the server sends `0A`, the A1 its swing timing follows. `0x6D` to stand.
 - A player hit: `0x95` with life/mana/stamina and **position zero** — the client re-seats its
   player only for non-zero x and y (`0x45DB20` → `0x4804E0`) — then `0x0D` `[0][guid][event]
   [0][0][03][60]` (`0x53B4B0`; client `0x45CCC0` → `0x461250`): `13` a small hit's sound, `06`
