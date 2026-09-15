@@ -15,11 +15,7 @@ function finish(int $status, string $message): void
     exit;
 }
 
-$config = __DIR__ . '/ladder-config.php';
-if (!is_file($config)) {
-    finish(500, 'ladder-config.php is missing');
-}
-require $config;
+require __DIR__ . '/bnetcc/bootstrap.php';
 
 if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
     header('Allow: POST');
@@ -36,9 +32,9 @@ if ($auth === '' && function_exists('getallheaders')) {
         }
     }
 }
-$token = defined('LADDER_PUSH_TOKEN') ? (string) LADDER_PUSH_TOKEN : '';
+$token = (string) LADDER_PUSH_TOKEN;
 if (strlen($token) < 16) {
-    finish(500, 'LADDER_PUSH_TOKEN is not set (16 characters or more)');
+    finish(500, 'LADDER_PUSH_TOKEN is not set in site-config.php (16 characters or more)');
 }
 if (!preg_match('/^Bearer\s+(.+)$/i', $auth, $m) || !hash_equals($token, trim($m[1]))) {
     finish(401, 'bad token');
@@ -57,11 +53,12 @@ if (!is_array($data) || !isset($data['generated'], $data['games'], $data['diablo
     finish(400, 'not a ladder snapshot');
 }
 
-$file = LADDER_DATA_FILE;
+$file = (string) LADDER_DATA_FILE;
 $dir = dirname($file);
-if (!is_dir($dir) && !mkdir($dir, 0755, true)) {
+if (!is_dir($dir) && !@mkdir($dir, 0755, true)) {
     finish(500, 'cannot create the data directory');
 }
+site_data_path('ladder.lock'); // makes sure the data folder has its deny-all .htaccess
 // Write beside the file and rename over it, so a reader never sees half a file.
 $temp = $file . '.' . bin2hex(random_bytes(6)) . '.tmp';
 if (file_put_contents($temp, $body, LOCK_EX) === false || !rename($temp, $file)) {

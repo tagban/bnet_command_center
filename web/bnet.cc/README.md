@@ -126,17 +126,13 @@ browser ──GET  /ladder.php ─▶ ladder.js ──GET /ladder-data.php──
 | `ladder.js`, `ladder.css` | Draw the ladders: game tabs, Iron Man, Diablo II mode/game/class and WarCraft III game choices, sorting, player search, 50 per page. Every view is a shareable link (`ladder.php?g=d2&m=hardcore&c=barbarian`). |
 | `ladder-header.inc.php`, `ladder-footer.inc.php` | Copies of the bnet.cc header and footer, used only when the site's own are not found. |
 | `war3-ladder.php` | Sends old links to the ladder page's WarCraft III tab (`ladder.php?g=w3`). |
-| `ladder-config.sample.php` | Settings; copy it to `ladder-config.php`. |
 
 ### Installing the ladders
 
 1. Upload the files to the site's root, next to `header.php`.
-2. Copy `ladder-config.sample.php` to `ladder-config.php` and set:
-   - `LADDER_PUSH_TOKEN` to a long random string;
-   - `LADDER_DATA_FILE` to a path PHP can write, ideally outside the web root;
-   - `LADDER_HEADER_FILE` / `LADDER_FOOTER_FILE` to the site's own template files. `header.php`
-     ends by opening `#main-content`, and `footer.php` closes it through `sidebar.php`. If either is
-     left empty, the built-in copy is used.
+2. In `site-config.php`, set `LADDER_PUSH_TOKEN` to a long random string. The standings are kept in
+   `SITE_DATA_DIR` as `ladder.json`. The ladder page works before then; it says the ladder has not
+   been published yet. An older `ladder-config.php`, if one is there, is still read.
 3. If the host runs Apache and pushes come back `401 bad token`, the host is dropping the
    `Authorization` header. Add this to `.htaccess`:
    ```apache

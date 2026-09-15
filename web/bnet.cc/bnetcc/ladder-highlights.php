@@ -1,6 +1,5 @@
 <?php
-// The ladder leaders for the home page, read from the standings the server pushes
-// (ladder-config.php's LADDER_DATA_FILE).
+// The ladder leaders for the home page, read from the standings the server pushes (LADDER_DATA_FILE).
 
 declare(strict_types=1);
 
@@ -9,14 +8,7 @@ require_once __DIR__ . '/bootstrap.php';
 /** The pushed ladder snapshot, or null before the first push. */
 function ladder_snapshot(): ?array
 {
-    $config = BNETCC_ROOT . '/ladder-config.php';
-    if (!defined('LADDER_DATA_FILE') && is_file($config)) {
-        require_once $config;
-    }
-    if (!defined('LADDER_DATA_FILE')) {
-        return null;
-    }
-    $data = site_read_json(LADDER_DATA_FILE, null);
+    $data = site_read_json((string) LADDER_DATA_FILE, null);
     return is_array($data) && isset($data['games'], $data['diablo2']) ? $data : null;
 }
 
