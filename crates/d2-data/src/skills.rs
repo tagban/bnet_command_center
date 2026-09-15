@@ -18,6 +18,10 @@ pub struct Skill {
     pub req_level: i32,
     /// `maxlvl`.
     pub max_level: i32,
+    /// `cost mult` (`+0x234`): what a point of the skill on an item adds to its price, in 1024ths.
+    pub cost_mult: i32,
+    /// `cost add` (`+0x238`): gold a point of it adds.
+    pub cost_add: i32,
 }
 
 /// Every skill, by id.
@@ -38,6 +42,8 @@ impl Skills {
                 item_type: row.get("itypea1").filter(|s| !s.is_empty()).map(str::to_string),
                 req_level: row.int("reqlevel").unwrap_or(0) as i32,
                 max_level: row.int("maxlvl").unwrap_or(0) as i32,
+                cost_mult: row.int("cost mult").unwrap_or(0) as i32,
+                cost_add: row.int("cost add").unwrap_or(0) as i32,
             })
             .collect();
         Self { rows }

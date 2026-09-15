@@ -21,6 +21,13 @@ pub struct StatCost {
     pub param_bits: u8,
     /// `ValShift` (`+0x18`): the stat is kept shifted left this far.
     pub val_shift: u8,
+    /// `Multiply` (`+0x10`): what each point adds to an item's price, in 1024ths of it.
+    pub cost_multiply: i32,
+    /// `Add` (`+0x14`): gold an item with the stat costs more.
+    pub cost_add: i32,
+    /// `Encode` (`+0x30`): how the parameter is packed — 1 a skill, 2 a skill cast on an event
+    /// with its level, 3 a charged skill, 4 a value by time of day.
+    pub encode: u8,
 }
 
 /// Every stat, by id.
@@ -50,6 +57,9 @@ impl ItemStats {
                 save_add: int("Save Add") as i32,
                 param_bits: u8::try_from(int("Save Param Bits")).unwrap_or(0),
                 val_shift: u8::try_from(int("ValShift")).unwrap_or(0),
+                cost_multiply: int("Multiply") as i32,
+                cost_add: int("Add") as i32,
+                encode: u8::try_from(int("Encode")).unwrap_or(0),
             };
             let at = usize::from(id);
             if stats.by_id.len() <= at {

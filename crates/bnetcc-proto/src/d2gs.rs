@@ -70,6 +70,9 @@ pub mod sc {
     /// An item spell waits for its target: `[icon u8][item guid u32][skill u16]` (8 bytes; builder
     /// `0x0053D220`) — an identify scroll turns the cursor to pick what it identifies.
     pub const ITEM_SPELL_READY: u8 = 0x3F;
+    /// A trade with a vendor settled: `[kind u8][result u8][u32][item guid u32][gold u32]` (15
+    /// bytes; builder `0x0053D740`, client `0x004B6390`).
+    pub const NPC_TRANSACTION: u8 = 0x2A;
     /// An object's mode changed (12 bytes).
     pub const OBJECT_STATE: u8 = 0x0E;
     /// Which unit is the client's own player (6 bytes).
@@ -216,6 +219,18 @@ pub mod cs {
     /// Use an item in the belt: `[item guid u32][u32][u32]` (13 bytes; engine handler
     /// `0x0054B560` → `0x00562390`).
     pub const USE_BELT_ITEM: u8 = 0x26;
+    /// Close an NPC's menu: `[unit type u32][guid u32]` (9 bytes; engine handler `0x0054B9F0` →
+    /// `0x00572F20`).
+    pub const NPC_CANCEL: u8 = 0x30;
+    /// Buy from a vendor: `[npc guid u32][item guid u32][u32: bit 31 fill, low word 0 trade or 2
+    /// gamble][cost u32]` (17 bytes; engine handler `0x0054BAC0` → `0x00577F30`).
+    pub const NPC_BUY: u8 = 0x32;
+    /// Sell to a vendor: `[npc guid u32][item guid u32][item mode u16][u16][cost u32]` (17 bytes;
+    /// engine handler `0x0054BB20` → `0x00579510`).
+    pub const NPC_SELL: u8 = 0x33;
+    /// Pick from an NPC's menu: `[action u32: 1 trade, 2 gamble, 3 hire][npc guid u32][u32]` (13
+    /// bytes; engine handler `0x0054BCA0` → `0x00579D60`).
+    pub const NPC_ACTION: u8 = 0x38;
     /// Travel by waypoint: `[waypoint guid u32][level u16][u16]` (9 bytes; engine handler
     /// `0x0054C5D0`).
     pub const WAYPOINT_TRAVEL: u8 = 0x49;
@@ -772,6 +787,35 @@ pub mod item_action {
     pub const REMOVE_FROM_BELT: u8 = 0x0F;
     /// `0x9D`: out of a grid (`0x004C2C80`).
     pub const REMOVE_FROM_CONTAINER: u8 = 0x05;
+    /// `0x9C`: into the open trade window's stock, at the page and cell its bits give
+    /// (`0x004C3C00`; per-frame unit flag 4, `0x0053EF30`).
+    pub const ADD_TO_STORE: u8 = 0x0B;
+    /// `0x9C`: out of the open trade window's stock (`0x004C3C00`; unit flag `0x10`).
+    pub const REMOVE_FROM_STORE: u8 = 0x0C;
+}
+
+/// `0x2A` kinds and results, as the vendor routines send them.
+pub mod transaction {
+    /// Kind of a refusal.
+    pub const REFUSED: u8 = 0;
+    /// Kind of an item sold to the player (`0x00577830`).
+    pub const BOUGHT: u8 = 4;
+    /// Kind of an item the player sold (`0x00579510`).
+    pub const SOLD: u8 = 3;
+    /// Result: done.
+    pub const OK: u8 = 0;
+    /// Result of a sale: done.
+    pub const SOLD_OK: u8 = 1;
+    /// Result: no such item or vendor.
+    pub const NO_ITEM: u8 = 7;
+    /// Result: the trade cannot be made.
+    pub const CANNOT: u8 = 9;
+    /// Result: no room for what was bought.
+    pub const NO_ROOM: u8 = 10;
+    /// Result: the store is not open.
+    pub const NOT_OPEN: u8 = 11;
+    /// Result: not enough gold.
+    pub const NO_GOLD: u8 = 12;
 }
 
 /// Item flags as the item bits carry them.
@@ -880,6 +924,17 @@ pub fn item_spell_ready(icon: u8, guid: u32, skill: u16) -> Vec<u8> {
     let mut p = vec![sc::ITEM_SPELL_READY, icon];
     p.extend_from_slice(&guid.to_le_bytes());
     p.extend_from_slice(&skill.to_le_bytes());
+    p
+}
+
+/// `0x2A`: a trade settled — `kind` and `result` ([`transaction`]), the item (`u32::MAX` for none)
+/// and the player's gold after it. The engine leaves bytes 3–6 as they were on its stack; they are
+/// sent as 0.
+#[must_use]
+pub fn npc_transaction(kind: u8, result: u8, guid: u32, gold: u32) -> Vec<u8> {
+    let mut p = vec![sc::NPC_TRANSACTION, kind, result, 0, 0, 0, 0];
+    p.extend_from_slice(&guid.to_le_bytes());
+    p.extend_from_slice(&gold.to_le_bytes());
     p
 }
 

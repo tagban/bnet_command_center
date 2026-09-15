@@ -171,12 +171,21 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
    healing potions in the belt, a Town Portal and an Identify scroll); characters made before
    2026-09-15 that have been saved keep what they had.
    *Not yet:* the stash and cube, sockets filled, tomes, Town Portal, stamina, antidote and
-   thawing potions, shops, repair, and other players seeing what you wear.
-5. *Expect nothing else to work:* NPCs never move, there is no shop and no travel to other acts.
+   thawing potions, repair, and other players seeing what you wear.
+5. *Expect shops:* talk to Akara, Charsi or Gheed and pick **Trade**. Their goods fill the tabs:
+   Charsi's weapons and armour, Akara's staves, wands, potions, scrolls, tomes and keys, Gheed's
+   mix — some white, some superior, some blue, priced as the game prices them. Right-clicking to
+   buy takes the gold and puts the item in your belt (potions, when there is a free slot) or
+   inventory; weapons and armour leave the vendor's stock, potions and scrolls never run out.
+   Shift and right-click a potion to fill your belt. Selling an item of yours (drop it on the
+   vendor's goods) adds the gold and puts the item in the vendor's stock. A vendor restocks when you open
+   Trade alone more than four minutes after the stock was made. *Not yet:* gambling, repair,
+   hiring, identifying at Cain, and buying scrolls straight into a tome.
+6. *Expect nothing else to work:* NPCs never move and there is no travel to other acts.
    Esc → Save and Exit returns to chat (verified).
-6. Send the log from the moment you clicked Create Game (`item picked up`, `item moved`,
-   `item dropped`, `item identified`, `potion drunk`, `item move refused` and `no room to pick it
-   up` lines say what the server did with items).
+7. Send the log from the moment you clicked Create Game (`item picked up`, `item moved`,
+   `item dropped`, `item identified`, `potion drunk`, `item move refused`, `no room to pick it
+   up`, `vendor stocked`, `bought` and `sold` lines say what the server did with items).
 
 What it shows, in order:
 

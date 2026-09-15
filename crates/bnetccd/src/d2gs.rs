@@ -44,6 +44,7 @@ use crate::session::hex_preview;
 
 mod items;
 pub mod map;
+mod trade;
 
 /// Players per game, as the engine allows.
 const MAX_PLAYERS: usize = 8;
@@ -183,6 +184,8 @@ struct Game {
     item_seeds: d2_drlg::rng::Seed,
     /// Item guids handed out when the game has no population to count them.
     spare_item_guid: u32,
+    /// Vendors' stocks, by the vendor's guid ([`trade`]).
+    stores: HashMap<u32, trade::Store>,
 }
 
 /// Gold or an item on the ground.
@@ -495,6 +498,7 @@ impl GameServer {
                 made_uniques: HashSet::new(),
                 item_seeds: d2_drlg::rng::Seed::new(rand::thread_rng().gen(), 0x29A),
                 spare_item_guid: 0,
+                stores: HashMap::new(),
             },
         );
         let game = &g.by_id[&id];
@@ -1270,6 +1274,9 @@ impl GameServer {
         game.views.remove(name);
         game.outgoing.remove(name);
         game.carried.remove(name);
+        for store in game.stores.values_mut() {
+            store.open.remove(name);
+        }
         game.battle.remove_player(name);
         if game.connected.is_empty() && game.staged.is_empty() {
             let game = g.by_id.remove(&game_id).expect("present");
@@ -1446,22 +1453,29 @@ fn take_gold(rules: &GameData, game: &mut Game, name: &str, guid: u32, amount: u
     let (taken, total) = game.battle.pick_up_gold(name, amount).filter(|&(taken, _)| taken > 0)?;
     info!(player = name, guid, taken, total, "gold picked up");
     let mut replies = vec![d2gs::gold_update(total - taken, total)];
-    let mut dropped = None;
-    if taken < amount {
-        let ground = &game.ground;
-        let occupied = |x: i32, y: i32| ground.values().any(|p| (i32::from(p.x), i32::from(p.y)) == (x, y));
-        let at = game.positions.get(name).copied();
-        let spot = at.and_then(|from| drop_spot(game.world.as_ref()?, &occupied, from));
-        if let (Some((room, x, y)), Some(population)) = (spot, game.population.as_mut()) {
-            let left = GroundItem { room, x: x as u16, y: y as u16, what: Loot::Gold(amount - taken) };
-            let new_guid = population.next_guid(unit_type::ITEM);
-            let packet = ground_packet(rules, new_guid, &left, true, game.item_version);
-            game.ground.insert(new_guid, left);
-            replies.push(packet.clone());
-            dropped = Some((room, packet));
-        }
+    let dropped = drop_gold_at(rules, game, name, amount - taken);
+    if let Some((_, packet)) = &dropped {
+        replies.push(packet.clone());
     }
     Some((replies, dropped))
+}
+
+/// A falling gold pile of `amount` at the nearest free spot to a player: where it went and its
+/// packet. `None` for no gold or no spot.
+fn drop_gold_at(rules: &GameData, game: &mut Game, name: &str, amount: u32) -> Option<(RoomId, Vec<u8>)> {
+    if amount == 0 {
+        return None;
+    }
+    let ground = &game.ground;
+    let occupied = |x: i32, y: i32| ground.values().any(|p| (i32::from(p.x), i32::from(p.y)) == (x, y));
+    let from = game.positions.get(name).copied()?;
+    let (room, x, y) = drop_spot(game.world.as_ref()?, &occupied, from)?;
+    let population = game.population.as_mut()?;
+    let left = GroundItem { room, x: x as u16, y: y as u16, what: Loot::Gold(amount) };
+    let new_guid = population.next_guid(unit_type::ITEM);
+    let packet = ground_packet(rules, new_guid, &left, true, game.item_version);
+    game.ground.insert(new_guid, left);
+    Some((room, packet))
 }
 
 /// An item (already off the ground) onto a player's cursor (`to_cursor`, `0x9C` action 1), or
@@ -2108,6 +2122,30 @@ async fn run(
                         flush(stream, peer, tables, &mut outbox).await?;
                     }
                 }
+                (Stage::InGame, cs::NPC_ACTION) => {
+                    let Some(p) = player.as_ref() else { continue };
+                    for packet in server.npc_action(p.game_id, &p.character.name, u32_at(1), u32_at(5)) {
+                        outbox.push(&packet);
+                    }
+                    flush(stream, peer, tables, &mut outbox).await?;
+                }
+                (Stage::InGame, cs::NPC_CANCEL) => {
+                    let Some(p) = player.as_ref() else { continue };
+                    server.npc_cancel(p.game_id, &p.character.name, u32_at(5));
+                }
+                (Stage::InGame, op @ (cs::NPC_BUY | cs::NPC_SELL)) => {
+                    let Some(p) = player.as_mut() else { continue };
+                    let replies = if op == cs::NPC_BUY {
+                        server.buy(p.game_id, &p.character.name, u32_at(1), u32_at(5), u32_at(9))
+                    } else {
+                        server.sell(p.game_id, &p.character.name, u32_at(1), u32_at(5), u16_at(9))
+                    };
+                    for packet in &replies {
+                        outbox.push(packet);
+                    }
+                    flush(stream, peer, tables, &mut outbox).await?;
+                    server.save_character(p).await;
+                }
                 (Stage::InGame, cs::RESPAWN) => {
                     // Done on the next frame the corpse has settled (see `respawn`).
                     pending_respawn = true;
@@ -2502,6 +2540,11 @@ pub(crate) mod tests {
     /// waypoint players start on (object 3), the stash (267) and an NPC who talks (monster 10,
     /// two helmets to pick from); a crate stands in the fourth room, two rooms away.
     fn test_town() -> (GameData, PresetLevel) {
+        town_with_npc(10, "guard")
+    }
+
+    /// [`test_town`] with its talking NPC as monster `class`, `MonStats.txt` `Id` `id`.
+    fn town_with_npc(class: u16, id: &str) -> (GameData, PresetLevel) {
         use d2_data::levels::Levels;
         use d2_data::monsters::{Monsters, COMPONENT_COLUMNS};
         use d2_data::presets::{MonPresets, Objects, PresetMonster};
@@ -2526,14 +2569,14 @@ pub(crate) mod tests {
                       1\t0\t32\t8\t32\t8\t32\t8\t0\t0\t0\t2\t1\t0\r\n\
                       3\t0\t8\t8\t8\t8\t8\t8\t0\t0\t0\t3\t2\t1\r\n";
         rules.set_levels(Levels::from_table(&Table::parse(levels.as_bytes())).unwrap());
-        let monstats = Table::parse(b"Id\thcIdx\tMonStatsEx\tnpc\tinteract\r\nguard\t10\tguard\t1\t1\r\n");
+        let monstats = Table::parse(format!("Id\thcIdx\tMonStatsEx\tnpc\tinteract\r\n{id}\t{class}\t{id}\t1\t1\r\n").as_bytes());
         let mut ms2 = String::from("Id\tcritter");
         for c in COMPONENT_COLUMNS {
             ms2 += &format!("\t{c}");
         }
-        ms2 += "\r\nguard\t0\tcap,helm\r\n";
+        ms2 += &format!("\r\n{id}\t0\tcap,helm\r\n");
         let empty = |col: &str| Table::parse(format!("{col}\r\n").as_bytes());
-        let presets = MonPresets::from_tables(&Table::parse(b"Act\tPlace\r\n1\tguard\r\n"), &monstats, &empty("Superunique"), &empty("code")).unwrap();
+        let presets = MonPresets::from_tables(&Table::parse(format!("Act\tPlace\r\n1\t{id}\r\n").as_bytes()), &monstats, &empty("Superunique"), &empty("code")).unwrap();
         rules.set_map_tables(presets, Monsters::from_tables(&monstats, &Table::parse(ms2.as_bytes())).unwrap(), Objects::from_table(&objects));
         let room = |x, y| Coords { x, y, w: 8, h: 8 };
         let at = |class, x, y| PlacedUnit { class, x, y, path: Vec::new() };
@@ -2543,7 +2586,7 @@ pub(crate) mod tests {
             map: String::new(),
             rooms: vec![room(1152, 888), room(1160, 888), room(1168, 888), room(1176, 888)],
             units: vec![
-                at(UnitClass::Monster(PresetMonster::Class { class: 10, name: "guard".into() }), 5815, 4455),
+                at(UnitClass::Monster(PresetMonster::Class { class: i32::from(class), name: id.into() }), 5815, 4455),
                 at(UnitClass::Object(1), 5812, 4444),
                 at(UnitClass::Object(2), 5890, 4444),
                 at(UnitClass::Object(3), 5805, 4447),
@@ -3104,6 +3147,86 @@ pub(crate) mod tests {
         assert!(axe.identified());
         assert_eq!(axe.stats, [item_bits::ItemStat { id: 19, param: 0, value: 12 }], "the stats go out once identified");
         assert!(gs.identify_item(id, "Hero", 50, 51).is_empty(), "once");
+    }
+
+    /// Akara's trade window opens with her stock on its pages; a staff bought costs her price,
+    /// leaves her stock and lands in the inventory, and cannot be bought twice; potions, always in
+    /// stock, fill the belt and one more goes to the inventory; the staff sold back pays half its
+    /// cost and joins her stock again; nobody trades with a closed window.
+    #[test]
+    fn a_vendor_sells_and_buys_back() {
+        use d2_formats::excel::Table;
+        let (mut rules, town) = town_with_npc(148, "akara");
+        let itemtypes = Table::parse(
+            b"ItemType\tCode\tEquiv1\tBeltable\tStorePage\r\nWeapon\tweap\t\t0\tweap\r\nStaff\tstaf\tweap\t0\tweap\r\nPotion\tpoti\t\t1\tmisc\r\n",
+        );
+        let weapons = Table::parse(
+            b"name\tcode\ttype\tlevel\tspawnable\tcost\tcomponent\tinvwidth\tinvheight\tdurability\tAkaraMin\tAkaraMax\r\nShort Staff\tsst\tstaf\t1\t1\t168\t5\t1\t3\t20\t1\t1\r\n",
+        );
+        let misc = Table::parse(
+            b"name\tcode\ttype\tlevel\tspawnable\tcost\tcomponent\tinvwidth\tinvheight\tcompactsave\tautobelt\tPermStoreItem\tAkaraMax\r\nMinor Healing Potion\thp1\tpoti\t1\t1\t30\t16\t1\t1\t1\t1\t1\t1\r\n",
+        );
+        rules.set_items(d2_data::items::Items::from_tables(&itemtypes, &weapons, &Table::parse(b"name\tcode\ttype\r\n"), &misc).unwrap(), Vec::new());
+        let stats = Table::parse(b"Stat\tID\tSave Bits\tSave Add\tSave Param Bits\tValShift\r\ndurability\t72\t8\t0\t\t\r\nmaxdurability\t73\t8\t0\t\t\r\n");
+        rules.set_item_rules(d2_data::item_stats::ItemStats::from_table(&stats).unwrap(), d2_data::item_stats::ItemRatios::default());
+        let npc = Table::parse(b"npc\tbuy mult\tsell mult\trep mult\tmax buy\tmax buy (N)\tmax buy (H)\r\nakara\t512\t1024\t128\t5000\t30000\t35000\r\n");
+        let trades = d2_data::trade::NpcTrades::from_table(&npc, rules.monsters());
+        rules.set_trade_tables(trades, Vec::new());
+        let gs = GameServer::new(test_tables(), Some(rules)).with_town(town);
+        let id = gs.create("market", "", 0).unwrap();
+        let p = Player::new(id, character("Hero", 0, 0x20), 0, 0, (0, 0));
+        let stats = p.join_stats(gs.rules.as_ref().unwrap()).unwrap();
+        gs.join_battle(id, "Hero", 0, &stats);
+        gs.join_items(&p);
+        gs.lock().by_id.get_mut(&id).unwrap().battle.pick_up_gold("Hero", 1000);
+        gs.view_change(id, &[], &[RoomId { level: 1, index: 1 }]);
+        let rules = gs.rules.clone().unwrap();
+        let read = |packet: &[u8]| item_bits::read(&packet[8..], rules.items(), rules.item_stats(), item_bits::Target::Network).unwrap().0;
+        let guid_of = |packet: &[u8]| u32::from_le_bytes(packet[4..8].try_into().unwrap());
+        let npc = 1;
+        assert_eq!(gs.buy(id, "Hero", npc, 1, 0), [d2gs::npc_transaction(0, d2gs::transaction::CANNOT, u32::MAX, 1000)], "the window is not open");
+
+        let window = gs.npc_action(id, "Hero", 1, npc);
+        assert_eq!(window.len(), 2, "one staff, one potion");
+        assert!(window.iter().all(|w| (w[0], w[1]) == (0x9C, item_action::ADD_TO_STORE)));
+        let staff = window.iter().find(|w| &read(w).code == b"sst ").unwrap();
+        assert!(matches!(read(staff).location, Location::Stored { page: 1, .. }), "the weapons page");
+        let potion = window.iter().find(|w| &read(w).code == b"hp1 ").unwrap();
+        assert!(matches!(read(potion).location, Location::Stored { page: 3, .. }), "the misc page");
+        let (staff, potion) = (guid_of(staff), guid_of(potion));
+        assert_eq!(gs.npc_action(id, "Hero", 1, npc).len(), 2, "the same stock again");
+
+        let bought = gs.buy(id, "Hero", npc, staff, 0);
+        assert_eq!(bought.len(), 4);
+        let copy = u32::from_le_bytes(bought[0][7..11].try_into().unwrap());
+        assert_eq!(bought[0], d2gs::npc_transaction(d2gs::transaction::BOUGHT, 0, copy, 1000 - 168), "Akara's price: the cost");
+        assert_eq!(bought[1], d2gs::set_stat(14, 832));
+        assert_eq!((bought[2][1], guid_of(&bought[2])), (item_action::REMOVE_FROM_STORE, staff));
+        assert_eq!((bought[3][1], guid_of(&bought[3]), read(&bought[3]).location), (item_action::PUT_IN_CONTAINER, copy, Location::Stored { col: 0, row: 0, page: 0 }));
+        assert_eq!(gs.buy(id, "Hero", npc, staff, 0), [d2gs::npc_transaction(0, d2gs::transaction::NO_ITEM, staff, 832)], "sold out");
+
+        let potions = gs.buy(id, "Hero", npc, potion, 0x8000_0000);
+        let deals: Vec<&Vec<u8>> = potions.iter().filter(|q| q[0] == 0x2A).collect();
+        assert_eq!(deals.len(), 5, "four into the belt, a fifth into the inventory");
+        let placed: Vec<u8> = potions.iter().filter(|q| q[0] == 0x9C).map(|q| q[1]).collect();
+        assert_eq!(placed, [item_action::PUT_IN_BELT; 4].into_iter().chain([item_action::PUT_IN_CONTAINER]).collect::<Vec<_>>(), "never out of stock");
+        assert_eq!(gs.lock().by_id[&id].battle.player_gold("Hero"), Some(832 - 5 * 30));
+
+        let sold = gs.sell(id, "Hero", npc, copy, 0);
+        assert_eq!((sold[0][0], sold[0][1], read_owned(&rules, &sold[0]).flags & item_bits::flags::USED), (0x9D, item_action::REMOVE_FROM_CONTAINER, item_bits::flags::USED));
+        assert_eq!(sold[1], d2gs::npc_transaction(d2gs::transaction::SOLD, d2gs::transaction::SOLD_OK, copy, 682 + 84), "half the cost");
+        assert_eq!(sold[2], vec![0x19, 84]);
+        let back = sold.last().unwrap();
+        assert_eq!((back[1], &read(back).code), (item_action::ADD_TO_STORE, b"sst "));
+        assert_eq!(gs.lock().by_id[&id].stores[&npc].items.len(), 2);
+        assert!(gs.lock().by_id[&id].carried["Hero"].inventory.get(copy).is_none());
+
+        gs.npc_cancel(id, "Hero", npc);
+        assert_eq!(gs.sell(id, "Hero", npc, copy, 0), [d2gs::npc_transaction(0, d2gs::transaction::NOT_OPEN, u32::MAX, 766)]);
+    }
+
+    fn read_owned(rules: &GameData, packet: &[u8]) -> Item {
+        item_bits::read(&packet[13..], rules.items(), rules.item_stats(), item_bits::Target::Network).unwrap().0
     }
 
     /// A hand axe picked up is worn in the empty right hand; a second, which an Amazon cannot

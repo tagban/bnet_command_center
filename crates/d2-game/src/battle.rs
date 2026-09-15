@@ -1048,6 +1048,20 @@ impl Battle {
         Some((taken, h.gold))
     }
 
+    /// A player's gold.
+    #[must_use]
+    pub fn player_gold(&self, name: &str) -> Option<u32> {
+        self.heroes.get(name).map(|h| h.gold)
+    }
+
+    /// A player pays `amount` of its gold: its new total, `None` when it has less or is not in the
+    /// fight (`0x00576D90`, which also takes from the stash; the stash is not modelled).
+    pub fn pay_gold(&mut self, name: &str, amount: u32) -> Option<u32> {
+        let h = self.heroes.get_mut(name)?;
+        h.gold = h.gold.checked_sub(amount)?;
+        Some(h.gold)
+    }
+
     fn gain_experience(&mut self, data: &GameData, name: &str, gain: u32, events: &mut Vec<Event>) {
         let Some(h) = self.heroes.get_mut(name) else { return };
         if gain == 0 {

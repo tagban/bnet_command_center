@@ -86,8 +86,38 @@ pub struct ItemType {
     pub max_sockets: [i32; 3],
     /// `VarInvGfx`: how many inventory pictures an item of the type picks from (`+0x23`).
     pub var_inv_gfx: i32,
+    /// `Quiver` (`+0x0E`): a quiver's launcher type is named — arrows and bolts, priced by the
+    /// piece.
+    pub quiver: bool,
+    /// `StorePage` (`+0x22`): the trade window tab an item of the type is shown on, as a
+    /// `StorePage.txt` row ([`STORE_PAGES`]).
+    pub store_page: Option<u8>,
     /// Every type this one is, itself included.
     ancestors: Vec<i32>,
+}
+
+/// `StorePage.txt`'s codes, by row: the tabs of a vendor's trade window.
+pub const STORE_PAGES: [&str; 4] = ["armo", "weap", "mag", "misc"];
+
+/// The vendors whose stock columns the item tables carry, in the engine's order of them
+/// (`Misc.txt`'s `AkaraMin` is `+0x146`, `GheedMin` `+0x147`, `CharsiMin` `+0x148`, …), which is not
+/// the tables' column order. `Hralti` is spelled as the column is.
+pub const VENDORS: [&str; 17] =
+    ["Akara", "Gheed", "Charsi", "Fara", "Lysander", "Drognan", "Hralti", "Alkor", "Ormus", "Elzix", "Asheara", "Cain", "Halbu", "Jamella", "Malah", "Larzuk", "Drehya"];
+
+/// What one vendor stocks of an item: `<vendor>Min`, `Max`, `MagicMin`, `MagicMax`, `MagicLvl`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VendorStock {
+    /// `…Min`: fewest normal ones.
+    pub min: u8,
+    /// `…Max`: most normal ones.
+    pub max: u8,
+    /// `…MagicMin`: fewest magic ones.
+    pub magic_min: u8,
+    /// `…MagicMax`: most magic ones.
+    pub magic_max: u8,
+    /// `…MagicLvl`: the store level magic ones need.
+    pub magic_level: u8,
 }
 
 /// `ItemTypes.txt`, by type id.
@@ -130,6 +160,8 @@ impl ItemTypes {
                     rarity: int("Rarity"),
                     max_sockets: [int("MaxSock1"), int("MaxSock25"), int("MaxSock40")],
                     var_inv_gfx: int("VarInvGfx"),
+                    quiver: row.get("Quiver").is_some_and(|q| !q.is_empty()),
+                    store_page: row.get("StorePage").and_then(|p| STORE_PAGES.iter().position(|c| *c == p)).map(|i| i as u8),
                     ancestors: Vec::new(),
                 };
                 (row, [text("Equiv1"), text("Equiv2")])
@@ -292,6 +324,19 @@ pub struct ItemDef {
     pub str_bonus: i32,
     /// See [`Self::str_bonus`].
     pub dex_bonus: i32,
+    /// `cost` (`+0xE0`): the base of every price.
+    pub cost: i32,
+    /// `gamble cost` (`+0xD4`).
+    pub gamble_cost: i32,
+    /// `bitfield1` (`+0xDC`): bit 0 lets a vendor stock magic ones.
+    pub bitfield1: i32,
+    /// Each vendor's stock of the item, in [`VENDORS`] order.
+    pub vendors: [VendorStock; 17],
+    /// `PermStoreItem` (`+0x1A4`): always in a vendor's stock, never sold out.
+    pub perm_store_item: bool,
+    /// `NightmareUpgrade`, `HellUpgrade` (`+0x19C`, `+0x1A0`): what a vendor stocks in its place on
+    /// those difficulties; `None` for `xxx`.
+    pub upgrades: [Option<Code>; 2],
 }
 
 /// Every item, in class id order.
@@ -379,6 +424,15 @@ impl Items {
                     magic_level: int("magic lvl"),
                     str_bonus: int("StrBonus"),
                     dex_bonus: int("DexBonus"),
+                    cost: int("cost"),
+                    gamble_cost: int("gamble cost"),
+                    bitfield1: int("bitfield1"),
+                    vendors: VENDORS.map(|v| {
+                        let byte = |c: &str| row.int(&format!("{v}{c}")).unwrap_or(0).clamp(0, 255) as u8;
+                        VendorStock { min: byte("Min"), max: byte("Max"), magic_min: byte("MagicMin"), magic_max: byte("MagicMax"), magic_level: byte("MagicLvl") }
+                    }),
+                    perm_store_item: int("PermStoreItem") != 0,
+                    upgrades: ["NightmareUpgrade", "HellUpgrade"].map(|c| row.get(c).filter(|u| !u.is_empty() && *u != "xxx").map(code)),
                 }
             }));
         }

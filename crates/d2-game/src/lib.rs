@@ -16,3 +16,4 @@ pub mod loot;
 pub mod path;
 pub mod population;
 pub mod spawn;
+pub mod store;
