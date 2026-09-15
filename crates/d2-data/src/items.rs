@@ -59,6 +59,20 @@ pub struct ItemType {
     pub body_locations: Vec<String>,
     /// `Beltable`: whether an item of the type goes in a belt.
     pub beltable: bool,
+    /// `Magic`: an item of the type is always magic (`+0x14`).
+    pub always_magic: bool,
+    /// `Rare`: an item of the type can be rare (`+0x15`).
+    pub can_be_rare: bool,
+    /// `Normal`: an item of the type is always normal (`+0x16`).
+    pub always_normal: bool,
+    /// `TreasureClass`: the engine builds `<code><level>` treasure classes for it (`+0x1D`).
+    pub treasure_class: bool,
+    /// `Rarity`: an item's weight in those classes (`+0x1E`).
+    pub rarity: i32,
+    /// `MaxSock1`, `MaxSock25`, `MaxSock40`: most sockets by item level.
+    pub max_sockets: [i32; 3],
+    /// `VarInvGfx`: how many inventory pictures an item of the type picks from (`+0x23`).
+    pub var_inv_gfx: i32,
     /// Every type this one is, itself included.
     ancestors: Vec<i32>,
 }
@@ -87,8 +101,22 @@ impl ItemTypes {
             .map(|row| {
                 let text = |c: &str| row.get(c).unwrap_or_default().to_string();
                 let body_locations = ["BodyLoc1", "BodyLoc2"].iter().map(|c| text(c)).filter(|s| !s.is_empty()).collect();
-                let beltable = row.int("Beltable").unwrap_or(0) != 0;
-                (ItemType { name: text("ItemType"), code: text("Code"), body_locations, beltable, ancestors: Vec::new() }, [text("Equiv1"), text("Equiv2")])
+                let int = |c: &str| row.int(c).unwrap_or(0) as i32;
+                let row = ItemType {
+                    name: text("ItemType"),
+                    code: text("Code"),
+                    body_locations,
+                    beltable: int("Beltable") != 0,
+                    always_magic: int("Magic") != 0,
+                    can_be_rare: int("Rare") != 0,
+                    always_normal: int("Normal") != 0,
+                    treasure_class: int("TreasureClass") != 0,
+                    rarity: int("Rarity"),
+                    max_sockets: [int("MaxSock1"), int("MaxSock25"), int("MaxSock40")],
+                    var_inv_gfx: int("VarInvGfx"),
+                    ancestors: Vec::new(),
+                };
+                (row, [text("Equiv1"), text("Equiv2")])
             })
             .collect();
         let id_of = |rows: &[(ItemType, [String; 2])], code: &str| rows.iter().position(|r| !code.is_empty() && r.0.code == code).map(|i| i as i32);
@@ -132,6 +160,11 @@ impl ItemTypes {
     pub fn is(&self, id: i32, parent: &str) -> bool {
         self.id(parent).is_some_and(|p| self.is_a(id, p))
     }
+
+    /// Every type, by id.
+    pub fn iter(&self) -> impl Iterator<Item = &ItemType> {
+        self.rows.iter()
+    }
 }
 
 /// Which table an item row came from.
@@ -158,6 +191,8 @@ pub struct ItemDef {
     pub alternate_gfx: Option<Code>,
     /// `type`, as a type id (-1 when unknown).
     pub item_type: i32,
+    /// `type2`, as a type id (-1 when blank).
+    pub item_type2: i32,
     /// `component`: the body part it is drawn on (0 head, 5 right hand, 6 left hand, 7 shield,
     /// 10 special 3; 16 not drawn).
     pub component: i32,
@@ -191,6 +226,47 @@ pub struct ItemDef {
     pub duration: i32,
     /// `stat1`–`stat3` with `calc1`–`calc3`, where both are given and the calc is a number.
     pub effects: Vec<(String, i32)>,
+    /// `level`: the item's quality level, which places it in the `<type><level>` treasure
+    /// classes and against the monster's level in the quality roll (`+0xFD`).
+    pub level: i32,
+    /// `levelreq`.
+    pub level_req: i32,
+    /// `version`: 0 for classic, 100 for an item only in Lord of Destruction (`+0xF6`).
+    pub version: i32,
+    /// `spawnable` (`+0x133`).
+    pub spawnable: bool,
+    /// `unique`: only ever unique (`+0x129`).
+    pub unique_only: bool,
+    /// `durability`: its maximum (`+0x112`); 0 with [`Self::no_durability`].
+    pub durability: i32,
+    /// `nodurability`.
+    pub no_durability: bool,
+    /// `minac`, `maxac` (`+0xCC`, `+0xD0`).
+    pub defense: (i32, i32),
+    /// `block` (`+0x111`).
+    pub block: i32,
+    /// `speed` (`+0xD8`).
+    pub speed: i32,
+    /// `mindam`, `maxdam` (`+0xFE`, `+0xFF`).
+    pub damage: (i32, i32),
+    /// `2handmindam`, `2handmaxdam` (`+0x102`, `+0x103`).
+    pub two_hand_damage: (i32, i32),
+    /// `minmisdam`, `maxmisdam` (`+0x100`, `+0x101`).
+    pub missile_damage: (i32, i32),
+    /// `reqstr`, `reqdex`.
+    pub requirements: (i32, i32),
+    /// `gemsockets`: most sockets the base item takes.
+    pub gem_sockets: i32,
+    /// `minstack`, `maxstack`, `spawnstack`.
+    pub stack: (i32, i32, i32),
+    /// `normcode`, `ubercode`, `ultracode`: the item's normal, exceptional and elite tiers.
+    pub tiers: [Code; 3],
+    /// `auto prefix`: the `AutoMagic.txt` group an expansion item may get (`+0xF8`).
+    pub auto_prefix: i32,
+    /// `2handed`.
+    pub two_handed: bool,
+    /// `belt`: the `Belts.txt` row a belt uses.
+    pub belt: i32,
 }
 
 /// Every item, in class id order.
@@ -233,6 +309,7 @@ impl Items {
                     code: code(text("code")),
                     alternate_gfx: row.get("alternategfx").map(code),
                     item_type: types.id(text("type")).unwrap_or(-1),
+                    item_type2: types.id(text("type2")).unwrap_or(-1),
                     component: row.get("component").map_or(16, |_| int("component")),
                     armor_pieces: [piece("rArm"), piece("lArm"), piece("Torso"), piece("Legs"), piece("rSPad"), piece("lSPad")],
                     weapon_class: row.get("wclass").map(code),
@@ -253,6 +330,26 @@ impl Items {
                             Some((stat.to_string(), row.get(&format!("calc{i}"))?.trim().parse().ok()?))
                         })
                         .collect(),
+                    level: int("level"),
+                    level_req: int("levelreq"),
+                    version: int("version"),
+                    spawnable: int("spawnable") != 0,
+                    unique_only: int("unique") != 0,
+                    durability: int("durability"),
+                    no_durability: int("nodurability") != 0,
+                    defense: (int("minac"), int("maxac")),
+                    block: int("block"),
+                    speed: int("speed"),
+                    damage: (int("mindam"), int("maxdam")),
+                    two_hand_damage: (int("2handmindam"), int("2handmaxdam")),
+                    missile_damage: (int("minmisdam"), int("maxmisdam")),
+                    requirements: (int("reqstr"), int("reqdex")),
+                    gem_sockets: int("gemsockets"),
+                    stack: (int("minstack"), int("maxstack"), int("spawnstack")),
+                    tiers: [code(text("normcode")), code(text("ubercode")), code(text("ultracode"))],
+                    auto_prefix: int("auto prefix"),
+                    two_handed: int("2handed") != 0,
+                    belt: int("belt"),
                 }
             }));
         }
@@ -279,6 +376,25 @@ impl Items {
     #[must_use]
     pub fn class_of(&self, code: &Code) -> Option<i32> {
         self.by_code.get(code).copied()
+    }
+
+    /// Whether item `class` — its `type` or `type2` — is the type coded `parent` or inherits
+    /// from it (`0x00629BB0`).
+    #[must_use]
+    pub fn is(&self, class: i32, parent: &str) -> bool {
+        self.types.id(parent).is_some_and(|p| self.is_type(class, p))
+    }
+
+    /// Whether item `class` — its `type` or `type2` — is type `parent` or inherits from it.
+    #[must_use]
+    pub fn is_type(&self, class: i32, parent: i32) -> bool {
+        self.get(class).is_some_and(|d| self.types.is_a(d.item_type, parent) || (d.item_type2 >= 0 && self.types.is_a(d.item_type2, parent)))
+    }
+
+    /// Whether item `class` is an exceptional or elite tier (`0x00629F70`).
+    #[must_use]
+    pub fn is_uber(&self, class: i32) -> bool {
+        self.get(class).is_some_and(|d| d.tiers[0] != *b"    " && d.code != d.tiers[0])
     }
 
     /// Whether item `class` is of a beltable type.

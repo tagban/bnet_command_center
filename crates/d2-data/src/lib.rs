@@ -18,6 +18,7 @@ use d2_formats::mpq::{self, ArchiveSet, DATA_ARCHIVES};
 pub mod appearance;
 pub mod character;
 pub mod engine;
+pub mod item_stats;
 pub mod items;
 pub mod levels;
 pub mod lvlsub;
@@ -125,6 +126,8 @@ pub struct GameData {
     objects: Objects,
     shrines: Shrines,
     items: Items,
+    item_stats: item_stats::ItemStats,
+    item_ratios: item_stats::ItemRatios,
     treasure: treasure::TreasureClasses,
     /// `ArmType.txt`'s tokens, by body armour weight.
     armor_types: Vec<Code>,
@@ -164,7 +167,10 @@ impl GameData {
         data.shrines = Shrines::from_table(&read("shrines.txt")?);
         data.items = Items::from_tables(&read("itemtypes.txt")?, &read("weapons.txt")?, &read("armor.txt")?, &read("misc.txt")?)?;
         data.armor_types = read("armtype.txt")?.rows().filter_map(|r| r.get("Token").map(items::code)).collect();
+        data.item_stats = item_stats::ItemStats::from_table(&read("itemstatcost.txt")?)?;
+        data.item_ratios = item_stats::ItemRatios::from_table(&read("itemratio.txt")?);
         data.treasure = treasure::TreasureClasses::from_table(&read("treasureclassex.txt")?)?;
+        data.treasure.add_item_classes(&data.items);
         data.archives = Some(Arc::new(archives));
         Ok(data)
     }
@@ -204,6 +210,24 @@ impl GameData {
     #[must_use]
     pub fn items(&self) -> &Items {
         &self.items
+    }
+
+    /// `ItemStatCost.txt`.
+    #[must_use]
+    pub fn item_stats(&self) -> &item_stats::ItemStats {
+        &self.item_stats
+    }
+
+    /// `ItemRatio.txt`.
+    #[must_use]
+    pub fn item_ratios(&self) -> &item_stats::ItemRatios {
+        &self.item_ratios
+    }
+
+    /// Replace the item stat and ratio tables — for tests.
+    pub fn set_item_rules(&mut self, stats: item_stats::ItemStats, ratios: item_stats::ItemRatios) {
+        self.item_stats = stats;
+        self.item_ratios = ratios;
     }
 
     /// `ArmType.txt`'s tokens (`lit`, `med`, `hvy`), by body armour weight.
@@ -404,6 +428,8 @@ impl GameData {
             objects: Objects::default(),
             shrines: Shrines::default(),
             items: Items::default(),
+            item_stats: item_stats::ItemStats::default(),
+            item_ratios: item_stats::ItemRatios::default(),
             treasure: treasure::TreasureClasses::default(),
             armor_types: Vec::new(),
             archives: None,

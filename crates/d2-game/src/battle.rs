@@ -224,8 +224,12 @@ pub enum Event {
         x: u16,
         /// Where it fell, world subtiles.
         y: u16,
-        /// The item code or item-type code the treasure class named (`hp1`, `weap3`).
+        /// The item code the treasure class named (`hp1`, `lax`).
         code: String,
+        /// The quality mods of the classes it came through.
+        mods: d2_data::treasure::QualityMods,
+        /// The item level: the monster's level.
+        level: i32,
     },
     /// `0x1D`–`0x1F`: one of a player's stats.
     PlayerStat {
@@ -908,14 +912,14 @@ impl Battle {
         let Some(class) = data.treasure().upgraded(treasure, level) else { return };
         let players = (self.heroes.len() as u32).max(1);
         let seed = &mut self.seed;
-        let drops = data.treasure().roll(class, players, &mut |n| seed.pick(n));
+        let drops = data.treasure().roll_for(class, players, self.expansion, &mut |n| seed.pick(n));
         for drop in drops {
             match drop {
                 Drop::Gold { mul } => {
                     let amount = gold_amount(level, mul, &mut |n| self.seed.pick(n));
                     events.push(Event::GoldDrop { room, x: x as u16, y: y as u16, amount });
                 }
-                Drop::Item(code) => events.push(Event::ItemDrop { room, x: x as u16, y: y as u16, code }),
+                Drop::Item(code, mods) => events.push(Event::ItemDrop { room, x: x as u16, y: y as u16, code, mods, level }),
             }
         }
     }

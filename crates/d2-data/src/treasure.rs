@@ -9,11 +9,18 @@
 //!
 //! A monster's class comes from `MonStats.txt` `TreasureClass1`, upgraded within its `group` to
 //! the highest `level` the monster has reached ([`TreasureClasses::upgraded`]).
+//!
+//! A class's `Unique`, `Set`, `Rare` and `Magic` columns better the quality roll of what drops
+//! from it; nested classes carry the best of each down (`0x0055A6D0`). An entry naming an item
+//! type and a level — `weap3`, `armo12` — is one of the classes the engine builds itself at load
+//! (`0x006541C0`, [`TreasureClasses::add_item_classes`]). Items only in Lord of Destruction never
+//! drop in a classic game.
 
 use std::collections::HashMap;
 
 use d2_formats::excel::Table;
 
+use crate::items::Items;
 use crate::Error;
 
 /// Most things one monster drops (`0x0055A6D0`'s default limit).
@@ -28,6 +35,30 @@ pub struct Entry {
     pub mul: u32,
     /// Its probability.
     pub prob: u32,
+    /// An item only in Lord of Destruction, left out of a classic game's rolls.
+    pub expansion_only: bool,
+}
+
+/// How much a treasure class betters each quality's odds, in 1024ths of the chance number
+/// (`0x00558640`: `chance −= chance × mod / 1024`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QualityMods {
+    /// `Unique`.
+    pub unique: u32,
+    /// `Set`.
+    pub set: u32,
+    /// `Rare`.
+    pub rare: u32,
+    /// `Magic`.
+    pub magic: u32,
+}
+
+impl QualityMods {
+    /// The better of each.
+    #[must_use]
+    pub fn max(self, other: Self) -> Self {
+        Self { unique: self.unique.max(other.unique), set: self.set.max(other.set), rare: self.rare.max(other.rare), magic: self.magic.max(other.magic) }
+    }
 }
 
 /// A treasure class row.
@@ -45,6 +76,8 @@ pub struct TreasureClass {
     pub no_drop: u32,
     /// `Item1`..`Item10` with their `Prob`s.
     pub entries: Vec<Entry>,
+    /// `Unique`, `Set`, `Rare`, `Magic`.
+    pub mods: QualityMods,
 }
 
 /// What one roll produced.
@@ -55,8 +88,8 @@ pub enum Drop {
         /// The multiplier.
         mul: u32,
     },
-    /// An item code or item-type code (`weap3`, `hp1`).
-    Item(String),
+    /// An item code, with the quality mods of the classes it came through.
+    Item(String, QualityMods),
 }
 
 impl TreasureClass {
@@ -64,7 +97,11 @@ impl TreasureClass {
     /// new `NoDrop` is `total × fⁿ / (1 − fⁿ)`, truncated.
     #[must_use]
     pub fn no_drop_for(&self, players: u32) -> u32 {
-        let total: u32 = self.entries.iter().map(|e| e.prob).sum();
+        self.no_drop_in(players, true)
+    }
+
+    fn no_drop_in(&self, players: u32, expansion: bool) -> u32 {
+        let total: u32 = self.entries.iter().filter(|e| expansion || !e.expansion_only).map(|e| e.prob).sum();
         if self.no_drop == 0 || players < 2 {
             return self.no_drop;
         }
@@ -106,7 +143,7 @@ impl TreasureClasses {
                         let mut parts = item.split(',');
                         let name = parts.next().unwrap_or_default().to_string();
                         let mul = parts.find_map(|p| p.strip_prefix("mul=")).and_then(|m| m.parse().ok()).unwrap_or(0);
-                        Some(Entry { name, mul, prob })
+                        Some(Entry { name, mul, prob, expansion_only: false })
                     })
                     .collect();
                 let tc = TreasureClass {
@@ -116,11 +153,60 @@ impl TreasureClasses {
                     picks: int("Picks") as i32,
                     no_drop: u32::try_from(int("NoDrop")).unwrap_or(0),
                     entries,
+                    mods: QualityMods {
+                        unique: u32::try_from(int("Unique")).unwrap_or(0),
+                        set: u32::try_from(int("Set")).unwrap_or(0),
+                        rare: u32::try_from(int("Rare")).unwrap_or(0),
+                        magic: u32::try_from(int("Magic")).unwrap_or(0),
+                    },
                 };
                 Some((name.to_ascii_lowercase(), tc))
             })
             .collect();
         Ok(Self { by_name })
+    }
+
+    /// Build the classes the engine makes for each item type flagged `TreasureClass` (`0x006541C0`):
+    /// `<code><n>` for n = 3, 6, … 96, holding every spawnable, non-quest item of the type (by
+    /// `type` or `type2`) whose `level` is above n − 3 and at most n, each weighted by its own
+    /// type's `Rarity` (at least 1). Throwing potions only go in their own type's classes.
+    pub fn add_item_classes(&mut self, items: &Items) {
+        let types = items.types();
+        let tpot = types.id("tpot");
+        for (type_id, t) in types.iter().enumerate().filter(|(_, t)| t.treasure_class) {
+            let type_id = type_id as i32;
+            for top in (3..=96).step_by(3) {
+                let entries = items
+                    .iter()
+                    .enumerate()
+                    .filter(|&(class, def)| {
+                        let class = class as i32;
+                        !def.quest
+                            && def.spawnable
+                            && items.is_type(class, type_id)
+                            && (Some(type_id) == tpot || !tpot.is_some_and(|p| items.is_type(class, p)))
+                            && def.level > top - 3
+                            && def.level <= top
+                    })
+                    .map(|(_, def)| Entry {
+                        name: crate::items::code_str(&def.code),
+                        mul: 0,
+                        prob: types.get(def.item_type).map_or(1, |ty| ty.rarity.max(1)) as u32,
+                        expansion_only: def.version >= 100,
+                    })
+                    .collect();
+                let name = format!("{}{top}", t.code);
+                self.by_name.entry(name.to_ascii_lowercase()).or_insert(TreasureClass {
+                    name,
+                    group: 0,
+                    level: top - 3,
+                    picks: 1,
+                    no_drop: 0,
+                    entries,
+                    mods: QualityMods::default(),
+                });
+            }
+        }
     }
 
     /// A class by name, any case.
@@ -146,17 +232,25 @@ impl TreasureClasses {
         )
     }
 
-    /// Roll `class` for a game of `players`, drawing numbers from `pick` (uniform in `[0, n)`).
+    /// Roll `class` for an expansion game of `players`, drawing numbers from `pick` (uniform in
+    /// `[0, n)`).
     pub fn roll(&self, class: &TreasureClass, players: u32, pick: &mut dyn FnMut(u32) -> u32) -> Vec<Drop> {
+        self.roll_for(class, players, true, pick)
+    }
+
+    /// Roll `class` for a game of `players`, classic or expansion.
+    pub fn roll_for(&self, class: &TreasureClass, players: u32, expansion: bool, pick: &mut dyn FnMut(u32) -> u32) -> Vec<Drop> {
         let mut drops = Vec::new();
-        self.roll_into(class, players, pick, &mut drops, 0);
+        self.roll_into(class, players, expansion, class.mods, pick, &mut drops, 0);
         drops
     }
 
-    fn roll_into(&self, class: &TreasureClass, players: u32, pick: &mut dyn FnMut(u32) -> u32, drops: &mut Vec<Drop>, depth: usize) {
+    #[allow(clippy::too_many_arguments)] // the recursion's own state
+    fn roll_into(&self, class: &TreasureClass, players: u32, expansion: bool, mods: QualityMods, pick: &mut dyn FnMut(u32) -> u32, drops: &mut Vec<Drop>, depth: usize) {
         if depth > 63 {
             return;
         }
+        let entries: Vec<&Entry> = class.entries.iter().filter(|e| expansion || !e.expansion_only).collect();
         let picks = class.picks.unsigned_abs().max(1);
         for taken in 0..picks {
             if drops.len() >= MAX_DROPS {
@@ -165,31 +259,34 @@ impl TreasureClasses {
             let entry = if class.picks < 0 {
                 // Sequential: entry i drops Prob_i times.
                 let mut running = 0;
-                class.entries.iter().find(|e| {
+                entries.iter().find(|e| {
                     running += e.prob;
                     running > taken
                 })
             } else {
-                let no_drop = class.no_drop_for(players);
-                let total: u32 = class.entries.iter().map(|e| e.prob).sum::<u32>() + no_drop;
+                let no_drop = class.no_drop_in(players, expansion);
+                let total: u32 = entries.iter().map(|e| e.prob).sum::<u32>() + no_drop;
+                if total == 0 {
+                    continue;
+                }
                 let r = pick(total);
                 if r < no_drop {
                     continue;
                 }
                 let r = r - no_drop;
                 let mut running = 0;
-                class.entries.iter().find(|e| {
+                entries.iter().find(|e| {
                     running += e.prob;
                     running > r
                 })
             };
             let Some(entry) = entry else { continue };
             if let Some(sub) = self.get(&entry.name) {
-                self.roll_into(sub, players, pick, drops, depth + 1);
+                self.roll_into(sub, players, expansion, mods.max(sub.mods), pick, drops, depth + 1);
             } else if entry.name.eq_ignore_ascii_case("gld") {
                 drops.push(Drop::Gold { mul: entry.mul });
             } else {
-                drops.push(Drop::Item(entry.name.clone()));
+                drops.push(Drop::Item(entry.name.clone(), mods));
             }
         }
     }
@@ -218,7 +315,8 @@ mod tests {
             level,
             picks,
             no_drop,
-            entries: entries.iter().map(|&(n, p)| Entry { name: n.into(), mul: 0, prob: p }).collect(),
+            entries: entries.iter().map(|&(n, p)| Entry { name: n.into(), mul: 0, prob: p, expansion_only: false }).collect(),
+            mods: QualityMods::default(),
         }
     }
 
@@ -234,7 +332,7 @@ mod tests {
         assert!(with(99).is_empty(), "inside NoDrop");
         assert_eq!(with(100), [Drop::Gold { mul: 0 }]);
         assert_eq!(with(120), [Drop::Gold { mul: 0 }]);
-        assert_eq!(with(121), [Drop::Item("hp1".into())], "a sub-class resolves in place");
+        assert_eq!(with(121), [Drop::Item("hp1".into(), QualityMods::default())], "a sub-class resolves in place");
     }
 
     #[test]
@@ -250,7 +348,7 @@ mod tests {
     fn negative_picks_drop_every_entry_its_count() {
         let tcs = classes(vec![class("Boss", 0, 0, -3, 0, &[("gld", 2), ("hp1", 1)])]);
         let drops = tcs.roll(tcs.get("Boss").unwrap(), 1, &mut |_| panic!("no draws"));
-        assert_eq!(drops, [Drop::Gold { mul: 0 }, Drop::Gold { mul: 0 }, Drop::Item("hp1".into())]);
+        assert_eq!(drops, [Drop::Gold { mul: 0 }, Drop::Gold { mul: 0 }, Drop::Item("hp1".into(), QualityMods::default())]);
     }
 
     #[test]
@@ -301,6 +399,31 @@ mod tests {
             gold += drops.iter().filter(|d| matches!(d, Drop::Gold { .. })).count();
         }
         assert!((20..70).contains(&gold), "about 21 in 160 rolls, 39 of 300: {gold}");
+    }
+
+    /// With the operator's install: the engine's own `weap3` and `armo3` classes hold the
+    /// low-level bases, weighted by their type's rarity, and Act I's equipment class reaches them
+    /// with its quality mods.
+    #[test]
+    fn with_a_real_install_item_type_classes_are_built() {
+        let Ok(dir) = std::env::var("BNETCC_D2_DATA_DIR") else { return };
+        let data = crate::GameData::load(dir).expect("install loads");
+        let weap3 = data.treasure().get("weap3").expect("weap3");
+        let names: Vec<&str> = weap3.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"hax") && names.contains(&"ssd") && !names.contains(&"lsd"), "{names:?}");
+        assert!(weap3.entries.iter().all(|e| e.prob >= 1));
+        let armo3 = data.treasure().get("armo3").expect("armo3");
+        assert!(armo3.entries.iter().any(|e| e.name == "cap"));
+        assert!(data.treasure().get("weap96").is_some() && data.treasure().get("weap99").is_none());
+        let mut state = 5u64;
+        let mut pick = |n: u32| {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as u32) % n.max(1)
+        };
+        let equip = data.treasure().get("Act 1 Equip A").expect("Act 1 Equip A");
+        let drops: Vec<Drop> = (0..200).flat_map(|_| data.treasure().roll_for(equip, 1, false, &mut pick)).collect();
+        assert!(drops.iter().all(|d| matches!(d, Drop::Item(code, _) if data.items().class_of(&crate::items::code(code)).is_some())), "{drops:?}");
+        assert!(!drops.iter().any(|d| matches!(d, Drop::Item(code, _) if data.items().get(data.items().class_of(&crate::items::code(code)).unwrap()).unwrap().version >= 100)), "no expansion items in a classic game");
     }
 
     #[test]
