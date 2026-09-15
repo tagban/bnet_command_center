@@ -3,16 +3,20 @@
 // and the history the site builds from every push, so charts survive server restarts and still
 // show while the server is down.
 //
-// History: `points`, one per five minutes for eight days (the most seen in each); `days`, one per
-// day for 180 days; `record`, the most players ever online at once.
+// The server pushes every 30 minutes (`interval_secs = 1800`), so a snapshot counts as fresh for 35
+// minutes, and the charts break their line only where two pushes in a row are missing.
+//
+// History: `points`, one per half hour for eight days (the most seen in each); `days`, one per day
+// for 180 days; `record`, the most players ever online at once.
 
 declare(strict_types=1);
 
 require_once __DIR__ . '/bootstrap.php';
 
-const SERVER_FRESH_SECONDS = 180;
-const SERVER_POINT_SECONDS = 300;
-const SERVER_POINTS_KEEP = 8 * 24 * 12;
+const SERVER_FRESH_SECONDS = 2100;
+const SERVER_POINT_SECONDS = 1800;
+const SERVER_POINTS_KEEP = 8 * 24 * 2;
+const SERVER_GAP_SECONDS = 3 * SERVER_POINT_SECONDS;
 const SERVER_DAYS_KEEP = 180;
 
 /** The latest snapshot and how old it is: [data or null, seconds since it arrived]. */
@@ -166,7 +170,7 @@ function server_chart(array $series, int $from, int $to, int $width = 520, int $
         if ($t < $from || $t > $to) {
             continue;
         }
-        if ($prev !== null && $t - $prev > 900) {
+        if ($prev !== null && $t - $prev > SERVER_GAP_SECONDS) {
             $runs[] = $run;
             $run = [];
         }

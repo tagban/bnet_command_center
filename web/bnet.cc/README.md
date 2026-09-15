@@ -63,9 +63,10 @@ categories, and nested folders become breadcrumbs.
 
 ## Server data
 
-Every minute the server sends bnet.cc a snapshot of itself: its stats push. `server-push.php` keeps
-the latest one and adds it to the site's own history (five-minute points for eight days, one row per
-day for 180 days, and the most players ever online). So the charts don't reset when the server
+Every 30 minutes the server sends bnet.cc a snapshot of itself: its stats push. `server-push.php`
+keeps the latest one and adds it to the site's own history (half-hour points for eight days, one row
+per day for 180 days, and the most players ever online). A snapshot counts as current for 35
+minutes (`SERVER_FRESH_SECONDS` in `bnetcc/server.php`); change it with the push interval. So the charts don't reset when the server
 restarts, and the pages still show the last known state, marked Offline, while it is down.
 
 On the server, in `bnetccd.toml` (this replaces the old stats push URL):
@@ -74,7 +75,7 @@ On the server, in `bnetccd.toml` (this replaces the old stats push URL):
 [stats_push]
 url = "https://www.bnet.cc/server-push.php"
 token = "a long random string"        # the same as SERVER_PUSH_TOKEN in site-config.php
-interval_secs = 60
+interval_secs = 1800                  # every 30 minutes; bnetcc/server.php expects this
 include_users = true                  # names in Who's Online; false shows counts only
 ```
 
@@ -144,7 +145,7 @@ browser ──GET  /ladder.php ─▶ ladder.js ──GET /ladder-data.php──
    [ladder_push]
    url = "https://www.bnet.cc/ladder-push.php"
    token = "the same long random string"   # empty = use [stats_push] token
-   interval_secs = 300
+   interval_secs = 1800                      # every 30 minutes
    ```
    Restart the server. It pushes at startup, every `interval_secs`, and within a minute of a
    counted ladder game or the end of a Diablo II season.
