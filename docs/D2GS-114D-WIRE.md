@@ -700,8 +700,66 @@ else walks the player there; we do not check range. Gold (`0x55C850`) takes what
 (level × 10,000, `0x622E70`) and drops the rest as a new pile from the player (`0x55B030` →
 `0x55A090`, placed the same way).
 
-Not done: items other than gold (the TC rolls them; quality, affixes, inventory placement and the
-`.d2s` item list are next), and the second player count in `NoDrop`.
+Not done: the second player count in `NoDrop`. `TreasureClassEx.txt` quotes an entry holding a
+comma (`"gld,mul=1280"`); the quotes are stripped before the multiplier is read (until 2026-09-15
+such entries were taken for unknown items and dropped nothing).
+
+### Simple items: drops, belt, inventory, potions (2026-09-15)
+
+A treasure pick naming an item code makes the item when it is simple: `Misc.txt` `compactsave`,
+not gold, a quest item or a stack — potions, scrolls, gems, skulls, runes. Type picks (`weap3`,
+`armo6`) and magic items (rings, amulets, charms, jewels) are skipped.
+
+**Bits.** A simple item (flag `0x200000`) is written by `0x62AF80` and read by `0x62A970`:
+flags 32, version 10, mode 3, then on the ground (mode 3 or 5) x 16 and y 16, otherwise body
+location 4, column 4, row 4 and page + 1 3 (`+0x45` holds the page, −1 for none), the code 32,
+the gold amount for type 4, and the quest-difficulty bits for quest items. A `.d2s` item starts
+with `JM` 16 and ends with a realm-data bit (0, or 1 and 32 + 32 + 32). Version is the game's
+`+0x78`: 101 in an expansion game, 2 in a classic one (`0x530930`). The flags written are the
+item's with `0x80000` cleared and `0x800000` set (`0x6312B0`). A belt item's column is its slot
+and its row 0: `0x63AFD0` places belt items at x = slot, y = 0 (bnemu's `slot % 4`, `slot / 4`
+reading does not match it). Checked against a retail pickup capture byte for byte:
+`9c 04 14 10 2b0b3efa 1000a0006500728206270302` is hp2 at column 9, row 3 of the inventory.
+
+**Packets.** `0x9C` (`0x53EAE0`) is `[0x9C][action][size][category][guid]` and the bits; `0x9D`
+(`0x53CEF0`) adds `[owner type u8][owner guid u32]` before the bits. The category is ItemsTxt
+`+0x115`, `component` (16 for these items). The client's action sets are disjoint (`0x45EB10`,
+`0x45EC70`); what the server sends is picked per frame from the item's action flags `+0x14`
+(`0x5973F0`): `2`/`0x80` → `0x9C` 4, `4` → `0x9D` 5, `8`/`0x200` → `0x9D` 6, `0x400`/`0x2000` →
+`0x9C` `0x0E`, `0x800` → `0x9C` `0x0F`, `0x1000` → `0x9C` `0x10`.
+
+**Pickup** (`0x563560`, after gold): tomes take scrolls and stacks merge (`0x560020`); an item
+for an empty body location is equipped (`0x55D710`); a beltable item (ItemTypes `Beltable`)
+with `autobelt` (`+0x131`) goes to the belt (`0x63C790` → `0x63C600`: first a column already
+holding a matching item, then the first free bottom slot) — mode 2, action flag `0x2000`; else
+the inventory (`0x5600A0` → `0x63B950`) — mode 0, action flag `0x80`; with no room `0x55C9A0`
+event `0x17` and the item stays. The inventory spot (`0x63B850`): for a one-row item in a
+player's grid (`0x63B490`) every column from the right, each row from the bottom, keeping the
+free spot with the highest contact score (`0x63B340`: occupied cells and grid edges along its
+four sides; a tie keeps the first, a spot closed on every side wins at once); other shapes row by
+row from the top (`0x63B620`, 2 × 2 and three-row items have their own passes, not read). Empty
+10 × 4: (9, 3), (9, 2), (9, 1), (9, 0), (8, 3)… We send `0x0A` to everyone near, then the item
+`0x9C` action `0x0E` (belt) or 4 (inventory) to the picker, flags `0x00A00010`. No belt worn is
+taken as four slots.
+
+**Use.** `0x26` (13, `0x54B560` → `0x562390`) uses a belt item (mode 2), `0x20` (13, `0x54B1E0`
+→ `0x55E170`) a stored one (mode 0); both need the item useable and run `0x5BF240`, which calls
+the `pSpell` routine from the table at `0x741790`. Taken out: from the belt `0x9C` action `0x0F`
+(`0x561E70`), from the inventory `0x9D` action 5 (`0x55E000`), both with flag `0x20` added. The
+belt then slides its column down (`0x55EDC0`, `0x9D` action `0x15` per moved item) — never
+needed with one row. `pSpell` 3 (`0x5BE3F0`): each stat's calc `<< 8`; `hpregen` ×1.5 for
+Amazon, Paladin, Assassin and ×2 for Barbarian (`0x62A5D0`), `manarecovery` ×1.5 for Amazon,
+Paladin, Assassin and ×2 for Sorceress, Necromancer, Druid (`0x62A620`); doubled when
+`rand(100) < rand(vitality) >> 1` (energy for mana, from the unit's seed); with `len` it becomes a
+state (`healthpot`/`manapot`) whose per-frame rate is `(rate × frames left + total) / (len +
+frames left)`. `pSpell` 5 (`0x5BEAC0`): each stat's percent of its maximum, at once. We model the
+rate in 256ths a frame and tell the client by `0x95`; the state packets and `ValShift` precision
+are not ported.
+
+**Join.** `SendUnitToClient` for a player (`0x571F90`) sends its items through `0x534F80`:
+stored `0x9C` 4, belt `0x9C` `0x0E` (own player only), equipped `0x9D` 6. The client's action 4
+and `0x0E` handlers put the item on `0x7A6A70`, the client's own player, which `0x0B` sets
+(`0x45CC50`); we send the items right after the stats that follow `0x0B`.
 
 ## 6. Server packet builders (opcode → function)
 
@@ -731,10 +789,10 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
   behind the caves (Cave Level 2 and the other treasure levels, `DrlgType` 2) and the other acts'
   mazes.
 - Combat (§5 *Fighting*): the per-class AI routines, items and weapons, skills.
-- Loot (§5 *Gold drops and pickup*): item drops — base item from the TC code (`weap3`/`armo3`
-  type-and-level picks), quality (`0x558640`), the full item body, inventory and belt placement
-  (`0x9C` action 4), the `.d2s` item list; bnemu's `ItemBitstreamEncoder` and captures cover the
-  bodies.
+- Loot (§5 *Simple items*): equipment and magic items — base item from the TC code
+  (`weap3`/`armo3` type-and-level picks), quality (`0x558640`), the full item body
+  (`0x62CBE0`); cursor moves (`0x17`–`0x19`, `0x23`, `0x24`), stacks, tomes, belts worn and the
+  stash; bnemu's `ItemBitstreamEncoder` and captures cover the bodies.
 - bnemu (MIT, permission recorded in `docs/LEGAL.md`) has worked items and vendors to port from;
   its wilderness collision is approximate, so collision stays on libd2.
 - Unique packs and champions; wandering monsters; NPCs walking their DS1 paths (`0x666120`); the

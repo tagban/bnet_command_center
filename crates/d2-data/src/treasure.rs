@@ -100,7 +100,8 @@ impl TreasureClasses {
                 let int = |c: &str| row.int(c).unwrap_or(0);
                 let entries = (1..=10)
                     .filter_map(|i| {
-                        let item = row.get(&format!("Item{i}")).filter(|s| !s.is_empty())?;
+                        // An entry with a comma is quoted in the file: `"gld,mul=1280"`.
+                        let item = row.get(&format!("Item{i}")).map(|s| s.trim_matches('"')).filter(|s| !s.is_empty())?;
                         let prob = u32::try_from(row.int(&format!("Prob{i}")).unwrap_or(0)).ok().filter(|&p| p > 0)?;
                         let mut parts = item.split(',');
                         let name = parts.next().unwrap_or_default().to_string();
@@ -234,6 +235,15 @@ mod tests {
         assert_eq!(with(100), [Drop::Gold { mul: 0 }]);
         assert_eq!(with(120), [Drop::Gold { mul: 0 }]);
         assert_eq!(with(121), [Drop::Item("hp1".into())], "a sub-class resolves in place");
+    }
+
+    #[test]
+    fn a_quoted_gold_entry_keeps_its_multiplier() {
+        let table = Table::parse(b"Treasure Class\tgroup\tlevel\tPicks\tNoDrop\tItem1\tProb1\r\nChamp\t\t\t-1\t\t\"gld,mul=1280\"\t1\r\n");
+        let tcs = TreasureClasses::from_table(&table).unwrap();
+        let champ = tcs.get("Champ").unwrap();
+        assert_eq!((champ.entries[0].name.as_str(), champ.entries[0].mul), ("gld", 1280));
+        assert_eq!(tcs.roll(champ, 1, &mut |_| 0), [Drop::Gold { mul: 1280 }]);
     }
 
     #[test]

@@ -21,6 +21,12 @@
 //! - Stamina (`0x0057F240`, `0x00580500`): running outside a town spends `RunDrain × 2` 256ths a
 //!   frame; standing gains a 256th of the maximum a frame, walking half that, and swinging or
 //!   running nothing. On Battle.net the server does this and tells the client.
+//! - Potions (`0x005BF240` by `Misc.txt` `pSpell`): a healing or mana potion (3, `0x005BE3F0`) spreads
+//!   its `calc1` points — ×1.5 for an Amazon, Paladin or Assassin, ×2 for a Barbarian's healing and
+//!   a Sorceress's, Necromancer's or Druid's mana, and doubled again when `rand(100)` falls under
+//!   half of `rand(vitality)` (energy for mana) — over `len` frames, a potion drunk while one works
+//!   folding what is left of it into the new one; a rejuvenation potion (5, `0x005BEAC0`) restores
+//!   its percentages of life and mana at once.
 //! - The packets' shapes and pacing are from a recorded retail fight (bnemu
 //!   `docs/d2/re/combat.md`): a kill is `DYING`, then `DEAD` one death animation later.
 //! - A walking monster covers `MonStats.txt` `Velocity` sixteenths of a subtile a frame, as a
@@ -205,6 +211,17 @@ pub enum Event {
         /// Gold.
         amount: u32,
     },
+    /// A dying monster dropped an item (`0x9C`), by code, from where it fell.
+    ItemDrop {
+        /// The room the monster died in.
+        room: RoomId,
+        /// Where it fell, world subtiles.
+        x: u16,
+        /// Where it fell, world subtiles.
+        y: u16,
+        /// The item code or item-type code the treasure class named (`hp1`, `weap3`).
+        code: String,
+    },
     /// `0x1D`–`0x1F`: one of a player's stats.
     PlayerStat {
         /// The player.
@@ -303,6 +320,74 @@ pub enum Motion {
     Running,
 }
 
+/// What drinking a potion does (`Misc.txt` `pSpell` and its stats).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Potion {
+    /// `pSpell` 3 with `hpregen`: `points` of life over `frames`.
+    Healing {
+        /// Whole points before the class's share.
+        points: i32,
+        /// Frames.
+        frames: i32,
+    },
+    /// `pSpell` 3 with `manarecovery`: `points` of mana over `frames`.
+    Mana {
+        /// Whole points before the class's share.
+        points: i32,
+        /// Frames.
+        frames: i32,
+    },
+    /// `pSpell` 5: percentages of maximum life and mana, at once.
+    Rejuvenation {
+        /// Percent of maximum life.
+        life: i32,
+        /// Percent of maximum mana.
+        mana: i32,
+    },
+}
+
+impl Potion {
+    /// The potion an item is, from its `pSpell`, stats and `len`.
+    #[must_use]
+    pub fn of(item: &d2_data::items::ItemDef) -> Option<Self> {
+        let calc = |stat: &str| item.effects.iter().find(|(s, _)| s.eq_ignore_ascii_case(stat)).map(|&(_, v)| v);
+        match item.spell {
+            3 => {
+                let frames = item.duration.max(0);
+                calc("hpregen").map(|points| Self::Healing { points, frames }).or_else(|| calc("manarecovery").map(|points| Self::Mana { points, frames }))
+            }
+            5 => Some(Self::Rejuvenation { life: calc("hitpoints").unwrap_or(0), mana: calc("mana").unwrap_or(0) }),
+            _ => None,
+        }
+    }
+}
+
+/// A potion working on life or mana: 256ths a frame, for each frame after it was drunk up to and
+/// including `until`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Recovery {
+    per_frame: i32,
+    until: u64,
+}
+
+impl Recovery {
+    /// Fold a new potion's `total` 256ths over `frames` into what is left of this one
+    /// (`0x005BE3F0`: the rate is `(rate × left + total) / (frames + left)`).
+    fn add(&mut self, now: u64, total: i32, frames: i32) {
+        let left = self.until.saturating_sub(now) as i64;
+        let span = i64::from(frames.max(1)) + left;
+        self.per_frame = ((i64::from(self.per_frame) * left + i64::from(total)) / span) as i32;
+        self.until = now + span as u64;
+    }
+
+    /// One frame's worth for `value` up to `max`.
+    fn step(&self, now: u64, value: &mut i32, max: i32) {
+        if now <= self.until && *value < max {
+            *value = (*value + self.per_frame).min(max);
+        }
+    }
+}
+
 /// A player in the fight. Life, mana and stamina are 256ths, as the engine keeps them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Hero {
@@ -330,9 +415,11 @@ struct Hero {
     dying_frames: u64,
     motion: Motion,
     run_drain: i32,
-    /// Whole stamina the client was last told, and when.
-    told_stamina: u16,
+    /// Whole life, mana and stamina the client was last told, and when.
+    told: (u16, u16, u16),
     told_at: u64,
+    healing: Recovery,
+    mana_recovery: Recovery,
 }
 
 impl Hero {
@@ -346,9 +433,15 @@ impl Hero {
 
     /// Its life, mana and stamina for its client, noting what was told when.
     fn vitals(&mut self, name: &str, now: u64) -> Event {
+        let whole = self.whole();
+        (self.told, self.told_at) = (whole, now);
+        Event::PlayerVitals { player: name.to_string(), life: whole.0, mana: whole.1, stamina: whole.2 }
+    }
+
+    /// Whole life, mana and stamina.
+    fn whole(&self) -> (u16, u16, u16) {
         let whole = |v: i32| (v.max(0) >> 8).min(0x7FFF) as u16;
-        (self.told_stamina, self.told_at) = (whole(self.stamina), now);
-        Event::PlayerVitals { player: name.to_string(), life: whole(self.life), mana: whole(self.mana), stamina: whole(self.stamina) }
+        (whole(self.life), whole(self.mana), whole(self.stamina))
     }
 
     /// One frame of stamina (`0x0057F240` drain, `0x00580500` regeneration).
@@ -561,8 +654,10 @@ impl Battle {
             dying_frames: anim_frames(data, token, "DT", "hth", 28),
             motion: Motion::Standing,
             run_drain: data.class(class).map_or(20, |c| c.run_drain),
-            told_stamina: (get(stat::STAMINA) >> 8) as u16,
+            told: ((get(stat::HITPOINTS) >> 8) as u16, (get(stat::MANA) >> 8) as u16, (get(stat::STAMINA) >> 8) as u16),
             told_at: 0,
+            healing: Recovery::default(),
+            mana_recovery: Recovery::default(),
         };
         self.heroes.insert(name.to_string(), hero);
     }
@@ -737,9 +832,17 @@ impl Battle {
                 continue;
             }
             h.stamina_step(now);
-            let whole = (h.stamina >> 8) as u16;
-            let at_end = whole == 0 || h.stamina == h.max_stamina;
-            if whole != h.told_stamina && (now >= h.told_at + VITALS_EVERY || at_end) {
+            let (healing, mana_recovery) = (h.healing, h.mana_recovery);
+            healing.step(now, &mut h.life, h.max_life);
+            mana_recovery.step(now, &mut h.mana, h.max_mana);
+            let whole = h.whole();
+            let at_end = whole.2 == 0
+                || h.stamina == h.max_stamina
+                || now == healing.until
+                || now == mana_recovery.until
+                || h.life == h.max_life && whole.0 != h.told.0
+                || h.mana == h.max_mana && whole.1 != h.told.1;
+            if whole != h.told && (now >= h.told_at + VITALS_EVERY || at_end) {
                 events.push(h.vitals(name, now));
             }
         }
@@ -791,17 +894,66 @@ impl Battle {
     }
 
     /// Roll a dead monster's treasure class (upgraded to its level) for the players in the game.
-    /// Gold piles are dropped from where it fell (the caller finds each its spot); items are not
-    /// made yet.
+    /// Gold piles and items are dropped from where it fell; the caller finds each its spot and
+    /// makes the items it can.
     fn drop_treasure(&mut self, data: &GameData, room: RoomId, (x, y): (i32, i32), treasure: &str, level: i32, events: &mut Vec<Event>) {
         let Some(class) = data.treasure().upgraded(treasure, level) else { return };
         let players = (self.heroes.len() as u32).max(1);
         let seed = &mut self.seed;
         let drops = data.treasure().roll(class, players, &mut |n| seed.pick(n));
         for drop in drops {
-            if let Drop::Gold { mul } = drop {
-                let amount = gold_amount(level, mul, &mut |n| self.seed.pick(n));
-                events.push(Event::GoldDrop { room, x: x as u16, y: y as u16, amount });
+            match drop {
+                Drop::Gold { mul } => {
+                    let amount = gold_amount(level, mul, &mut |n| self.seed.pick(n));
+                    events.push(Event::GoldDrop { room, x: x as u16, y: y as u16, amount });
+                }
+                Drop::Item(code) => events.push(Event::ItemDrop { room, x: x as u16, y: y as u16, code }),
+            }
+        }
+    }
+
+    /// A player drinks `potion`: what its client is told at once (a rejuvenation's life and mana);
+    /// `None` when the player is not in the fight or is dead, and nothing is used up.
+    pub fn drink(&mut self, name: &str, potion: Potion) -> Option<Vec<Event>> {
+        let now = self.frame;
+        let h = self.heroes.get_mut(name)?;
+        if h.dead {
+            return None;
+        }
+        // `0x0062A5D0` and `0x0062A620`, by class: Amazon 0, Sorceress 1, Necromancer 2, Paladin 3,
+        // Barbarian 4, Druid 5, Assassin 6.
+        let share = |v: i32, doubled: &[u8]| match h.class {
+            0 | 3 | 6 => v + (v >> 1),
+            c if doubled.contains(&c) => v * 2,
+            _ => v,
+        };
+        let seed = &mut self.seed;
+        // A lucky draw doubles it (`0x005BE520`): rand(100) under half of rand(the attribute).
+        let mut lucky = |attribute: i32, v: i32| {
+            if attribute > 0 {
+                let half = seed.pick(attribute as u32) >> 1;
+                if seed.pick(100) < half {
+                    return v * 2;
+                }
+            }
+            v
+        };
+        match potion {
+            Potion::Healing { points, frames } => {
+                let total = lucky(h.attributes[usize::from(stat::VITALITY)], share(points << 8, &[4]));
+                h.healing.add(now, total, frames);
+                Some(Vec::new())
+            }
+            Potion::Mana { points, frames } => {
+                let total = lucky(h.attributes[usize::from(stat::ENERGY)], share(points << 8, &[1, 2, 5]));
+                h.mana_recovery.add(now, total, frames);
+                Some(Vec::new())
+            }
+            Potion::Rejuvenation { life, mana } => {
+                let part = |max: i32, percent: i32| if percent >= 100 { max } else { (i64::from(max) * i64::from(percent) / 100) as i32 };
+                h.life = (h.life + part(h.max_life, life)).min(h.max_life);
+                h.mana = (h.mana + part(h.max_mana, mana)).min(h.max_mana);
+                Some(vec![h.vitals(name, now)])
             }
         }
     }
@@ -1236,6 +1388,95 @@ mod tests {
         b.place_player("hero", Some((1000, 1000, 1)), &[]);
         b.set_motion("hero", Motion::Running);
         assert!(b.advance(&data, 500, &open).is_empty(), "the camp costs nothing");
+    }
+
+    /// A hero of `class` with 1 life, 1 mana and no vitality or energy (so no lucky doubling).
+    fn weakened(data: &GameData, class: u8) -> Battle {
+        let mut stats = data.new_character_stats(class).unwrap();
+        for (id, value) in &mut stats {
+            match *id {
+                stat::HITPOINTS | stat::MANA => *value = 1 << 8,
+                stat::VITALITY | stat::ENERGY => *value = 0,
+                _ => {}
+            }
+        }
+        let mut b = Battle::new(0, 99);
+        b.add_player(data, "hero", class, &stats);
+        b.place_player("hero", Some((1000, 1000, 1)), &[]);
+        b
+    }
+
+    fn vitals(events: &[Event]) -> Vec<(u16, u16)> {
+        events.iter().filter_map(|e| if let Event::PlayerVitals { life, mana, .. } = e { Some((*life, *mana)) } else { None }).collect()
+    }
+
+    #[test]
+    fn a_healing_potion_spreads_its_share_over_its_frames() {
+        let data = data();
+        let open = |_: i32, _: i32| Some(1);
+        // A Barbarian drinks for twice the points: 20 over 192 frames, 26/256 a frame.
+        let mut b = weakened(&data, 4);
+        assert_eq!(b.drink("hero", Potion::Healing { points: 10, frames: 192 }), Some(Vec::new()));
+        let mut events = b.advance(&data, 100, &open);
+        events.extend(b.advance(&data, 192, &open));
+        let told = vitals(&events);
+        assert!(told.windows(2).all(|w| w[1].0 > w[0].0), "rising: {told:?}");
+        assert_eq!(told.last().unwrap().0, ((256 + 26 * 192) >> 8) as u16, "the last frame is told");
+        assert!(b.advance(&data, 300, &open).is_empty(), "then it is spent");
+        let life = |b: &Battle| b.player_stats("hero").unwrap().iter().find(|s| s.0 == stat::HITPOINTS).unwrap().1;
+        assert_eq!(life(&b), 256 + 26 * 192);
+
+        // A second potion halfway folds the rest of the first into it.
+        let mut b = weakened(&data, 1);
+        b.drink("hero", Potion::Healing { points: 10, frames: 192 });
+        b.advance(&data, 96, &open);
+        b.drink("hero", Potion::Healing { points: 10, frames: 192 });
+        b.advance(&data, 96 + 100, &open);
+        b.advance(&data, 96 + 200, &open);
+        b.advance(&data, 96 + 288, &open);
+        // 13 a frame for 96 frames, then (13 × 96 + 2560) / 288 = 13 for 288 more.
+        assert_eq!(life(&b), 256 + 13 * 96 + 13 * 288);
+    }
+
+    #[test]
+    fn mana_and_rejuvenation_follow_the_class_and_the_maximum() {
+        let data = data();
+        let open = |_: i32, _: i32| Some(1);
+        // An Amazon gets half again: 30 mana over 128 frames (60/256 a frame).
+        let mut b = weakened(&data, 0);
+        b.drink("hero", Potion::Mana { points: 20, frames: 128 });
+        b.advance(&data, 100, &open);
+        b.advance(&data, 128, &open);
+        let stat_of = |b: &Battle, id: u8| b.player_stats("hero").unwrap().iter().find(|s| s.0 == id).unwrap().1 as i32;
+        assert_eq!(stat_of(&b, stat::MANA), (256 + 60 * 128).min(stat_of(&b, stat::MAXMANA)));
+        // A rejuvenation potion: 35% of each at once, told straight away.
+        let mut b = weakened(&data, 4);
+        let (max_life, max_mana) = (stat_of(&b, stat::MAXHP), stat_of(&b, stat::MAXMANA));
+        let told = b.drink("hero", Potion::Rejuvenation { life: 35, mana: 35 }).unwrap();
+        assert_eq!(stat_of(&b, stat::HITPOINTS), 256 + max_life * 35 / 100);
+        assert_eq!(vitals(&told), [(((256 + max_life * 35 / 100) >> 8) as u16, ((256 + max_mana * 35 / 100) >> 8) as u16)]);
+        b.drink("hero", Potion::Rejuvenation { life: 100, mana: 100 });
+        assert_eq!((stat_of(&b, stat::HITPOINTS), stat_of(&b, stat::MANA)), (max_life, max_mana), "a full one fills");
+        assert_eq!(b.drink("nobody", Potion::Rejuvenation { life: 100, mana: 100 }), None);
+    }
+
+    #[test]
+    fn potions_read_from_their_misc_row() {
+        let itemtypes = Table::parse(b"ItemType\tCode\tEquiv1\r\nPotion\tpoti\t\r\n");
+        let empty = Table::parse(b"name\tcode\ttype\r\n");
+        let misc = Table::parse(
+            b"name\tcode\ttype\tpSpell\tlen\tstat1\tcalc1\tstat2\tcalc2\r\n\
+              Minor Healing Potion\thp1\tpoti\t3\t192\thpregen\t30\t\t\r\n\
+              Minor Mana Potion\tmp1\tpoti\t3\t128\tmanarecovery\t20\t\t\r\n\
+              Rejuv Potion\trvs\tpoti\t5\t\thitpoints\t35\tmana\t35\r\n\
+              Stamina Potion\tvps\tpoti\t9\t750\tstaminarecoverybonus\t5000\t\t\r\n",
+        );
+        let items = d2_data::items::Items::from_tables(&itemtypes, &empty, &empty, &misc).unwrap();
+        let potion = |i: i32| Potion::of(items.get(i).unwrap());
+        assert_eq!(potion(0), Some(Potion::Healing { points: 30, frames: 192 }));
+        assert_eq!(potion(1), Some(Potion::Mana { points: 20, frames: 128 }));
+        assert_eq!(potion(2), Some(Potion::Rejuvenation { life: 35, mana: 35 }));
+        assert_eq!(potion(3), None, "stamina is not ported");
     }
 
     #[test]

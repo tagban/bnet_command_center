@@ -65,6 +65,8 @@ pub mod sc {
     pub const ADD_GOLD_BYTE: u8 = 0x19;
     /// An item made, moved or placed where no unit owns it (variable; size at `+2`).
     pub const ITEM_ACTION_WORLD: u8 = 0x9C;
+    /// An item action naming the unit that owns the item (variable; size at `+2`).
+    pub const ITEM_ACTION_OWNED: u8 = 0x9D;
     /// An object's mode changed (12 bytes).
     pub const OBJECT_STATE: u8 = 0x0E;
     /// Which unit is the client's own player (6 bytes).
@@ -169,6 +171,12 @@ pub mod cs {
     /// Pick an item up: `[unit type u32][item guid u32][to cursor u32]` (13 bytes; engine
     /// handler `0x0054AAD0`, then `0x00548B00` as for `0x13`).
     pub const PICK_UP_ITEM: u8 = 0x16;
+    /// Use an item in the inventory: `[item guid u32][x u32][y u32]` (13 bytes; engine handler
+    /// `0x0054B1E0` → `0x0055E170`).
+    pub const USE_ITEM: u8 = 0x20;
+    /// Use an item in the belt: `[item guid u32][u32][u32]` (13 bytes; engine handler
+    /// `0x0054B560` → `0x00562390`).
+    pub const USE_BELT_ITEM: u8 = 0x26;
     /// Travel by waypoint: `[waypoint guid u32][level u16][u16]` (9 bytes; engine handler
     /// `0x0054C5D0`).
     pub const WAYPOINT_TRAVEL: u8 = 0x49;
@@ -695,30 +703,124 @@ pub fn set_stat(stat: u8, value: u32) -> Vec<u8> {
     w.finish()
 }
 
-/// `0x9C` action 0 (add to ground; client `0x004C25B0`) for a gold pile at `(x, y)`: the 8-byte
-/// header `[0x9C][action][size][category][guid u32]`, then the item bits — flags (identified
-/// `0x10`, just dropped `0x2000` for the fall and its sound, simple `0x200000`, `0x800000` set on
-/// every item), version 101, mode 3 (ground), `x`/`y`, code `gld `, and the amount behind a
-/// one-bit width flag (12 bits, or 32 above 4095; `0x0062A970` stores it as stat 14).
-/// `dropping` false leaves a pile that is just there. ⚠️ The category byte is sent as 0; the
-/// client does not read it for action 0.
+/// Item actions. `0x9C` (client `0x0045EB10`) and `0x9D` (`0x0045EC70`, which names the owning
+/// unit) take disjoint sets, and the client halts on an action its packet does not take.
+pub mod item_action {
+    /// `0x9C`: made on the ground (`0x004C25B0`).
+    pub const ADD_TO_GROUND: u8 = 0x00;
+    /// `0x9C`: into a grid — made there when the client has no such unit (`0x004C2AD0`).
+    pub const PUT_IN_CONTAINER: u8 = 0x04;
+    /// `0x9C`: into a belt slot (`0x004C4130`).
+    pub const PUT_IN_BELT: u8 = 0x0E;
+    /// `0x9C`: out of the belt (`0x004C42A0`).
+    pub const REMOVE_FROM_BELT: u8 = 0x0F;
+    /// `0x9D`: out of a grid (`0x004C2C80`).
+    pub const REMOVE_FROM_CONTAINER: u8 = 0x05;
+}
+
+/// Item flags as the item bits carry them.
+pub mod item_flags {
+    /// Identified.
+    pub const IDENTIFIED: u32 = 0x10;
+    /// Set on the packet that takes out an item used up (`0x00561E70`, `0x0055E000`).
+    pub const USED: u32 = 0x20;
+    /// Just placed in the world: the client plays the fall and its sound.
+    pub const DROPPED: u32 = 0x2000;
+    /// Simple (`compactsave`): no quality, stats or sockets follow the code.
+    pub const COMPACT: u32 = 0x0020_0000;
+    /// On every item written (`0x006312B0`).
+    pub const WRITTEN: u32 = 0x0080_0000;
+    /// A simple identified item.
+    pub const SIMPLE: u32 = IDENTIFIED | COMPACT | WRITTEN;
+}
+
+/// Where a simple item is, as its bits say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemSpot {
+    /// On the ground (mode 3) at world subtiles.
+    Ground {
+        /// World subtiles.
+        x: u16,
+        /// World subtiles.
+        y: u16,
+    },
+    /// Stored in a grid (mode 0): column, row and the page (0 the inventory).
+    Stored {
+        /// Column.
+        col: u8,
+        /// Row.
+        row: u8,
+        /// Page: 0 the inventory, 3 the cube, 4 the stash.
+        page: u8,
+    },
+    /// In a belt slot (mode 2).
+    Belt {
+        /// Slot, 0 at the bottom left.
+        slot: u8,
+    },
+}
+
+/// A simple item's bits (`0x0062AF80`, read back by `0x0062A970`): flags 32, version 10, mode 3,
+/// then `x`/`y` 16 each on the ground or body location 4, column 4, row 4 and page + 1 3 in a
+/// grid or belt (a belt slot is its column), the code 32, and for gold a one-bit width flag and the
+/// amount in 12 or 32 bits.
+fn simple_item_bits(flags: u32, version: u16, spot: ItemSpot, code: [u8; 4], gold: Option<u32>) -> BitWriter {
+    let mut w = BitWriter::with_bytes(24);
+    w.put(flags, 32).put(u32::from(version.min(0x3FF)), 10);
+    match spot {
+        ItemSpot::Ground { x, y } => {
+            w.put(3, 3).put(u32::from(x), 16).put(u32::from(y), 16);
+        }
+        ItemSpot::Stored { col, row, page } => {
+            w.put(0, 3).put(0, 4).put(u32::from(col.min(15)), 4).put(u32::from(row.min(15)), 4).put(u32::from(page.min(6)) + 1, 3);
+        }
+        ItemSpot::Belt { slot } => {
+            w.put(2, 3).put(0, 4).put(u32::from(slot.min(15)), 4).put(0, 4).put(0, 3);
+        }
+    }
+    w.put(u32::from_le_bytes(code), 32);
+    if let Some(amount) = gold {
+        let big = amount > 0xFFF;
+        w.put(u32::from(big), 1).put(amount, if big { 32 } else { 12 });
+    }
+    w
+}
+
+/// `0x9C`: `[0x9C][action][size][category][guid u32]` and the item's bits. `category` is the
+/// item's `Misc.txt` `component` (`0x00628660`; 16 for potions, scrolls and gems).
 #[must_use]
-pub fn ground_gold(guid: u32, x: u16, y: u16, amount: u32, dropping: bool) -> Vec<u8> {
-    let big = amount > 0xFFF;
-    let bits = 32 + 10 + 3 + 32 + 32 + 1 + if big { 32 } else { 12 };
-    let mut w = BitWriter::with_bytes(8 + bits / 8 + 1);
-    w.bit = 8 * 8;
-    let flags = 0x10 | 0x0020_0000 | 0x0080_0000 | if dropping { 0x2000 } else { 0 };
-    w.put(flags, 32).put(101, 10).put(3, 3).put(u32::from(x), 16).put(u32::from(y), 16);
-    w.put(u32::from_le_bytes(*b"gld "), 32).put(u32::from(big), 1).put(amount, if big { 32 } else { 12 });
-    let size = w.bytes_used();
-    let mut bytes = w.bytes;
-    bytes.truncate(size);
-    bytes[0] = sc::ITEM_ACTION_WORLD;
-    bytes[1] = 0;
-    bytes[2] = size as u8;
-    bytes[4..8].copy_from_slice(&guid.to_le_bytes());
-    bytes
+pub fn item_world(action: u8, category: u8, guid: u32, flags: u32, version: u16, spot: ItemSpot, code: [u8; 4]) -> Vec<u8> {
+    item_packet(sc::ITEM_ACTION_WORLD, action, category, guid, None, simple_item_bits(flags, version, spot, code, None))
+}
+
+/// `0x9D`: as `0x9C` with the owning player's `[unit type u8 0][guid u32]` after the item's guid
+/// (`0x0053CEF0`).
+#[must_use]
+#[allow(clippy::too_many_arguments)] // the packet's own fields
+pub fn item_owned(action: u8, category: u8, guid: u32, owner: u32, flags: u32, version: u16, spot: ItemSpot, code: [u8; 4]) -> Vec<u8> {
+    item_packet(sc::ITEM_ACTION_OWNED, action, category, guid, Some(owner), simple_item_bits(flags, version, spot, code, None))
+}
+
+fn item_packet(opcode: u8, action: u8, category: u8, guid: u32, owner: Option<u32>, bits: BitWriter) -> Vec<u8> {
+    let mut p = vec![opcode, action, 0, category];
+    p.extend_from_slice(&guid.to_le_bytes());
+    if let Some(owner) = owner {
+        p.push(0);
+        p.extend_from_slice(&owner.to_le_bytes());
+    }
+    p.extend_from_slice(&bits.bytes[..bits.bytes_used()]);
+    p[2] = p.len() as u8;
+    p
+}
+
+/// `0x9C` action 0 for a gold pile at `(x, y)` (flags identified, simple and written, with
+/// [`item_flags::DROPPED`] when `dropping`; version as the game's). `dropping` false leaves a
+/// pile that is just there. The category is sent as 0; the client does not read it for action 0.
+#[must_use]
+pub fn ground_gold(guid: u32, x: u16, y: u16, amount: u32, dropping: bool, version: u16) -> Vec<u8> {
+    let flags = item_flags::SIMPLE | if dropping { item_flags::DROPPED } else { 0 };
+    let bits = simple_item_bits(flags, version, ItemSpot::Ground { x, y }, *b"gld ", Some(amount));
+    item_packet(sc::ITEM_ACTION_WORLD, item_action::ADD_TO_GROUND, 0, guid, None, bits)
 }
 
 /// A player's gold (stat 14) going from `old` to `new`, as the engine tells its client
@@ -1009,7 +1111,7 @@ mod tests {
 
     #[test]
     fn a_gold_pile_is_a_simple_ground_item() {
-        let p = ground_gold(0x1234, 5000, 5700, 37, true);
+        let p = ground_gold(0x1234, 5000, 5700, 37, true, 101);
         assert_eq!(&p[..8], &[0x9C, 0, p.len() as u8, 0, 0x34, 0x12, 0, 0]);
         assert_eq!(p.len(), 8 + 16, "122 bits");
         // Flags 0x00A02010, then version 101 in the next 10 bits: the same leading bytes as a
@@ -1021,9 +1123,27 @@ mod tests {
         assert_eq!((field(45, 16), field(61, 16)), (5000, 5700));
         assert_eq!(field(77, 32).to_le_bytes(), *b"gld ");
         assert_eq!((field(109, 1), field(110, 12)), (0, 37));
-        let big = ground_gold(1, 0, 0, 5000, false);
+        let big = ground_gold(1, 0, 0, 5000, false, 101);
         assert_eq!(big.len(), 8 + 18, "142 bits");
         assert_eq!(big[9] & 0x20, 0, "no drop animation");
+    }
+
+    #[test]
+    fn simple_items_match_the_retail_pickup() {
+        // Retail, picking up a Light Healing Potion into the inventory's column 9, row 3:
+        // `9c 04 14 10 2b0b3efa 1000a0006500728206270302`.
+        let p = item_world(item_action::PUT_IN_CONTAINER, 16, 0xFA3E_0B2B, item_flags::SIMPLE, 101, ItemSpot::Stored { col: 9, row: 3, page: 0 }, *b"hp2 ");
+        assert_eq!(p, [0x9C, 0x04, 0x14, 0x10, 0x2B, 0x0B, 0x3E, 0xFA, 0x10, 0x00, 0xA0, 0x00, 0x65, 0x00, 0x72, 0x82, 0x06, 0x27, 0x03, 0x02]);
+        let bit = |p: &[u8], i: usize| (p[i / 8] >> (i % 8)) & 1;
+        let field = |p: &[u8], from: usize, len: usize| (0..len).map(|i| u32::from(bit(p, from + i)) << i).sum::<u32>();
+        let belt = item_world(item_action::PUT_IN_BELT, 16, 7, item_flags::SIMPLE, 2, ItemSpot::Belt { slot: 3 }, *b"rvs ");
+        assert_eq!((belt[2] as usize, belt.len()), (20, 20));
+        let body = &belt[8..];
+        assert_eq!((field(body, 32, 10), field(body, 42, 3), field(body, 45, 4), field(body, 49, 4), field(body, 53, 4), field(body, 57, 3)), (2, 2, 0, 3, 0, 0), "classic version, belt mode, slot as the column");
+        let owned = item_owned(item_action::REMOVE_FROM_CONTAINER, 16, 7, 1, item_flags::SIMPLE | item_flags::USED, 101, ItemSpot::Stored { col: 0, row: 1, page: 0 }, *b"mp1 ");
+        assert_eq!(&owned[..13], &[0x9D, 0x05, 25, 0x10, 7, 0, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(owned.len(), 25);
+        assert_eq!(field(&owned[13..], 0, 32), 0x00A0_0030);
     }
 
     fn sizes_for_tests() -> [i32; CLIENT_OPCODES] {

@@ -20,17 +20,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bnetcc_proto::d2::status;
-use bnetcc_proto::d2gs::{self, cs, join_failed, ClientPacketLen, EngineTables, GameLogon, Outbox};
+use bnetcc_proto::d2gs::{self, cs, item_action, item_flags, join_failed, ClientPacketLen, EngineTables, GameLogon, ItemSpot, Outbox};
 use bnetcc_storage::Character;
 use d2_data::engine::EngineData;
 use d2_data::{stat, GameData};
-use d2_formats::d2s::Save;
+use d2_formats::d2s::{Save, SimpleItem};
 use d2_drlg::act::Act;
 use d2_drlg::collision::TileSources;
 use d2_drlg::preset::PresetLevel;
 use d2_drlg::world::{RoomId, World};
 use d2_game::battle::{self, Battle, Event};
 use d2_game::clock::ActClock;
+use d2_game::inventory::{Held, Inventory, Place};
 use d2_game::population::{unit_type, waypoint_spawn, MonsterRoom, Population, Spawned, SUBCLASS_WAYPOINT};
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -160,18 +161,45 @@ struct Game {
     outgoing: HashMap<String, Vec<Vec<u8>>>,
     /// Guids of the warp tiles sent so far, by level and index into the level's warps.
     warp_guids: HashMap<(i32, usize), u32>,
-    /// Gold lying on the ground, by item guid.
-    ground: HashMap<u32, GroundGold>,
+    /// Gold and items lying on the ground, by item guid.
+    ground: HashMap<u32, GroundItem>,
+    /// What each connected player carries.
+    carried: HashMap<String, Carried>,
+    /// The version every item made in the game carries: 101 in an expansion game, 2 in a classic
+    /// one (`0x00530930`).
+    item_version: u16,
+    /// Item guids handed out when the game has no population to count them.
+    spare_item_guid: u32,
 }
 
-/// A gold pile on the ground.
+/// Gold or an item on the ground.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GroundGold {
+struct GroundItem {
     room: RoomId,
     x: u16,
     y: u16,
-    amount: u32,
+    what: Loot,
 }
+
+/// What lies on the ground.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Loot {
+    /// A gold pile.
+    Gold(u32),
+    /// A simple item, by class and code.
+    Item { class: i32, code: [u8; 4] },
+}
+
+/// A player's items, and whether they came from its save whole: when its `.d2s` holds items the
+/// server cannot read (anything but simple ones) nothing is picked up, used or written back.
+#[derive(Debug, Clone, Default)]
+struct Carried {
+    inventory: Inventory,
+    complete: bool,
+}
+
+/// Belt and inventory flags of a simple item as the engine sends it held.
+const HELD_FLAGS: u32 = item_flags::SIMPLE;
 
 /// Why the realm could not create a game.
 #[derive(Debug, PartialEq, Eq)]
@@ -213,9 +241,15 @@ impl GameServer {
     }
 
     /// The `.d2s` for a player as it stands: its save (or a new character's) with the fight's
-    /// stats, its level and the waypoints learned on this difficulty; and its level.
+    /// stats, its level, the waypoints learned on this difficulty and the items it carries (when
+    /// they came from its save whole); and its level.
     fn character_save(&self, p: &Player) -> Option<(Vec<u8>, u32)> {
-        let stats = self.lock().by_id.get(&p.game_id)?.battle.player_stats(&p.character.name)?;
+        let (stats, items) = {
+            let g = self.lock();
+            let game = g.by_id.get(&p.game_id)?;
+            let items = game.carried.get(&p.character.name).filter(|c| c.complete).map(|c| saved_items(&c.inventory));
+            (game.battle.player_stats(&p.character.name)?, items)
+        };
         let now = u32::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs()).unwrap_or(0);
         let mut save = p.save.clone().unwrap_or_else(|| {
             let created = u32::try_from(p.character.created_at).unwrap_or(now);
@@ -228,6 +262,9 @@ impl GameServer {
         save.set_level(u8::try_from(level).unwrap_or(99), now);
         let d = usize::from(p.difficulty.min(2));
         save.waypoints[d][2..2 + d2gs::WAYPOINT_FLAG_BYTES].copy_from_slice(&p.waypoints);
+        if let Some(items) = items {
+            save.set_simple_items(&items);
+        }
         Some((save.to_bytes(), level))
     }
 
@@ -434,6 +471,9 @@ impl GameServer {
                 outgoing: HashMap::new(),
                 warp_guids: HashMap::new(),
                 ground: HashMap::new(),
+                carried: HashMap::new(),
+                item_version: 101,
+                spare_item_guid: 0,
             },
         );
         let game = &g.by_id[&id];
@@ -489,6 +529,7 @@ impl GameServer {
         let at = game.staged.iter().position(|c| c.name.eq_ignore_ascii_case(&logon.name))?;
         let character = game.staged.remove(at);
         game.battle.set_expansion(character.status & status::EXPANSION != 0);
+        game.item_version = if character.status & status::EXPANSION != 0 { 101 } else { 2 };
         game.connected.push(character.name.clone());
         Some(Player::new(logon.game_id, character, game.difficulty, game.map_seed, game.spawn))
     }
@@ -557,8 +598,8 @@ impl GameServer {
             return Some((u16::try_from(warp.x).ok()?, u16::try_from(warp.y).ok()?));
         }
         if kind == u32::from(unit_type::ITEM) {
-            let pile = g.by_id.get(&game_id)?.ground.get(&guid)?;
-            return Some((pile.x, pile.y));
+            let item = g.by_id.get(&game_id)?.ground.get(&guid)?;
+            return Some((item.x, item.y));
         }
         let population = g.by_id.get(&game_id)?.population.as_ref()?;
         match *population.find(u8::try_from(kind).ok()?, guid)?.1 {
@@ -690,9 +731,9 @@ impl GameServer {
                     }
                 }
             }
-            // Gold already lying there.
-            for (&guid, pile) in game.ground.iter().filter(|(_, p)| p.room == id) {
-                packets.push(d2gs::ground_gold(guid, pile.x, pile.y, pile.amount, false));
+            // Gold and items already lying there.
+            for (&guid, item) in game.ground.iter().filter(|(_, p)| p.room == id) {
+                packets.push(ground_packet(rules, guid, item, false, game.item_version));
             }
             // The room's warps that lead somewhere built, after its other units.
             let Some(level) = world.levels().iter().find(|l| l.id == id.level) else { continue };
@@ -782,7 +823,7 @@ impl GameServer {
         game.battle.set_motion(name, motion);
         let due = (game.created.elapsed().as_micros() / SERVER_FRAME.as_micros()) as u64;
         if due > game.battle.frame() {
-            let Game { battle, world, positions, views, population, outgoing, ground, .. } = game;
+            let Game { battle, world, positions, views, population, outgoing, ground, item_version, .. } = game;
             for (player, &(x, y)) in positions.iter() {
                 let level = world.as_ref().and_then(|w| w.room_at(x, y)).map(|r| r.level);
                 battle.place_player(player, level.map(|l| (x, y, l)), views.get(player).map_or(&[], Vec::as_slice));
@@ -797,22 +838,33 @@ impl GameServer {
                 battle.advance(rules, due, &open)
             };
             for event in events {
-                if let Event::GoldDrop { x, y, amount, .. } = event {
-                    // A pile on the ground, seen by whoever holds its room.
-                    let Some(population) = population.as_mut() else { continue };
-                    let taken = |x: i32, y: i32| ground.values().any(|p| (i32::from(p.x), i32::from(p.y)) == (x, y));
-                    let Some((room, x, y)) = drop_spot(world, &taken, (i32::from(x), i32::from(y))) else { continue };
-                    let (x, y) = (x as u16, y as u16);
-                    let guid = population.next_guid(unit_type::ITEM);
-                    ground.insert(guid, GroundGold { room, x, y, amount });
-                    for (player, view) in views.iter() {
-                        if view.contains(&room) {
-                            outgoing.entry(player.clone()).or_default().push(d2gs::ground_gold(guid, x, y, amount, true));
+                let (x, y, what) = match &event {
+                    Event::GoldDrop { x, y, amount, .. } => (*x, *y, Loot::Gold(*amount)),
+                    Event::ItemDrop { x, y, code, .. } => match simple_item_class(rules, code) {
+                        Some(class) => (*x, *y, Loot::Item { class, code: d2_data::items::code(code) }),
+                        None => {
+                            debug!(game_id, %code, "treasure item not made: only simple items are");
+                            continue;
                         }
+                    },
+                    _ => {
+                        share_out(event, rules, world, battle, views, outgoing, population.as_mut());
+                        continue;
                     }
-                    continue;
+                };
+                // On the ground, seen by whoever holds its room.
+                let Some(population) = population.as_mut() else { continue };
+                let taken = |x: i32, y: i32| ground.values().any(|p| (i32::from(p.x), i32::from(p.y)) == (x, y));
+                let Some((room, x, y)) = drop_spot(world, &taken, (i32::from(x), i32::from(y))) else { continue };
+                let item = GroundItem { room, x: x as u16, y: y as u16, what };
+                let guid = population.next_guid(unit_type::ITEM);
+                ground.insert(guid, item);
+                let packet = ground_packet(rules, guid, &item, true, *item_version);
+                for (player, view) in views.iter() {
+                    if view.contains(&room) {
+                        outgoing.entry(player.clone()).or_default().push(packet.clone());
+                    }
                 }
-                share_out(event, rules, world, battle, views, outgoing, population.as_mut());
             }
         }
         game.outgoing.remove(name).unwrap_or_default()
@@ -825,51 +877,121 @@ impl GameServer {
         (mode != battle::DEAD_MODE).then_some((x, y))
     }
 
-    /// A player picks up a gold pile (engine `0x16` → `0x548B00` type 4 → `0x563560` →
-    /// `0x55C850`): it takes what its purse holds (level × 10,000, `0x622E70`), the pile goes for
-    /// everyone near, and its client is told its gold as the engine tells it (`0x19` for a small
+    /// A player picks up what lies on the ground (engine `0x16` → `0x548B00` type 4 → `0x563560`).
+    ///
+    /// Gold (`0x55C850`): it takes what its purse holds (level × 10,000, `0x622E70`), the pile goes
+    /// for everyone near, and its client is told its gold as the engine tells it (`0x19` for a small
     /// gain). What does not fit is dropped as a new pile from the player (`0x55B030`, placed as
     /// [`drop_spot`] places drops).
-    /// Items other than gold are not on the ground yet; anything else is ignored.
+    ///
+    /// A simple item goes where [`Inventory::place_for`] puts it: its unit goes for everyone near
+    /// (`0x0A`) and its client is sent it in the belt (`0x9C` action `0x0E`) or the inventory
+    /// (action 4). With no room it stays where it is.
     ///
     /// ⚠️ Range is not checked (the engine picks up within 5 subtiles and walks the player
     /// closer otherwise; the client walks up before it asks).
     fn pick_up(&self, game_id: u16, name: &str, guid: u32) -> Vec<Vec<u8>> {
+        let Some(rules) = &self.rules else { return Vec::new() };
         let mut g = self.lock();
         let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
-        let Some(pile) = game.ground.get(&guid).copied() else { return Vec::new() };
-        let Some((taken, total)) = game.battle.pick_up_gold(name, pile.amount) else { return Vec::new() };
-        if taken == 0 {
+        let Some(item) = game.ground.remove(&guid) else { return Vec::new() };
+        let taken = match item.what {
+            Loot::Gold(amount) => take_gold(rules, game, name, guid, amount),
+            Loot::Item { class, code } => take_item(rules, game, name, guid, class, code),
+        };
+        let Some((replies, dropped)) = taken else {
+            game.ground.insert(guid, item);
+            return Vec::new();
+        };
+        // Everyone else near: the unit goes, then what was dropped again.
+        let gone = d2gs::remove_unit(unit_type::ITEM, guid);
+        let shown = [(item.room, gone.clone())].into_iter().chain(dropped);
+        for (room, packet) in shown {
+            for (player, view) in &game.views {
+                if player != name && view.contains(&room) {
+                    game.outgoing.entry(player.clone()).or_default().push(packet.clone());
+                }
+            }
+        }
+        let mut out = vec![gone];
+        out.extend(replies);
+        out
+    }
+
+    /// A player uses an item it holds — in the belt (`0x26`, `0x00562390`) or the inventory
+    /// (`0x20`, `0x0055E170`). A healing, mana or rejuvenation potion is drunk
+    /// ([`battle::Battle::drink`]) and goes: `0x9C` action `0x0F` from the belt, `0x9D` action 5
+    /// from the inventory, both flagged used, then what the drink changed at once. Anything else,
+    /// and anything used from the wrong place or by a dead player, does nothing.
+    ///
+    /// Not ported: other items' uses (scrolls, stamina, antidote and thawing potions), and belt
+    /// columns sliding down, which one row of slots never needs.
+    fn use_item(&self, game_id: u16, name: &str, guid: u32, from_belt: bool) -> Vec<Vec<u8>> {
+        let Some(rules) = &self.rules else { return Vec::new() };
+        let mut g = self.lock();
+        let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
+        let Some(carried) = game.carried.get_mut(name).filter(|c| c.complete) else { return Vec::new() };
+        let Some(held) = carried.inventory.get(guid).copied() else { return Vec::new() };
+        if from_belt != matches!(held.place, Place::Belt(_)) {
             return Vec::new();
         }
-        game.ground.remove(&guid);
-        let gone = d2gs::remove_unit(unit_type::ITEM, guid);
-        for (player, view) in &game.views {
-            if player != name && view.contains(&pile.room) {
-                game.outgoing.entry(player.clone()).or_default().push(gone.clone());
-            }
-        }
-        info!(game_id, player = name, guid, taken, total, "gold picked up");
-        let mut replies = vec![gone, d2gs::gold_update(total - taken, total)];
-        let at = game.positions.get(name).copied();
-        let ground = &game.ground;
-        let occupied = |x: i32, y: i32| ground.values().any(|p| (i32::from(p.x), i32::from(p.y)) == (x, y));
-        let spot = at.and_then(|from| drop_spot(game.world.as_ref()?, &occupied, from));
-        if let (Some((room, x, y)), Some(population)) = (spot, game.population.as_mut()) {
-            if taken < pile.amount {
-                let left = GroundGold { room, x: x as u16, y: y as u16, amount: pile.amount - taken };
-                let guid = population.next_guid(unit_type::ITEM);
-                game.ground.insert(guid, left);
-                let packet = d2gs::ground_gold(guid, left.x, left.y, left.amount, true);
-                for (player, view) in &game.views {
-                    if player != name && view.contains(&room) {
-                        game.outgoing.entry(player.clone()).or_default().push(packet.clone());
-                    }
+        let Some(potion) = rules.items().get(held.class).filter(|d| d.useable).and_then(battle::Potion::of) else {
+            debug!(game_id, player = name, item = %d2_data::items::code_str(&held.code), "item use not ported");
+            return Vec::new();
+        };
+        let Some(changed) = game.battle.drink(name, potion) else { return Vec::new() };
+        carried.inventory.remove(guid);
+        info!(game_id, player = name, guid, item = %d2_data::items::code_str(&held.code), "potion drunk");
+        let mut out = vec![held_packet(rules, &held, true)];
+        out.extend(changed.iter().filter_map(|e| battle_packet(e, name)));
+        out
+    }
+
+    /// A joining player's items from its save, held in the game, and the packets that give them
+    /// to its client: `0x9C` action 4 for the inventory, action `0x0E` for the belt. A save holding
+    /// anything else is left as it is and the player carries nothing.
+    fn join_items(&self, p: &Player) -> Vec<Vec<u8>> {
+        let Some(rules) = &self.rules else { return Vec::new() };
+        let mut g = self.lock();
+        let Some(game) = g.by_id.get_mut(&p.game_id) else { return Vec::new() };
+        let saved = match &p.save {
+            None => Some(Vec::new()),
+            Some(save) => save.simple_items().map(|(items, _)| items),
+        };
+        let mut carried = Carried { inventory: Inventory::default(), complete: saved.is_some() };
+        for item in saved.unwrap_or_default() {
+            let place = match (item.mode, item.page) {
+                (2, _) => Place::Belt(item.col),
+                (0, 1) => Place::Grid { col: item.col, row: item.row },
+                _ => {
+                    carried.complete = false;
+                    break;
                 }
-                replies.push(packet);
+            };
+            let Some(class) = rules.items().class_of(&item.code) else {
+                carried.complete = false;
+                break;
+            };
+            let size = rules.items().get(class).map_or((1, 1), |d| d.inv_size);
+            let guid = match game.population.as_mut() {
+                Some(population) => population.next_guid(unit_type::ITEM),
+                None => {
+                    game.spare_item_guid += 1;
+                    game.spare_item_guid
+                }
+            };
+            if !carried.inventory.insert(Held { guid, class, code: item.code, version: item.version, size, place }) {
+                carried.complete = false;
+                break;
             }
         }
-        replies
+        if !carried.complete {
+            warn!(character = %p.character.name, "its saved items are not all simple ones; it carries nothing this game");
+            carried.inventory = Inventory::default();
+        }
+        let packets = carried.inventory.items().iter().map(|held| held_packet(rules, held, false)).collect();
+        game.carried.insert(p.character.name.clone(), carried);
+        packets
     }
 
     /// A player swings at a monster.
@@ -911,6 +1033,7 @@ impl GameServer {
         game.positions.remove(name);
         game.views.remove(name);
         game.outgoing.remove(name);
+        game.carried.remove(name);
         game.battle.remove_player(name);
         if game.connected.is_empty() && game.staged.is_empty() {
             let game = g.by_id.remove(&game_id).expect("present");
@@ -929,12 +1052,122 @@ fn battle_packet(event: &Event, recipient: &str) -> Option<Vec<u8>> {
         Event::MonsterWalk { guid, x, y, .. } => d2gs::monster_walk(*guid, *x, *y),
         Event::MonsterStop { guid, x, y, life, .. } => d2gs::monster_standing(*guid, *x, *y, *life),
         Event::MonsterAttack { guid, target, x, y, .. } if target == recipient => d2gs::monster_attack(*guid, PLAYER_GUID, *x, *y),
-        Event::MonsterAttack { .. } | Event::MonsterState { .. } | Event::GoldDrop { .. } => return None,
+        Event::MonsterAttack { .. } | Event::MonsterState { .. } | Event::GoldDrop { .. } | Event::ItemDrop { .. } => return None,
         Event::PlayerReaction { event, .. } => d2gs::player_reaction(unit_type::PLAYER, PLAYER_GUID, *event, 0, 0),
         Event::PlayerVitals { life, mana, stamina, .. } => d2gs::life_and_position(*life, *mana, *stamina, 0, 0, 0, 0),
         Event::Experience { old, new, .. } => d2gs::experience(*old, *new),
         Event::PlayerStat { stat, value, .. } => d2gs::set_stat(*stat, *value),
     })
+}
+
+/// A treasure class's item code as an item the server can make: a simple (`compactsave`) misc
+/// item that is not gold, a quest item or a stack — potions, scrolls, gems, runes.
+fn simple_item_class(rules: &GameData, code: &str) -> Option<i32> {
+    if code.len() > 4 {
+        return None;
+    }
+    let class = rules.items().class_of(&d2_data::items::code(code))?;
+    let def = rules.items().get(class)?;
+    let simple = def.compact && !def.quest && !def.stackable && def.file == d2_data::items::ItemFile::Misc && &def.code != b"gld ";
+    simple.then_some(class)
+}
+
+/// The `0x9C` category byte of an item: its `component` (`0x00628660`).
+fn item_category(rules: &GameData, class: i32) -> u8 {
+    rules.items().get(class).map_or(16, |d| u8::try_from(d.component).unwrap_or(16))
+}
+
+/// `0x9C` action 0 for something on the ground, `dropping` for the fall.
+fn ground_packet(rules: &GameData, guid: u32, item: &GroundItem, dropping: bool, version: u16) -> Vec<u8> {
+    match item.what {
+        Loot::Gold(amount) => d2gs::ground_gold(guid, item.x, item.y, amount, dropping, version),
+        Loot::Item { class, code } => {
+            let flags = item_flags::SIMPLE | if dropping { item_flags::DROPPED } else { 0 };
+            d2gs::item_world(item_action::ADD_TO_GROUND, item_category(rules, class), guid, flags, version, ItemSpot::Ground { x: item.x, y: item.y }, code)
+        }
+    }
+}
+
+/// A held item going into its place (`used` false: `0x9C` action `0x0E` for the belt, 4 for the
+/// inventory) or used up out of it (`0x9C` action `0x0F`, `0x9D` action 5, flagged used).
+fn held_packet(rules: &GameData, held: &Held, used: bool) -> Vec<u8> {
+    let category = item_category(rules, held.class);
+    let flags = HELD_FLAGS | if used { item_flags::USED } else { 0 };
+    match (held.place, used) {
+        (Place::Belt(slot), false) => d2gs::item_world(item_action::PUT_IN_BELT, category, held.guid, flags, held.version, ItemSpot::Belt { slot }, held.code),
+        (Place::Belt(slot), true) => d2gs::item_world(item_action::REMOVE_FROM_BELT, category, held.guid, flags, held.version, ItemSpot::Belt { slot }, held.code),
+        (Place::Grid { col, row }, false) => {
+            d2gs::item_world(item_action::PUT_IN_CONTAINER, category, held.guid, flags, held.version, ItemSpot::Stored { col, row, page: 0 }, held.code)
+        }
+        (Place::Grid { col, row }, true) => d2gs::item_owned(
+            item_action::REMOVE_FROM_CONTAINER,
+            category,
+            held.guid,
+            PLAYER_GUID,
+            flags,
+            held.version,
+            ItemSpot::Stored { col, row, page: 0 },
+            held.code,
+        ),
+    }
+}
+
+/// A player's items as its `.d2s` lists them.
+fn saved_items(inventory: &Inventory) -> Vec<SimpleItem> {
+    inventory
+        .items()
+        .iter()
+        .map(|h| {
+            let (mode, col, row, page) = match h.place {
+                Place::Belt(slot) => (2, slot, 0, 0),
+                Place::Grid { col, row } => (0, col, row, 1),
+            };
+            SimpleItem { flags: HELD_FLAGS, version: h.version, mode, body: 0, col, row, page, code: h.code }
+        })
+        .collect()
+}
+
+/// What a pickup sends its player, and what it put back on the ground for everyone else near.
+type Taken = (Vec<Vec<u8>>, Option<(RoomId, Vec<u8>)>);
+
+/// A gold pile of `amount` (already off the ground) into a player's purse: what its client is told,
+/// and a new pile, falling, for what did not fit. `None` when the purse takes nothing.
+fn take_gold(rules: &GameData, game: &mut Game, name: &str, guid: u32, amount: u32) -> Option<Taken> {
+    let (taken, total) = game.battle.pick_up_gold(name, amount).filter(|&(taken, _)| taken > 0)?;
+    info!(player = name, guid, taken, total, "gold picked up");
+    let mut replies = vec![d2gs::gold_update(total - taken, total)];
+    let mut dropped = None;
+    if taken < amount {
+        let ground = &game.ground;
+        let occupied = |x: i32, y: i32| ground.values().any(|p| (i32::from(p.x), i32::from(p.y)) == (x, y));
+        let at = game.positions.get(name).copied();
+        let spot = at.and_then(|from| drop_spot(game.world.as_ref()?, &occupied, from));
+        if let (Some((room, x, y)), Some(population)) = (spot, game.population.as_mut()) {
+            let left = GroundItem { room, x: x as u16, y: y as u16, what: Loot::Gold(amount - taken) };
+            let new_guid = population.next_guid(unit_type::ITEM);
+            game.ground.insert(new_guid, left);
+            let packet = ground_packet(rules, new_guid, &left, true, game.item_version);
+            replies.push(packet.clone());
+            dropped = Some((room, packet));
+        }
+    }
+    Some((replies, dropped))
+}
+
+/// A simple item (already off the ground) into a player's belt or inventory: the packet that
+/// gives it to its client. `None` when there is no room or its items are not in hand.
+fn take_item(rules: &GameData, game: &mut Game, name: &str, guid: u32, class: i32, code: [u8; 4]) -> Option<Taken> {
+    let def = rules.items().get(class)?;
+    let carried = game.carried.get_mut(name).filter(|c| c.complete)?;
+    let belts = def.auto_belt && rules.items().beltable(class);
+    let Some(place) = carried.inventory.place_for(def.inv_size, belts) else {
+        info!(player = name, guid, item = %d2_data::items::code_str(&code), "no room to pick it up");
+        return None;
+    };
+    let held = Held { guid, class, code, version: game.item_version, size: def.inv_size, place };
+    carried.inventory.insert(held).then_some(())?;
+    info!(player = name, guid, item = %d2_data::items::code_str(&code), ?place, "item picked up");
+    Some((vec![held_packet(rules, &held, false)], None))
 }
 
 /// `SendUnitToClient` for a monster: `0xAC`, its alignment state, and `0x6D` unless it is a
@@ -1463,6 +1696,17 @@ async fn run(
                         server.save_character(p).await;
                     }
                 }
+                (Stage::InGame, op @ (cs::USE_ITEM | cs::USE_BELT_ITEM)) => {
+                    let Some(p) = player.as_mut() else { continue };
+                    let replies = server.use_item(p.game_id, &p.character.name, u32_at(1), op == cs::USE_BELT_ITEM);
+                    if !replies.is_empty() {
+                        for packet in &replies {
+                            outbox.push(packet);
+                        }
+                        flush(stream, peer, tables, &mut outbox).await?;
+                        server.save_character(p).await;
+                    }
+                }
                 (Stage::InGame, cs::RESPAWN) => {
                     // Done on the next frame the corpse has settled (see `respawn`).
                     pending_respawn = true;
@@ -1601,6 +1845,11 @@ async fn enter_game(
         outbox.push(&d2gs::set_stat(id, value));
     }
     server.join_battle(p.game_id, &p.character.name, p.character.class, &stats);
+    // Its items, once the client has its own unit to put them on (the action 4 and 0x0E handlers
+    // place them in the client's own player, `0x7A6A70`, which 0x0B sets).
+    for packet in server.join_items(p) {
+        outbox.push(&packet);
+    }
     outbox.push(&d2gs::select_skill(0, PLAYER_GUID, true, 0, u32::MAX));
     outbox.push(&d2gs::select_skill(0, PLAYER_GUID, false, 0, u32::MAX));
     // Then life, mana and stamina in whole points, before the player has a position (0x548760).
@@ -1762,6 +2011,8 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         d2gs::encode_frame(&tables.huffman, &[0x01, 0x00, 0x04, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00], &mut out).unwrap();
         assert_eq!(out, vec![0x05, 0x7A, 0x09, 0xA5, 0xF0]);
+        let size = |op: u8| engine.client_packet_sizes[usize::from(op)];
+        assert_eq!((size(cs::PICK_UP_ITEM), size(cs::USE_ITEM), size(cs::USE_BELT_ITEM)), (13, 13, 13), "the item packets' lengths");
     }
 
     #[test]
@@ -2368,15 +2619,141 @@ pub(crate) mod tests {
             gs.set_view(id, name, &[room]);
         }
         gs.view_change(id, &[], &[room]);
-        gs.lock().by_id.get_mut(&id).unwrap().ground.insert(77, GroundGold { room, x: x + 3, y, amount: 25 });
+        gs.lock().by_id.get_mut(&id).unwrap().ground.insert(77, GroundItem { room, x: x + 3, y, what: Loot::Gold(25) });
         let got = gs.pick_up(id, "Hero", 77);
         assert_eq!(got[..2], [d2gs::remove_unit(unit_type::ITEM, 77), vec![0x19, 10]], "10 fit");
         let (left, pile) = gs.lock().by_id[&id].ground.iter().map(|(&g, &p)| (g, p)).next().unwrap();
-        assert_eq!((pile.x, pile.y, pile.amount), (x + 2, y + 3, 15), "placed as drops are");
-        assert_eq!(got[2], d2gs::ground_gold(left, x + 2, y + 3, 15, true));
+        assert_eq!((pile.x, pile.y, pile.what), (x + 2, y + 3, Loot::Gold(15)), "placed as drops are");
+        assert_eq!(got[2], d2gs::ground_gold(left, x + 2, y + 3, 15, true, 101));
         let friend = gs.lock().by_id.get_mut(&id).unwrap().outgoing.remove("Friend").unwrap();
         assert_eq!(friend, [got[0].clone(), got[2].clone()], "the one near sees both");
         assert!(gs.pick_up(id, "Hero", left).is_empty(), "a full purse takes nothing");
+    }
+
+    /// Made-up item tables in the real shapes: Minor Healing and Mana Potions (belted), a
+    /// Rejuvenation Potion, a Chipped Ruby, a Skeleton Key (a stack) and a Hand Axe.
+    fn item_rules(mut rules: GameData) -> GameData {
+        use d2_data::items::Items;
+        use d2_formats::excel::Table;
+        let itemtypes = Table::parse(
+            b"ItemType\tCode\tEquiv1\tBeltable\r\nPotion\tpoti\t\t1\r\nHealing Potion\thpot\tpoti\t1\r\nGem\tgem\t\t0\r\nKey\tkey\t\t0\r\nAxe\taxe\t\t0\r\n",
+        );
+        let weapons = Table::parse(b"name\tcode\ttype\tcompactsave\tcomponent\r\nHand Axe\thax\taxe\t0\t5\r\n");
+        let armor = Table::parse(b"name\tcode\ttype\r\n");
+        let misc = Table::parse(
+            b"name\tcode\ttype\tcomponent\tinvwidth\tinvheight\tcompactsave\tautobelt\tstackable\tuseable\tpSpell\tlen\tstat1\tcalc1\tstat2\tcalc2\r\n\
+              Minor Healing Potion\thp1\thpot\t16\t1\t1\t1\t1\t0\t1\t3\t192\thpregen\t30\t\t\r\n\
+              Rejuv Potion\trvs\tpoti\t16\t1\t1\t1\t1\t0\t1\t5\t\thitpoints\t35\tmana\t35\r\n\
+              Chipped Ruby\tgcr\tgem\t16\t1\t1\t1\t0\t0\t0\t\t\t\t\t\t\r\n\
+              Skeleton Key\tkey\tkey\t16\t1\t1\t0\t0\t1\t0\t\t\t\t\t\t\r\n",
+        );
+        rules.set_items(Items::from_tables(&itemtypes, &weapons, &armor, &misc).unwrap(), Vec::new());
+        rules
+    }
+
+    #[test]
+    fn only_simple_misc_items_are_made_from_treasure() {
+        let rules = item_rules(test_rules());
+        let class = |code: &str| simple_item_class(&rules, code);
+        assert!(class("hp1").is_some() && class("rvs").is_some() && class("gcr").is_some());
+        assert_eq!((class("key"), class("hax"), class("gld"), class("weap3"), class("hp1x")), (None, None, None, None, None), "stacks, equipment, gold and type picks are not");
+        let hp1 = class("hp1").unwrap();
+        let on_ground = GroundItem { room: RoomId { level: 2, index: 0 }, x: 10, y: 20, what: Loot::Item { class: hp1, code: *b"hp1 " } };
+        assert_eq!(
+            ground_packet(&rules, 5, &on_ground, true, 2),
+            d2gs::item_world(item_action::ADD_TO_GROUND, 16, 5, 0x00A0_2010, 2, ItemSpot::Ground { x: 10, y: 20 }, *b"hp1 ")
+        );
+    }
+
+    /// Potions picked up fill the four belt slots, then the inventory from its right-hand column;
+    /// one from the belt is drunk and taken out; a gem, not beltable, goes straight to the
+    /// inventory; a full inventory leaves things on the ground. What is carried is saved and comes
+    /// back into the belt and inventory in the next game.
+    #[tokio::test]
+    async fn potions_are_belted_drunk_saved_and_brought_back() {
+        use bnetcc_storage::memory::MemoryStorage;
+        use bnetcc_storage::model::Credential;
+        let storage = crate::storage::spawn(Box::new(MemoryStorage::new()));
+        let owner = storage.create_account("Owner", Credential::Xsha1 { digest: [1; 20] }).await.unwrap();
+        let mut hero = character("Hero", 4, 0x20);
+        hero.account = owner.id;
+        storage.create_character(hero.clone()).await.unwrap();
+        let (rules, town) = test_town();
+        let rules = item_rules(rules);
+        let (hp1, rvs, gcr) = (simple_item_class(&rules, "hp1").unwrap(), simple_item_class(&rules, "rvs").unwrap(), simple_item_class(&rules, "gcr").unwrap());
+        let gs = GameServer::new(test_tables(), Some(rules)).with_town(town).with_storage(storage.clone());
+        let id = gs.create("probe", "", 0).unwrap();
+        let (x, y) = gs.lock().by_id[&id].spawn;
+        let room = gs.lock().by_id[&id].world.as_ref().unwrap().room_at(i32::from(x), i32::from(y)).unwrap();
+        let mut p = Player::new(id, hero.clone(), 0, 0, (x, y));
+        let stats = p.join_stats(gs.rules.as_ref().unwrap()).unwrap();
+        gs.join_battle(id, "Hero", 4, &stats);
+        assert!(gs.join_items(&p).is_empty(), "a new character carries nothing");
+        gs.set_position(id, "Hero", f64::from(x), f64::from(y));
+        gs.set_view(id, "Hero", &[room]);
+        let put = |guid: u32, class: i32, code: &[u8; 4], dx: u16| {
+            gs.lock().by_id.get_mut(&id).unwrap().ground.insert(guid, GroundItem { room, x: x + dx, y, what: Loot::Item { class, code: *code } });
+        };
+        for guid in 100..105 {
+            put(guid, hp1, b"hp1 ", (guid - 99) as u16);
+        }
+        put(105, gcr, b"gcr ", 7);
+        let simple = item_flags::SIMPLE;
+        for (guid, slot) in (100..104).zip(0u8..) {
+            let got = gs.pick_up(id, "Hero", guid);
+            assert_eq!(got, [d2gs::remove_unit(unit_type::ITEM, guid), d2gs::item_world(0x0E, 16, guid, simple, 101, ItemSpot::Belt { slot }, *b"hp1 ")]);
+        }
+        let fifth = gs.pick_up(id, "Hero", 104);
+        assert_eq!(fifth[1], d2gs::item_world(4, 16, 104, simple, 101, ItemSpot::Stored { col: 9, row: 3, page: 0 }, *b"hp1 "), "the belt is full");
+        let gem = gs.pick_up(id, "Hero", 105);
+        assert_eq!(gem[1], d2gs::item_world(4, 16, 105, simple, 101, ItemSpot::Stored { col: 9, row: 2, page: 0 }, *b"gcr "));
+        assert!(gs.pick_up(id, "Hero", 105).is_empty(), "once");
+
+        // Drinking: from the belt, and from the inventory by its own packet only.
+        assert!(gs.use_item(id, "Hero", 101, false).is_empty(), "a belt potion is not used as an inventory one");
+        assert_eq!(gs.use_item(id, "Hero", 101, true), [d2gs::item_world(0x0F, 16, 101, simple | item_flags::USED, 101, ItemSpot::Belt { slot: 1 }, *b"hp1 ")]);
+        assert!(gs.use_item(id, "Hero", 101, true).is_empty(), "gone");
+        assert!(gs.use_item(id, "Hero", 105, false).is_empty(), "a gem is not drunk");
+        let from_pack = gs.use_item(id, "Hero", 104, false);
+        assert_eq!(from_pack, [d2gs::item_owned(5, 16, 104, PLAYER_GUID, simple | item_flags::USED, 101, ItemSpot::Stored { col: 9, row: 3, page: 0 }, *b"hp1 ")]);
+        // A rejuvenation potion picked up takes the free belt slot and tells the client its
+        // life and mana when drunk.
+        put(106, rvs, b"rvs ", 8);
+        assert_eq!(gs.pick_up(id, "Hero", 106)[1], d2gs::item_world(0x0E, 16, 106, simple, 101, ItemSpot::Belt { slot: 1 }, *b"rvs "));
+        let drunk = gs.use_item(id, "Hero", 106, true);
+        assert_eq!((drunk.len(), drunk[1][0]), (2, 0x95), "{drunk:02x?}");
+
+        // Saved and brought back.
+        gs.save_character(&mut p).await;
+        let stored = storage.character_by_name("Hero").await.unwrap();
+        let save = Save::parse(stored.save.as_deref().unwrap()).unwrap();
+        let (items, _) = save.simple_items().unwrap();
+        let held: Vec<(u8, u8, u8, [u8; 4])> = items.iter().map(|i| (i.mode, i.col, i.page, i.code)).collect();
+        assert_eq!(held, [(2, 0, 0, *b"hp1 "), (2, 2, 0, *b"hp1 "), (2, 3, 0, *b"hp1 "), (0, 9, 1, *b"gcr ")]);
+        gs.leave(id, "Hero");
+        let id = gs.create("again", "", 0).unwrap();
+        let q = Player::new(id, stored, 0, 0, (x, y));
+        let back = gs.join_items(&q);
+        let places: Vec<(u8, u8)> = back.iter().map(|p| (p[1], p[8 + 7] >> 6 & 1)).collect();
+        assert_eq!(back.len(), 4);
+        assert_eq!(places.iter().filter(|(action, _)| *action == 0x0E).count(), 3, "three in the belt");
+        assert_eq!(back[3], d2gs::item_world(4, 16, u32::from_le_bytes([back[3][4], back[3][5], back[3][6], back[3][7]]), simple, 101, ItemSpot::Stored { col: 9, row: 2, page: 0 }, *b"gcr "));
+
+        // A full inventory leaves an item on the ground.
+        {
+            let mut g = gs.lock();
+            let carried = g.by_id.get_mut(&id).unwrap().carried.get_mut("Hero").unwrap();
+            let mut guid = 1000;
+            while let Some(place) = carried.inventory.place_for((1, 1), true) {
+                guid += 1;
+                carried.inventory.insert(Held { guid, class: gcr, code: *b"gcr ", version: 101, size: (1, 1), place });
+            }
+        }
+        let (x2, y2) = gs.lock().by_id[&id].spawn;
+        let room2 = gs.lock().by_id[&id].world.as_ref().unwrap().room_at(i32::from(x2), i32::from(y2)).unwrap();
+        gs.lock().by_id.get_mut(&id).unwrap().ground.insert(7, GroundItem { room: room2, x: x2, y: y2, what: Loot::Item { class: hp1, code: *b"hp1 " } });
+        assert!(gs.pick_up(id, "Hero", 7).is_empty());
+        assert!(gs.lock().by_id[&id].ground.contains_key(&7), "still there");
     }
 
     /// A character leaving a game is saved as a `.d2s` holding its stats and its waypoints; the
@@ -2645,7 +3022,36 @@ pub(crate) mod tests {
         }
         assert!(fought > 0, "no game had a monster to fight");
         assert!(hit_back > 0, "no pack fought back");
-        eprintln!("{fought} kills, {piles} gold piles");
+        eprintln!("{fought} kills, {piles} piles on the ground");
+    }
+
+    /// With the operator's install: the potions, scrolls, gems and runes Act I treasure names are
+    /// simple items the server makes, belted as the game belts them; stacks, jewellery and
+    /// equipment are not made yet.
+    #[test]
+    fn with_a_real_install_treasure_potions_are_simple_items() {
+        let Ok(dir) = std::env::var("BNETCC_D2_DATA_DIR") else {
+            return;
+        };
+        let rules = GameData::load(&dir).unwrap();
+        let items = rules.items();
+        for code in ["hp1", "hp5", "mp1", "mp5", "rvs", "rvl", "yps", "vps", "wms", "isc", "tsc", "gcv", "gfr", "skc", "r01"] {
+            let class = simple_item_class(&rules, code).unwrap_or_else(|| panic!("{code} is simple"));
+            let def = items.get(class).unwrap();
+            assert_eq!((def.inv_size, item_category(&rules, class)), ((1, 1), 16), "{code}");
+        }
+        for code in ["key", "aqv", "cqv", "opl", "rin", "amu", "jew", "cm1", "weap3", "armo6", "gld"] {
+            assert_eq!(simple_item_class(&rules, code), None, "{code} is not made");
+        }
+        let def = |code: &str| items.get(items.class_of(&d2_data::items::code(code)).unwrap()).unwrap();
+        let hp1 = items.class_of(&d2_data::items::code("hp1")).unwrap();
+        assert!(def("hp1").auto_belt && items.beltable(hp1));
+        let isc = items.class_of(&d2_data::items::code("isc")).unwrap();
+        assert!(items.beltable(isc) && !def("isc").auto_belt, "scrolls fit the belt but are not put there");
+        assert_eq!(battle::Potion::of(def("hp1")), Some(battle::Potion::Healing { points: 30, frames: 192 }));
+        assert_eq!(battle::Potion::of(def("mp5")), Some(battle::Potion::Mana { points: 250, frames: 128 }));
+        assert_eq!(battle::Potion::of(def("rvl")), Some(battle::Potion::Rejuvenation { life: 100, mana: 100 }));
+        assert_eq!(battle::Potion::of(def("vps")), None);
     }
 
     #[test]

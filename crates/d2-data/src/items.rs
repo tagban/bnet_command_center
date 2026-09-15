@@ -6,6 +6,8 @@
 //! markers skipped, and a type "is a" type it names in `Equiv1`/`Equiv2`, transitively
 //! (`ITEMS_CheckItemTypeId`, `0x00629B50`, reads the matrix built from those columns).
 
+use std::collections::HashMap;
+
 use d2_formats::excel::Table;
 
 use crate::Error;
@@ -55,6 +57,8 @@ pub struct ItemType {
     pub code: String,
     /// `BodyLoc1`/`BodyLoc2`: where an item of the type is worn (`head`, `tors`, `rarm`, …).
     pub body_locations: Vec<String>,
+    /// `Beltable`: whether an item of the type goes in a belt.
+    pub beltable: bool,
     /// Every type this one is, itself included.
     ancestors: Vec<i32>,
 }
@@ -77,33 +81,31 @@ impl ItemTypes {
                 return Err(Error::BadTable { table: "itemtypes.txt", problem: format!("no {column} column") });
             }
         }
-        let raw: Vec<(String, String, [String; 2], Vec<String>)> = t
+        // Each row with its two equivalents, its ancestors filled in below.
+        let mut rows: Vec<(ItemType, [String; 2])> = t
             .rows()
             .map(|row| {
                 let text = |c: &str| row.get(c).unwrap_or_default().to_string();
-                let locations = ["BodyLoc1", "BodyLoc2"].iter().map(|c| text(c)).filter(|s| !s.is_empty()).collect();
-                (text("ItemType"), text("Code"), [text("Equiv1"), text("Equiv2")], locations)
+                let body_locations = ["BodyLoc1", "BodyLoc2"].iter().map(|c| text(c)).filter(|s| !s.is_empty()).collect();
+                let beltable = row.int("Beltable").unwrap_or(0) != 0;
+                (ItemType { name: text("ItemType"), code: text("Code"), body_locations, beltable, ancestors: Vec::new() }, [text("Equiv1"), text("Equiv2")])
             })
             .collect();
-        let id_of = |code: &str| raw.iter().position(|r| !code.is_empty() && r.1 == code).map(|i| i as i32);
-        let rows = raw
-            .iter()
-            .enumerate()
-            .map(|(id, (name, code, _, locations))| {
-                let mut ancestors = vec![id as i32];
-                let mut at = 0;
-                while at < ancestors.len() {
-                    let (_, _, equiv, _) = &raw[ancestors[at] as usize];
-                    for parent in equiv.iter().filter_map(|e| id_of(e)) {
-                        if !ancestors.contains(&parent) {
-                            ancestors.push(parent);
-                        }
+        let id_of = |rows: &[(ItemType, [String; 2])], code: &str| rows.iter().position(|r| !code.is_empty() && r.0.code == code).map(|i| i as i32);
+        for id in 0..rows.len() {
+            let mut ancestors = vec![id as i32];
+            let mut at = 0;
+            while at < ancestors.len() {
+                for parent in rows[ancestors[at] as usize].1.iter().filter_map(|e| id_of(&rows, e)) {
+                    if !ancestors.contains(&parent) {
+                        ancestors.push(parent);
                     }
-                    at += 1;
                 }
-                ItemType { name: name.clone(), code: code.clone(), body_locations: locations.clone(), ancestors }
-            })
-            .collect();
+                at += 1;
+            }
+            rows[id].0.ancestors = ancestors;
+        }
+        let rows = rows.into_iter().map(|(row, _)| row).collect();
         Ok(Self { rows })
     }
 
@@ -170,6 +172,25 @@ pub struct ItemDef {
     pub transform: i32,
     /// The table it came from.
     pub file: ItemFile,
+    /// `invwidth`/`invheight`: inventory cells.
+    pub inv_size: (u8, u8),
+    /// `compactsave`: saved and sent as a simple item — no quality, stats or sockets
+    /// (Game.exe sets item flag `0x200000` from it, `0x006312B0`).
+    pub compact: bool,
+    /// `autobelt`: picked up straight into a free belt slot (`0x0063C600`).
+    pub auto_belt: bool,
+    /// `stackable`: carries a quantity.
+    pub stackable: bool,
+    /// `useable`: right-clicking it uses it.
+    pub useable: bool,
+    /// `quest`: a quest item.
+    pub quest: bool,
+    /// `pSpell`: what using it does (3 a healing or mana potion, 5 a rejuvenation potion).
+    pub spell: i32,
+    /// `len`: frames its effect lasts, 0 for at once.
+    pub duration: i32,
+    /// `stat1`–`stat3` with `calc1`–`calc3`, where both are given and the calc is a number.
+    pub effects: Vec<(String, i32)>,
 }
 
 /// Every item, in class id order.
@@ -177,6 +198,12 @@ pub struct ItemDef {
 pub struct Items {
     types: ItemTypes,
     rows: Vec<ItemDef>,
+    by_code: HashMap<Code, i32>,
+}
+
+/// An inventory size from its column: 1 to 15 cells (the item bits' grid fields are four bits).
+fn piece_size(v: Option<i64>) -> u8 {
+    v.unwrap_or(1).clamp(1, 15) as u8
 }
 
 impl Items {
@@ -212,10 +239,28 @@ impl Items {
                     two_handed_class: row.get("2handedwclass").map(code),
                     transform: int("Transform"),
                     file,
+                    inv_size: (piece_size(row.int("invwidth")), piece_size(row.int("invheight"))),
+                    compact: int("compactsave") != 0,
+                    auto_belt: int("autobelt") != 0,
+                    stackable: int("stackable") != 0,
+                    useable: int("useable") != 0,
+                    quest: int("quest") != 0,
+                    spell: int("pSpell"),
+                    duration: int("len"),
+                    effects: (1..=3)
+                        .filter_map(|i| {
+                            let stat = row.get(&format!("stat{i}")).filter(|s| !s.is_empty())?;
+                            Some((stat.to_string(), row.get(&format!("calc{i}"))?.trim().parse().ok()?))
+                        })
+                        .collect(),
                 }
             }));
         }
-        Ok(Self { types, rows })
+        let mut by_code = HashMap::new();
+        for (class, row) in rows.iter().enumerate() {
+            by_code.entry(row.code).or_insert(class as i32);
+        }
+        Ok(Self { types, rows, by_code })
     }
 
     /// The item types.
@@ -228,6 +273,18 @@ impl Items {
     #[must_use]
     pub fn get(&self, class: i32) -> Option<&ItemDef> {
         usize::try_from(class).ok().and_then(|i| self.rows.get(i))
+    }
+
+    /// An item's class id by its code (the first row with it).
+    #[must_use]
+    pub fn class_of(&self, code: &Code) -> Option<i32> {
+        self.by_code.get(code).copied()
+    }
+
+    /// Whether item `class` is of a beltable type.
+    #[must_use]
+    pub fn beltable(&self, class: i32) -> bool {
+        self.get(class).and_then(|d| self.types.get(d.item_type)).is_some_and(|t| t.beltable)
     }
 
     /// Every item, in class id order.
@@ -291,5 +348,27 @@ mod tests {
         assert_eq!((war_hat.alternate_gfx, war_hat.component, war_hat.file), (Some(*b"cap "), 0, ItemFile::Armor));
         assert_eq!(items.get(2).unwrap().component, 16, "no component column: not drawn");
         assert_eq!(code_str(b"cap "), "cap");
+    }
+
+    #[test]
+    fn potions_carry_their_belt_and_use_columns() {
+        let itemtypes = Table::parse(b"ItemType\tCode\tEquiv1\tBeltable\r\nPotion\tpoti\t\t1\r\nHealing Potion\thpot\tpoti\t1\r\nGem\tgem\t\t0\r\n");
+        let empty = Table::parse(b"name\tcode\ttype\r\n");
+        let misc = Table::parse(
+            b"name\tcode\ttype\tinvwidth\tinvheight\tcompactsave\tautobelt\tuseable\tpSpell\tlen\tstat1\tcalc1\tstat2\tcalc2\r\n\
+              Minor Healing Potion\thp1\thpot\t1\t1\t1\t1\t1\t3\t192\thpregen\t30\t\t\r\n\
+              Chipped Ruby\tgcr\tgem\t1\t1\t1\t0\t0\t\t\t\t\t\t\r\n\
+              Skeleton Key\tkey\tgem\t1\t1\t0\t0\t0\t\t\t\t\t\t\r\n",
+        );
+        let items = Items::from_tables(&itemtypes, &empty, &empty, &misc).unwrap();
+        let hp1 = items.class_of(&code("hp1")).unwrap();
+        let def = items.get(hp1).unwrap();
+        assert_eq!((def.inv_size, def.compact, def.auto_belt, def.useable, def.spell, def.duration), ((1, 1), true, true, true, 3, 192));
+        assert_eq!(def.effects, [("hpregen".to_string(), 30)]);
+        assert!(items.beltable(hp1), "the type's own column");
+        let ruby = items.class_of(&code("gcr")).unwrap();
+        assert!(!items.beltable(ruby) && items.get(ruby).unwrap().effects.is_empty());
+        assert!(!items.get(items.class_of(&code("key")).unwrap()).unwrap().compact);
+        assert_eq!(items.class_of(&code("zzz")), None);
     }
 }

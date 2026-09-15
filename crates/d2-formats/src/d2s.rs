@@ -24,6 +24,10 @@ const SKILL_LEN: usize = 32;
 /// Bits each saved stat takes (`ItemStatCost.txt` `CSvBits`), ids 0–15.
 const STAT_BITS: [u32; 16] = [10, 10, 10, 10, 10, 8, 21, 21, 21, 21, 21, 21, 7, 32, 25, 25];
 const STAT_END: u32 = 0x1FF;
+/// Item flag: saved and sent without quality, stats or sockets (`compactsave`).
+pub const ITEM_COMPACT: u32 = 0x0020_0000;
+/// Item flag: an ear, which carries a name instead of a code.
+const ITEM_EAR: u32 = 0x0001_0000;
 
 /// Why a save could not be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +71,27 @@ pub struct Save {
     pub skills: [u8; 30],
     /// From the player's `JM` to the end of the file.
     pub items: Vec<u8>,
+}
+
+/// A simple item — `compactsave`, no quality, stats or sockets — as `0x0062AF80` writes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimpleItem {
+    /// Its flags (`0x10` identified, [`ITEM_COMPACT`], `0x800000` on every item written).
+    pub flags: u32,
+    /// The game's item version: 101 in an expansion game, 2 in a classic one (`0x00530930`).
+    pub version: u16,
+    /// Where it is: 0 stored in a grid, 1 equipped, 2 in the belt.
+    pub mode: u8,
+    /// Body location when equipped.
+    pub body: u8,
+    /// Grid column, or the belt slot.
+    pub col: u8,
+    /// Grid row (0 in the belt).
+    pub row: u8,
+    /// The grid page plus one: 0 none (the belt), 1 the inventory, 4 the cube, 5 the stash.
+    pub page: u8,
+    /// Its code, space-padded.
+    pub code: [u8; 4],
 }
 
 fn u32_at(b: &[u8], at: usize) -> u32 {
@@ -222,6 +247,75 @@ impl Save {
         out
     }
 
+    /// The player's own items (the first `JM` list) when every one is simple, and where the list
+    /// ends in [`Self::items`]; `None` when an item is not simple or the list does not read to a
+    /// whole (a real item body is not modelled).
+    #[must_use]
+    pub fn simple_items(&self) -> Option<(Vec<SimpleItem>, usize)> {
+        let data = &self.items;
+        if data.get(..2) != Some(b"JM") {
+            return None;
+        }
+        let count = usize::from(u16::from_le_bytes([*data.get(2)?, *data.get(3)?]));
+        let mut at = 4;
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+            if data.get(at..at + 2) != Some(b"JM") {
+                return None;
+            }
+            let mut bits = BitReader { data: &data[at..], bit: 16 };
+            let flags = bits.read(32)?;
+            if flags & ITEM_COMPACT == 0 || flags & ITEM_EAR != 0 {
+                return None;
+            }
+            let version = bits.read(10)? as u16;
+            let mode = bits.read(3)? as u8;
+            if mode == 3 || mode == 5 {
+                return None;
+            }
+            let (body, col, row, page) = (bits.read(4)? as u8, bits.read(4)? as u8, bits.read(4)? as u8, bits.read(3)? as u8);
+            let code = bits.read(32)?.to_le_bytes();
+            if &code == b"gld " {
+                return None;
+            }
+            if bits.read(1)? != 0 {
+                bits.read(32)?;
+                bits.read(32)?;
+                bits.read(32)?;
+            }
+            items.push(SimpleItem { flags, version, mode, body, col, row, page, code });
+            at += bits.bit.div_ceil(8);
+        }
+        // The corpse's list follows.
+        (data.get(at..at + 2) == Some(b"JM")).then_some((items, at))
+    }
+
+    /// Replace the player's own items with `items`, keeping what follows the list (the corpse,
+    /// the mercenary, the golem). Does nothing when the list does not read ([`Self::simple_items`]).
+    pub fn set_simple_items(&mut self, items: &[SimpleItem]) -> bool {
+        let Some((_, end)) = self.simple_items() else { return false };
+        let mut out = b"JM".to_vec();
+        out.extend_from_slice(&(items.len() as u16).to_le_bytes());
+        for item in items {
+            let mut bits = BitWriter::default();
+            bits.write(0x4D4A, 16);
+            bits.write(item.flags | ITEM_COMPACT, 32);
+            bits.write(u32::from(item.version.min(0x3FF)), 10);
+            bits.write(u32::from(item.mode.min(7)), 3);
+            bits.write(u32::from(item.body.min(15)), 4);
+            bits.write(u32::from(item.col.min(15)), 4);
+            bits.write(u32::from(item.row.min(15)), 4);
+            bits.write(u32::from(item.page.min(7)), 3);
+            bits.write(u32::from_le_bytes(item.code), 32);
+            // No realm data.
+            bits.write(0, 1);
+            out.extend_from_slice(&bits.bytes);
+        }
+        out.extend_from_slice(&self.items[end..]);
+        self.items = out;
+        true
+    }
+
     /// A stat's raw value, 0 when not saved.
     #[must_use]
     pub fn stat(&self, id: u16) -> u32 {
@@ -325,6 +419,29 @@ mod tests {
         assert_eq!(back.stat(13), 1234);
         assert!(back.items.ends_with(b"jfkf\0"), "expansion blocks");
         assert_eq!(Save::parse(&bytes[..700]), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn simple_items_are_fourteen_bytes_and_keep_the_lists_after_them() {
+        let mut save = Save::new("Tester", 4, 0x20, 1_000, &[(0, 30)]);
+        assert_eq!(save.simple_items(), Some((Vec::new(), 4)));
+        let potion = SimpleItem { flags: 0x0080_0010, version: 101, mode: 2, body: 0, col: 3, row: 0, page: 0, code: *b"hp1 " };
+        let gem = SimpleItem { flags: 0x00A0_0010, version: 101, mode: 0, body: 0, col: 9, row: 3, page: 1, code: *b"gcr " };
+        assert!(save.set_simple_items(&[potion, gem]));
+        assert_eq!(save.items.len(), 4 + 14 * 2 + 4 + 5, "two items, the corpse list and the expansion blocks");
+        assert!(save.items.ends_with(b"JM\0\0jfkf\0"));
+        let back = Save::parse(&save.to_bytes()).unwrap();
+        let (items, _) = back.simple_items().unwrap();
+        assert_eq!(items, [SimpleItem { flags: 0x00A0_0010, ..potion }, gem], "written compact");
+        // The retail pickup's hp2 at column 9, row 3 of the inventory, as a save writes it.
+        let mut hp2 = Save::new("Tester", 4, 0, 1_000, &[]);
+        hp2.set_simple_items(&[SimpleItem { code: *b"hp2 ", ..gem }]);
+        assert_eq!(hp2.items[4..18], [0x4A, 0x4D, 0x10, 0x00, 0xA0, 0x00, 0x65, 0x00, 0x72, 0x82, 0x06, 0x27, 0x03, 0x02]);
+        // A full item stops the reading, and then nothing is replaced.
+        let mut full = back.clone();
+        full.items[4 + 4] &= !0x20;
+        assert_eq!(full.simple_items(), None);
+        assert!(!full.set_simple_items(&[]));
     }
 
     #[test]
