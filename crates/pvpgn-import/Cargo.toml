@@ -1,0 +1,23 @@
+[package]
+name = "bnetcc-pvpgn-import"
+description = "Bring a PvPGN server's accounts, profiles, records and Diablo II characters into Command Center."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "bnetcc-pvpgn-import"
+path = "src/main.rs"
+
+[dependencies]
+bnetcc-crypto = { path = "../bnetcc-crypto" }
+bnetcc-storage = { path = "../bnetcc-storage" }
+bnetcc-storage-sqlite = { path = "../bnetcc-storage-sqlite" }
+d2-formats = { path = "../d2-formats" }
+clap.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

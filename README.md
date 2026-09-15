@@ -119,12 +119,15 @@ Prebuilt archives for Linux, macOS (Intel + Apple Silicon), and Windows are atta
 each [GitHub Release](https://github.com/tagban/bnet_command_center/releases), and to every
 manual run of the [Release workflow](https://github.com/tagban/bnet_command_center/actions/workflows/release.yml)
 (as downloadable artifacts — use the **Run workflow** button to get a build without cutting a
-version). Each archive holds two executables:
+version). Each archive holds three executables:
 
 - **`bnetcc-launcher`** — start here. On first run it writes a `bnetccd.toml`, then launches
   the server, printing the game port and the admin-panel URL. The server prints a one-time
   admin password to the same console on its first run.
 - **`bnetccd`** — the server itself, for when you want to manage the config by hand.
+- **`bnetcc-pvpgn-import`** — moving from PvPGN? It brings your accounts (with their
+  passwords), profiles, records, locks and Diablo II realm characters across. See
+  [`docs/PVPGN-IMPORT.md`](docs/PVPGN-IMPORT.md).
 
 ```sh
 # macOS / Linux — unpack and run

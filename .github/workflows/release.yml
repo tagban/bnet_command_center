@@ -41,7 +41,7 @@ jobs:
       - name: Build release binaries
         run: >
           cargo build --release --locked --target ${{ matrix.target }}
-          -p bnetccd -p bnetcc-launcher
+          -p bnetccd -p bnetcc-launcher -p bnetcc-pvpgn-import
 
       # Version label: the tag name on a tag build, otherwise a short dev-SHA.
       - name: Compute version
@@ -63,7 +63,7 @@ jobs:
           staging="dist/$name"
           bindir="target/${{ matrix.target }}/release"
           mkdir -p "$staging"
-          cp "$bindir/bnetccd" "$bindir/bnetcc-launcher" "$staging/"
+          cp "$bindir/bnetccd" "$bindir/bnetcc-launcher" "$bindir/bnetcc-pvpgn-import" "$staging/"
           cp bnetccd.example.toml README.md LICENSE-MIT LICENSE-APACHE "$staging/"
           tar -C dist -czf "$name.tar.gz" "$name"
           echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
@@ -76,7 +76,7 @@ jobs:
           $staging = "dist/$name"
           $bindir = "target/${{ matrix.target }}/release"
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
-          Copy-Item "$bindir/bnetccd.exe","$bindir/bnetcc-launcher.exe" $staging
+          Copy-Item "$bindir/bnetccd.exe","$bindir/bnetcc-launcher.exe","$bindir/bnetcc-pvpgn-import.exe" $staging
           Copy-Item bnetccd.example.toml,README.md,LICENSE-MIT,LICENSE-APACHE $staging
           Compress-Archive -Path $staging -DestinationPath "$name.zip"
           "ASSET=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
