@@ -8,6 +8,10 @@ pub const ENERGY: u8 = 1;
 pub const DEXTERITY: u8 = 2;
 /// `vitality`.
 pub const VITALITY: u8 = 3;
+/// `statpts`: attribute points to spend.
+pub const STATPTS: u8 = 4;
+/// `newskills`: skill points to spend.
+pub const NEWSKILLS: u8 = 5;
 /// `hitpoints` — current life, 1/256 fixed-point.
 pub const HITPOINTS: u8 = 6;
 /// `maxhp`, 1/256 fixed-point.
@@ -26,6 +30,8 @@ pub const LEVEL: u8 = 12;
 pub const EXPERIENCE: u8 = 13;
 /// `gold`.
 pub const GOLD: u8 = 14;
+/// `lastexp` — experience the current level started at.
+pub const LASTEXP: u8 = 29;
 /// `nextexp` — experience needed to leave the current level.
 pub const NEXTEXP: u8 = 30;
 /// `velocitypercent`.

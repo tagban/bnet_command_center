@@ -3,6 +3,11 @@
 Status of Diablo II support, how the closed realm is put together, and how to test it with a
 real client.
 
+The Diablo II server is here mainly for older computers — Mac OS 9, Mac OS X 10.4 and earlier —
+that can no longer play on Battle.net because their patches are no longer made. It is
+educational and supports that older architecture; on a modern computer, buy *Diablo II:
+Resurrected* for the true Battle.net experience (see the README's *Purpose*).
+
 | Button in the client | What it is | Status |
 |---|---|---|
 | **Open Battle.net** | BNCS login + chat; characters live on the player's PC; games are peer-to-peer | Login and chat work through the same path as StarCraft |
@@ -20,7 +25,8 @@ A closed-realm client can:
   in this server's database (`characters` table, schema v2),
 - enter chat as the character: shown as **`Character*Account`** with the character's portrait
   (class, level, hardcore/expansion/ladder bits) in its statstring,
-- open the game lobby: the game list is empty, the ladder is empty.
+- open the game lobby and the **ladder**: ladder characters ranked by experience, softcore and
+  hardcore, classic and expansion, overall and by class, down to rank 500.
 
 **Creating or joining a game answers "Server Down" / "Game does not exist."** That is
 expected: hosting a closed-realm game needs a Diablo II game server (§5).
@@ -33,6 +39,21 @@ Rules the realm enforces:
   make expansion characters**; LoD sees both and can upgrade classic characters.
 - A character belongs to one account: nobody else can list, select, delete, or chat as it.
 - Up to `diablo2.max_characters` per account (default 18).
+
+### Ladder seasons
+
+The ladder runs in **seasons**, ended by hand from the admin panel's **D2 ladder** page
+(`/d2/season`), since how long a season should last depends on how many people play (tagban,
+2026-09-14). The page shows the season, when it began and how many softcore and hardcore
+characters are on the ladder. **End season** turns every ladder character, softcore and hardcore
+alike, into a normal character that keeps its level, items and progress, in the realm and in its
+`.d2s`. The ladder is then empty, and new ladder characters belong to the next season. A player
+still in a game when the season ends plays that game as a ladder character and is saved without
+the ladder bit.
+
+The season number and start are kept in `bnetccd-d2-season.json` beside the account database (in
+memory with in-memory storage). Unlike StarCraft and Warcraft II, the Diablo II ladder needs no
+wins: a character is on it from creation.
 
 ### Verified against a real client
 
@@ -130,12 +151,32 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
    verified 2026-09-13).
    Shrines and wells stand where they should, with their names (using them does nothing yet;
    verified 2026-09-13). Cold Plains' waypoint is always beside the way in from Blood Moor.
-   Otherwise the areas are empty — no monsters, and cave entrances do not lead anywhere. Walking through a fence can make the server think you are somewhere
-   you are not (it has no collision).
-4. *Expect nothing else to work:* life/mana/stamina show (level-1 values from
-   `charstats.txt`), NPCs never walk, there is no combat, no shop and no travel to other
-   acts. Esc → Save and Exit returns to chat (verified).
-5. Send the log from the moment you clicked Create Game.
+   *Expect monsters:* each area fills with its own kinds as you approach — Blood Moor's
+   zombies, quill rats and packs of fallen, Cold Plains' brutes, dark ones and shamans with
+   their fallen, and so on, 50–160 an area. They notice you, come for you and hit; clicking one
+   swings at it with the weapon you wear (bare-handed without one), and a kill pays experience.
+4. *Expect loot:* a kill sometimes drops a gold pile, a potion, a scroll, a gem, a rune, or a
+   weapon, armour, ring or amulet — white, grey (low quality), superior, blue (magic), yellow
+   (rare), green (set) or gold (unique), magic and better ones unidentified. Clicking gold adds
+   it to your gold (up to 10,000 a level). Clicking a healing, mana or rejuvenation potion puts it
+   in the first free of the belt's four slots; an identified weapon or armour you can use goes
+   straight on when its place is empty; anything else goes in the inventory, filling from the
+   right-hand column up; with no room it stays on the ground. Belt keys 1–4, or right-clicking a
+   potion in the inventory, drinks it. Items can be picked up onto the cursor, moved about the
+   inventory and belt, worn, swapped with what you wear, taken off and dropped. Right-clicking a
+   Scroll of Identify and then clicking an unidentified item identifies it. What you wear
+   counts: a weapon's damage (with strength), armour's defence, and life, mana, attributes and
+   attack rating from magic items. What you carry and wear is saved and is back next game. *A
+   new character* starts with its class's items (a weapon, a buckler for most, four minor
+   healing potions in the belt, a Town Portal and an Identify scroll); characters made before
+   2026-09-15 that have been saved keep what they had.
+   *Not yet:* the stash and cube, sockets filled, tomes, Town Portal, stamina, antidote and
+   thawing potions, shops, repair, and other players seeing what you wear.
+5. *Expect nothing else to work:* NPCs never move, there is no shop and no travel to other acts.
+   Esc → Save and Exit returns to chat (verified).
+6. Send the log from the moment you clicked Create Game (`item picked up`, `item moved`,
+   `item dropped`, `item identified`, `potion drunk`, `item move refused` and `no room to pick it
+   up` lines say what the server did with items).
 
 What it shows, in order:
 
@@ -181,7 +222,11 @@ client ── (login connection) SID_ENTERCHAT "Tyrael", "bncc,Tyrael"
   a random 64-bit handle into an in-memory ticket table (`Node::mint_realm_ticket`). A ticket
   lives as long as the login connection that minted it — the client reconnects to the realm
   with the same data after each game.
-- **The portrait** is 33 bytes: see `bnetcc_proto::d2` for the byte table.
+- **The portrait** is 33 bytes: see `bnetcc_proto::d2` for the byte table. Its equipment bytes
+  are graphics values, not items; the server writes a map for chat bots,
+  [`d2-equipment.json`](D2-EQUIPMENT-FILE.md), into the BNFTP files directory at startup, and a
+  pack of the character-select animations, [`d2-characters.zip`](D2-CHARACTER-PACK.md), so a bot
+  can draw the character.
 
 Wire layouts that matter and are easy to get wrong:
 
@@ -203,6 +248,9 @@ realm = true                          # offer the closed realm (never in warnet 
 description = "Diablo II closed realm"
 address = ""                          # public host/IP for internet players
 max_characters = 18
+data_dir = ""                         # your 1.14d install: Game.exe and the MPQs
+equipment_file = "d2-equipment.json"  # written into [files] dir for bots; "" disables
+character_pack = "d2-characters.zip"  # the character animations as layers, for bots; "" disables
 ```
 
 The realm's *name* is `server.realm`.

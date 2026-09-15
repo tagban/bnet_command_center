@@ -11,8 +11,16 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod animdata;
+pub mod cof;
+pub mod d2s;
+pub mod dcc;
 pub mod ds1;
+pub mod dt1;
 pub mod excel;
+pub mod gif;
 pub mod mpq;
 pub mod pe;
 pub mod pkware;
+pub mod tbl;
+pub mod zip;

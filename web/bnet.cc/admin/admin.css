@@ -1,0 +1,50 @@
+/* bnet.cc admin, in the site's colours. */
+* { box-sizing: border-box; }
+body { margin: 0; background: #000; color: #CCC; font: 13px/1.5 Arial, Helvetica, sans-serif; }
+a { color: #FFAC04; font-weight: bold; text-decoration: none; }
+a:hover { color: #FFF; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; padding: 12px 20px; background: #111; border-bottom: 2px solid #333; }
+header .logo { font: italic 24px Impact, "Arial Black", sans-serif; color: #00C0FF; letter-spacing: 1px; text-shadow: 0 0 10px #0055AA; }
+header .sub { color: #999; text-transform: uppercase; letter-spacing: 3px; font-size: 10px; }
+header nav { margin-left: auto; display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
+main { max-width: 760px; margin: 0 auto; padding: 20px 16px 40px; }
+h1 { color: #FFF; font-variant: small-caps; font-size: 18px; letter-spacing: 1px; border-bottom: 1px solid #333; padding-bottom: 4px; }
+code, pre.code { font-family: Menlo, Consolas, monospace; font-size: 12px; color: #00C0FF; }
+pre.code { background: #111; border: 1px solid #333; padding: 10px; white-space: pre-wrap; word-break: break-all; }
+.card { background: #0a0a0a; border: 1px solid #333; padding: 16px; max-width: 360px; }
+.card.wide { max-width: none; }
+label { display: block; color: #FFF; font-weight: bold; margin-bottom: 12px; }
+input[type=text], input[type=password], textarea { display: block; width: 100%; margin-top: 4px; background: #161616; border: 1px solid #575757; color: #EEE; padding: 7px 8px; font: 13px Arial, Helvetica, sans-serif; }
+textarea { font-family: Menlo, Consolas, monospace; font-size: 12px; line-height: 1.5; resize: vertical; }
+input:focus, textarea:focus { outline: none; border-color: #00C0FF; }
+.checks { display: flex; flex-wrap: wrap; gap: 18px; margin: 4px 0 14px; }
+label.check { display: inline-flex; align-items: center; gap: 6px; font-weight: normal; color: #CCC; margin: 0; }
+.buttons { display: flex; align-items: center; gap: 12px; }
+button, a.button { background: #393731; color: #FFF; border: 1px solid #575757; padding: 6px 14px; font: bold 12px Arial, Helvetica, sans-serif; cursor: pointer; display: inline-block; }
+button:hover, a.button:hover { border-color: #00C0FF; color: #FFF; }
+button.secondary { background: #1a1a1a; }
+button.danger { background: #5a1a1a; border-color: #7a2a2a; }
+button:disabled { opacity: .5; cursor: default; }
+button.link { background: none; border: 0; padding: 0; color: #FFAC04; font: bold 13px Arial, Helvetica, sans-serif; }
+form.inline { display: inline; }
+.danger-zone { margin-top: 18px; }
+.help { color: #999; font-size: 12px; margin: -4px 0 10px; }
+.meta { color: #999; }
+.ok { background: rgba(90, 196, 125, .12); border: 1px solid #5ac47d; color: #5ac47d; padding: 8px 12px; }
+.err { background: rgba(224, 106, 106, .12); border: 1px solid #e06a6a; color: #e06a6a; padding: 8px 12px; }
+table.list { width: 100%; border-collapse: collapse; border: 1px solid #575757; }
+table.list th { background: #393731; color: #FFF; text-align: left; padding: 6px 8px; font-size: 12px; }
+table.list td { padding: 6px 8px; border-top: 1px solid #000; background: #161616; }
+table.list tr:nth-child(odd) td { background: #252525; }
+.tag { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; padding: 1px 5px; border: 1px solid; }
+.tag.live { color: #5ac47d; }
+.tag.draft { color: #999; }
+.tag.pin { color: #00C0FF; }
+.preview { border: 1px dashed #00C0FF; padding: 12px 14px; margin-bottom: 16px; background: #0a0a0a; }
+.preview-label { color: #00C0FF; font-size: 10px; text-transform: uppercase; letter-spacing: 2px; }
+.preview-title { color: #FFF; font-weight: bold; font-size: 15px; margin: 2px 0 8px; }
+.post-body p { margin: 0 0 10px; }
+.post-body .post-h { color: #FFF; font-size: 14px; margin: 12px 0 6px; }
+.post-body .post-list { margin: 0 0 10px 18px; padding: 0; }
+table.list input[type=text], table.list textarea { margin-top: 0; }
+table.list td { vertical-align: top; }

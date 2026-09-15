@@ -4,6 +4,8 @@
 
 mod admin;
 mod config;
+mod d2_characters;
+mod d2_equipment;
 mod d2gs;
 mod discord;
 mod moderation;
@@ -11,7 +13,9 @@ mod node;
 mod outbound;
 mod public_status;
 mod realm;
+mod season;
 mod session;
+mod ladder_push;
 mod stats_push;
 mod status;
 mod tracker;
@@ -45,6 +49,16 @@ struct Args {
     /// Validate the configuration and exit without binding anything.
     #[arg(long)]
     check: bool,
+
+    /// Write the Diablo II equipment map (`diablo2.equipment_file`) built from
+    /// `diablo2.data_dir` to this path and exit.
+    #[arg(long, value_name = "PATH")]
+    write_d2_equipment: Option<PathBuf>,
+
+    /// Write the Diablo II character pack (`diablo2.character_pack`) built from
+    /// `diablo2.data_dir` to this path and exit.
+    #[arg(long, value_name = "PATH")]
+    write_d2_characters: Option<PathBuf>,
 }
 
 fn main() -> std::process::ExitCode {
@@ -76,6 +90,32 @@ fn main() -> std::process::ExitCode {
     if args.check {
         info!("configuration is valid");
         return std::process::ExitCode::SUCCESS;
+    }
+
+    if let Some(path) = &args.write_d2_characters {
+        return match d2_characters::write(&cfg.diablo2.data_dir, path) {
+            Ok(_) => {
+                info!(path = %path.display(), "wrote the Diablo II character pack");
+                std::process::ExitCode::SUCCESS
+            }
+            Err(e) => {
+                error!("{e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+
+    if let Some(path) = &args.write_d2_equipment {
+        return match d2_equipment::write(&cfg.diablo2.data_dir, path) {
+            Ok(_) => {
+                info!(path = %path.display(), "wrote the Diablo II equipment map");
+                std::process::ExitCode::SUCCESS
+            }
+            Err(e) => {
+                error!("{e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
@@ -156,6 +196,16 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
     };
     if let Some(dir) = &files_dir {
         info!(dir = %dir.display(), "serving operator-supplied files over BNFTP");
+        let d2 = &cfg.diablo2;
+        let wanted = !d2.equipment_file.is_empty() || !d2.character_pack.is_empty();
+        if wanted && !d2.data_dir.trim().is_empty() {
+            tokio::spawn(d2_equipment::publish(
+                d2.data_dir.clone(),
+                dir.clone(),
+                d2.equipment_file.clone(),
+                d2.character_pack.clone(),
+            ));
+        }
     }
 
     // UDP :6112 for the login-time UDP check that lets classic clients host/join games.
@@ -179,6 +229,13 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
 
     // Staff bans persist to a JSON file next to the account database (in-memory storage keeps
     // them in memory only). Same derivation as the admin panel's `bnetccd-admin/`.
+    // The Diablo II ladder season lives beside them the same way.
+    let d2_season_path = (!cfg.storage.path.is_empty()).then(|| {
+        std::path::Path::new(&cfg.storage.path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("bnetccd-d2-season.json"), |p| p.join("bnetccd-d2-season.json"))
+    });
     let bans_path = if cfg.storage.path.is_empty() {
         None
     } else {
@@ -194,7 +251,7 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
     // offers no game infrastructure at all.
     let offer_d2_realm = cfg.diablo2.realm && policy.mode != bnetcc_core::policy::ServerMode::Warnet;
     let d2_game_server = if offer_d2_realm && cfg.diablo2.game_server_probe {
-        d2gs::GameServer::start(&cfg.diablo2.data_dir, cfg.listen.bncs.ip()).await
+        d2gs::GameServer::start(&cfg.diablo2.data_dir, cfg.listen.bncs.ip(), storage.clone()).await
     } else {
         None
     };
@@ -225,6 +282,8 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
             files_dir,
             admins: cfg.admins.clone(),
             auto_op_private: cfg.channels.auto_op_private,
+            min_game_length: bnetcc_core::ladder::MIN_GAME_LENGTH,
+            d2_season_path,
             channel_rules: cfg.channel_rules()?,
             cd_key_uniqueness: cfg.limits.cd_key_uniqueness,
             channel_caps: node::ChannelCaps {
@@ -252,6 +311,14 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
     // Optional stats push to an external website (outbound-only, no forwarded port needed).
     if !cfg.stats_push.url.trim().is_empty() {
         tokio::spawn(stats_push::run(Arc::clone(&node), cfg.stats_push.clone()));
+    }
+    // The ladder standings, the same way.
+    if !cfg.ladder_push.url.trim().is_empty() {
+        let mut ladder = cfg.ladder_push.clone();
+        if ladder.token.trim().is_empty() {
+            ladder.token = cfg.stats_push.token.clone();
+        }
+        tokio::spawn(ladder_push::run(Arc::clone(&node), ladder));
     }
 
     // Optional PvPGN-compatible tracking: advertise this server to public trackers, and/or

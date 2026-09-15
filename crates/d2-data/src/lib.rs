@@ -11,20 +11,36 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
+use d2_formats::animdata::AnimData;
 use d2_formats::excel::Table;
 use d2_formats::mpq::{self, ArchiveSet, DATA_ARCHIVES};
 
+pub mod affixes;
+pub mod appearance;
+pub mod character;
 pub mod engine;
+pub mod item_bits;
+pub mod item_stats;
+pub mod items;
 pub mod levels;
 pub mod lvlsub;
+pub mod monlvl;
 pub mod monsters;
 pub mod presets;
+pub mod skills;
 pub mod stat;
+pub mod strings;
+pub mod tiles;
+pub mod treasure;
 
+use items::{Code, Items};
 use levels::Levels;
 use lvlsub::LvlSubs;
+use monlvl::MonLvls;
 use monsters::Monsters;
 use presets::{LvlPrests, MonPresets, Objects, Shrines};
+use strings::Strings;
+use tiles::{LvlMazes, LvlTypes, LvlWarps};
 
 /// Classes in `charstats.txt` order, which is the engine's class id.
 pub const CLASSES: [&str; 7] = ["Amazon", "Sorceress", "Necromancer", "Paladin", "Barbarian", "Druid", "Assassin"];
@@ -79,21 +95,63 @@ pub struct ClassStats {
     pub stamina: u8,
     /// `hpadd`: life on top of vitality at level 1.
     pub life_bonus: u8,
+    /// `ToHitFactor`: attack rating the class adds.
+    pub to_hit_factor: i32,
+    /// `RunDrain`: how fast running spends stamina.
+    pub run_drain: i32,
+    /// `LifePerLevel`, `StaminaPerLevel`, `ManaPerLevel`: quarters of a point per level.
+    pub per_level: (i32, i32, i32),
+    /// `StatPerLevel`: stat points per level.
+    pub stat_per_level: i32,
+    /// `LifePerVitality`, `StaminaPerVitality`, `ManaPerMagic`: quarters of a point per point
+    /// of vitality or energy.
+    pub per_point: (i32, i32, i32),
+    /// `WalkVelocity`, `RunVelocity`.
+    pub velocity: (i32, i32),
+}
+
+/// An item a new character starts with: `charstats.txt` `item1`…`item10` with their `loc` and
+/// `count` (read by `0x00534F10`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartItem {
+    /// `itemN`: the item's code.
+    pub code: Code,
+    /// `itemNloc`: the body location it is worn at (`rarm`, `larm`), when it is worn.
+    pub location: Option<String>,
+    /// `itemNcount`: how many.
+    pub count: u8,
 }
 
 /// The rules loaded so far.
 #[derive(Debug, Clone)]
 pub struct GameData {
     classes: [ClassStats; 7],
+    /// Each class's starting items, in column order.
+    start_items: [Vec<StartItem>; 7],
+    /// Each class's `StartSkill`: the skill its first starting item carries a point of.
+    start_skills: [Option<String>; 7],
     /// `experience.txt` by level (row `"0"` first), one column per class.
     experience: Vec<[u32; 7]>,
     levels: Levels,
     lvl_prests: LvlPrests,
     lvl_subs: LvlSubs,
+    lvl_types: LvlTypes,
+    lvl_warps: LvlWarps,
+    lvl_mazes: LvlMazes,
     mon_presets: MonPresets,
     monsters: Monsters,
+    monster_levels: MonLvls,
+    anim_data: AnimData,
     objects: Objects,
     shrines: Shrines,
+    items: Items,
+    item_stats: item_stats::ItemStats,
+    item_ratios: item_stats::ItemRatios,
+    affixes: affixes::Affixes,
+    skills: skills::Skills,
+    treasure: treasure::TreasureClasses,
+    /// `ArmType.txt`'s tokens, by body armour weight.
+    armor_types: Vec<Code>,
     /// The install's archives, kept open for map files; `None` when built from tables.
     archives: Option<Arc<ArchiveSet>>,
 }
@@ -116,12 +174,38 @@ impl GameData {
         data.levels = Levels::from_table(&read("levels.txt")?)?;
         data.lvl_prests = LvlPrests::from_table(&read("lvlprest.txt")?)?;
         data.lvl_subs = LvlSubs::from_table(&read("lvlsub.txt")?)?;
+        data.lvl_types = LvlTypes::from_table(&read("lvltypes.txt")?)?;
+        data.lvl_warps = LvlWarps::from_table(&read("lvlwarp.txt")?)?;
+        data.lvl_mazes = LvlMazes::from_table(&read("lvlmaze.txt")?)?;
         let monstats = read("monstats.txt")?;
         data.mon_presets =
             MonPresets::from_tables(&read("monpreset.txt")?, &monstats, &read("superuniques.txt")?, &read("monplace.txt")?)?;
         data.monsters = Monsters::from_tables(&monstats, &read("monstats2.txt")?)?;
+        data.monster_levels = MonLvls::from_table(&read("monlvl.txt")?)?;
+        let anim = archives.read("data\\global\\animdata.d2")?.ok_or(Error::MissingTable("animdata.d2"))?;
+        data.anim_data = AnimData::parse(&anim).map_err(|e| Error::BadTable { table: "animdata.d2", problem: e.to_string() })?;
         data.objects = Objects::from_table(&read("objects.txt")?);
         data.shrines = Shrines::from_table(&read("shrines.txt")?);
+        data.items = Items::from_tables(&read("itemtypes.txt")?, &read("weapons.txt")?, &read("armor.txt")?, &read("misc.txt")?)?;
+        data.armor_types = read("armtype.txt")?.rows().filter_map(|r| r.get("Token").map(items::code)).collect();
+        data.item_stats = item_stats::ItemStats::from_table(&read("itemstatcost.txt")?)?;
+        data.item_ratios = item_stats::ItemRatios::from_table(&read("itemratio.txt")?);
+        data.affixes = affixes::Affixes::from_tables(
+            &read("magicprefix.txt")?,
+            &read("magicsuffix.txt")?,
+            &read("automagic.txt")?,
+            &read("rareprefix.txt")?,
+            &read("raresuffix.txt")?,
+            &read("properties.txt")?,
+            &read("qualityitems.txt")?,
+            &read("lowqualityitems.txt")?,
+            &read("uniqueitems.txt")?,
+            &read("setitems.txt")?,
+            &read("sets.txt")?,
+        );
+        data.skills = skills::Skills::from_table(&read("skills.txt")?);
+        data.treasure = treasure::TreasureClasses::from_table(&read("treasureclassex.txt")?)?;
+        data.treasure.add_item_classes(&data.items);
         data.archives = Some(Arc::new(archives));
         Ok(data)
     }
@@ -139,6 +223,95 @@ impl GameData {
         }
     }
 
+    /// A language's string tables, e.g. `"eng"`; tables the install lacks are left out.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Mpq`] if a table is there but cannot be read, [`Error::BadTable`] if it does not
+    /// parse.
+    pub fn strings(&self, language: &str) -> Result<Strings, Error> {
+        let mut tables = Vec::new();
+        for name in strings::TABLES {
+            if let Some(bytes) = self.read_file(&format!("data\\local\\lng\\{language}\\{name}"))? {
+                let table = d2_formats::tbl::StringTable::parse(&bytes)
+                    .ok_or(Error::BadTable { table: name, problem: "not a string table".into() })?;
+                tables.push(table);
+            }
+        }
+        Ok(Strings::from_tables(tables))
+    }
+
+    /// `Weapons.txt`, `Armor.txt` and `Misc.txt`, with `ItemTypes.txt`.
+    #[must_use]
+    pub fn items(&self) -> &Items {
+        &self.items
+    }
+
+    /// `ItemStatCost.txt`.
+    #[must_use]
+    pub fn item_stats(&self) -> &item_stats::ItemStats {
+        &self.item_stats
+    }
+
+    /// `ItemRatio.txt`.
+    #[must_use]
+    pub fn item_ratios(&self) -> &item_stats::ItemRatios {
+        &self.item_ratios
+    }
+
+    /// The affix, property, unique and set tables.
+    #[must_use]
+    pub fn affixes(&self) -> &affixes::Affixes {
+        &self.affixes
+    }
+
+    /// Replace the affix tables — for tests.
+    pub fn set_affixes(&mut self, affixes: affixes::Affixes) {
+        self.affixes = affixes;
+    }
+
+    /// `Skills.txt`.
+    #[must_use]
+    pub fn skills(&self) -> &skills::Skills {
+        &self.skills
+    }
+
+    /// What a new character of `class` starts with.
+    #[must_use]
+    pub fn start_items(&self, class: u8) -> &[StartItem] {
+        self.start_items.get(usize::from(class)).map_or(&[], Vec::as_slice)
+    }
+
+    /// The skill a new character's first item carries a point of (`StartSkill`), by id.
+    #[must_use]
+    pub fn start_skill(&self, class: u8) -> Option<i32> {
+        let name = self.start_skills.get(usize::from(class))?.as_deref()?;
+        (0..self.skills.len() as i32).find(|&id| self.skills.get(id).is_some_and(|s| s.name.eq_ignore_ascii_case(name)))
+    }
+
+    /// Replace the skills table — for tests.
+    pub fn set_skills(&mut self, skills: skills::Skills) {
+        self.skills = skills;
+    }
+
+    /// Replace the item stat and ratio tables — for tests.
+    pub fn set_item_rules(&mut self, stats: item_stats::ItemStats, ratios: item_stats::ItemRatios) {
+        self.item_stats = stats;
+        self.item_ratios = ratios;
+    }
+
+    /// `ArmType.txt`'s tokens (`lit`, `med`, `hvy`), by body armour weight.
+    #[must_use]
+    pub fn armor_types(&self) -> &[Code] {
+        &self.armor_types
+    }
+
+    /// Replace the item tables — for building rules from tables in tests.
+    pub fn set_items(&mut self, items: Items, armor_types: Vec<Code>) {
+        self.items = items;
+        self.armor_types = armor_types;
+    }
+
     /// `LvlPrest.txt`.
     #[must_use]
     pub fn lvl_prests(&self) -> &LvlPrests {
@@ -149,6 +322,24 @@ impl GameData {
     #[must_use]
     pub fn lvl_subs(&self) -> &LvlSubs {
         &self.lvl_subs
+    }
+
+    /// `LvlTypes.txt`.
+    #[must_use]
+    pub fn lvl_types(&self) -> &LvlTypes {
+        &self.lvl_types
+    }
+
+    /// `LvlWarp.txt`.
+    #[must_use]
+    pub fn lvl_warps(&self) -> &LvlWarps {
+        &self.lvl_warps
+    }
+
+    /// `LvlMaze.txt`.
+    #[must_use]
+    pub fn lvl_mazes(&self) -> &LvlMazes {
+        &self.lvl_mazes
     }
 
     /// `MonPreset.txt`, resolved.
@@ -180,6 +371,35 @@ impl GameData {
         &self.monsters
     }
 
+    /// `MonLvl.txt`.
+    #[must_use]
+    pub fn monster_levels(&self) -> &MonLvls {
+        &self.monster_levels
+    }
+
+    /// `TreasureClassEx.txt`.
+    #[must_use]
+    pub fn treasure(&self) -> &treasure::TreasureClasses {
+        &self.treasure
+    }
+
+    /// `animdata.d2`: animation lengths and hit frames.
+    #[must_use]
+    pub fn anim_data(&self) -> &AnimData {
+        &self.anim_data
+    }
+
+    /// Replace the monster level and animation tables — for building rules in tests.
+    pub fn set_combat_tables(&mut self, monster_levels: MonLvls, anim_data: AnimData) {
+        self.monster_levels = monster_levels;
+        self.anim_data = anim_data;
+    }
+
+    /// Replace the treasure classes — for building rules from tables in tests.
+    pub fn set_treasure(&mut self, treasure: treasure::TreasureClasses) {
+        self.treasure = treasure;
+    }
+
     /// Replace the map tables — for building rules from tables in tests.
     pub fn set_map_tables(&mut self, mon_presets: MonPresets, monsters: Monsters, objects: Objects) {
         self.mon_presets = mon_presets;
@@ -194,7 +414,22 @@ impl GameData {
     /// [`Error::BadTable`] if a class row or column is missing or out of range.
     pub fn from_tables(charstats: &Table, experience: &Table) -> Result<Self, Error> {
         let bad = |table, problem: String| Error::BadTable { table, problem };
-        let mut classes = [ClassStats { strength: 0, dexterity: 0, energy: 0, vitality: 0, stamina: 0, life_bonus: 0 }; 7];
+        let mut start_items: [Vec<StartItem>; 7] = Default::default();
+        let mut start_skills: [Option<String>; 7] = Default::default();
+        let mut classes = [ClassStats {
+            strength: 0,
+            dexterity: 0,
+            energy: 0,
+            vitality: 0,
+            stamina: 0,
+            life_bonus: 0,
+            to_hit_factor: 0,
+            run_drain: 0,
+            per_level: (0, 0, 0),
+            stat_per_level: 0,
+            per_point: (0, 0, 0),
+            velocity: (0, 0),
+        }; 7];
         for (id, name) in CLASSES.iter().enumerate() {
             let row = charstats
                 .rows()
@@ -212,7 +447,30 @@ impl GameData {
                 vitality: byte("vit")?,
                 stamina: byte("stamina")?,
                 life_bonus: byte("hpadd")?,
+                to_hit_factor: row.int("ToHitFactor").unwrap_or(0) as i32,
+                run_drain: row.int("RunDrain").unwrap_or(0) as i32,
+                per_level: (
+                    row.int("LifePerLevel").unwrap_or(0) as i32,
+                    row.int("StaminaPerLevel").unwrap_or(0) as i32,
+                    row.int("ManaPerLevel").unwrap_or(0) as i32,
+                ),
+                stat_per_level: row.int("StatPerLevel").unwrap_or(0) as i32,
+                per_point: (
+                    row.int("LifePerVitality").unwrap_or(0) as i32,
+                    row.int("StaminaPerVitality").unwrap_or(0) as i32,
+                    row.int("ManaPerMagic").unwrap_or(0) as i32,
+                ),
+                velocity: (row.int("WalkVelocity").unwrap_or(0) as i32, row.int("RunVelocity").unwrap_or(0) as i32),
             };
+            start_items[id] = (1..=10)
+                .filter_map(|n| {
+                    let code = row.get(&format!("item{n}")).filter(|c| !c.is_empty() && *c != "0")?;
+                    let count = u8::try_from(row.int(&format!("item{n}count")).unwrap_or(0)).ok().filter(|&c| c > 0)?;
+                    let location = row.get(&format!("item{n}loc")).filter(|l| !l.is_empty()).map(str::to_string);
+                    Some(StartItem { code: items::code(code), location, count })
+                })
+                .collect();
+            start_skills[id] = row.get("StartSkill").filter(|s| !s.is_empty()).map(str::to_string);
         }
 
         let mut levels = Vec::new();
@@ -237,14 +495,28 @@ impl GameData {
         }
         Ok(Self {
             classes,
+            start_items,
+            start_skills,
             experience: levels,
             levels: Levels::default(),
             lvl_prests: LvlPrests::default(),
             lvl_subs: LvlSubs::default(),
+            lvl_types: LvlTypes::default(),
+            lvl_warps: LvlWarps::default(),
+            lvl_mazes: LvlMazes::default(),
             mon_presets: MonPresets::default(),
             monsters: Monsters::default(),
+            monster_levels: MonLvls::default(),
+            anim_data: AnimData::default(),
             objects: Objects::default(),
             shrines: Shrines::default(),
+            items: Items::default(),
+            item_stats: item_stats::ItemStats::default(),
+            item_ratios: item_stats::ItemRatios::default(),
+            affixes: affixes::Affixes::default(),
+            skills: skills::Skills::default(),
+            treasure: treasure::TreasureClasses::default(),
+            armor_types: Vec::new(),
             archives: None,
         })
     }
@@ -272,6 +544,23 @@ impl GameData {
     pub fn next_level_experience(&self, class: u8, level: usize) -> Option<u32> {
         let class = usize::from(class).min(6);
         self.experience.get(level).map(|row| row[class])
+    }
+
+    /// The stats a player joins with from its saved ones (`.d2s` ids 0–15, life, mana and
+    /// stamina in 256ths), as `(stat, value)` in ascending stat order: those it has, with the
+    /// experience bounds of its level and the rates a new character gets.
+    #[must_use]
+    pub fn saved_character_stats(&self, class: u8, saved: &[(u16, u32)]) -> Vec<(u8, u32)> {
+        let get = |id: u8| saved.iter().find(|&&(s, _)| s == u16::from(id)).map_or(0, |&(_, v)| v);
+        let level = get(stat::LEVEL).max(1);
+        let mut stats: Vec<(u8, u32)> = (0..=stat::GOLD).filter(|&id| get(id) != 0 || id == stat::LEVEL).map(|id| (id, if id == stat::LEVEL { level } else { get(id) })).collect();
+        let last = if level > 1 { self.next_level_experience(class, level as usize - 1).unwrap_or(0) } else { 0 };
+        if last != 0 {
+            stats.push((stat::LASTEXP, last));
+        }
+        stats.push((stat::NEXTEXP, self.next_level_experience(class, level as usize).unwrap_or(0)));
+        stats.extend([(stat::VELOCITY_PERCENT, 100), (stat::ATTACK_RATE, 100), (stat::OTHER_ANIM_RATE, 100)]);
+        stats
     }
 
     /// The stats a new character starts with, as `(stat, value)` in ascending stat order —
@@ -383,5 +672,9 @@ mod tests {
         assert_eq!(data.objects().get(2).unwrap().parm0, 3, "a shrine: boost or magic");
         assert_eq!(data.shrines().get(1).map(|s| s.effect_class), Some(4), "Refill is a boost");
         assert_eq!(data.shrines().of_class(1), (16..=22).collect::<Vec<_>>(), "the magic shrines");
+        let moor = &data.levels().get(2).unwrap().monsters;
+        assert_eq!((moor.types, moor.density[0], moor.normal.as_slice()), (3, 520, &["zombie1".to_string(), "fallen1".into(), "quillrat1".into()][..]));
+        let shaman = data.monsters().get(data.monsters().class_named("fallenshaman1").unwrap()).unwrap().spawn;
+        assert_eq!((shaman.party, shaman.minions[0]), ((2, 6), 19), "a shaman brings two to six fallen");
     }
 }

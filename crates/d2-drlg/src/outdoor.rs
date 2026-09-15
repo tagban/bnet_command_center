@@ -36,7 +36,9 @@ use d2_data::GameData;
 use d2_formats::ds1::{Ds1, SubstGroup, UnitKind};
 
 use crate::act::Act;
+use crate::collision::{self, BuiltRoom, RoomCollision, TileSources};
 use crate::preset::ROOM_TILES;
+use crate::room_tiles::{self, PresetWindow, RoomContext, Seams, Substitution, Warps};
 use crate::rng::{self, Seed};
 use crate::Coords;
 
@@ -139,6 +141,18 @@ pub struct OutdoorLevel {
     pub roads: Vec<Vec<(i32, i32)>>,
 }
 
+/// A generated level's rooms, built: their collision maps and the units their init placed, both
+/// in [`OutdoorLevel::rooms`] order.
+#[derive(Debug, Clone)]
+pub struct BuiltLevel {
+    /// Each room's collision map.
+    pub collision: Vec<RoomCollision>,
+    /// Each room's units, in placement order.
+    pub units: Vec<Vec<RoomUnit>>,
+    /// The warp tiles of its set pieces.
+    pub warps: Vec<room_tiles::WarpTile>,
+}
+
 /// A unit a wilderness room's init places.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoomUnit {
@@ -175,6 +189,11 @@ pub struct OutdoorRoom {
     /// `sSeed`'s low word once the room is made (after the terrain rolls); its init starts
     /// again from [`OutdoorRoom::seed`].
     pub seed_after: u32,
+    /// A piece room's piece corner in world tiles (the room's own corner for a plain room).
+    pub origin: (i32, i32),
+    /// Vis slots whose warp tile lies in the room, by bit (`DRLGPRESET_BuildPresetArea`'s scan
+    /// of a scanned piece's walls).
+    pub warp_slots: u8,
 }
 
 impl OutdoorLevel {
@@ -300,98 +319,119 @@ impl<'a> Act1Outdoors<'a> {
         g.finish()
     }
 
-    /// The waypoint and shrine a plain room's init stamps from their substitution maps, with the
-    /// maps' units (`DRLGOUTROOM_InitGridCells`, `0x0067D2D0`): the room's floor is laid, the
-    /// roads' edges are cut into it (Act I, `0x00680C80`), then the waypoint pass and the shrine
-    /// pass place their pieces on the room's own seed. (The terrain pass after them needs the
-    /// tile library's rolls and is not ported; it places decoration, not these.)
+    /// A generated level's rooms as the engine inits them: each room's tiles built in list order
+    /// — a piece room from its map, a plain room from its init (`DRLGOUTROOM_InitGridCells`,
+    /// `0x0067D2D0`: the floor, the roads' edges cut in (`0x00680C80`), then the waypoint, shrine
+    /// and terrain pieces placed on the room's own seed) — with the units those pieces bring,
+    /// and every room's collision map ([`collision::level_collision`]).
     ///
     /// # Errors
     ///
-    /// [`Error`] if a map cannot be read or the placement takes a path not ported.
-    pub fn room_units(&self, level: &OutdoorLevel, room: &OutdoorRoom) -> Result<Vec<RoomUnit>, Error> {
-        let (waypoints, shrines) = ((room.link >> 16) & 3, (room.link >> 12) & 0xF);
-        if room.preset != 0 || (waypoints == 0 && shrines == 0) {
-            return Ok(Vec::new());
-        }
-        let def = self.data.levels().get(level.id).ok_or(Error::NotAct1Wilderness(level.id))?;
-        let mut init = RoomInit::new(room);
-        init.cut_roads(&level.roads, &self.tables.edge_orientations);
-        let mut units = Vec::new();
-        if waypoints != 0 {
-            self.substitution_pass(&mut init, def.sub_waypoint, 0, waypoints as u32, &mut units)?;
-        }
-        if shrines != 0 {
-            self.substitution_pass(&mut init, def.sub_shrine, 0, shrines as u32, &mut units)?;
-        }
-        Ok(units)
-    }
-
-    /// `SubTypeWpShrine` (`0x006707A0`): each row of the group whose bit is set places its map.
-    fn substitution_pass(&self, init: &mut RoomInit, group: i32, theme: usize, picks: u32, units: &mut Vec<RoomUnit>) -> Result<(), Error> {
-        if group == -1 {
-            return Ok(());
-        }
-        let rows = self.data.lvl_subs().from_group(group);
-        let mut bits = picks;
-        for row in rows {
-            if bits == 0 {
-                break;
-            }
-            if bits & 1 != 0 {
-                let member = format!("data\\global\\tiles\\{}", row.file.replace('/', "\\"));
-                let bytes = self.data.read_file(&member).map_err(Error::Data)?.ok_or(Error::MissingMap(member))?;
-                let map = Ds1::parse(&bytes).map_err(Error::Ds1)?;
-                if map.subst_groups.is_empty() {
-                    return Err(Error::Halt("a substitution map without groups"));
-                }
-                if row.check_all {
-                    return Err(Error::NotPorted("a room substitution that checks every position"));
-                }
-                self.place_in_room(init, row, &map, theme, units);
-            }
-            bits >>= 1;
-        }
-        Ok(())
-    }
-
-    /// `DRLGOUTDOOR_DoNotCheckAll` (`0x00670170`): up to `Max` times, a random group of the map
-    /// at a random free position — every position in a shuffle when `Trials` is -1.
-    fn place_in_room(&self, init: &mut RoomInit, row: &LvlSub, map: &Ds1, theme: usize, units: &mut Vec<RoomUnit>) {
-        let (max, trials) = (row.max.get(theme).copied().unwrap_or(0), row.trials.get(theme).copied().unwrap_or(0));
-        if max < 1 {
-            return;
-        }
-        for _ in 0..max {
-            let group = map.subst_groups[init.seed.pick(map.subst_groups.len() as u32) as usize];
-            let (max_x, max_y) = (init.size.0.wrapping_sub(group.w), init.size.1.wrapping_sub(group.h));
-            if max_x.wrapping_add(1) <= 1 || max_y.wrapping_add(1) <= 1 {
+    /// [`Error`] if the level, a piece's row or a map is not in the install, or a substitution
+    /// takes a path not ported.
+    pub fn build_rooms(&self, sources: &TileSources, level: &OutdoorLevel) -> Result<BuiltLevel, Error> {
+        let data = self.data;
+        let def = data.levels().get(level.id).ok_or(Error::NotAct1Wilderness(level.id))?;
+        let types = sources.tiles.level_type(data, def.level_type);
+        let warp_ids = self.warps.get(&level.id).map_or(def.warp, |(_, w)| *w);
+        // DRLGOUTDOOR_CreateOutdoorRoomExGrid (0x006750F0): a plain room's DT1 mask before its
+        // terrain rows add theirs.
+        let base_mask: u32 = match def.level_type {
+            2 => 0x4_4103,
+            0x10 | 0x16 | 0x1B | 0x1C => 1,
+            0x15 => 4,
+            0x1E | 0x1F => 0x11,
+            _ => 0,
+        };
+        let terrain = if def.sub_type == -1 { &[][..] } else { data.lvl_subs().group(def.sub_type) };
+        let mut seams = Seams::new();
+        let mut built = Vec::with_capacity(level.rooms.len());
+        let mut units = Vec::with_capacity(level.rooms.len());
+        let mut warps = Vec::new();
+        for (index, room) in level.rooms.iter().enumerate() {
+            if room.preset != 0 {
+                let row = data.lvl_prests().by_def(room.preset).ok_or(Error::NoPreset(room.preset))?;
+                let file = row.file_for(room.file).ok_or(Error::NoPreset(room.preset))?;
+                let map = sources.maps.get(data, file).ok_or_else(|| Error::MissingMap(file.to_string()))?;
+                let library = types.room(row.dt1_mask);
+                // DRLGROOMEX_LinkNearRoomsByVis (0x0066C2A0) for each warp slot, newest node first.
+                let nodes = (0..8)
+                    .rev()
+                    .filter(|&s| room.warp_slots >> s & 1 != 0 && warp_ids[s] != -1)
+                    .map(|s| data.lvl_warps().setup(warp_ids[s], b'b'))
+                    .collect();
+                let ctx = RoomContext {
+                    library: &library,
+                    tables: &self.engine.tiles,
+                    level: level.id,
+                    rect: room.area,
+                    seed: room.seed,
+                    seams: Some(&mut seams),
+                    warps: Some(Warps { table: data.lvl_warps(), ids: warp_ids, nodes }),
+                };
+                let window = PresetWindow { origin: room.origin, size: row.size, fill_blanks: row.fill_blanks, kill_edge: row.kill_edge };
+                let (tiles, cells) = room_tiles::preset_room_with_warps(ctx, &map, window);
+                warps.extend(room_tiles::warp_tiles(index, room.area, &cells, room.warp_slots));
+                built.push(BuiltRoom { area: room.area, tiles, preset: true });
+                units.push(Vec::new());
                 continue;
             }
-            let spot = if trials == -1 {
-                let total = max_y.wrapping_mul(max_x);
-                if total <= 0 {
-                    continue;
-                }
-                let mut spots: Vec<(i32, i32)> = (0..total).map(|i| (i % max_x, i / max_x)).collect();
-                for _ in 0..total {
-                    let a = init.seed.pick(total as u32) as usize;
-                    let b = init.seed.pick(total as u32) as usize;
-                    spots.swap(a, b);
-                }
-                spots.into_iter().map(|(x, y)| (x + 1, y + 1)).find(|&(x, y)| init.fits(x, y, group, map))
-            } else {
-                (0..trials).find_map(|_| {
-                    let x = init.seed.pick(max_x as u32) as i32 + 1;
-                    let y = init.seed.pick(max_y as u32) as i32 + 1;
-                    init.fits(x, y, group, map).then_some((x, y))
-                })
-            };
-            if let Some((x, y)) = spot {
-                init.stamp(x, y, group, map);
-                units.extend(self.group_units(init.origin, x, y, group, map));
+            let mask = terrain
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| room.sub_picks >> (i & 31) & 1 != 0)
+                .fold(base_mask, |m, (_, r)| m | r.dt1_mask as u32);
+            let library = types.room(mask);
+            let mut init = RoomInit::new(room);
+            init.cut_roads(&level.roads, &self.tables.edge_orientations);
+            // SubTypeWpShrine (0x006707A0) three times: waypoint, shrine, terrain.
+            let (waypoints, shrines) = ((room.link >> 16) & 3, (room.link >> 12) & 0xF);
+            let mut plan = Vec::new();
+            if waypoints != 0 && def.sub_waypoint != -1 {
+                plan.push((def.sub_waypoint, 0usize, waypoints as u32));
             }
+            if shrines != 0 && def.sub_shrine != -1 {
+                plan.push((def.sub_shrine, 0, shrines as u32));
+            }
+            if def.sub_type != -1 && def.sub_theme >= 0 && room.sub_picks != 0 {
+                plan.push((def.sub_type, def.sub_theme as usize, room.sub_picks));
+            }
+            let mut maps = Vec::with_capacity(plan.len());
+            for &(group, _, picks) in &plan {
+                let mut row_maps = Vec::new();
+                for (i, row) in data.lvl_subs().from_group(group).iter().enumerate().take(32) {
+                    if picks >> i & 1 == 0 {
+                        row_maps.push(None);
+                        continue;
+                    }
+                    let map = sources.maps.get(data, &row.file).ok_or_else(|| Error::MissingMap(row.file.clone()))?;
+                    if map.subst_groups.is_empty() {
+                        return Err(Error::Halt("a substitution map without groups"));
+                    }
+                    if row.check_all {
+                        return Err(Error::NotPorted("a room substitution that checks every position"));
+                    }
+                    row_maps.push(Some(map));
+                }
+                maps.push(row_maps);
+            }
+            let passes: Vec<Substitution<'_>> = plan
+                .iter()
+                .zip(&maps)
+                .map(|(&(group, theme, picks), row_maps)| Substitution {
+                    rows: data.lvl_subs().from_group(group),
+                    maps: row_maps.iter().map(|m| m.as_deref()).collect(),
+                    theme,
+                    picks,
+                })
+                .collect();
+            let ctx = RoomContext { library: &library, tables: &self.engine.tiles, level: level.id, rect: room.area, seed: room.seed, seams: Some(&mut seams), warps: None };
+            let (tiles, stamps) = room_tiles::outdoor_room(ctx, init.floor_grid(), 0, &passes);
+            units.push(stamps.iter().flat_map(|st| self.group_units((room.area.x, room.area.y), st.x, st.y, st.group, st.map)).collect());
+            built.push(BuiltRoom { area: room.area, tiles, preset: false });
         }
+        let void = if def.level_type == 19 { 0x01 } else { 0x05 };
+        Ok(BuiltLevel { collision: collision::level_collision(level.id, &built, &seams, void), units, warps })
     }
 
     /// `0x0066FA10`: the map's units strictly inside the group's box, moved to where the box
@@ -1814,7 +1854,7 @@ impl<'a, 'b> Generator<'a, 'b> {
                         let area = Coords { x: tx, y: ty, w: ROOM_TILES, h: ROOM_TILES };
                         let sub_picks = self.sub_picks(&mut state);
                         let (seed, seed_after) = (self.last_room_seed, state.low);
-                        rooms.push(OutdoorRoom { area, preset: 0, file: 0, outdoor, link, seed, sub_picks, seed_after });
+                        rooms.push(OutdoorRoom { area, preset: 0, file: 0, outdoor, link, seed, sub_picks, seed_after, origin: (tx, ty), warp_slots: 0 });
                     }
                     continue;
                 }
@@ -1828,15 +1868,21 @@ impl<'a, 'b> Generator<'a, 'b> {
                     self.seed.step();
                 }
                 let file = (outdoor >> 16) & 0xF;
-                if row.scan || row.pops != 0 {
-                    self.piece_units(row.file_for(file))?;
-                }
                 let (w, h) = row.size;
+                let mut warp_cells = HashMap::new();
+                if row.scan || row.pops != 0 {
+                    if let Some(map) = self.piece_units(row.file_for(file))? {
+                        if row.scan && map.width - 1 == w && map.height - 1 == h {
+                            warp_cells = scan_warps(&map);
+                        }
+                    }
+                }
                 for py in (0..h.max(0)).step_by(ROOM_TILES as usize) {
                     for px in (0..w.max(0)).step_by(ROOM_TILES as usize) {
                         let seed = self.room_seed().low;
                         let area = Coords { x: tx + px, y: ty + py, w: ROOM_TILES.min(w - px), h: ROOM_TILES.min(h - py) };
-                        rooms.push(OutdoorRoom { area, preset, file, outdoor, link, seed, sub_picks: 0, seed_after: seed });
+                        let warp_slots = warp_cells.get(&(px / ROOM_TILES, py / ROOM_TILES)).copied().unwrap_or(0);
+                        rooms.push(OutdoorRoom { area, preset, file, outdoor, link, seed, sub_picks: 0, seed_after: seed, origin: (tx, ty), warp_slots });
                     }
                 }
             }
@@ -1886,8 +1932,8 @@ impl<'a, 'b> Generator<'a, 'b> {
     /// The level-seed draws of `DRLGPRESET_AddPresetUnitToDrlgMap` (`0x006675F0`) for a scanned
     /// piece's map: some units — certain monsters and placements, and a few objects — are kept
     /// only on a roll. The engine walks the units newest first.
-    fn piece_units(&mut self, file: Option<&str>) -> Result<(), Error> {
-        let Some(file) = file else { return Ok(()) };
+    fn piece_units(&mut self, file: Option<&str>) -> Result<Option<Ds1>, Error> {
+        let Some(file) = file else { return Ok(None) };
         let member = format!("data\\global\\tiles\\{}", file.replace('/', "\\"));
         let bytes = self.ctx.data.read_file(&member).map_err(Error::Data)?.ok_or(Error::MissingMap(member))?;
         let map = Ds1::parse(&bytes).map_err(Error::Ds1)?;
@@ -1916,17 +1962,38 @@ impl<'a, 'b> Generator<'a, 'b> {
                 self.seed.step();
             }
         }
-        Ok(())
+        Ok(Some(map))
     }
 }
 
-/// A plain room's grids during its init: floor and wall, one cell wider and taller than the room.
+/// `DRLGPRESET_BuildPresetArea`'s warp scan: each wall tile of type 10 or 11
+/// whose main index is a vis slot (below 8) and whose sub index is 0 or 4 (or that marks a unit)
+/// flags its 8×8 room with the slot. Keyed by room column and row in the map.
+fn scan_warps(map: &Ds1) -> HashMap<(i32, i32), u8> {
+    let mut cells = HashMap::new();
+    for (walls, types) in map.walls.iter().zip(&map.orientations).take(4) {
+        for y in 0..map.height {
+            for x in 0..map.width {
+                let at = (y * map.width + x) as usize;
+                let (Some(&wall), Some(&kind)) = (walls.get(at), types.get(at)) else { continue };
+                if kind != 10 && kind != 11 {
+                    continue;
+                }
+                let (slot, sub) = (wall >> 20 & 0x3F, wall >> 8 & 0xFF);
+                if slot < 8 && (sub == 0 || sub == 4 || wall & 0x8000_0000 != 0) {
+                    *cells.entry((x / ROOM_TILES, y / ROOM_TILES)).or_insert(0u8) |= 1 << slot;
+                }
+            }
+        }
+    }
+    cells
+}
+
+/// A plain room's floor during its init, one cell wider and taller than the room.
 struct RoomInit {
     origin: (i32, i32),
     size: (i32, i32),
-    seed: Seed,
     floor: Grid,
-    wall: Grid,
 }
 
 impl RoomInit {
@@ -1938,7 +2005,7 @@ impl RoomInit {
                 floor.set(x, y, 0x4_0002);
             }
         }
-        Self { origin: (room.area.x, room.area.y), size: (w, h), seed: Seed::new(room.seed, 0x29A), floor, wall: Grid::new(w + 1, h + 1) }
+        Self { origin: (room.area.x, room.area.y), size: (w, h), floor }
     }
 
     /// `0x00680C80`: rasterize the roads two tiles wide into an edge grid a tile bigger than the
@@ -2004,40 +2071,15 @@ impl RoomInit {
         }
     }
 
-    /// `DRLGOUTDOOR_CheckSubTileOverlap` (`0x0066FCF0`): every tile the group puts floor or wall
-    /// on is plain floor, not yet stamped.
-    fn fits(&self, x: i32, y: i32, group: SubstGroup, map: &Ds1) -> bool {
-        for dy in 0..group.h {
-            for dx in 0..group.w {
-                let floor = layer_at(&map.floors, map.width, map.height, group.x + dx, group.y + dy);
-                let wall = layer_at(&map.walls, map.width, map.height, group.x + dx, group.y + dy);
-                let walled = !map.walls.is_empty() && wall & 1 != 0;
-                if floor & 2 == 0 && !walled {
-                    continue;
-                }
-                let cell = self.floor.get(x + dx, y + dy);
-                if cell & 0x3F0_FF00 != 0 || cell & 2 == 0 || self.wall.get(x + dx, y + dy) & 1 != 0 {
-                    return false;
-                }
+    /// The floor grid as the tile pass reads it.
+    fn floor_grid(&self) -> room_tiles::Grid {
+        let mut grid = room_tiles::Grid::new(self.size.0 + 1, self.size.1 + 1);
+        for y in 0..=self.size.1 {
+            for x in 0..=self.size.0 {
+                grid.set(x, y, self.floor.get(x, y));
             }
         }
-        true
-    }
-
-    /// `DRLGOUTDOOR_ApplyLvlSubTileData` (`0x0066FAD0`), its floor and first wall layer.
-    fn stamp(&mut self, x: i32, y: i32, group: SubstGroup, map: &Ds1) {
-        for dy in 0..group.h {
-            for dx in 0..group.w {
-                let floor = layer_at(&map.floors, map.width, map.height, group.x + dx, group.y + dy) as i32;
-                if floor & 2 != 0 {
-                    self.floor.set(x + dx, y + dy, floor | 0x80);
-                }
-                let wall = layer_at(&map.walls, map.width, map.height, group.x + dx, group.y + dy) as i32;
-                if wall & 1 != 0 {
-                    self.wall.set(x + dx, y + dy, wall);
-                }
-            }
-        }
+        grid
     }
 }
 
@@ -2063,7 +2105,7 @@ fn direction_index(dx: i32, dy: i32) -> i32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use d2_data::engine::EngineData;
     use std::path::PathBuf;
@@ -2121,7 +2163,7 @@ mod tests {
     /// The operator's install (`BNETCC_D2_DATA_DIR`, `BNETCC_D2_GAME_EXE`) and a libd2 checkout
     /// (`LIBD2_DIR`) whose engine recordings the tests compare against; nothing from them is
     /// copied here.
-    fn install() -> Option<(GameData, EngineData, PathBuf)> {
+    pub(crate) fn install() -> Option<(GameData, EngineData, PathBuf)> {
         let (Ok(dir), Ok(exe), Ok(libd2)) =
             (std::env::var("BNETCC_D2_DATA_DIR"), std::env::var("BNETCC_D2_GAME_EXE"), std::env::var("LIBD2_DIR"))
         else {
@@ -2132,18 +2174,147 @@ mod tests {
         Some((data, engine, PathBuf::from(libd2).join("packages/drlg/src/golden")))
     }
 
-    fn number(line: &str, key: &str, from: usize) -> Option<(i64, usize)> {
+    pub(crate) fn number(line: &str, key: &str, from: usize) -> Option<(i64, usize)> {
         let at = line.get(from..)?.find(key)? + from + key.len();
         let end = line[at..].find(|c: char| !(c.is_ascii_digit() || c == '-')).map_or(line.len(), |e| e + at);
         Some((line[at..end].parse().ok()?, end))
     }
 
-    fn read_golden(path: &std::path::Path) -> String {
+    pub(crate) fn read_golden(path: &std::path::Path) -> String {
         if path.extension().is_some_and(|e| e == "gz") {
             let out = std::process::Command::new("gzip").arg("-dc").arg(path).output().expect("gzip");
             String::from_utf8(out.stdout).expect("utf-8")
         } else {
             std::fs::read_to_string(path).expect("golden file")
+        }
+    }
+
+    /// Recorded rooms by `(level, px, py)`: width and cells.
+    pub(crate) type RecordedRooms = HashMap<(i32, i32, i32), (i32, Vec<u16>)>;
+
+    /// A collision recording's seed and rooms, strips joined.
+    pub(crate) fn recorded_collision(text: &str, levels: &[i32]) -> (u32, RecordedRooms) {
+        let mut seed = 0;
+        let mut rooms = RecordedRooms::new();
+        for line in text.lines() {
+            if line.contains("\"drlg_seed\"") {
+                seed = number(line, "\"seed\":", 0).map_or(0, |(s, _)| s as u32);
+                continue;
+            }
+            let Some((level, _)) = number(line, "\"levelId\":", 0) else { continue };
+            if !levels.contains(&(level as i32)) {
+                continue;
+            }
+            let get = |key| number(line, key, 0).map(|(v, _)| v as i32).unwrap();
+            let (px, py, w, h, y0) = (get("\"px\":"), get("\"py\":"), get("\"w\":"), get("\"h\":"), get("\"y0\":"));
+            let at = line.find("\"cells\":[").unwrap() + 9;
+            let end = line[at..].find(']').unwrap() + at;
+            let strip: Vec<u16> = line[at..end].split(',').filter(|v| !v.is_empty()).map(|v| v.trim().parse::<u32>().unwrap() as u16).collect();
+            let room = rooms.entry((level as i32, px, py)).or_insert((w, Vec::new()));
+            let need = ((y0 + h) * w) as usize;
+            if room.1.len() < need {
+                room.1.resize(need, 0);
+            }
+            room.1[(y0 * w) as usize..need].copy_from_slice(&strip[..(h * w) as usize]);
+        }
+        (seed, rooms)
+    }
+
+    /// With the operator's install and libd2's engine recordings: each Act I wilderness room's
+    /// collision map equals the engine's, bit for bit in the terrain bits (`0x1F`).
+    #[test]
+    fn with_libd2_recordings_collision_matches_the_engine() {
+        let Some((data, engine, golden)) = install() else { return };
+        let sources = TileSources::new();
+        for file in [
+            "coll_seed1_all.jsonl.gz",
+            "coll_seed2_all.jsonl.gz",
+            "coll_seed17_all.jsonl.gz",
+            "coll_seed18_all.jsonl.gz",
+            "coll_seed777_all.jsonl.gz",
+            "coll_seed_holdout.jsonl.gz",
+            "coll_seed_holdout2.jsonl.gz",
+        ] {
+            let (seed, recorded) = recorded_collision(&read_golden(&golden.join(file)), &ACT1_WILDERNESS);
+            let act = Act::build(data.levels(), 0, 1, seed);
+            let outdoors = Act1Outdoors::new(&data, &engine, &act, seed).expect("substitution maps");
+            let mut report = Vec::new();
+            let (mut rooms, mut cells, mut wrong) = (0, 0usize, 0usize);
+            for &id in &ACT1_WILDERNESS {
+                let level = outdoors.generate(id).expect("level");
+                let maps = outdoors.build_rooms(&sources, &level).expect("rooms").collision;
+                let (mut level_wrong, mut missing) = (0usize, 0);
+                let mut worst: Vec<(usize, Coords)> = Vec::new();
+                for room in &maps {
+                    let Some((w, theirs)) = recorded.get(&(id, room.area.x * 5, room.area.y * 5)) else {
+                        missing += 1;
+                        continue;
+                    };
+                    rooms += 1;
+                    assert_eq!(*w, room.area.w * 5, "{file} level {id} room {:?} width", room.area);
+                    let bad = room.cells.iter().zip(theirs).filter(|(a, b)| **a & 0x1F != (**b & 0x1F) as u8).count();
+                    cells += room.cells.len();
+                    level_wrong += bad;
+                    if bad > 0 {
+                        worst.push((bad, room.area));
+                    }
+                }
+                worst.sort_by(|a, b| b.0.cmp(&a.0));
+                wrong += level_wrong;
+                report.push(format!("level {id}: {} rooms, {missing} not recorded, {level_wrong} cells differ, worst {:?}", maps.len(), &worst[..worst.len().min(4)]));
+            }
+            eprintln!("{file}: {rooms} rooms, {cells} cells, {wrong} differ\n{}", report.join("\n"));
+            assert_eq!(wrong, 0, "{file}");
+        }
+    }
+
+    /// With the operator's install and libd2's recordings: for 200 seeds on Normal and on Hell,
+    /// each Act I wilderness level's collision checksum equals the engine's — an FNV-1a hash of
+    /// each room's subtile corner, size and terrain bits, summed over the level's rooms.
+    #[test]
+    fn with_libd2_recordings_collision_checksums_match_for_200_seeds() {
+        let Some((data, engine, golden)) = install() else { return };
+        let sources = TileSources::new();
+        let fnv = |h: &mut u32, v: u32| {
+            for b in v.to_le_bytes() {
+                *h = (*h ^ u32::from(b)).wrapping_mul(0x0100_0193);
+            }
+        };
+        for (file, difficulty) in [("coll_crc_masked_200_normal.jsonl.gz", 0u8), ("coll_crc_masked_200_hell.jsonl.gz", 2)] {
+            let mut recorded: HashMap<(u32, i32), u32> = HashMap::new();
+            for line in read_golden(&golden.join(file)).lines() {
+                let get = |key| number(line, key, 0).map(|(v, _)| v);
+                if let (Some(seed), Some(level), Some(crc)) = (get("\"seed\":"), get("\"levelId\":"), get("\"crc\":")) {
+                    if ACT1_WILDERNESS.contains(&(level as i32)) {
+                        recorded.insert((seed as u32, level as i32), crc as u32);
+                    }
+                }
+            }
+            let (mut checked, mut wrong) = (0, Vec::new());
+            for seed in 1..=200u32 {
+                let act = Act::build(data.levels(), 0, difficulty, seed);
+                let outdoors = Act1Outdoors::new(&data, &engine, &act, seed).expect("substitution maps");
+                for &id in &ACT1_WILDERNESS {
+                    let Some(&theirs) = recorded.get(&(seed, id)) else { continue };
+                    let level = outdoors.generate(id).expect("level");
+                    let ours = outdoors.build_rooms(&sources, &level).expect("rooms").collision.iter().fold(0u32, |sum, room| {
+                        let mut h = 0x811C_9DC5;
+                        for v in [room.area.x * 5, room.area.y * 5, room.area.w * 5, room.area.h * 5] {
+                            fnv(&mut h, v as u32);
+                        }
+                        for &c in &room.cells {
+                            fnv(&mut h, u32::from(c & 0x1F));
+                        }
+                        sum.wrapping_add(h)
+                    });
+                    checked += 1;
+                    if ours != theirs {
+                        wrong.push((seed, id));
+                    }
+                }
+            }
+            assert!(checked > 1000, "{file}: only {checked} levels recorded");
+            assert!(wrong.is_empty(), "{file}: {} of {checked} levels differ: {:?}", wrong.len(), &wrong[..wrong.len().min(20)]);
         }
     }
 
@@ -2320,14 +2491,15 @@ mod tests {
         };
         let data = GameData::load(dir).expect("game data");
         let engine = EngineData::from_game_exe(&std::fs::read(exe).expect("Game.exe")).expect("1.14d tables");
+        let sources = TileSources::new();
         for seed in [1u32, 2, 305_419_896, 0x1234_5678] {
             let act = Act::build(data.levels(), 0, 0, seed);
             let outdoors = Act1Outdoors::new(&data, &engine, &act, seed).unwrap();
             for id in ACT1_WILDERNESS {
                 let level = outdoors.generate(id).unwrap();
+                let built = outdoors.build_rooms(&sources, &level).unwrap();
                 let (mut waypoints, mut shrines) = (0, 0);
-                for room in &level.rooms {
-                    let units = outdoors.room_units(&level, room).unwrap();
+                for (room, units) in level.rooms.iter().zip(&built.units) {
                     let objects: Vec<_> = units.iter().filter(|u| u.kind == UnitKind::Object).collect();
                     if (room.link >> 16) & 3 != 0 {
                         let waypoint: Vec<_> =

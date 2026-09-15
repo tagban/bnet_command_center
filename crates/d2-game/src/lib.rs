@@ -8,5 +8,11 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod battle;
 pub mod clock;
+pub mod gear;
+pub mod inventory;
+pub mod loot;
+pub mod path;
 pub mod population;
+pub mod spawn;

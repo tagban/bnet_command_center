@@ -24,7 +24,7 @@ name = "Command Center"
 #
 # A hub can narrow this but a node can never widen it.
 mode = "gaming"
-motd = "Welcome to Command Center."
+motd = "Welcome to Command Center, an educational server for older computers. On a modern computer, buy Diablo II: Resurrected, Warcraft III: Reforged, StarCraft: Remastered or Warcraft II: Remastered."
 # Realm name for WarCraft III accounts. WarCraft III logs in with SRP, so its accounts
 # cannot share a password with the other games' accounts; they live in their own
 # namespace and appear as `Name@<realm>` in chat, whispers and bans. Names typed in the
@@ -215,6 +215,14 @@ data_dir = ""
 # Blizzard's join sequence and stands in the Rogue Encampment — no stats, NPCs or actions. Needs
 # data_dir. Every game packet is logged. See docs/D2GS-114D-WIRE.md.
 game_server_probe = false
+# With data_dir and [files] dir both set, the server writes this file into the files directory at
+# startup: a JSON map from the equipment bytes of a realm character's chat statstring (helm, body
+# armour, weapons, shield) to the items they show, for chat bots to download over BNFTP like
+# icons.bni. Built from your install; rewritten only when it changes. Empty disables it.
+equipment_file = "d2-equipment.json"
+# Likewise a ZIP of the character-select animations as layers (about 6 MB), with a manifest that
+# says how to draw a realm character from its statstring. See docs/D2-CHARACTER-PACK.md.
+character_pack = "d2-characters.zip"
 
 [admins]
 # Accounts treated as Battle.net Administrators (sysops). They carry the admin flag and

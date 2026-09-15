@@ -134,6 +134,35 @@ pub fn build_default(product: FourCc) -> Vec<u8> {
     s
 }
 
+/// A StarCraft or Warcraft II player's record, as its chat statstring shows it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Record {
+    /// Ladder rating; 0 without ladder games.
+    pub rating: u32,
+    /// Ladder rank, 1 the best; 0 when unranked (below 500, the server's lowest rank).
+    pub rank: u32,
+    /// Normal-game wins.
+    pub wins: u32,
+    /// Highest ladder rating.
+    pub high_rating: u32,
+    /// Iron Man ladder rating (Warcraft II only).
+    pub iron_rating: u32,
+    /// Iron Man ladder rank (Warcraft II only), as `rank`.
+    pub iron_rank: u32,
+}
+
+/// The statstring for a StarCraft-family or Warcraft II user with a [`Record`]: the reversed
+/// tag then the nine fields of [`layout::STARCRAFT_FIELDS`] — rating, rank, wins, spawned
+/// (0), league (0), high rating, Iron Man rating and rank, and the reversed tag as the icon.
+/// An empty record is exactly [`build_default`]'s line.
+#[must_use]
+pub fn build_starcraft(product: FourCc, record: Record) -> Vec<u8> {
+    let a = product.as_ascii();
+    let tag = String::from_utf8_lossy(&[a[3], a[2], a[1], a[0]]).into_owned();
+    let Record { rating, rank, wins, high_rating, iron_rating, iron_rank } = record;
+    format!("{tag} {rating} {rank} {wins} 0 0 {high_rating} {iron_rating} {iron_rank} {tag}").into_bytes()
+}
+
 /// A WarCraft III race tier, the middle character of an icon code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
@@ -259,6 +288,17 @@ mod tests {
         assert_eq!(s.fields().len(), layout::DIABLO_FIELDS);
         assert_eq!(s.field_u32(0), Some(1), "level 1");
         assert_eq!(s.field_u32(3), Some(30), "warrior strength");
+    }
+
+    #[test]
+    fn a_starcraft_record_fills_the_ladder_fields() {
+        assert_eq!(build_starcraft(product::SEXP, Record::default()), build_default(product::SEXP));
+        let record = Record { rating: 1016, rank: 3, wins: 12, high_rating: 1040, iron_rating: 990, iron_rank: 7 };
+        let line = build_starcraft(product::W2BN, record);
+        assert_eq!(line, b"NB2W 1016 3 12 0 0 1040 990 7 NB2W");
+        let s = Statstring::parse(&line);
+        assert_eq!(s.product(), Some(product::W2BN));
+        assert_eq!(s.fields().len(), layout::STARCRAFT_FIELDS);
     }
 
     #[test]

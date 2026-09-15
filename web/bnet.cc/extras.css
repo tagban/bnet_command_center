@@ -1,0 +1,78 @@
+/* bnet.cc news, releases and home-page widgets. Built on the site's own classes (b.header, .row,
+   .rowAlt, .tiny, .white); this only adds what those do not cover. */
+.post { margin-bottom: 18px; padding-bottom: 12px; border-bottom: 1px dotted #333333; background-color: transparent; }
+.post-short { margin-bottom: 12px; padding-bottom: 8px; }
+.post-title { font-size: 14px; font-weight: bold; color: #FFFFFF; background-color: transparent; }
+.post-pin { font-size: 9px; text-transform: uppercase; letter-spacing: 1px; color: #00C0FF; border: 1px solid #00C0FF; padding: 0 4px; vertical-align: middle; background-color: transparent; }
+.post-meta { color: #888888; font-size: 11px; margin: 2px 0 8px; background-color: transparent; }
+.post-body, .post-body p, .post-body li { line-height: 1.55; background-color: transparent; }
+.post-body p { margin: 0 0 10px; }
+.post-body .post-h { color: #FFFFFF; font-size: 13px; margin: 12px 0 6px; }
+.post-body .post-list { margin: 0 0 10px 18px; padding: 0; color: #CCCCCC; }
+.post-body code { color: #00C0FF; font-family: Consolas, Menlo, monospace; font-size: 12px; background-color: transparent; }
+.post-excerpt { color: #BBBBBB; line-height: 1.5; background-color: transparent; }
+.post-nav { margin: 6px 0 0; background-color: transparent; }
+.post-empty { color: #888888; background-color: transparent; }
+.post-pager { display: flex; justify-content: space-between; margin-top: 10px; background-color: transparent; }
+.dim { color: #666666; background-color: transparent; }
+
+.rel-project { margin-bottom: 22px; background-color: transparent; }
+.rel-project-name { color: #FFFFFF; font-size: 14px; font-weight: bold; border-bottom: 1px solid #333333; padding-bottom: 3px; margin-bottom: 8px; background-color: transparent; }
+.rel-project-name .tiny { margin-left: 6px; }
+.rel { padding: 6px 0; border-bottom: 1px dotted #262626; background-color: transparent; }
+.rel-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; background-color: transparent; }
+.rel-tag { color: #888888; font-size: 11px; background-color: transparent; }
+.rel-badge { font-size: 9px; text-transform: uppercase; letter-spacing: 1px; color: #00C0FF; border: 1px solid #00C0FF; padding: 0 4px; background-color: transparent; }
+.rel-badge.rel-pre { color: #FFAC04; border-color: #FFAC04; }
+.rel-date { margin-left: auto; color: #888888; font-size: 11px; background-color: transparent; }
+.rel-notes { margin: 6px 0 4px; padding-left: 10px; border-left: 2px solid #333333; }
+.rel-assets { margin: 4px 0 0 18px; padding: 0; background-color: transparent; }
+.rel-assets li { margin: 2px 0; background-color: transparent; }
+
+.rel-widget, .lad-widget { margin-top: 6px; background-color: #343434; }
+.lad-widget .lad-game { background-color: #1a1a1a; color: #FFFFFF; font-weight: bold; padding-top: 6px; }
+.lad-num { text-align: right; white-space: nowrap; }
+.lad-dead { color: #E05050; background-color: transparent; }
+
+.srv-top { margin: 4px 0 8px; background-color: #343434; }
+.srv-tile { text-align: center; padding: 8px 4px; }
+.srv-n { font-size: 20px; font-weight: bold; color: #FFFFFF; background-color: transparent; }
+.srv-l { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: #888888; background-color: transparent; }
+.srv-up { color: #4caf50; background-color: transparent; }
+.srv-down { color: #e53935; background-color: transparent; }
+.srv-bar { display: inline-block; height: 9px; background-color: #00C0FF; vertical-align: middle; min-width: 1px; }
+.srv-who { margin: 0 0 6px; line-height: 1.6; background-color: transparent; }
+.srv-who-game { display: inline-block; min-width: 110px; color: #00C0FF; font-weight: bold; background-color: transparent; }
+.srv-win, .srv-plus { color: #4caf50; background-color: transparent; }
+.srv-loss, .srv-disconnect, .srv-minus { color: #e05050; background-color: transparent; }
+.srv-draw { color: #CCCCCC; background-color: transparent; }
+svg.chart { display: block; margin: 4px 0 0; background-color: #0f0f0f; border: 1px solid #262626; }
+svg.chart .chart-grid { stroke: #262626; stroke-width: 1; }
+svg.chart .chart-axis { fill: #666666; font-size: 9px; font-family: Arial, Helvetica, sans-serif; }
+svg.chart .chart-line { fill: none; stroke: #00C0FF; stroke-width: 1.5; stroke-linejoin: round; }
+svg.chart .chart-area { fill: rgba(0, 192, 255, 0.15); stroke: none; }
+svg.chart .chart-dot { fill: #00C0FF; }
+.chart-caption { display: flex; justify-content: space-between; color: #666666; font-size: 10px; margin: 2px 0 6px; background-color: transparent; }
+
+.dl-search { display: flex; gap: 6px; margin: 0 0 12px; }
+.dl-search input { flex: 1; min-width: 0; background-color: #161616; border: 1px solid #575757; color: #00C0FF; padding: 6px 8px; font-family: Arial, Helvetica, sans-serif; }
+.dl-search input:focus { outline: none; border-color: #00C0FF; }
+.dl-search button { background-color: #393731; border: 1px solid #575757; color: #FFFFFF; font-weight: bold; font-size: 11px; padding: 4px 12px; cursor: pointer; }
+.dl-cats { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 16px; background-color: transparent; }
+.dl-cat { flex: 1 1 150px; display: block; background-color: #161616; border: 1px solid #333333; padding: 10px 12px; text-decoration: none; }
+.dl-cat:hover { border-color: #00C0FF; }
+.dl-cat span { display: block; background-color: transparent; }
+.dl-cat .dl-cat-name { color: #FFAC04; font-size: 15px; font-weight: bold; }
+.dl-cat:hover .dl-cat-name { color: #FFFFFF; }
+.dl-cat .dl-cat-count { color: #CCCCCC; font-size: 12px; font-weight: normal; margin-top: 2px; }
+.dl-cat .dl-cat-about { color: #999999; font-size: 11px; font-weight: normal; margin-top: 4px; }
+.dl-cat .dl-cat-date { color: #666666; font-size: 10px; font-weight: normal; margin-top: 4px; }
+.dl-trail { margin: 0 0 10px; display: flex; flex-wrap: wrap; gap: 6px; background-color: transparent; }
+.dl-folder-about { margin: 0 0 10px; }
+.dl-table td { vertical-align: top; }
+.dl-table td + td { white-space: nowrap; }
+.dl-cat.dl-empty .dl-cat-name { color: #777777; }
+.dl-type { display: inline-block; min-width: 30px; text-align: center; font-size: 9px; font-weight: bold; letter-spacing: 1px; color: #00C0FF; border: 1px solid #1f4a5a; background-color: #0e1a1f; padding: 0 3px; vertical-align: 1px; }
+.dl-type.dl-dir { color: #FFAC04; border-color: #5a4a1f; background-color: #1f1a0e; }
+.dl-about { color: #BBBBBB; font-size: 12px; margin-top: 3px; background-color: transparent; }
+.dl-kind { color: #666666; font-size: 10px; margin-top: 2px; background-color: transparent; }

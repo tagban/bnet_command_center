@@ -217,8 +217,7 @@ impl Mcp {
             }
             msg::CREATEGAME => Some(self.create_game(frame)),
             msg::JOINGAME => Some(self.join_game(frame).await),
-            // An empty ladder: the all-zero form the client clears its list with.
-            msg::REQUESTLADDERDATA => Some(Frame::new(msg::REQUESTLADDERDATA, vec![0; 14])),
+            msg::REQUESTLADDERDATA => Some(self.ladder_data(frame).await),
             // Neither has a reply: the client gave up on a create, or asked a character's rank
             // (a request whose reply the client has no handler for).
             msg::CANCELGAMECREATE | msg::CHARRANK => None,
@@ -304,8 +303,11 @@ impl Mcp {
         Some(Frame::new(frame.id, w.finish()))
     }
 
-    /// `MCP_CHARCREATE`: `u32 class, u16 status, cstr name`. Reply: `u32 result`.
-    async fn char_create(&self, frame: &Frame) -> Option<Frame> {
+    /// `MCP_CHARCREATE`: `u32 class, u16 status, cstr name`. Reply: `u32 result`. A character made
+    /// is the one the connection plays: the retail client goes straight on to `MCP_MOTD`, chat and
+    /// `MCP_CREATEGAME`/`MCP_JOINGAME` without an `MCP_CHARLOGON` (seen with a real client,
+    /// 2026-09-15).
+    async fn char_create(&mut self, frame: &Frame) -> Option<Frame> {
         let reply = |result: u32| {
             let mut w = Writer::with_capacity(4);
             w.u32(result);
@@ -358,6 +360,7 @@ impl Mcp {
                     status = %format!("{status:#04x}"),
                     "character created"
                 );
+                self.selected = Some(name);
                 reply(char_create_result::OK)
             }
             Err(CreateCharacterError::NameTaken) => reply(char_create_result::NAME_TAKEN),
@@ -374,6 +377,16 @@ impl Mcp {
             c.account == self.account_id()
                 && (self.expansion_client() || c.status & d2::status::EXPANSION == 0)
         })
+    }
+
+    /// `MCP_REQUESTLADDERDATA`: `u8 ladder type, u16 start` — sixteen entries of that ladder from
+    /// the zero-based start ([`ladder_reply`]).
+    async fn ladder_data(&self, frame: &Frame) -> Frame {
+        let mut r = frame.reader();
+        let ladder = r.u8().unwrap_or(0);
+        let start = r.u16().unwrap_or(0);
+        let characters = self.node.all_characters().await;
+        Frame::new(msg::REQUESTLADDERDATA, ladder_reply(&characters, ladder, start, self.account_id()))
     }
 
     /// `MCP_CHARLOGON`: `cstr name`. Reply: `u32 result`.
@@ -533,4 +546,120 @@ impl Mcp {
 #[must_use]
 pub fn portrait(c: &Character) -> Portrait {
     Portrait { class: c.class, status: c.status, level: c.level, progression: c.progression }
+}
+
+/// Which characters a Diablo II ladder type lists (`MCP_REQUESTLADDERDATA`, BNETDocs): hardcore
+/// or softcore, classic or expansion, and one class or all. Classic ladders are `0x00`–`0x05`
+/// (hardcore) and `0x09`–`0x0E` (softcore), expansion ones `0x13`–`0x1A` and `0x1B`–`0x22`; the
+/// first of each run is the overall ladder, the rest one class each in class order.
+#[must_use]
+pub fn ladder_filter(ladder: u8) -> Option<(bool, bool, Option<u8>)> {
+    let (hardcore, expansion, base, classes) = match ladder {
+        0x00..=0x05 => (true, false, 0x00, 5),
+        0x09..=0x0E => (false, false, 0x09, 5),
+        0x13..=0x1A => (true, true, 0x13, 7),
+        0x1B..=0x22 => (false, true, 0x1B, 7),
+        _ => return None,
+    };
+    let offset = ladder - base;
+    (offset <= classes).then(|| (hardcore, expansion, offset.checked_sub(1)))
+}
+
+/// A character's experience, from its `.d2s` (0 without one).
+pub(crate) fn experience_of(character: &Character) -> u32 {
+    character.save.as_deref().and_then(|b| d2_formats::d2s::Save::parse(b).ok()).map_or(0, |s| s.stat(13))
+}
+
+/// The `MCP_REQUESTLADDERDATA` reply for `ladder` from `start`: the ladder characters of that
+/// kind, most experienced first, down to rank 500 (`bnetcc_core::ladder::MAX_RANK`), sixteen at a
+/// time (BNETDocs layout). Header `u8` ladder type,
+/// `u16` total payload size, `u16` this chunk's size, `u16` its offset — one chunk here — then
+/// `u32` first entry's rank, `u32` entries, `u32` 16, and per entry `u32` experience low and high
+/// words, `u8` flags (class, `0x08` the asker's own, `0x10` dead, `0x20` hardcore, `0x40`
+/// expansion), `u8` completed acts, `u16` level, `char[16]` name.
+#[must_use]
+pub fn ladder_reply(characters: &[Character], ladder: u8, start: u16, asker: bnetcc_core::AccountId) -> Vec<u8> {
+    let mut listed: Vec<(&Character, u32)> = match ladder_filter(ladder) {
+        Some((hardcore, expansion, class)) => characters
+            .iter()
+            .filter(|c| c.status & d2::status::LADDER != 0)
+            .filter(|c| (c.status & d2::status::HARDCORE != 0) == hardcore && (c.status & d2::status::EXPANSION != 0) == expansion)
+            .filter(|c| class.map_or(true, |k| c.class == k))
+            .map(|c| (c, experience_of(c)))
+            .collect(),
+        None => Vec::new(),
+    };
+    listed.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.level.cmp(&a.0.level)).then_with(|| a.0.name.cmp(&b.0.name)));
+    listed.truncate(bnetcc_core::ladder::MAX_RANK as usize);
+    let page: Vec<&(&Character, u32)> = listed.iter().skip(usize::from(start)).take(16).collect();
+    let mut payload = Writer::with_capacity(12 + page.len() * 28);
+    payload.u32(u32::from(start)).u32(page.len() as u32).u32(16);
+    for (c, experience) in page {
+        let mut flags = c.class & 7;
+        if c.account == asker {
+            flags |= 0x08;
+        }
+        if c.status & d2::status::HARDCORE != 0 {
+            flags |= 0x20;
+            if c.status & 0x08 != 0 {
+                flags |= 0x10;
+            }
+        }
+        if c.status & d2::status::EXPANSION != 0 {
+            flags |= 0x40;
+        }
+        let mut name = [0u8; 16];
+        let n = c.name.len().min(15);
+        name[..n].copy_from_slice(&c.name.as_bytes()[..n]);
+        payload.u32(*experience).u32(0).u8(flags).u8(c.progression).u16(u16::from(c.level)).bytes(&name);
+    }
+    let payload = payload.finish();
+    let mut w = Writer::with_capacity(7 + payload.len());
+    w.u8(ladder).u16(payload.len() as u16).u16(payload.len() as u16).u16(0).bytes(&payload);
+    w.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hero(name: &str, account: u64, class: u8, status: u8, level: u8, experience: u32) -> Character {
+        let save = d2_formats::d2s::Save::new(name, class, status, 0, &[(12, u32::from(level)), (13, experience)]);
+        Character { account, name: name.into(), class, status, level, progression: 1, created_at: 0, last_played: 0, save: Some(save.to_bytes()) }
+    }
+
+    #[test]
+    fn a_ladder_lists_its_kind_of_ladder_character_by_experience() {
+        use d2::status::{EXPANSION, HARDCORE, LADDER};
+        let chars = vec![
+            hero("Low", 1, 4, LADDER | EXPANSION, 5, 2_000),
+            hero("High", 2, 1, LADDER | EXPANSION, 20, 900_000),
+            hero("Assassin", 3, 6, LADDER | EXPANSION, 12, 50_000),
+            hero("NotLadder", 4, 4, EXPANSION, 90, 9_999_999),
+            hero("Hardcore", 5, 4, LADDER | EXPANSION | HARDCORE | 0x08, 30, 1_000_000),
+            hero("Classic", 6, 4, LADDER, 10, 30_000),
+        ];
+        assert_eq!(ladder_filter(0x1B), Some((false, true, None)));
+        assert_eq!(ladder_filter(0x20), Some((false, true, Some(4))));
+        assert_eq!(ladder_filter(0x0E), Some((false, false, Some(4))));
+        assert_eq!(ladder_filter(0x07), None);
+
+        let reply = ladder_reply(&chars, 0x1B, 0, 1);
+        let total = u16::from_le_bytes([reply[1], reply[2]]) as usize;
+        assert_eq!(reply.len(), 7 + total);
+        assert_eq!(u32::from_le_bytes(reply[11..15].try_into().unwrap()), 3, "softcore expansion ladder characters");
+        let name_at = |i: usize| String::from_utf8_lossy(&reply[19 + i * 28 + 12..19 + i * 28 + 28]).trim_end_matches('\0').to_string();
+        assert_eq!((name_at(0), name_at(1), name_at(2)), ("High".into(), "Assassin".into(), "Low".into()));
+        assert_eq!(u32::from_le_bytes(reply[19..23].try_into().unwrap()), 900_000);
+        assert_eq!(reply[19 + 2 * 28 + 8], 4 | 0x08 | 0x40, "the asker's own Barbarian, highlighted");
+
+        let hardcore = ladder_reply(&chars, 0x13, 0, 1);
+        assert_eq!(hardcore[19 + 8], 4 | 0x10 | 0x20 | 0x40, "a dead hardcore character");
+        let barbarians = ladder_reply(&chars, 0x20, 0, 1);
+        assert_eq!(u32::from_le_bytes(barbarians[11..15].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(ladder_reply(&chars, 0x1B, 16, 1)[11..15].try_into().unwrap()), 0, "past the end");
+
+        let crowd: Vec<Character> = (0..510).map(|i| hero(&format!("c{i}"), 7, 4, LADDER | EXPANSION, 10, 100_000 - i)).collect();
+        assert_eq!(u32::from_le_bytes(ladder_reply(&crowd, 0x1B, 496, 1)[11..15].try_into().unwrap()), 4, "ranks 497 to 500, and no further");
+    }
 }

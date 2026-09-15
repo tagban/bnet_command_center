@@ -452,6 +452,48 @@ engine's is); operating them is not answered.
 player learns the waypoint either way; only an active one (mode 1 or 2) answers with the menu. The
 test does the same.
 
+### Monsters in the wilderness (2026-09-13)
+
+**Rosters.** At game start `AllocMonsterRegion` (`0x5479C0`) gives each level a region: on one seed
+stream `{game seed, 0x29A}`, level by level in id order, `MONREGION_PopulateMonsterTypes`
+(`0x5475E0`) draws up to `NumMon` (at most 13) distinct classes from `Levels.txt` `mon1..10`
+(`nmon1..10` past Normal), rerolling the first up to 20 times for a `rangedtype` class on a
+`rangedspawn` level, and keeps the `isSpawn` ones with their `Rarity`; `SEED_RollChampionPack`
+(`0x5BDB20`) then rolls champion looks on the same stream (not ported).
+
+**A room's monsters.** When a room is first populated, `MONSTER_SpawnRoomMonsters` (`0x54EC90`)
+takes `MonDen` (clamped to 10000) and walks `(height / 3) × (width / 3)` subtile slots. Each
+steps the game seed; a slot with low word mod 100000 ≤ `MonDen` rolls a class on the room's seed
+(`0x5BDE80`: a pick in the summed rarities, swapped for its `spawn` class when `placespawn` and the
+next roll mod 100 is over 20), then `MONSTERREGION_CheckSpawnDensity` (`0x5BE020`) decides a unique
+pack: short of `MonUMin`, a roll under the share of the level's rooms seen so far; short of
+`MonUMax`, a 6% roll. A plain spawn skips on `sparsePopulate` (a game-seed roll over it), then
+`SPAWN_SpawnMonsterWithMinions` (`0x54DF80`) places the group before the next slot rolls; fallen and
+scarabs (base classes 19 and 91, `0x54EC40`) spawn one. The test does this with no unique names,
+champions or wandering monsters, and sends each monster as the NPCs are sent (`0xAC`, `0xAA`,
+`0x6D`), standing (mode 1) at full life. Act I's wilderness gets 80–230 a level (seeds 1,
+`0x12345678`, `0xBEEF`), from its roster, their minions and replacements only.
+
+**Where they stand** (2026-09-14, read from the disassembly). `0x54DC40` rolls up to 20 spots on
+the room's seed inside the room inset by a subtile (`0x54DAC0`: `x + 1 + pick(w - 1)`, then y). A
+spot within `sqrt(Levels.txt WarpDist)` subtiles of where players arrive is skipped (`0x54DB50`:
+the level's waypoint tile, `0x66AD80`, and a list at `drlg+0x1E0` not identified yet); the rest
+get a dry-run placement. The placement core `0x5B2A00` searches around a point: `rings` −1 tests
+the point itself, otherwise rings of 3, 6, … `rings × 3` subtiles. Each ring steps the room seed
+once — an even low word enters on the top or bottom edge at `pick(c)` along it, an odd one on a
+side — then two more steps flip the offsets' signs, and it walks `8c` cells turning at the corners.
+A cell must be inside the room (`PtInRect`), pass a few classes' own checks (`0x5FD350`, not
+ported) and be clear in the collision map (`0x64D9B0`: MonStats2 `SizeX` 1 one subtile, 2 a cross,
+3 a 3×3 square; mask by `spawnCol` — blank `0x3C01`, 1 `0x1C0`, 2 `0x3F11`, 3 none). The group's
+first member is placed at the spot (another `rings` −1 probe), then `pick(MaxGrp - MinGrp + 1) +
+MinGrp - 1` more on its seed in rings of 3 around it (`0x5B2F70`). Every member's creation brings
+`rand(PartyMin..=PartyMax)` minions on its own seed (`0x4CC790`), `minion1` and `minion2` in turn,
+in rings of 4 around it (`0x5B2830`, `0x5B23C0`), before the next member. Not ported: the flying
+classes' placement (`spawnCol` 1, `0x5B2700`), objects' and monsters' exact footprints, and the coord
+lists `0x54EC90` really walks (from `0x61AD50`: sub-rects, each with an id at `+0x28` and a flag at
+`+0x20` that skips it; the test uses the whole room). Rooms of a `LvlPrest.txt` piece with `Populate` 0 get no monsters (their rooms carry the
+no-spawn flag, `DRLGROOMEX_AllocRoomExTypePreset`; where the engine tests it is not confirmed).
+
 ### Talking, the stash and the waypoint (2026-09-13)
 
 `0x13` `[type u32][guid u32]` (handler `0x54AA90`, type ≤ 5) goes to `0x548B00`:
@@ -512,6 +554,303 @@ behind the ticks, so period 1 lasts a single frame and the day restarts at 340°
 The handshake test keeps one clock per game (Act I), steps it by elapsed server frames, and
 sends `0x53` on each report; eclipses are not ported.
 
+### Collision (2026-09-14)
+
+**Where it comes from.** Each room gets a map of `WorldSize × 5` subtiles when it comes into play
+(`DRLGROOM_AllocRoomCollisionGrid`, `0x0064C900`): every floor, wall and roof tile of the room, and
+of the rooms around it whose corner lies inside it, is stamped in (`TileLibrary_AddCollision`,
+`0x0064C4C0`) — its DT1 tile's 25 subtile flag bytes, rows read bottom first, plus bits its draw
+flags carry over the whole tile (`0x02` → `0x10`, `0x40` → `0x01`, `0x80` → `0x04`). A plain
+wilderness cell no floor covers gets `0x05` (solid rock). Bits: `0x01` wall (blocks walking), `0x02`
+blocks sight, `0x04` missile barrier, `0x08` blocks players only, `0x10` preset tile.
+
+**A room's tiles.** A room loads the DT1 files of its level type (`LvlTypes.txt`) that its DT1 mask
+picks by column, then `Blank.dt1`, `InvisWal.dt1` and `Warp.dt1` (`0x0066F240`, read in Ghidra). A
+preset piece's mask is `LvlPrest.txt` `Dt1Mask`; a plain Act I wilderness room's is `0x44103` ORed
+with each terrain row it rolled (`DRLGROOMEX_RollLevelSubstitutionMask`). Its grids are a window
+into the piece's DS1, or, for a plain room, the grass floor with the road edges cut in, then the
+waypoint, shrine and terrain passes (`SubTypeWpShrine` three times) — each stamps the piece's floor,
+first wall layer with its tile types, and a shadow tile per shadow cell, which is a roll. Then
+`DRLGROOMTILE_ProcessTile` (`0x0066E9B0`) makes each cell's tiles: `GetTileLibraryEntry`
+(`0x0066D820`) collects the matching tiles of every file in load order, newest record first within
+a file, and picks by rarity on the room's seed `{nSeed, 0x29A}`. Border cells go through
+`UpdateOrAddTile` (`0x0066E940`): a room built earlier that owns the tile keeps it, and a blank
+floor it owns is re-typed on the owner's seed (`0x0066E740`, tables at `0x006EF574`/`0x006EF620`).
+Lit warps (cave mouths) add a second wall tile and four floor tiles (`0x0066E260`, `0x0066E360`).
+
+**A DS1 quirk.** `Act1\Outdoors\Trees.ds1` counts 14 substitution groups and holds 13; the engine
+reads the missing one as zeros, and without that group the terrain pass rolls differently in every
+room that picks trees.
+
+**Checked.** `d2_drlg::room_tiles` and `d2_drlg::collision` (from libd2 `materialize.zig`,
+`tilegen.zig` and `lib.zig`) reproduce libd2's engine recordings for every Act I wilderness level
+(Blood Moor to Tamoe Highland and the Burial Grounds): all rooms of seven per-subtile captures
+(seeds 1, 2, 17, 18, 777 and two blind holdouts, about 4,100 rooms and 6.5 million subtiles) and
+the per-level checksums of 200 seeds on Normal and on Hell, with no difference in the terrain bits.
+The same room build now gives the world the units its pieces carry — including the objects in the
+terrain maps (`Object.ds1`, `Swamp2.ds1`), which were not spawned before.
+
+Not yet: the towns' and other preset levels' maps, cross-level seams where a neighbouring level's
+preset room reaches into a room (`DRLGROOMEX_LinkNearRoomsByVis`), and using the maps — monster
+spots, walk checks and paths.
+
+### Fighting (2026-09-14)
+
+`d2_game::battle` runs a game's fight in engine frames; the wire shapes and pacing are bnemu's
+recorded retail Blood Moor fight (`docs/d2/re/combat.md`, MIT, permission in `docs/LEGAL.md`), the
+builders confirmed here:
+
+- C→S `0x06`/`0x07`/`0x09`/`0x0A` (left skill) and `0x0D`/`0x0E`/`0x10`/`0x11` (right) carry
+  `[unit type u32][guid u32]`; handlers `0x549D80`, `0x549E00`, `0x549EE0`, `0x549F40` (`0x09`
+  and `0x0A` call the first two) all start the skill. A new character's skills are Attack, so
+  each is a swing; one under way ignores more. The hit lands on the swing's `animdata.d2`
+  trigger frame (Barbarian `BAA1HTH` 12 frames, hit on 6).
+- Monster numbers: `MonStats.txt` value × `MonLvl.txt` percentage for the monster's level
+  (`0x5A0000` row lookup, stride `0x78`, 30 values: AC, TH, HP, DM, XP each classic then `L-`,
+  per difficulty; `0x5A1990` indexes `difficulty + (expansion + group) × 3`). Level: `Level` on
+  Normal, the area's `MonLvl2`/`3` (`Ex`) otherwise.
+- To-hit `0x57D9B0`: `200·AR/(AR+DEF)·alvl/(alvl+dlvl)`, 5..95; player AR `(dex−7)·5 +
+  ToHitFactor` (`0x622560`), defence `dex/4` (`0x6223F0`). Flinch gate `0x57CB00` (physical:
+  never under max/16, always from max/4).
+- Monster hit: `0xAB` `[type][guid][life/128]` (`0x53C150`) and, when it flinches, `0x69`
+  `[guid][event 06][x][y][life][03]` (`0x53BA40`). Kill: `0x69` event `08` flag 3, then `09` flag
+  0 one `DT` animation later (Fallen 800 ms, as recorded). Experience: `0x1A` byte / `0x1B` word
+  gain, `0x1C` total (`0x53BDD0`); level-ups as `0x1D`–`0x1F` stats 12, 4, 5, 6–11, 29, 30.
+- Monsters: notice within `aidist` (35 when blank), walk `0x67` `[guid][01][x][y][01][00][0D]
+  [75 u16][05]` (handler `0x45CDE0`; the client paths there and glides ≈5.77 subtiles/s whatever the
+  class), attack `0x6C` `[guid][10][00][target][00][x][y]` (`0x53BAA0`; client `0x45CFB0` asserts
+  the attacker's position), `0x6D` to stand.
+- A player hit: `0x95` with life/mana/stamina and **position zero** — the client re-seats its
+  player only for non-zero x and y (`0x45DB20` → `0x4804E0`) — then `0x0D` `[0][guid][event]
+  [0][0][03][60]` (`0x53B4B0`; client `0x45CCC0` → `0x461250`): `13` a small hit's sound, `06`
+  get-hit, `08` dying (+ "You have died"), `09` corpse. `0x41` (1 byte) is the release
+  (`0x54C0E0`, only for a player in mode 0x11): life, mana and stamina set to their maximums and
+  sent as stats (`0x548520` → `0x53BE40`), state 0x36 on and off, the move to the camp as waypoint
+  travel (`0x53AEC0`), then mode TN/NU. A life stat or `0x95` with life for a player in mode 0x11
+  stands it up (`0x45D4B0`, `0x45DB20`: mode 5, dead flag `0x10000` cleared).
+- **The client runs some packets late.** Its handler table (`0x7114D0`, 12-byte rows: handler,
+  size, deferred handler) gives `0x0C`–`0x10`, `0x17`, `0x4C`, `0x4D` and `0x67`–`0x72` an empty
+  first handler and a second one: `0x45F7B0` queues the packet on its unit (`0x45F730`) and the
+  unit's next update runs the queue (`0x480810` → `0x45FA40`), after everything else that arrived
+  in the frame. `0x0D` event 8 (mode 0, life 0, dead flag) and 9 (mode 0x11, the same) are among
+  them. A corpse event sent in the same frame as the stand-up therefore lands after it and kills
+  the player again — which is what kept "You have died" up in town (2026-09-15). The release now
+  waits until the corpse event went out in an earlier frame, and sends none of its own.
+- Not the engine's yet: the per-class AI routines, the path finder (`d2_game::path`, bounded A*),
+  unarmed 1–2 damage, the experience level-gap table.
+
+**Stamina.** On Battle.net the client only displays stat 10 (bnemu's gdb trace). The server steps
+it every frame: running outside a town spends `RunDrain × 2` 256ths (`0x57F240`, CharStats
+`+0x42`), standing gains `max >> 8`, walking `max >> 9` (walking out of town only above one
+point), anything else nothing (`0x580500`). Sent as `0x95` on whole-point changes.
+
+### Maze levels and warps (2026-09-14)
+
+`d2_drlg::maze` ports libd2's `DRLGMAZE_GenerateLevel` for Act I's caves (level type 3): the
+Den of Evil (`LvlMaze` Rooms 1, grown by the cave tables to three cells), Cave, Underground
+Passage, Hole and Pit. Matches libd2's engine recordings room for room (place, seed, preset,
+flags) and cell for cell in collision, and by checksum for 200 seeds on Normal and Hell.
+
+Warps, from the engine:
+- A room's warp nodes (`RoomEx+0x4C`: `[0]` destination RoomEx, `[4]` next, `+0xC` its tiles,
+  `+0x10` `LvlWarp.txt` row) are set up as its tiles are (`0x66E260`, `0x66E360`).
+- Warp tiles reach the client as units of type 5: `0x09` (11) `[5][guid][class u8][x u16][y u16]`
+  from `SendUnitToClient`'s default case (`0x53BCD0`); the client makes one at that spot
+  (`0x45CB90` → `0x4661C0` → `0x465FD0` case 5). `class` is the `LvlWarp` `Id`.
+- C→S `0x13` with type 5 (`0x54AA90` → `0x548B00` case 5): within 5 subtiles `0x5550B0`, else the
+  player walks there. `0x5550B0` → `0x6195A0` → `0x66AB00` finds the node whose `LvlWarp` `Id` is
+  the unit's class, the destination room's node back, initializes that room (`0x61B730`) and
+  returns its tile unit; the player goes to a free spot by it (`0x64E7B0`, mask `0x1C09`) through
+  `0x554EA0` — as waypoint travel — then walks by the destination row's `ExitWalkX`/`Y`
+  (`+0x14`/`+0x18`) with `0x0D` event 1.
+- **Not found:** where the server allocates the tile units (their guid, and exactly where they
+  stand). The allocator `0x555230`'s 44 callers pass no literal 5, and the D2Common room alloc
+  `0x619890` calls a callback at `act+0x4C` whose setter was not found. The test server puts the
+  unit on the warp cell's corner, gives it the next type-5 guid, and lands the player on the
+  destination cell plus `ExitWalk`.
+
+### Gold drops and pickup (2026-09-14)
+
+A dying monster rolls its `MonStats.txt` `TreasureClass1` (the difficulty's column) in
+`d2_data::treasure`, following the resolver `0x55A6D0`:
+- The class is upgraded within its `group` to the highest `level` the monster has reached.
+- `Picks > 0`: each pick draws `rand(NoDrop + ΣProb)` from the unit's seed (`0x6AC690C5` LCG);
+  inside `NoDrop` nothing drops, else the first entry whose running `Prob` passes the draw. A
+  class entry is pushed and resolved in place. `Picks < 0`: entry *i* drops `Prob_i` times.
+  At most 6 drops (the default limit when no output array is passed).
+- `NoDrop` for *n* players (1–8; the game's count averaged with a second count, `0x535790`, not
+  yet identified — solo it is 1): `f = NoDrop/(NoDrop+ΣProb)`, new `NoDrop = ΣProb·fⁿ/(1−fⁿ)`.
+- A gold pick makes a `gld` item whose stat 14 is `ilvl + rand(5·ilvl)`, at least 1 (`0x557AB0`;
+  `ilvl` is the monster's stat 12, set in `0x55A550`), then `× mul >> 8` when the entry carries
+  one (`0x55A6D0` at `0x55AF2F`, the entry's `+0x0A` word).
+
+On the wire:
+- **S→C `0x9C` action 0** (client `0x45EB10` → `0x4C25B0`), `[0x9C][action][size u8][category]
+  [guid u32]`, then the item bits from `+8` read by `0x62A970`: flags 32 (`0x10` identified,
+  `0x2000` just dropped → fall animation and sound, `0x200000` simple, `0x800000` on every item),
+  version 10 (101), mode 3 (3 = ground), x 16, y 16, code 32 (`gld `), then — for an item type
+  with the gold property — a 1-bit width flag and the amount in 12 or 32 bits. The client does
+  not read the category for action 0; we send 0.
+- **C→S `0x16`** (13): `[unit type u32][item guid u32][to cursor u32]`. For gold we remove the pile
+  for everyone holding its room (`0x0A` type 4), tell the picker its gold as the engine does
+  (`0x53E9B0`: a gain of 1–254 is `0x19 [gain]`, else stat 14 by `0x1D`–`0x1F`) and save.
+- Piles stay in the game: a room coming near sends its piles without the drop flag, a room left
+  behind sends their `0x0A`s.
+
+Where a drop lands (`0x555DA0`): the search starts two subtiles right and three down from the
+unit when a room is there, and `0x64E810` → `0x64DEA0` takes that spot or the free one with the
+least `|dx|+|dy|` ring by ring out to 50 (each ring's side edges row by row, then its top and
+bottom, first found winning a tie). Free means clear of the spawn mask `0x3E01` (wall, item,
+object, door, no-path, pet) and seen from the unit past no wall or door (`0x801`, `0x66A670`). We
+track walls and piles only, and look along a plain straight line.
+
+Pickup: `0x16` goes through `0x54AAD0` to `0x548B00` with the unit type, as `0x13` does. Within 5
+subtiles and unblocked the engine picks the item up (`0x563560` auto-place, `0x55CF50` to cursor),
+else walks the player there; we do not check range. Gold (`0x55C850`) takes what the purse holds
+(level × 10,000, `0x622E70`) and drops the rest as a new pile from the player (`0x55B030` →
+`0x55A090`, placed the same way).
+
+Not done: the second player count in `NoDrop`. `TreasureClassEx.txt` quotes an entry holding a
+comma (`"gld,mul=1280"`); the quotes are stripped before the multiplier is read (until 2026-09-15
+such entries were taken for unknown items and dropped nothing).
+
+### Simple items: drops, belt, inventory, potions (2026-09-15)
+
+A treasure pick naming an item code makes the item when it is simple: `Misc.txt` `compactsave`,
+not gold, a quest item or a stack — potions, scrolls, gems, skulls, runes. Type picks (`weap3`,
+`armo6`) and magic items (rings, amulets, charms, jewels) are skipped.
+
+**Bits.** A simple item (flag `0x200000`) is written by `0x62AF80` and read by `0x62A970`:
+flags 32, version 10, mode 3, then on the ground (mode 3 or 5) x 16 and y 16, otherwise body
+location 4, column 4, row 4 and page + 1 3 (`+0x45` holds the page, −1 for none), the code 32,
+the gold amount for type 4, and the quest-difficulty bits for quest items. A `.d2s` item starts
+with `JM` 16 and ends with a realm-data bit (0, or 1 and 32 + 32 + 32). Version is the game's
+`+0x78`: 101 in an expansion game, 2 in a classic one (`0x530930`). The flags written are the
+item's with `0x80000` cleared and `0x800000` set (`0x6312B0`). A belt item's column is its slot
+and its row 0: `0x63AFD0` places belt items at x = slot, y = 0 (bnemu's `slot % 4`, `slot / 4`
+reading does not match it). Checked against a retail pickup capture byte for byte:
+`9c 04 14 10 2b0b3efa 1000a0006500728206270302` is hp2 at column 9, row 3 of the inventory.
+
+**Packets.** `0x9C` (`0x53EAE0`) is `[0x9C][action][size][category][guid]` and the bits; `0x9D`
+(`0x53CEF0`) adds `[owner type u8][owner guid u32]` before the bits. The category is ItemsTxt
+`+0x115`, `component` (16 for these items). The client's action sets are disjoint (`0x45EB10`,
+`0x45EC70`); what the server sends is picked per frame from the item's action flags `+0x14`
+(`0x5973F0`): `2`/`0x80` → `0x9C` 4, `4` → `0x9D` 5, `8`/`0x200` → `0x9D` 6, `0x400`/`0x2000` →
+`0x9C` `0x0E`, `0x800` → `0x9C` `0x0F`, `0x1000` → `0x9C` `0x10`.
+
+**Pickup** (`0x563560`, after gold): tomes take scrolls and stacks merge (`0x560020`); an item
+for an empty body location is equipped (`0x55D710`); a beltable item (ItemTypes `Beltable`)
+with `autobelt` (`+0x131`) goes to the belt (`0x63C790` → `0x63C600`: first a column already
+holding a matching item, then the first free bottom slot) — mode 2, action flag `0x2000`; else
+the inventory (`0x5600A0` → `0x63B950`) — mode 0, action flag `0x80`; with no room `0x55C9A0`
+event `0x17` and the item stays. The inventory spot (`0x63B850`): for a one-row item in a
+player's grid (`0x63B490`) every column from the right, each row from the bottom, keeping the
+free spot with the highest contact score (`0x63B340`: occupied cells and grid edges along its
+four sides; a tie keeps the first, a spot closed on every side wins at once); other shapes row by
+row from the top (`0x63B620`, 2 × 2 and three-row items have their own passes, not read). Empty
+10 × 4: (9, 3), (9, 2), (9, 1), (9, 0), (8, 3)… We send `0x0A` to everyone near, then the item
+`0x9C` action `0x0E` (belt) or 4 (inventory) to the picker, flags `0x00A00010`. No belt worn is
+taken as four slots.
+
+**Use.** `0x26` (13, `0x54B560` → `0x562390`) uses a belt item (mode 2), `0x20` (13, `0x54B1E0`
+→ `0x55E170`) a stored one (mode 0); both need the item useable and run `0x5BF240`, which calls
+the `pSpell` routine from the table at `0x741790`. Taken out: from the belt `0x9C` action `0x0F`
+(`0x561E70`), from the inventory `0x9D` action 5 (`0x55E000`), both with flag `0x20` added. The
+belt then slides its column down (`0x55EDC0`, `0x9D` action `0x15` per moved item) — never
+needed with one row. `pSpell` 3 (`0x5BE3F0`): each stat's calc `<< 8`; `hpregen` ×1.5 for
+Amazon, Paladin, Assassin and ×2 for Barbarian (`0x62A5D0`), `manarecovery` ×1.5 for Amazon,
+Paladin, Assassin and ×2 for Sorceress, Necromancer, Druid (`0x62A620`); doubled when
+`rand(100) < rand(vitality) >> 1` (energy for mana, from the unit's seed); with `len` it becomes a
+state (`healthpot`/`manapot`) whose per-frame rate is `(rate × frames left + total) / (len +
+frames left)`. `pSpell` 5 (`0x5BEAC0`): each stat's percent of its maximum, at once. We model the
+rate in 256ths a frame and tell the client by `0x95`; the state packets and `ValShift` precision
+are not ported.
+
+**Join.** `SendUnitToClient` for a player (`0x571F90`) sends its items through `0x534F80`:
+stored `0x9C` 4, belt `0x9C` `0x0E` (own player only), equipped `0x9D` 6. The client's action 4
+and `0x0E` handlers put the item on `0x7A6A70`, the client's own player, which `0x0B` sets
+(`0x45CC50`); we send the items right after the stats that follow `0x0B`.
+
+### Full items: making, moving, wearing, identifying (2026-09-15)
+
+**Bits.** A full item (writer `0x62FFF0`, reader `0x62CBE0`) goes on after the code: socketed
+items 3, the seed 32 (saves), item level 7, quality 4, a picture 3 behind a bit when the type has
+`VarInvGfx`, an automagic id 11 behind a bit, the quality's ids (magic prefix 11 + suffix 11,
+set/unique 12, rare names 8 + 8 then three prefix/suffix pairs of bit + 11 — the names and single
+ids only when identified in a packet), runeword, personal name, the save's realm bit, armour's
+defence (stat 31's width), maximum and current durability for armour and weapons, a stack's
+quantity 9, sockets, then — in a save or for an identified item — the stat lists ended by
+`0x1FF` (id 9, parameter, value in `ItemStatCost.txt` widths; 17/18, 48/49, 50/51, 52/53,
+54/55/56, 57/58/59 carry their partners). A `.d2s` list is `JM`, a count leaving out socketed
+items, the items. Five retail bodies read and write back byte for byte.
+
+**Making** (`0x55A6D0` per treasure pick). Quality (`0x558640`): the `ItemRatio.txt` row by uber
+and class-specific, `levels = monster level − item level`; each of unique, set, rare (type
+`Rare`), magic: `chance = (ratio − levels / divisor) × 128`, with magic find `× 100 / (100 +
+MF')` (MF' diminishing at 250/500/600 for unique/set/rare), no lower than `Min`, cut by the
+treasure class's mod `× mod / 1024`; it is that quality when nothing is left or `rand(left) <
+128`. Else superior when `(HiQuality − levels / div) × 128 ≤ 0` or its roll is under 128; else
+normal when `(Normal − levels / div) × 128 < 1` or its roll is under 128; else low quality. Type
+rules (`0x557450`): `Normal` types normal; `unique` items unique; `Magic` types at least magic
+(unique for quest items); no rare for types without `Rare`. Base values (`0x557AB0`): armour
+defence `minac + rand(maxac − minac + 1)`, durability max `durability`, current `rand(dur/2) +
+dur/2`; stacks `minstack + rand(maxstack − minstack)`; the picture `rand(VarInvGfx)`. Then the
+quality, falling back: low quality (`0x5C2D40`, a `LowQualityItems` row, a third of the
+durability, three quarters of the defence) → normal; superior (`0x5C2970`, a random
+`QualityItems` row that suits the type, its mods) → normal; magic (`0x5565E0`: a prefix half the
+time, a suffix half the time or always without a prefix; unidentified) → superior → normal; rare
+(`0x5C1BF0`: two names uniform among those whose types suit, then `[3,4,4,5,5,5,6,6][rand & 7]`
+affixes, each side up to three, a coin choosing the side; unidentified) → magic; set (`0x5C25C0`,
+rows for the code by `rarity`, Cow King's only on request) → magic with durability ×2 in LoD;
+unique (`0x5566B0`, rows for the code by `rarity`, ladder rows only in ladder games, once a game
+unless `nolimit`) → rare with durability ×3 in LoD. An affix (`0x5C1560`) is picked by
+`frequency` (× `level` for items with `magic lvl`) among spawnable rows of the game's version whose
+`level..maxlevel` holds the affix level (`magic lvl` added, or `ilvl − qlvl/2`, or `2·ilvl − 99`
+near the top), whose `itypes`/`etypes` suit, whose class suits, `rare` for rare/normal/superior,
+and whose group the item does not have. Staff mods (`0x5C0F90`) give wands, staves and scepters up
+to three class skills by item level. After the quality: ethereal 1 in 20 in LoD (`0x556CA0`),
+sockets for normal and superior items one in three up to the type's `MaxSock` by item level and 3/4/6
+by difficulty, never body armour in classic (`0x556B60`, count `seed % max + 1`), and LoD's
+automagic affix. Properties (`0x65FD70`) run each `Properties.txt` function (table `0x7462F8`),
+the first's value handed to the rest: 1/2 roll, 3/4/8 previous or roll, 5/6 minimum/maximum damage
+onto the stats the weapon uses (21/22 one-handed, 23/24 two-handed, 159/160 thrown; every one off
+weapons), 7 enhanced damage (+1 maximum instead when the percentage adds nothing), 10 skill tab,
+11 skill on event, 13 durability percent, 14 sockets, 15–17 fixed values, 18 by time, 19 charges,
+20 indestructible, 21/22/24 parameters, 23 ethereal.
+
+**Pickup and moves.** A picked-up item is worn when it is identified, its requirements are met,
+it is not a throwing potion and a body location of its type is free and suits it (`0x55D710`);
+else belt or inventory as simple items. `0x16` with `to cursor` lifts it (`0x9C` 1). Client moves
+(sizes from the table): `0x17` drop [item] (5), `0x18` into a grid [item][x][y][grid] (17), `0x19`
+lift [item] (5), `0x1A` wear [item][body] (9), `0x1C` take off [body u16] (3), `0x1D` swap worn
+[item][body] (9), `0x1F` swap in grid [cursor][item][x][y] (17), `0x23` into belt [item][slot] (9),
+`0x24` out of belt [item] (5), `0x25` swap in belt [cursor][item] (9). Each move sets an action
+flag the per-frame pass `0x5973F0` turns into a packet: lifted `0x9D` 5 (the old column, row and
+page kept in its bits, mode 4), put `0x9C` 4, worn `0x9D` 6 (flag 1: rebuild), taken off `0x9D` 8
+(the old body location kept), body swap `0x9D` 9 twice (the lifted one flagged `0x80` first, the
+worn one `0x40`), grid swap `0x9C` `0x0D` twice, belt `0x9C` `0x0E`/`0x0F`/`0x10`, dropped `0x9C` 2
+(`0x563C00`, spot as for drops). The client's handlers (`0x45EB10`, `0x45EC70`) read those
+flags and fields.
+
+**Wearing counts** (`0x57B420`, a player's physical damage): `min/max` from stats 21/22 (23/24
+when two-handed) — the weapon's base with its own enhanced damage (op 13) and flat bonuses —
+plus stat 111, then `× (100 + stat 18/17 + strength × StrBonus/100 + dexterity × DexBonus/100) /
+100` (strength alone for the fist), no lower than −90%, a roll between; `× mul/128`. Defence adds
+each armour's base with its own `ac%` and every flat bonus; attributes, life, mana, stamina and
+attack rating add to the player; an unidentified item's stats count for nothing. Saves and
+`0x1D`–`0x1F` stats keep the base values; the client works out what items add.
+
+**Identify.** Using a Scroll of Identify (`pSpell` 1 from `Books.txt` row 1) readies it: `0x3F
+[SpellIcon 0][scroll guid][book skill u16]` (8, `0x53D220`). The client sends `0x27 [item][scroll]`
+(9, `0x561ED0`): the scroll is used up (`0x9D` 5 used, from the belt `0x9C` `0x0F`), the item
+flagged identified and sent again with flag 1 (`0x9D` `0x15`, `0x4C4C70` rebuilds it). The book
+skill's charge count (`0x22`, `0x55E0D0`) is not sent.
+
+**Starting items** (`0x534F10`): `CharStats.txt` `item1`…`item10` with `loc` and `count`, each
+made normal at item level 1 (`0x534C70`), flagged `0x20000`, whole durability, a full stack, the
+class's `StartSkill` a point on the first; beltable ones into the belt, those with a location worn,
+the rest into the inventory as pickups place them.
+
 ## 6. Server packet builders (opcode → function)
 
 `scripts/d2re/server_send_builders.py <Game.exe>` finds every call to the queue function
@@ -533,10 +872,21 @@ The Ghidra project carries names for the functions in §3–§4 (`SendPacketToCl
   player (stats, skills, items, states).
 - Shops: `0x38` trade/gamble/repair and the store's items; hirelings; NPC quest messages.
 - Waypoint travel to other acts (`0x53ACC0`), which needs their maps.
-- Movement: paths and collision (`0x64DEA0`, libd2 `path.zig`/`collision.zig`) in place of
-  straight lines; cross-level near rooms by visibility slots (`0x66C220`); shrine init (`InitFn`
-  1) and the set pieces' map units (read at room init, not ported), then Blood Moor's monsters and
-  warps; NPC AI walking their DS1 paths (`0x666120`).
+- Collision for the town and other preset levels (the wilderness and Act I's maze caves are done),
+  then walk checks (`0x548EF0`) and paths (`0x64DEA0`, `path.zig`) in place of straight lines;
+  cross-level near rooms by visibility slots (`0x66C220`).
+- Where the server allocates warp tile units (§5 *Maze levels and warps*); the preset levels
+  behind the caves (Cave Level 2 and the other treasure levels, `DrlgType` 2) and the other acts'
+  mazes.
+- Combat (§5 *Fighting*): the per-class AI routines, items and weapons, skills.
+- Loot (§5 *Full items*): stacks merging, tomes and Town Portal, belts worn (more rows), the
+  stash and cube, socketing, the book skills' charges (`0x22`), other players seeing what is
+  worn, requirements from affixes and from what other items add, elemental damage and
+  resistances, Barbarian one-or-two-handed swords, shops and repair.
+- bnemu (MIT, permission recorded in `docs/LEGAL.md`) has worked items and vendors to port from;
+  its wilderness collision is approximate, so collision stays on libd2.
+- Unique packs and champions; wandering monsters; NPCs walking their DS1 paths (`0x666120`); the
+  set pieces' map units (read at room init).
 - The byte at `0x68`+20 and the `0x6A`/`0x6C`/`0x6E` handlers.
 - A packet capture from the real engine (`docs/D2GS-RUST.md` §2 oracle) would confirm the dump
   faster than reading it; §4 and §6 say where to look in that capture.

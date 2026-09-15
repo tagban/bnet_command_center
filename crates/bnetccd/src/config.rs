@@ -43,6 +43,8 @@ pub struct Config {
     pub discord: DiscordConfig,
     /// Optional stats push to an external website.
     pub stats_push: StatsPushConfig,
+    /// Optional ladder standings push to an external website.
+    pub ladder_push: LadderPushConfig,
     /// Optional PvPGN-compatible server tracking (advertise us / host a list).
     pub tracker: TrackerConfig,
     /// The Diablo II closed realm (private characters).
@@ -74,6 +76,14 @@ pub struct Diablo2Config {
     /// handshake test on port 4000 (`crate::d2gs`): a joining client gets Blizzard's join
     /// sequence and stands in the Rogue Encampment with no stats, NPCs or actions. Needs `data_dir`.
     pub game_server_probe: bool,
+    /// File name, in `[files] dir`, of the map from a realm character's statstring equipment
+    /// bytes to the items they show (`crate::d2_equipment`), built from `data_dir` at startup for
+    /// chat bots to fetch over BNFTP. Needs both directories; empty disables it.
+    pub equipment_file: String,
+    /// File name, in `[files] dir`, of the character pack (`crate::d2_characters`): the
+    /// character-select animations as layers with their manifest, built from `data_dir` at
+    /// startup for chat bots to fetch over BNFTP. Needs both directories; empty disables it.
+    pub character_pack: String,
 }
 
 impl Default for Diablo2Config {
@@ -85,6 +95,8 @@ impl Default for Diablo2Config {
             max_characters: 18,
             data_dir: String::new(),
             game_server_probe: false,
+            equipment_file: "d2-equipment.json".into(),
+            character_pack: "d2-characters.zip".into(),
         }
     }
 }
@@ -146,6 +158,26 @@ pub struct StatsPushConfig {
 impl Default for StatsPushConfig {
     fn default() -> Self {
         Self { url: String::new(), interval_secs: 60, token: String::new(), include_users: false }
+    }
+}
+
+/// Push the ladder standings JSON to an external URL (see `crate::ladder_push`): on an interval,
+/// and soon after a ladder changes. Disabled unless `url` is set.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LadderPushConfig {
+    /// The `https://` endpoint on your site that receives the ladder POST (`web/bnet.cc/ladder-push.php`).
+    /// Empty disables it.
+    pub url: String,
+    /// Bearer token, sent as `Authorization: Bearer <token>`. Empty uses `[stats_push] token`. A secret.
+    pub token: String,
+    /// Seconds between pushes when nothing changes (minimum 60).
+    pub interval_secs: u64,
+}
+
+impl Default for LadderPushConfig {
+    fn default() -> Self {
+        Self { url: String::new(), token: String::new(), interval_secs: 300 }
     }
 }
 
@@ -522,7 +554,7 @@ impl Default for ServerConfig {
         Self {
             name: "Command Center".into(),
             mode: "gaming".into(),
-            motd: "Welcome to Command Center.".into(),
+            motd: "Welcome to Command Center, an educational server for older computers. On a modern computer, buy Diablo II: Resurrected, Warcraft III: Reforged, StarCraft: Remastered or Warcraft II: Remastered.".into(),
             realm: "bncc".into(),
             wc3_logon: "nls".into(),
         }

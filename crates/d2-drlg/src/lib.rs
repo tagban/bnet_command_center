@@ -13,9 +13,13 @@
 #![warn(missing_docs)]
 
 pub mod act;
+pub mod collision;
+pub mod maze;
 pub mod outdoor;
 pub mod preset;
 pub mod rng;
+pub mod room_tiles;
+pub mod tiles;
 pub mod world;
 
 /// A rectangle in tiles: origin and size.

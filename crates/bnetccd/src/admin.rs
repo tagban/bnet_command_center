@@ -74,7 +74,7 @@ impl Admin {
             // The only time the password is ever shown. Loud and unmissable.
             info!(
                 "\n==================================================================\n\
-                   BNET Command Center — admin panel first-run password:\n\n    {password}\n\n\
+                   Command Center — admin panel first-run password:\n\n    {password}\n\n\
                    Sign in at https://<host>:6114 and change it immediately.\n\
                  ==================================================================",
             );

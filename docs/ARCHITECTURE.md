@@ -1,4 +1,4 @@
-# BNET Command Center — Architecture
+# Command Center — Architecture
 
 A clean-slate, federated Classic Battle.net server in Rust. Two roles, one codebase:
 

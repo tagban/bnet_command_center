@@ -24,6 +24,8 @@ pub struct LevelDef {
     pub id: i32,
     /// `Name`.
     pub name: String,
+    /// `LevelName`: the string key the client shows, e.g. `Blood Moor`.
+    pub level_name: String,
     /// `Act`, 0-based.
     pub act: u8,
     /// `SizeX`/`SizeY` per difficulty (Normal, Nightmare, Hell), in tiles.
@@ -52,6 +54,35 @@ pub struct LevelDef {
     pub sub_waypoint: i32,
     /// `SubShrine`: the `LvlSub.txt` group its shrines come from, -1 for none.
     pub sub_shrine: i32,
+    /// `WarpDist`: monsters do not spawn closer than its square root, in subtiles, to where
+    /// players arrive (`0x0054DB50`).
+    pub warp_dist: i32,
+    /// What monsters its rooms spawn.
+    pub monsters: LevelMonsters,
+}
+
+/// A level's `Levels.txt` monster columns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LevelMonsters {
+    /// `NumMon`: monster types a game picks for the level.
+    pub types: i32,
+    /// `rangedspawn`: the first type picked should be ranged.
+    pub ranged_first: bool,
+    /// `MonLvl1`..`MonLvl3`: the level of monsters on Nightmare and Hell in a classic game
+    /// (Normal takes each class's own `Level`).
+    pub area_level: [i32; 3],
+    /// `MonLvl1Ex`..`MonLvl3Ex`: the same in an expansion game.
+    pub area_level_expansion: [i32; 3],
+    /// `MonDen`, per difficulty: spawn density, in 100000ths per 3×3-subtile slot.
+    pub density: [i32; 3],
+    /// `MonUMin`/`MonUMax`, per difficulty: unique packs.
+    pub uniques: [(i32, i32); 3],
+    /// `mon1`..`mon10`: Normal's candidates (`MonStats.txt` ids).
+    pub normal: Vec<String>,
+    /// `nmon1`..`nmon10`: Nightmare's and Hell's.
+    pub nightmare: Vec<String>,
+    /// `umon1`..`umon10`: unique pack leaders on Normal.
+    pub unique: Vec<String>,
 }
 
 /// All levels, by id.
@@ -75,6 +106,9 @@ impl Levels {
         let mut by_id: Vec<Option<LevelDef>> = Vec::new();
         for row in t.rows() {
             let int = |c: &str| row.int(c).unwrap_or(0) as i32;
+            let names = |prefix: &str| -> Vec<String> {
+                (1..=25).filter_map(|i| row.get(&format!("{prefix}{i}"))).filter(|n| !n.is_empty()).map(str::to_string).collect()
+            };
             let id = int("Id");
             if id <= 0 {
                 continue; // the Null row
@@ -82,6 +116,7 @@ impl Levels {
             let def = LevelDef {
                 id,
                 name: row.get("Name").unwrap_or_default().to_string(),
+                level_name: row.get("LevelName").unwrap_or_default().to_string(),
                 act: int("Act") as u8,
                 size: [(int("SizeX"), int("SizeY")), (int("SizeX(N)"), int("SizeY(N)")), (int("SizeX(H)"), int("SizeY(H)"))],
                 offset: (int("OffsetX"), int("OffsetY")),
@@ -100,6 +135,22 @@ impl Levels {
                 sub_theme: row.int("SubTheme").map_or(-1, |v| v as i32),
                 sub_waypoint: row.int("SubWaypoint").map_or(-1, |v| v as i32),
                 sub_shrine: row.int("SubShrine").map_or(-1, |v| v as i32),
+                warp_dist: int("WarpDist"),
+                monsters: LevelMonsters {
+                    types: int("NumMon"),
+                    ranged_first: int("rangedspawn") != 0,
+                    area_level: [int("MonLvl1"), int("MonLvl2"), int("MonLvl3")],
+                    area_level_expansion: [int("MonLvl1Ex"), int("MonLvl2Ex"), int("MonLvl3Ex")],
+                    density: [int("MonDen"), int("MonDen(N)"), int("MonDen(H)")],
+                    uniques: [
+                        (int("MonUMin"), int("MonUMax")),
+                        (int("MonUMin(N)"), int("MonUMax(N)")),
+                        (int("MonUMin(H)"), int("MonUMax(H)")),
+                    ],
+                    normal: names("mon"),
+                    nightmare: names("nmon"),
+                    unique: names("umon"),
+                },
             };
             let at = id as usize;
             if by_id.len() <= at {

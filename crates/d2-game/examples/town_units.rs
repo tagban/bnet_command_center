@@ -28,7 +28,7 @@ fn main() {
     let mut pop = Population::new(1);
     for near in level.rooms_near(room) {
         println!("room {:?}", level.rooms[near]);
-        let a = pop.activate(&data, level.level_id, RoomId { level: level.level_id, index: near }, level.units_in(near));
+        let a = pop.activate(&data, level.level_id, RoomId { level: level.level_id, index: near }, level.units_in(near), None);
         for u in a.units {
             match *u {
                 Spawned::Object { guid, class, x, y, mode, .. } => {

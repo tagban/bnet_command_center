@@ -522,6 +522,9 @@ struct Bncs {
     /// and cleared when the game stops, so re-advertisements (state updates) do not re-count
     /// the game in the hosted-games metric.
     hosting_game: bool,
+    /// The game this session last hosted or joined, and since when — what its
+    /// `SID_GAMERESULT` is timed against.
+    game_seat: Option<GameSeat>,
     /// An NLS logon in flight: set by `SID_AUTH_ACCOUNTLOGON`, consumed by the proof.
     srp: Option<SrpPending>,
     /// The local address this connection arrived on — the realm address a LAN client is
@@ -579,6 +582,7 @@ async fn bncs_session(
         muted_until_ms: 0,
         kill: Arc::new(tokio::sync::Notify::new()),
         hosting_game: false,
+        game_seat: None,
         srp: None,
         local,
         realm_tickets: Vec::new(),
@@ -869,18 +873,22 @@ impl Bncs {
             sid::GETCHANNELLIST => self.channel_list(),
             sid::GETADVLISTEX => self.game_list(frame),
             sid::CHECKAD => self.check_ad(frame),
-            sid::STARTADVEX3 => self.advertise(frame),
+            sid::STARTADVEX3 => self.advertise(frame).await,
             // A game ended (STOPADV is also sent spuriously on logoff, which is harmless —
             // withdrawing a game the host does not have is a no-op).
-            sid::STOPADV | sid::LEAVEGAME => self.stop_advertising(),
+            sid::STOPADV => self.stop_advertising(true),
+            sid::LEAVEGAME => self.stop_advertising(false),
+            sid::NOTIFYJOIN => self.notify_join(frame),
             sid::NETGAMEPORT => self.net_game_port(frame),
             // Map authentication: a host sends the map's size, SHA-1 and filename to be
             // "authenticated" before the game can start. We approve every map — see the
             // handler; refusing leaves the host stuck on "Unable to authenticate map".
             sid::CHECKDATAFILE2 => self.check_data_file2(frame),
             // Post-game result report — the data behind win/loss records and the ladder.
-            // Currently capture-only while the wire format is decoded; see the handler.
             sid::GAMERESULT => self.game_result(frame).await,
+            // StarCraft / Warcraft II ladder standings and a player's rank.
+            sid::GETLADDERDATA => self.ladder_data(frame).await,
+            sid::FINDLADDERUSER => self.find_ladder_user(frame).await,
             // Legacy CD-key checks (old-logon flow). We accept the key — CD-key uniqueness
             // is enforced on the modern AUTH_CHECK path via KeyRegistry, not here.
             sid::CDKEY => self.cd_key_reply(sid::CDKEY),
@@ -907,7 +915,6 @@ impl Bncs {
             sid::NULL
             | sid::PING
             | sid::UDPPINGRESPONSE
-            | sid::NOTIFYJOIN
             | sid::CLICKAD
             | sid::CLIENTID
             | sid::CLIENTID2
@@ -1311,12 +1318,7 @@ impl Bncs {
         self.display_name = self.node.claim_name(&account.name);
         // Register with the moderation directory so staff can reach this session
         // (resolve its IP, or force it off) from any channel.
-        self.node.register_session(
-            &self.display_name,
-            self.peer.ip(),
-            self.out.clone(),
-            Arc::clone(&self.kill),
-        );
+        self.node.register_session(&self.display_name, self.peer.ip(), self.out.clone(), Arc::clone(&self.kill), self.product);
         self.account = Some(account);
     }
 
@@ -1872,7 +1874,7 @@ impl Bncs {
         self.node.unregister_session(&self.display_name);
         self.node.release_name(&self.display_name);
         self.display_name = self.node.claim_name(&chat_name);
-        self.node.register_session(&self.display_name, self.peer.ip(), self.out.clone(), Arc::clone(&self.kill));
+        self.node.register_session(&self.display_name, self.peer.ip(), self.out.clone(), Arc::clone(&self.kill), self.product);
         info!(peer = %self.peer, name = %self.display_name, "entered chat as a realm character");
     }
 
@@ -1881,6 +1883,7 @@ impl Bncs {
             return Step::Close;
         };
         self.adopt_realm_character(frame, &account).await;
+        self.show_record(&account).await;
         // The unique display name (with any #N), so a duplicate login sees itself correctly.
         let mut w = Writer::with_capacity(64);
         w.cstr(self.display_name.as_bytes())
@@ -1892,6 +1895,36 @@ impl Bncs {
         // Server MOTD, once, at chat entry — not on every channel join. A per-channel MOTD
         // is a separate future feature (see docs/ROADMAP.md).
         self.send(&chat_event(EventId::Info, 0, 0, b"", self.node.motd.as_bytes()))
+    }
+
+    /// A StarCraft or Warcraft II user's statstring shows their record: normal-game wins, and
+    /// the ladder (and Warcraft II Iron Man) rating, rank and high rating once they have
+    /// ladder games. Taken at chat entry and after each reported game, as channel joins show it.
+    async fn show_record(&mut self, account: &Account) {
+        use bnetcc_core::ladder::{rank_of, standings, League, SortMethod};
+        use bnetcc_storage::attr::AttrKey;
+        let Some(product) = self.product.filter(|&p| [product::STAR, product::SEXP, product::JSTR, product::SSHR, product::W2BN].contains(&p)) else {
+            return;
+        };
+        let key = |league: League, leaf: &str| AttrKey::new(&format!(r"Record\{product}\{}\{leaf}", league.index()));
+        let keys = vec![key(League::Normal, "wins"), key(League::Ladder, "rating"), key(League::Ladder, "high rating"), key(League::IronMan, "rating")];
+        let attrs = self.node.read_readable_attrs(&account.name, keys.clone()).await;
+        let number = |i: usize| attrs.get(&keys[i]).and_then(|v| v.parse::<u32>().ok());
+        let mut record = statstring::Record { wins: number(0).unwrap_or(0), ..statstring::Record::default() };
+        let product_name = product.to_string();
+        for (league, rating, rank) in [(League::Ladder, &mut record.rating, &mut record.rank), (League::IronMan, &mut record.iron_rating, &mut record.iron_rank)] {
+            let Some(current) = number(if league == League::Ladder { 1 } else { 3 }) else { continue };
+            if league == League::IronMan && product != product::W2BN {
+                continue;
+            }
+            *rating = current;
+            let ladder = standings(self.node.ladder_rows(&product_name, league).await, SortMethod::Rating);
+            *rank = rank_of(&ladder, &account.name).map_or(0, |r| r + 1);
+        }
+        if record.rating > 0 {
+            record.high_rating = number(2).unwrap_or(record.rating);
+        }
+        self.statstring = statstring::build_starcraft(product, record);
     }
 
     fn join_channel(&mut self, frame: &Frame) -> Step {
@@ -2745,7 +2778,7 @@ impl Bncs {
     /// in the node's directory so `SID_GETADVLISTEX` can hand it to other clients.
     ///
     /// ⚠️ Request layout unverified against a real client — see `game_list`.
-    fn advertise(&mut self, frame: &Frame) -> Step {
+    async fn advertise(&mut self, frame: &Frame) -> Step {
         if !self.node.policy.game_hosting.allowed() {
             // Warnet mode: hosting is off. Reply with the game's own documented code so the
             // client shows a real message rather than hanging on a dropped packet.
@@ -2764,15 +2797,25 @@ impl Bncs {
             let game_type = r.u16()?;
             let parameter = r.u16()?;
             let _unknown = r.u32()?;
-            let _ladder = r.u32()?;
+            let ladder = r.u32()?;
             let name = r.cstr(CHANNEL_NAME_MAX)?.to_vec();
             let password = r.cstr(CHANNEL_NAME_MAX)?.to_vec();
             let statstring = r.cstr(512)?.to_vec();
-            Ok::<_, bnetcc_proto::ProtoError>((state, game_type, parameter, name, password, statstring))
+            Ok::<_, bnetcc_proto::ProtoError>((state, game_type, parameter, ladder, name, password, statstring))
         })();
-        let Ok((state, game_type, parameter, name, password, statstring)) = parsed else {
+        let Ok((state, game_type, parameter, ladder, name, password, statstring)) = parsed else {
             return Step::Close;
         };
+        // A ladder or Iron Man game (the ladder field, 1 or 3) needs ten normal-game wins.
+        if ladder != 0 {
+            let wins = self.normal_wins(&account.name).await;
+            if wins < bnetcc_core::ladder::LADDER_MIN_WINS {
+                info!(peer = %self.peer, account = %account.name, wins, "ladder game refused: too few normal wins");
+                let mut w = Writer::with_capacity(4);
+                w.u32(advertise_status::TYPE_UNAVAILABLE);
+                return self.send(&Frame::new(sid::STARTADVEX3, w.finish()));
+            }
+        }
 
         let host_ip = match self.peer.ip() {
             std::net::IpAddr::V4(v4) => v4,
@@ -2781,6 +2824,7 @@ impl Bncs {
         // Kept for the (optional) Discord game announcement below, before `name` moves into
         // the ad.
         let game_name = String::from_utf8_lossy(&name).into_owned();
+        let seat_name = name.clone();
         let ad = crate::node::GameAd {
             name,
             password,
@@ -2801,6 +2845,7 @@ impl Bncs {
             // updates while the game is live.
             if !self.hosting_game {
                 self.hosting_game = true;
+                self.game_seat = Some(GameSeat { name: seat_name, since: std::time::Instant::now() });
                 let product = self.product.map_or_else(|| "unknown".to_string(), |p| p.to_string());
                 self.node.record_hosted_game(&product);
                 // Announce to the (optional) separate games webhook, fire-and-forget so a slow
@@ -2824,14 +2869,45 @@ impl Bncs {
         self.send(&Frame::new(sid::STARTADVEX3, w.finish()))
     }
 
-    /// `SID_STOPADV` (0x02) / `SID_LEAVEGAME` (0x1F): the host's game is over. Remove it
-    /// from the directory so it stops appearing in the game list.
-    fn stop_advertising(&mut self) -> Step {
+    /// `SID_STOPADV` (0x02) / `SID_LEAVEGAME` (0x1F): the host's game is no longer open to
+    /// join. Remove it from the directory so it stops appearing in the game list. A host sends
+    /// `SID_STOPADV` when its game starts (BNETDocs), so for a hosted game that is when it
+    /// started: its players' results are timed from then.
+    fn stop_advertising(&mut self, starts: bool) -> Step {
         if let Some(account) = &self.account {
             self.node.withdraw_game(account.id);
         }
+        if starts && self.hosting_game {
+            if let Some(seat) = &mut self.game_seat {
+                seat.since = std::time::Instant::now();
+                self.node.mark_game_started(self.product, &seat.name);
+            }
+        }
         // The game is over; a later STARTADVEX3 starts a new one and counts again.
         self.hosting_game = false;
+        Step::Continue
+    }
+
+    /// An account's normal-game wins for this session's product (`Record\<product>\0\wins`).
+    async fn normal_wins(&self, account: &str) -> u32 {
+        let Some(product) = self.product else { return 0 };
+        let key = bnetcc_storage::attr::AttrKey::new(&format!(r"Record\{product}\0\wins"));
+        let attrs = self.node.read_readable_attrs(account, vec![key.clone()]).await;
+        attrs.get(&key).and_then(|v| v.parse().ok()).unwrap_or(0)
+    }
+
+    /// `SID_NOTIFYJOIN` (0x22): `(u32)` product, `(u32)` version, `(string)` game name,
+    /// `(string)` password — the client joined a game. No reply.
+    fn notify_join(&mut self, frame: &Frame) -> Step {
+        let mut r = frame.reader();
+        let name = (|| -> Result<Vec<u8>, bnetcc_proto::ProtoError> {
+            let _product = r.u32()?;
+            let _version = r.u32()?;
+            Ok(r.cstr(CHANNEL_NAME_MAX)?.to_vec())
+        })();
+        if let Ok(name) = name {
+            self.game_seat = Some(GameSeat { name, since: std::time::Instant::now() });
+        }
         Step::Continue
     }
 
@@ -2864,7 +2940,7 @@ impl Bncs {
     }
 
     /// `SID_GAMERESULT` (0x2C): a host reports the outcome of a finished game. Body layout,
-    /// decoded from a real W2BN host (2026-09-09): `(u32)` header, `(u32)` slot count,
+    /// decoded from a real W2BN host (2026-09-09): `(u32)` game type, `(u32)` slot count,
     /// `(u32)[count]` per-slot result codes (1 win, 2 loss, 3 draw, 4 disconnect, 0 empty),
     /// `(cstring)[count]` player names, then a human-readable score-screen string.
     ///
@@ -2873,6 +2949,17 @@ impl Bncs {
     /// every player's client reports its own game). The outcome increments the PvPGN-style
     /// `Record\<product>\0\wins`/`losses`/`draws`/`disconnects` counters, served back via
     /// `SID_READUSERDATA`. No reply is expected. A solo game reports a draw, not a loss.
+    ///
+    /// The game type (BNETDocs: 0 normal, 1 ladder, 3 Iron Man) picks the league: a ladder or
+    /// Iron Man result goes to `Record\<product>\1\` or `\3\` instead, rated against the
+    /// average rating of the game's other players (see `bnetcc_core::ladder`).
+    ///
+    /// Only a game that ran longer than two minutes counts (`Node::min_game_length`), timed
+    /// from its start — its host's `SID_STOPADV` — or, if that was not seen, from when this
+    /// player hosted or joined it. A result from a session that neither hosted nor joined a
+    /// game is not counted. So a player who surrenders a counted game loses it, and the other
+    /// side's own report of its win counts. A ladder or Iron Man result from a player with fewer
+    /// than ten normal-game wins does not count either.
     async fn game_result(&mut self, frame: &Frame) -> Step {
         let Some(account) = self.account.clone() else {
             return Step::Continue;
@@ -2881,8 +2968,8 @@ impl Bncs {
             return Step::Continue;
         };
         let mut r = frame.reader();
-        let parsed = (|| -> Result<(Vec<u32>, Vec<String>), bnetcc_proto::ProtoError> {
-            let _header = r.u32()?;
+        let parsed = (|| -> Result<(u32, Vec<u32>, Vec<String>), bnetcc_proto::ProtoError> {
+            let game_type = r.u32()?;
             let count = (r.u32()? as usize).min(16);
             let mut results = Vec::with_capacity(count);
             for _ in 0..count {
@@ -2892,17 +2979,68 @@ impl Bncs {
             for _ in 0..count {
                 names.push(String::from_utf8_lossy(r.cstr(64)?).into_owned());
             }
-            Ok((results, names))
+            Ok((game_type, results, names))
         })();
-        let Ok((results, names)) = parsed else {
+        let Ok((game_type, results, names)) = parsed else {
             debug!(peer = %self.peer, "malformed SID_GAMERESULT; ignoring");
             return Step::Continue;
         };
-        let outcome = names
-            .iter()
-            .position(|n| n.eq_ignore_ascii_case(&account.name))
-            .and_then(|i| results.get(i).copied())
-            .and_then(crate::storage::GameOutcome::from_code);
+        let Some(seat) = self.game_seat.as_ref() else {
+            info!(peer = %self.peer, account = %account.name, "game result from a session in no game; not counted");
+            return Step::Continue;
+        };
+        let started = self.node.game_started_at(self.product, &seat.name).filter(|&at| at >= seat.since).unwrap_or(seat.since);
+        let lasted = started.elapsed();
+        if !self.node.min_game_length.is_zero() && lasted <= self.node.min_game_length {
+            info!(
+                peer = %self.peer,
+                account = %account.name,
+                game = %String::from_utf8_lossy(&seat.name),
+                seconds = lasted.as_secs(),
+                "game too short to count"
+            );
+            return Step::Continue;
+        }
+        let slot = names.iter().position(|n| n.eq_ignore_ascii_case(&account.name));
+        let outcome = slot.and_then(|i| results.get(i).copied()).and_then(crate::storage::GameOutcome::from_code);
+        let league = bnetcc_core::ladder::League::from_code(game_type);
+        if let (Some(o), Some(slot), bnetcc_core::ladder::League::Ladder | bnetcc_core::ladder::League::IronMan) = (outcome, slot, league) {
+            let wins = self.normal_wins(&account.name).await;
+            if wins < bnetcc_core::ladder::LADDER_MIN_WINS {
+                info!(peer = %self.peer, account = %account.name, wins, "ladder result not counted: too few normal wins");
+                return Step::Continue;
+            }
+            let key = bnetcc_storage::attr::AttrKey::new(&format!(r"Record\{product}\{}\rating", league.index()));
+            let mut ratings = Vec::new();
+            for (i, name) in names.iter().enumerate() {
+                if i == slot || name.is_empty() || results.get(i).copied().unwrap_or(0) == 0 {
+                    continue;
+                }
+                let attrs = self.node.read_readable_attrs(name, vec![key.clone()]).await;
+                let rating = attrs.get(&key).and_then(|v| v.parse::<u32>().ok());
+                ratings.push(rating.unwrap_or(bnetcc_core::ladder::START_RATING));
+            }
+            let opponent = if ratings.is_empty() {
+                bnetcc_core::ladder::START_RATING
+            } else {
+                (ratings.iter().map(|&r| u64::from(r)).sum::<u64>() / ratings.len() as u64) as u32
+            };
+            match self.node.record_ladder_game(account.id, &account.name, &product, league, o, opponent).await {
+                Ok(rating) => info!(
+                    peer = %self.peer,
+                    account = %account.name,
+                    product = %product,
+                    league = ?league,
+                    outcome = ?o,
+                    opponent,
+                    rating,
+                    "recorded ladder game"
+                ),
+                Err(e) => warn!(peer = %self.peer, error = %e, "failed to record ladder game"),
+            }
+            self.show_record(&account).await;
+            return Step::Continue;
+        }
         match outcome {
             Some(o) => match self.node.record_game(account.id, &product, o).await {
                 Ok(total) => info!(
@@ -2923,8 +3061,84 @@ impl Bncs {
                 "SID_GAMERESULT carried no recordable result for this player"
             ),
         }
+        if outcome.is_some() {
+            self.show_record(&account).await;
+        }
         Step::Continue
     }
+
+    /// `SID_GETLADDERDATA` (0x2E): a page of a product's ladder standings.
+    async fn ladder_data(&mut self, frame: &Frame) -> Step {
+        let mut r = frame.reader();
+        let request = (|| -> Result<[u32; 5], bnetcc_proto::ProtoError> { Ok([r.u32()?, r.u32()?, r.u32()?, r.u32()?, r.u32()?]) })();
+        let Ok([product, league, sort, start, count]) = request else {
+            debug!(peer = %self.peer, "malformed SID_GETLADDERDATA; ignoring");
+            return Step::Continue;
+        };
+        let rows = self.node.ladder_rows(&FourCc(product).to_string(), bnetcc_core::ladder::League::from_code(league)).await;
+        let standings = bnetcc_core::ladder::standings(rows, bnetcc_core::ladder::SortMethod::from_code(sort));
+        self.send(&Frame::new(sid::GETLADDERDATA, ladder_data_body([product, league, sort, start, count], &standings)))
+    }
+
+    /// `SID_FINDLADDERUSER` (0x2F): where a player stands on a product's ladder.
+    async fn find_ladder_user(&mut self, frame: &Frame) -> Step {
+        let mut r = frame.reader();
+        let request = (|| -> Result<(u32, u32, u32, String), bnetcc_proto::ProtoError> {
+            Ok((r.u32()?, r.u32()?, r.u32()?, String::from_utf8_lossy(r.cstr(64)?).into_owned()))
+        })();
+        let Ok((product, league, sort, name)) = request else {
+            debug!(peer = %self.peer, "malformed SID_FINDLADDERUSER; ignoring");
+            return Step::Continue;
+        };
+        let rows = self.node.ladder_rows(&FourCc(product).to_string(), bnetcc_core::ladder::League::from_code(league)).await;
+        let standings = bnetcc_core::ladder::standings(rows, bnetcc_core::ladder::SortMethod::from_code(sort));
+        let rank = bnetcc_core::ladder::rank_of(&standings, base_name(&name)).unwrap_or(u32::MAX);
+        let mut w = Writer::with_capacity(4);
+        w.u32(rank);
+        self.send(&Frame::new(sid::FINDLADDERUSER, w.finish()))
+    }
+}
+
+/// Largest page `SID_GETLADDERDATA` lists.
+const LADDER_PAGE: u32 = 20;
+
+/// `SID_GETLADDERDATA`'s reply body (BNETDocs layout): the request's product, league, sort,
+/// starting rank, then the ranks listed and one record per rank. There are no separate
+/// "official" records, so those fields are zero and the official rank is `0xFFFFFFFF`; the
+/// unknown fields and season are zero. An empty page ends with four zero bytes.
+fn ladder_data_body(request: [u32; 5], standings: &[bnetcc_core::ladder::LadderRow]) -> Vec<u8> {
+    let [product, league, sort, start, count] = request;
+    let page: Vec<_> = standings.iter().enumerate().skip(start as usize).take(count.min(LADDER_PAGE) as usize).collect();
+    let mut w = Writer::with_capacity(20 + page.len() * 96);
+    w.u32(product).u32(league).u32(sort).u32(start).u32(page.len() as u32);
+    if page.is_empty() {
+        w.u32(0);
+    }
+    for (rank, row) in page {
+        w.u32(row.wins).u32(row.losses).u32(row.disconnects).u32(row.rating).u32(rank as u32);
+        w.u32(0).u32(0).u32(0).u32(0); // official wins, losses, disconnects, rating
+        w.u32(0).u32(u32::MAX).u32(0).u32(0); // unknown, official rank, unknown, unknown
+        w.u32(row.high_rating).u32(0).u32(0); // highest rating, unknown, season
+        w.u64(filetime(row.last_game)).u64(0); // last game, official last game
+        w.cstr(row.name.as_bytes());
+    }
+    w.finish()
+}
+
+/// A Windows FILETIME (100 ns ticks since 1601) for Unix seconds; 0 stays 0.
+fn filetime(unix_secs: u64) -> u64 {
+    if unix_secs == 0 {
+        return 0;
+    }
+    (unix_secs + 11_644_473_600) * 10_000_000
+}
+
+/// A game a session hosted or joined.
+struct GameSeat {
+    /// Its name as advertised or joined.
+    name: Vec<u8>,
+    /// When the session joined it, or when its host started it.
+    since: std::time::Instant,
 }
 
 fn encode(frame: &Frame) -> Option<Wire> {
@@ -3326,6 +3540,218 @@ mod tests {
         send_frame(&mut s, &Frame::new(sid::ENTERCHAT, Writer::new().finish())).await;
         let _enter = recv_frame(&mut s).await; // ENTERCHAT reply (+ MOTD)
         s
+    }
+
+    /// `SID_NOTIFYJOIN` for a StarCraft: Brood War game called `name`.
+    fn notify_join_frame(name: &str) -> Frame {
+        let mut w = Writer::with_capacity(32);
+        w.fourcc(product::SEXP).u32(0xD3).cstr(name.as_bytes()).cstr(b"");
+        Frame::new(sid::NOTIFYJOIN, w.finish())
+    }
+
+    /// Record `wins` normal-game wins for an account.
+    async fn give_normal_wins(node: &Node, name: &str, wins: u32) {
+        let id = node.account(name).await.expect("account").id;
+        for _ in 0..wins {
+            node.record_game(id, "SEXP", crate::storage::GameOutcome::Win).await.unwrap();
+        }
+    }
+
+    /// A StarCraft or Warcraft II player needs ten normal-game wins for the ladder: before that
+    /// a ladder game cannot be hosted (the "game type unavailable" status) and a ladder result
+    /// does not count.
+    #[tokio::test]
+    async fn the_ladder_takes_ten_normal_wins() {
+        let node = Arc::new(crate::node::test_node());
+        let addr = spawn_node(Arc::clone(&node)).await;
+        let mut host = login(addr, "Artanis", "pw", 621).await;
+        let mut guest = login(addr, "Vorazun", "pw", 622).await;
+        give_normal_wins(&node, "Artanis", 9).await;
+        give_normal_wins(&node, "Vorazun", 10).await;
+        let ladder_game = |name: &str| {
+            let mut w = Writer::with_capacity(64);
+            w.u32(0).u32(0).u16(0x09).u16(0).u32(0xFF).u32(1).cstr(name.as_bytes()).cstr(b"").cstr(b",,,,1,,,,,,Artanis\rmap\r");
+            Frame::new(sid::STARTADVEX3, w.finish())
+        };
+        send_frame(&mut host, &ladder_game("ranked")).await;
+        assert_eq!(recv_frame(&mut host).await.reader().u32().unwrap(), advertise_status::TYPE_UNAVAILABLE, "nine wins");
+        assert!(list_game_names(&mut guest).await.is_empty());
+
+        // Vorazun hosts instead; Artanis joins and wins, but its result does not count.
+        send_frame(&mut guest, &ladder_game("ranked")).await;
+        assert_eq!(recv_frame(&mut guest).await.reader().u32().unwrap(), advertise_status::OK, "ten wins");
+        send_frame(&mut host, &notify_join_frame("ranked")).await;
+        send_frame(&mut guest, &Frame::empty(sid::STOPADV)).await;
+        let slots = [("Vorazun", 2), ("Artanis", 1)];
+        send_frame(&mut host, &game_result_frame(1, slots)).await;
+        send_frame(&mut guest, &game_result_frame(1, slots)).await;
+        let page = ladder_page(&mut guest, 1).await.expect("Vorazun's loss counts");
+        let mut r = page.reader();
+        r.bytes(20).unwrap();
+        let fields: Vec<u32> = (0..16).map(|_| r.u32().unwrap()).collect();
+        r.bytes(16).unwrap();
+        assert_eq!((String::from_utf8_lossy(r.cstr(64).unwrap()).as_ref(), fields[1]), ("Vorazun", 1));
+
+        // A tenth win, and Artanis's next ladder result counts.
+        give_normal_wins(&node, "Artanis", 1).await;
+        send_frame(&mut host, &game_result_frame(1, slots)).await;
+        assert!(ladder_page(&mut guest, 2).await.is_some(), "on the ladder now");
+    }
+
+    /// Normal-game wins and losses stored for an account.
+    async fn normal_record(node: &Node, name: &str) -> (u32, u32) {
+        let keys = ["wins", "losses"].map(|leaf| bnetcc_storage::attr::AttrKey::new(&format!(r"Record\SEXP\0\{leaf}")));
+        let attrs = node.read_readable_attrs(name, keys.to_vec()).await;
+        let get = |k: &bnetcc_storage::attr::AttrKey| attrs.get(k).and_then(|v| v.parse().ok()).unwrap_or(0);
+        (get(&keys[0]), get(&keys[1]))
+    }
+
+    /// A game counts only once it has run longer than the minimum (two minutes in production),
+    /// timed from its host's `SID_STOPADV`; a result from a session in no game never counts.
+    /// Past the minimum, the side that surrendered loses and the other wins.
+    #[tokio::test]
+    async fn a_game_counts_only_once_it_has_run_long_enough() {
+        let node = Arc::new(crate::node::test_node_with(|c| c.min_game_length = Duration::from_millis(400)));
+        let addr = spawn_node(Arc::clone(&node)).await;
+        let mut host = login(addr, "Zeratul", "pw", 611).await;
+        let mut guest = login(addr, "Aldaris", "pw", 612).await;
+        let slots = [("Zeratul", 1), ("Aldaris", 2)];
+        // Wait for each connection to have handled what it was sent.
+        async fn settle(s: &mut TcpStream) {
+            send_frame(s, &Frame::new(sid::FINDLADDERUSER, {
+                let mut w = Writer::with_capacity(16);
+                w.fourcc(product::SEXP).u32(1).u32(0).cstr(b"x");
+                w.finish()
+            }))
+            .await;
+            assert_eq!(recv_frame(s).await.id, sid::FINDLADDERUSER);
+        }
+
+        send_frame(&mut guest, &game_result_frame(0, slots)).await;
+        settle(&mut guest).await;
+        assert_eq!(normal_record(&node, "Aldaris").await, (0, 0), "no game joined");
+
+        send_frame(&mut host, &start_adv_frame("quick")).await;
+        let _ = recv_frame(&mut host).await;
+        send_frame(&mut guest, &notify_join_frame("quick")).await;
+        tokio::time::sleep(Duration::from_millis(500)).await; // the lobby does not count
+        send_frame(&mut host, &Frame::empty(sid::STOPADV)).await;
+        settle(&mut host).await;
+        // The guest surrenders at once: too short, for both.
+        send_frame(&mut guest, &game_result_frame(0, slots)).await;
+        send_frame(&mut host, &game_result_frame(0, slots)).await;
+        settle(&mut guest).await;
+        settle(&mut host).await;
+        assert_eq!(normal_record(&node, "Aldaris").await, (0, 0), "under the minimum");
+        assert_eq!(normal_record(&node, "Zeratul").await, (0, 0));
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        send_frame(&mut guest, &game_result_frame(0, slots)).await;
+        send_frame(&mut host, &game_result_frame(0, slots)).await;
+        settle(&mut guest).await;
+        settle(&mut host).await;
+        assert_eq!(normal_record(&node, "Aldaris").await, (0, 1), "the surrender is a loss");
+        assert_eq!(normal_record(&node, "Zeratul").await, (1, 0), "and the other side's win");
+    }
+
+    /// A `SID_GAMERESULT` for a two-player game of `game_type` with these per-slot codes.
+    fn game_result_frame(game_type: u32, slots: [(&str, u32); 2]) -> Frame {
+        let mut w = Writer::with_capacity(64);
+        w.u32(game_type).u32(2);
+        for (_, code) in slots {
+            w.u32(code);
+        }
+        for (name, _) in slots {
+            w.cstr(name.as_bytes());
+        }
+        w.cstr(b"On map \"Lost Temple\"");
+        Frame::new(sid::GAMERESULT, w.finish())
+    }
+
+    /// Ask for SEXP's ladder until it lists `count` players.
+    async fn ladder_page(stream: &mut TcpStream, count: u32) -> Option<Frame> {
+        let sexp = product::SEXP.0;
+        for _ in 0..50 {
+            let mut w = Writer::with_capacity(20);
+            w.u32(sexp).u32(1).u32(0).u32(0).u32(20);
+            send_frame(stream, &Frame::new(sid::GETLADDERDATA, w.finish())).await;
+            let reply = recv_frame(stream).await;
+            assert_eq!(reply.id, sid::GETLADDERDATA);
+            let mut r = reply.reader();
+            assert_eq!([r.u32().unwrap(), r.u32().unwrap(), r.u32().unwrap(), r.u32().unwrap()], [sexp, 1, 0, 0], "the request is echoed");
+            if r.u32().unwrap() == count {
+                return Some(reply);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn ladder_games_are_rated_listed_and_ranked() {
+        let node = Arc::new(crate::node::test_node());
+        let addr = spawn_node(Arc::clone(&node)).await;
+        let mut winner = login(addr, "Fenix", "pw", 601).await;
+        let mut loser = login(addr, "Tassadar", "pw", 602).await;
+        for name in ["Fenix", "Tassadar"] {
+            give_normal_wins(&node, name, 10).await;
+        }
+        // Fenix hosts, Tassadar joins, and the game starts.
+        send_frame(&mut winner, &start_adv_frame("duel")).await;
+        let _ = recv_frame(&mut winner).await;
+        send_frame(&mut loser, &notify_join_frame("duel")).await;
+        send_frame(&mut winner, &Frame::empty(sid::STOPADV)).await;
+        // Each client reports its own slot; a normal game stays off the ladder. The loser
+        // reports once the winner's result has landed, so its opponent is rated 1016.
+        let slots = [("Fenix", 1), ("Tassadar", 2)];
+        send_frame(&mut winner, &game_result_frame(0, slots)).await;
+        send_frame(&mut winner, &game_result_frame(1, slots)).await;
+        assert!(ladder_page(&mut loser, 1).await.is_some());
+        send_frame(&mut loser, &game_result_frame(1, slots)).await;
+        let page = ladder_page(&mut loser, 2).await;
+        let page = page.expect("both results reach the ladder");
+        let mut r = page.reader();
+        r.bytes(20).unwrap();
+        let mut entries = Vec::new();
+        for _ in 0..2 {
+            let fields: Vec<u32> = (0..16).map(|_| r.u32().unwrap()).collect();
+            let last_game = r.u64().unwrap();
+            let _official_last = r.u64().unwrap();
+            let name = String::from_utf8_lossy(r.cstr(64).unwrap()).into_owned();
+            entries.push((name, fields[0], fields[1], fields[3], fields[4], fields[13], last_game > 0));
+        }
+        assert_eq!(
+            entries,
+            [("Fenix".to_string(), 1, 0, 1016, 0, 1016, true), ("Tassadar".to_string(), 0, 1, 985, 1, 1000, true)],
+            "wins, losses, rating, rank, highest rating, last game"
+        );
+
+        let mut w = Writer::with_capacity(32);
+        w.u32(product::SEXP.0).u32(1).u32(0).cstr(b"tassadar");
+        send_frame(&mut winner, &Frame::new(sid::FINDLADDERUSER, w.finish())).await;
+        let rank = recv_frame(&mut winner).await;
+        assert_eq!((rank.id, rank.reader().u32().unwrap()), (sid::FINDLADDERUSER, 1));
+        let mut w = Writer::with_capacity(32);
+        w.u32(product::SEXP.0).u32(3).u32(0).cstr(b"Fenix");
+        send_frame(&mut winner, &Frame::new(sid::FINDLADDERUSER, w.finish())).await;
+        assert_eq!(recv_frame(&mut winner).await.reader().u32().unwrap(), u32::MAX, "no Iron Man games, no rank");
+
+        // Chat shows the record: normal wins, then the ladder rating, 1-based rank and high.
+        send_frame(&mut winner, &Frame::new(sid::ENTERCHAT, Writer::new().finish())).await;
+        let enter = recv_frame(&mut winner).await;
+        let mut r = enter.reader();
+        r.cstr(64).unwrap();
+        assert_eq!(r.cstr(128).unwrap(), b"PXES 1016 1 11 0 0 1016 0 0 PXES", "ten earned before the ladder, and one since");
+    }
+
+    #[test]
+    fn an_empty_ladder_page_ends_in_four_zero_bytes() {
+        let body = ladder_data_body([product::STAR.0, 1, 2, 40, 20], &[]);
+        let mut expected = Writer::with_capacity(24);
+        expected.u32(product::STAR.0).u32(1).u32(2).u32(40).u32(0).u32(0);
+        assert_eq!(body, expected.finish());
+        assert_eq!(filetime(0), 0);
+        assert_eq!(filetime(1_700_000_000), 133_444_736_000_000_000);
     }
 
     /// Build a `SID_STARTADVEX3` request for a game called `name`.
@@ -3971,8 +4397,8 @@ mod tests {
         let addr = spawn_node(Arc::new(node)).await;
         let mut bncs = d2_login(addr, product::D2XP, "Runner", 9201).await;
         let mut mcp = enter_realm(&mut bncs, "Runner").await;
+        // As the retail client does, it plays the character it has just made without logging on as it.
         assert_eq!(create_char(&mut mcp, 4, 0x20, "Wirt").await, 0x00);
-        assert_eq!(char_logon(&mut mcp, "Wirt").await, 0x00);
 
         let create = |id: u16, name: &[u8]| {
             let mut w = Writer::new();

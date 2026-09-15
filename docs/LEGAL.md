@@ -5,6 +5,25 @@ one of them is serious enough that you should talk to a lawyer before publishing
 
 ---
 
+## 0. What Command Center is for
+
+Command Center is an **educational** project: a readable, working study of the Classic Battle.net
+protocol. Its purpose is to keep games playable on **older computers and operating systems that
+once played on Battle.net and no longer can** (Mac OS 9, Mac OS X 10.4 and earlier), because the
+patches the live service requires are no longer made for them.
+
+It is not a substitute for Blizzard's games or service. **Anyone with a relatively modern computer
+who wants the true Battle.net experience should buy *Diablo II: Resurrected*, *Warcraft III:
+Reforged*, *StarCraft: Remastered* or *Warcraft II: Remastered*** — they are excellent and worth
+buying. Say this plainly wherever the project describes itself (README, bnet.cc, the default
+message of the day, the public status page).
+
+Command Center is not affiliated with, endorsed by or sponsored by Blizzard Entertainment.
+Battle.net, Diablo, StarCraft and Warcraft are trademarks or registered trademarks of Blizzard
+Entertainment, Inc.
+
+---
+
 ## 1. Source hygiene — what you may read, and what you must not
 
 | Source | License | Verdict |
@@ -13,6 +32,7 @@ one of them is serious enough that you should talk to a lawyer before publishing
 | **[BNETDocs/Atlas](https://github.com/BNETDocs/Atlas)** | **MIT** | ✅ **Readable and adaptable with attribution.** Its `Protocols/Game/Messages/SID_*.cs` are effectively an MIT-licensed executable specification of the same wire protocol. This is a large and under-appreciated advantage. |
 | **[wjlafrance/broken-sha1](https://github.com/wjlafrance/broken-sha1)** / MBNCSUtil | BSD-3-clause style | ✅ Readable with attribution. Used as the reference for `bnetcc-crypto`'s XSHA-1 (see `crates/bnetcc-crypto/src/xsha1.rs` header). |
 | **[jaenster/d2-dedicated-server](https://github.com/jaenster/d2-dedicated-server)** — Diablo II realm + game server (Zig) | **MIT** | ✅ **Readable and adaptable with attribution.** Its `apps/realmd` is a realm a retail 1.14d client renders; used to confirm MCP layouts for `crates/bnetccd/src/realm.rs` (credited there and in `docs/DIABLO2.md`). Its README documents its own RE/abandonware stance for game files — that is its operator's call, not a licence grant for Blizzard data. |
+| **[jshojan/bnemu](https://github.com/jshojan/bnemu)** — Battle.net emulator in Java with a D2 1.14d game server (combat, monster AI, items, vendors, quests) and a reverse-engineering wiki | **MIT**, and its team gave tagban permission to use its logic (2026-09-14) | ✅ **Readable and adaptable with attribution.** Port the logic, citing the bnemu file or wiki page. Its `d2gs-server/src/main/resources/d2data` holds Blizzard files (DS1s, excel tables): never copy those. Where a bnemu page says it follows another project (its "hyperion" reference, d2mapapi), check that project's licence before using that part. |
 | **[pvpgn/pvpgn-server](https://github.com/pvpgn/pvpgn-server)** — general source | **GPL-2.0-or-later** (386 of 405 files carry the header) | ⚠️ **Do not copy.** Reading it to learn *design* is fine; copying any function, struct, table, or distinctive parser makes Command Center a derivative and forces GPL on the whole binary. Rust's static linking means there is no "mere aggregation" escape. |
 | **`pvpgn/src/common/bnetsrp3.{cpp,h}`, `bigint.{cpp,h}`** | **AGPL-3.0-or-later** | 🛑 **Do not open.** This is the WarCraft III SRP-3 implementation — precisely the file a reimplementer is most tempted to read. AGPL §13 adds a network-use source-disclosure obligation, which is fatal for a hosted service. |
 | PvPGN `conf/*.conf.in`, `versioncheck.json`, `lua/`, `bnxplevel.conf` | GPL | ⚠️ The *values* (version hashes, XP tables) are facts and are free. The *files* are GPL works. Regenerate; don't copy. |
@@ -82,6 +102,21 @@ still keeps to:
 - **Reimplementation, not copied code.** Ported functions are written fresh in Rust and cite
   the 1.14d address they reproduce, so each can be checked against the binary.
 - **Attribution.** Files ported from libd2 carry its MIT notice and name their libd2 source.
+
+### Decision: the server hands out character artwork drawn from the install (2026-09-14)
+
+**Made by tagban (project owner), 2026-09-14**, after being told it conflicts with "do not use
+Blizzard artwork" above: `bnetccd` builds `d2-characters.zip` — Diablo II's character animations
+as GIF layers, with the palette and tint maps — from the operator's install at startup and serves
+it over BNFTP so chat bots can draw realm characters (`docs/D2-CHARACTER-PACK.md`). This is the
+same kind of act as serving an operator's `icons.bni`, at a larger scale. What still holds:
+
+- **No artwork in the repository.** The pack is generated at run time into the operator's files
+  directory; `diablo2.character_pack = ""` turns it off.
+- **Decoders written clean.** libd2's `dcc.zig` and `cof.zig` say they port OpenDiablo2, which is
+  GPL, so they were not used: `d2_formats::dcc` is written from Bilian Belchev's published DCC
+  format description, and `cof`, `gif` and `zip` from the files, `Game.exe` and the public
+  specifications.
 
 ---
 
