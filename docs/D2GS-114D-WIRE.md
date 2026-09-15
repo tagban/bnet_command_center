@@ -623,9 +623,19 @@ builders confirmed here:
 - A player hit: `0x95` with life/mana/stamina and **position zero** — the client re-seats its
   player only for non-zero x and y (`0x45DB20` → `0x4804E0`) — then `0x0D` `[0][guid][event]
   [0][0][03][60]` (`0x53B4B0`; client `0x45CCC0` → `0x461250`): `13` a small hit's sound, `06`
-  get-hit, `08` dying (+ "You have died"), `09` corpse. `0x41` (1 byte) is the release: the
-  server moves the player to the camp like waypoint travel and sends full life; `0x95` with life
-  on a dead unit stands it up (`0x45DB20`).
+  get-hit, `08` dying (+ "You have died"), `09` corpse. `0x41` (1 byte) is the release
+  (`0x54C0E0`, only for a player in mode 0x11): life, mana and stamina set to their maximums and
+  sent as stats (`0x548520` → `0x53BE40`), state 0x36 on and off, the move to the camp as waypoint
+  travel (`0x53AEC0`), then mode TN/NU. A life stat or `0x95` with life for a player in mode 0x11
+  stands it up (`0x45D4B0`, `0x45DB20`: mode 5, dead flag `0x10000` cleared).
+- **The client runs some packets late.** Its handler table (`0x7114D0`, 12-byte rows: handler,
+  size, deferred handler) gives `0x0C`–`0x10`, `0x17`, `0x4C`, `0x4D` and `0x67`–`0x72` an empty
+  first handler and a second one: `0x45F7B0` queues the packet on its unit (`0x45F730`) and the
+  unit's next update runs the queue (`0x480810` → `0x45FA40`), after everything else that arrived
+  in the frame. `0x0D` event 8 (mode 0, life 0, dead flag) and 9 (mode 0x11, the same) are among
+  them. A corpse event sent in the same frame as the stand-up therefore lands after it and kills
+  the player again — which is what kept "You have died" up in town (2026-09-15). The release now
+  waits until the corpse event went out in an earlier frame, and sends none of its own.
 - Not the engine's yet: the per-class AI routines, the path finder (`d2_game::path`, bounded A*),
   unarmed 1–2 damage, the experience level-gap table.
 

@@ -811,7 +811,10 @@ impl Battle {
 
     fn step(&mut self, data: &GameData, open: &dyn Fn(i32, i32) -> Option<i32>, events: &mut Vec<Event>) {
         let now = self.frame;
-        if let Some(due) = self.due.remove(&now) {
+        // Everything due by now, including frames a catch-up skipped.
+        let later = self.due.split_off(&(now + 1));
+        let ready = std::mem::replace(&mut self.due, later);
+        for due in ready.into_values() {
             for d in due {
                 match d {
                     Due::PlayerHit { player, guid } => self.player_hit(data, &player, guid, events),
@@ -1365,6 +1368,27 @@ mod tests {
         let revived = b.revive("hero");
         assert!(matches!(revived[..], [Event::PlayerVitals { life, .. }] if life > 0));
         assert!(!b.player_dead("hero"));
+    }
+
+    /// A game nobody drove for a while skips frames to catch up; what was due on them still
+    /// happens — a dead player is still laid out as a corpse, which its release waits for.
+    #[test]
+    fn what_falls_due_in_skipped_frames_still_happens() {
+        let data = data();
+        let mut b = battle(&data);
+        let open = |_: i32, _: i32| Some(ROOM.level);
+        b.place_player("hero", Some((120, 100, ROOM.level)), &[ROOM]);
+        let mut all = Vec::new();
+        for _ in 0..2000 {
+            all.extend(b.advance(&data, b.frame() + 1, &open));
+            if b.player_dead("hero") {
+                break;
+            }
+        }
+        assert!(all.iter().any(|e| *e == Event::PlayerReaction { player: "hero".into(), event: reaction::DYING }), "killed");
+        assert!(!all.iter().any(|e| *e == Event::PlayerReaction { player: "hero".into(), event: reaction::DEAD }), "not yet laid out");
+        let later = b.advance(&data, b.frame() + 10 * FRAMES_PER_SECOND, &open);
+        assert!(later.contains(&Event::PlayerReaction { player: "hero".into(), event: reaction::DEAD }), "the corpse, though its frame was skipped");
     }
 
     #[test]

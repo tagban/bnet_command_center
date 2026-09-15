@@ -1018,11 +1018,19 @@ impl GameServer {
         game.battle.spend_stat_point(rules, name, stat).iter().filter_map(|e| battle_packet(e, name)).collect()
     }
 
-    /// A dead player restarts at full life: its life, mana and stamina.
+    /// A dead player restarts at full life, as the release handler `0x0054C0E0` does it: life,
+    /// mana and stamina set to their maximums and each sent as its stat (`0x00548520` →
+    /// `0x0053BE40`, `0x1D`–`0x1F`), life first — a life stat for a player lying in mode 0x11 is
+    /// what stands it up on the client (`0x0045D780` → `0x0045D4B0`).
     fn revive(&self, game_id: u16, name: &str) -> Vec<Vec<u8>> {
         let mut g = self.lock();
         let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
-        game.battle.revive(name).iter().filter_map(|e| battle_packet(e, name)).collect()
+        game.battle.revive(name);
+        let Some(stats) = game.battle.player_stats(name) else { return Vec::new() };
+        [stat::HITPOINTS, stat::MANA, stat::STAMINA]
+            .iter()
+            .filter_map(|&id| stats.iter().find(|&&(s, _)| s == id).map(|&(s, v)| d2gs::set_stat(s, v)))
+            .collect()
     }
 
     /// A connected character left; an emptied game goes with it.
@@ -1399,26 +1407,25 @@ fn teleport(server: &GameServer, p: &Player, w: &mut Walker, x: u16, y: u16, out
 }
 
 /// After "You have died" (`0x41`): stand the player up where it lies, then take it to the camp's
-/// waypoint. The order matters: the client will not move a player in a death mode (`0x004654C0`
-/// returns for modes 0 and 0x11), so a `0x15` for a corpse leaves it in rooms the move just
-/// unloaded and the client halts (`0x0045D160`, error 1336). `0x0D` event 9 puts the corpse in
-/// mode 0x11 if its death throes are still playing, and `0x95` with life then revives it
-/// (`0x0045DB20`). `false` if the player is not dead or the camp has no room.
+/// waypoint, as `0x0054C0E0` does — life, mana and stamina as stats, then the move.
+///
+/// Two client rules decide the order. The client will not move a player in a death mode
+/// (`0x004654C0` returns for modes 0 and 0x11), so a `0x15` for a corpse leaves it in rooms the
+/// move just unloaded and the client halts (`0x0045D160`, error 1336): the stand-up comes first.
+/// And the client does not run `0x0D` as it arrives: it queues it on the unit (`0x0045F730`; so
+/// too `0x0C`–`0x10`, `0x17`, `0x4C`, `0x4D`, `0x67`–`0x72`) and runs the queue at the unit's next
+/// update (`0x00480810` → `0x0045FA40`), after everything else in the frame. The corpse's `0x0D`
+/// event 9 went out when the death throes ended ([`battle::Battle`]); sending it again here would
+/// run after the stand-up and kill the player again in town, the "You have died" screen stuck
+/// (tagban's test, 2026-09-15). `false` if the player is not dead or the camp has no room.
 fn respawn(server: &GameServer, p: &Player, w: &mut Walker, outbox: &mut Outbox) -> bool {
     if !server.player_dead(p.game_id, &p.character.name) || server.near(p.game_id, f64::from(p.spawn.0), f64::from(p.spawn.1)).is_none() {
         return false;
     }
-    outbox.push(&d2gs::player_reaction(unit_type::PLAYER, PLAYER_GUID, battle::reaction::DEAD, 0, 0));
-    let revived = server.revive(p.game_id, &p.character.name);
-    for packet in &revived {
-        outbox.push(packet);
+    for packet in server.revive(p.game_id, &p.character.name) {
+        outbox.push(&packet);
     }
-    let moved = teleport(server, p, w, p.spawn.0, p.spawn.1, outbox);
-    // Its life once more where it lands, in case the stand-up above came too soon.
-    for packet in &revived {
-        outbox.push(packet);
-    }
-    moved
+    teleport(server, p, w, p.spawn.0, p.spawn.1, outbox)
 }
 
 /// Whether the server's idea of the player stands close enough to a monster at (`x`, `y`) to hit it.
@@ -1468,6 +1475,10 @@ async fn run(
     let mut pending_attack: Option<(u32, Instant)> = None;
     // A release (0x41) waiting for the death throes to end.
     let mut pending_respawn = false;
+    // When the corpse event (0x0D event 9) was queued for the client: the stand-up must reach the
+    // client in a later frame than it (see `respawn`).
+    let mut corpse_told: Option<Instant> = None;
+    let corpse_event = d2gs::player_reaction(unit_type::PLAYER, PLAYER_GUID, battle::reaction::DEAD, 0, 0);
 
     loop {
         let limit = if stage == Stage::AwaitLogon { LOGON_TIMEOUT } else { IN_GAME_TIMEOUT };
@@ -1492,13 +1503,29 @@ async fn run(
             }
             let motion = walker.as_ref().map_or(battle::Motion::Standing, |w| w.motion(server.speed_scale));
             for packet in server.battle_step(p.game_id, &p.character.name, motion) {
+                if packet == corpse_event {
+                    corpse_told = Some(Instant::now());
+                }
                 outbox.push(&packet);
             }
             if pending_respawn && server.player_death_settled(p.game_id, &p.character.name) {
-                pending_respawn = false;
-                if let Some(w) = walker.as_mut() {
-                    info!(%peer, x = p.spawn.0, y = p.spawn.1, "respawn in town");
-                    respawn(server, p, w, &mut outbox);
+                match corpse_told {
+                    Some(told) if told.elapsed() >= SERVER_FRAME * 2 => {
+                        pending_respawn = false;
+                        corpse_told = None;
+                        if let Some(w) = walker.as_mut() {
+                            info!(%peer, x = p.spawn.0, y = p.spawn.1, "respawn in town");
+                            respawn(server, p, w, &mut outbox);
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        // The corpse event never went out (the client still plays the death
+                        // throes, mode 0, and a stand-up needs 0x11): send it, stand up later.
+                        info!(%peer, "corpse event sent before the release");
+                        outbox.push(&corpse_event);
+                        corpse_told = Some(Instant::now());
+                    }
                 }
             }
             frames_since_check += 1;
@@ -2798,8 +2825,9 @@ pub(crate) mod tests {
     }
 
     /// A player killed out in a made-up Blood Moor room and releasing (`0x41`) is stood up where it
-    /// lies — `0x0D` corpse, `0x95` with life — before the camp's rooms load and `0x15` moves it:
-    /// the client does not move a corpse, and halts when its room goes.
+    /// lies — life, mana and stamina as stats — before the camp's rooms load and `0x15` moves it:
+    /// the client does not move a corpse, and halts when its room goes. No `0x0D` goes with it: the
+    /// client runs that after the frame and would lay the player down again.
     #[test]
     fn a_dead_player_is_revived_before_it_is_moved_to_town() {
         use d2_data::monsters::Monsters;
@@ -2848,12 +2876,17 @@ pub(crate) mod tests {
         let mut outbox = Outbox::default();
         assert!(respawn(&gs, &player, &mut walker, &mut outbox));
         let sent = split_packets(&outbox.pending().flatten().copied().collect::<Vec<u8>>());
-        assert_eq!(sent[0], d2gs::player_reaction(0, PLAYER_GUID, battle::reaction::DEAD, 0, 0), "{sent:02x?}");
-        assert_eq!(sent[1][0], 0x95);
-        assert!(sent[1][1] != 0 || sent[1][2] & 0x7F != 0, "with life");
-        assert_eq!(sent[2][0], 0x07, "the camp's rooms after");
-        let n = sent.len();
-        assert_eq!((sent[n - 2][0], sent[n - 1][0]), (0x15, 0x95), "then the move, and its life again");
+        let full = gs.lock().by_id[&id].battle.player_stats("Hero").unwrap();
+        let of = |id: u8| full.iter().find(|s| s.0 == id).unwrap().1;
+        assert!(of(stat::HITPOINTS) > 0 && of(stat::HITPOINTS) == of(stat::MAXHP), "full life");
+        assert_eq!(
+            sent[..3],
+            [d2gs::set_stat(stat::HITPOINTS, of(stat::HITPOINTS)), d2gs::set_stat(stat::MANA, of(stat::MANA)), d2gs::set_stat(stat::STAMINA, of(stat::STAMINA))],
+            "life, mana and stamina as stats first: {sent:02x?}"
+        );
+        assert_eq!(sent[3][0], 0x07, "the camp's rooms after");
+        assert_eq!(sent.last().unwrap()[0], 0x15, "then the move");
+        assert!(!sent.iter().any(|p| p[0] == 0x0D), "no corpse event: the client would run it after the stand-up");
         assert!(!gs.player_dead(id, "Hero"));
         assert!(!respawn(&gs, &player, &mut walker, &mut Outbox::default()), "only the dead respawn");
     }
