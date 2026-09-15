@@ -102,6 +102,34 @@ pub fn make(data: &GameData, code: Code, level: i32, mods: QualityMods, making: 
     Some(m.item)
 }
 
+/// A new character's starting item of `code` (`0x00534C70`): normal, identified, item level 1,
+/// flagged a starter, its base defence rolled, whole durability and a full stack; the class's
+/// start skill (`skill`) a point on it when given. `None` for a code the tables lack.
+#[must_use]
+pub fn starter(data: &GameData, code: Code, version: u16, skill: Option<i32>, seed: u32) -> Option<Item> {
+    let items = data.items();
+    let class = items.class_of(&code)?;
+    let def = items.get(class)?;
+    let kind = items.types().get(def.item_type)?;
+    let mut item = Item::new(code, version, 1, Location::Ground { x: 0, y: 0 });
+    item.seed = seed;
+    item.flags |= flags::STARTER;
+    if def.compact {
+        return Some(item);
+    }
+    let making = Making { version, difficulty: 0, ladder: false, magic_find: 0 };
+    let mut m = Maker { data, making, class, def, kind, rng: Seed::new(seed, 666), item };
+    m.base();
+    m.item.durability = m.item.max_durability;
+    if def.stackable {
+        m.item.quantity = def.stack.1.clamp(1, 511) as u16;
+    }
+    if let Some(skill) = skill.and_then(|s| u16::try_from(s).ok()) {
+        m.put(List::Own, stat::SINGLE_SKILL, skill, 1, true);
+    }
+    Some(m.item)
+}
+
 impl Maker<'_> {
     fn is(&self, t: &str) -> bool {
         self.data.items().is(self.class, t)

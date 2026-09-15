@@ -1125,13 +1125,14 @@ impl GameServer {
     /// A joining player's items from its save, held in the game, and the packets that give them
     /// to its client: `0x9C` action 4 for the inventory, action `0x0E` for the belt, `0x9D` 6 worn.
     /// A save holding anything else (the stash, the cube, socketed items) is left as it is and the
-    /// player carries nothing.
+    /// player carries nothing. A character never saved gets its class's starting items
+    /// ([`starting_items`]).
     fn join_items(&self, p: &Player) -> Vec<Vec<u8>> {
         let Some(rules) = &self.rules else { return Vec::new() };
         let mut g = self.lock();
         let Some(game) = g.by_id.get_mut(&p.game_id) else { return Vec::new() };
         let saved = match &p.save {
-            None => Some(Vec::new()),
+            None => Some(starting_items(rules, game, p.character.class)),
             Some(save) => match item_bits::read_save_list(&save.items, rules.items(), rules.item_stats()) {
                 Ok((list, _)) => Some(list),
                 Err(why) => {
@@ -1158,7 +1159,14 @@ impl GameServer {
                     game.spare_item_guid
                 }
             };
-            if !carried.inventory.insert(Held { guid, class, size, place, item }) {
+            let mut held = Held { guid, class, size, place, item };
+            if p.save.is_none() && !carried.inventory.fits(&held) {
+                // A starting item finds its spot as a pickup does.
+                let belts = rules.items().get(class).is_some_and(|d| d.auto_belt) && rules.items().beltable(class);
+                let Some(spot) = carried.inventory.place_for(size, belts) else { continue };
+                held.place = spot;
+            }
+            if !carried.inventory.insert(held) {
                 carried.complete = false;
                 break;
             }
@@ -1292,6 +1300,32 @@ fn ground_packet(rules: &GameData, guid: u32, item: &GroundItem, dropping: bool,
             items::world(rules, item_action::ADD_TO_GROUND, guid, &shown)
         }
     }
+}
+
+/// A new character's starting items (`0x00534F10`), each at where it goes first: a beltable item
+/// in the belt, an item with a body location worn there, anything else in the inventory. Places
+/// already taken are found again as a pickup finds them.
+fn starting_items(rules: &GameData, game: &mut Game, class: u8) -> Vec<Item> {
+    let skill = rules.start_skill(class);
+    let mut out = Vec::new();
+    let mut belt = 0u8;
+    for (n, start) in rules.start_items(class).iter().enumerate() {
+        for _ in 0..start.count {
+            let Some(mut item) = loot::starter(rules, start.code, game.item_version, skill.filter(|_| n == 0), game.item_seeds.roll()) else { continue };
+            let Some(item_class) = rules.items().class_of(&item.code) else { continue };
+            item.location = if rules.items().beltable(item_class) {
+                belt += 1;
+                Location::Belt { slot: belt - 1 }
+            } else {
+                match start.location.as_deref().and_then(items::body_location) {
+                    Some(body) => Location::Equipped { body },
+                    None => Location::Stored { col: 15, row: 15, page: 0 },
+                }
+            };
+            out.push(item);
+        }
+    }
+    out
 }
 
 /// Tell the fight what a player's worn items add ([`d2_game::gear`]).
@@ -3459,6 +3493,52 @@ pub(crate) mod tests {
         assert_eq!(battle::Potion::of(def("mp5")), Some(battle::Potion::Mana { points: 250, frames: 128 }));
         assert_eq!(battle::Potion::of(def("rvl")), Some(battle::Potion::Rejuvenation { life: 100, mana: 100 }));
         assert_eq!(battle::Potion::of(def("vps")), None);
+    }
+
+    /// A new Amazon starts with javelins in her right hand and a buckler in her left, four minor
+    /// healing potions in the belt and the two scrolls in the inventory; a new Sorceress's staff
+    /// carries a point of Fire Bolt.
+    #[test]
+    fn with_a_real_install_new_characters_start_with_their_class_items() {
+        let Ok(dir) = std::env::var("BNETCC_D2_DATA_DIR") else {
+            return;
+        };
+        let rules = GameData::load(&dir).unwrap();
+        let gs = GameServer::new(test_tables(), Some(rules.clone()));
+        let id = gs.create("start", "", 0).unwrap();
+        let places = |class: u8| {
+            let p = Player::new(id, character("Fresh", class, 0), 0, 0, (0, 0));
+            let packets = gs.join_items(&p);
+            let g = gs.lock();
+            let carried = &g.by_id[&id].carried["Fresh"];
+            let held: Vec<(String, Place, u16, i32, bool)> = carried
+                .inventory
+                .items()
+                .iter()
+                .map(|h| (d2_data::items::code_str(&h.code()), h.place, h.item.quantity, h.item.durability, h.item.stats.iter().any(|s| s.id == 107)))
+                .collect();
+            (packets.len(), held)
+        };
+        let (sent, amazon) = places(0);
+        assert_eq!(sent, 8);
+        let summary: Vec<(&str, Place)> = amazon.iter().map(|(c, p, ..)| (c.as_str(), *p)).collect();
+        assert_eq!(
+            summary,
+            [
+                ("jav", Place::Body(4)),
+                ("buc", Place::Body(5)),
+                ("hp1", Place::Belt(0)),
+                ("hp1", Place::Belt(1)),
+                ("hp1", Place::Belt(2)),
+                ("hp1", Place::Belt(3)),
+                ("tsc", Place::Grid { col: 9, row: 3 }),
+                ("isc", Place::Grid { col: 9, row: 2 }),
+            ]
+        );
+        assert!(amazon[0].2 > 1 && amazon[1].3 > 0, "a full stack of javelins, a whole buckler: {amazon:?}");
+        gs.lock().by_id.get_mut(&id).unwrap().carried.clear();
+        let (_, sorceress) = places(1);
+        assert_eq!((sorceress[0].0.as_str(), sorceress[0].1, sorceress[0].4), ("sst", Place::Body(4), true), "Fire Bolt on the staff");
     }
 
     #[test]

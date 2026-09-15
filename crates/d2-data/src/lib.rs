@@ -110,10 +110,26 @@ pub struct ClassStats {
     pub velocity: (i32, i32),
 }
 
+/// An item a new character starts with: `charstats.txt` `item1`…`item10` with their `loc` and
+/// `count` (read by `0x00534F10`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartItem {
+    /// `itemN`: the item's code.
+    pub code: Code,
+    /// `itemNloc`: the body location it is worn at (`rarm`, `larm`), when it is worn.
+    pub location: Option<String>,
+    /// `itemNcount`: how many.
+    pub count: u8,
+}
+
 /// The rules loaded so far.
 #[derive(Debug, Clone)]
 pub struct GameData {
     classes: [ClassStats; 7],
+    /// Each class's starting items, in column order.
+    start_items: [Vec<StartItem>; 7],
+    /// Each class's `StartSkill`: the skill its first starting item carries a point of.
+    start_skills: [Option<String>; 7],
     /// `experience.txt` by level (row `"0"` first), one column per class.
     experience: Vec<[u32; 7]>,
     levels: Levels,
@@ -260,6 +276,19 @@ impl GameData {
         &self.skills
     }
 
+    /// What a new character of `class` starts with.
+    #[must_use]
+    pub fn start_items(&self, class: u8) -> &[StartItem] {
+        self.start_items.get(usize::from(class)).map_or(&[], Vec::as_slice)
+    }
+
+    /// The skill a new character's first item carries a point of (`StartSkill`), by id.
+    #[must_use]
+    pub fn start_skill(&self, class: u8) -> Option<i32> {
+        let name = self.start_skills.get(usize::from(class))?.as_deref()?;
+        (0..self.skills.len() as i32).find(|&id| self.skills.get(id).is_some_and(|s| s.name.eq_ignore_ascii_case(name)))
+    }
+
     /// Replace the skills table — for tests.
     pub fn set_skills(&mut self, skills: skills::Skills) {
         self.skills = skills;
@@ -385,6 +414,8 @@ impl GameData {
     /// [`Error::BadTable`] if a class row or column is missing or out of range.
     pub fn from_tables(charstats: &Table, experience: &Table) -> Result<Self, Error> {
         let bad = |table, problem: String| Error::BadTable { table, problem };
+        let mut start_items: [Vec<StartItem>; 7] = Default::default();
+        let mut start_skills: [Option<String>; 7] = Default::default();
         let mut classes = [ClassStats {
             strength: 0,
             dexterity: 0,
@@ -431,6 +462,15 @@ impl GameData {
                 ),
                 velocity: (row.int("WalkVelocity").unwrap_or(0) as i32, row.int("RunVelocity").unwrap_or(0) as i32),
             };
+            start_items[id] = (1..=10)
+                .filter_map(|n| {
+                    let code = row.get(&format!("item{n}")).filter(|c| !c.is_empty() && *c != "0")?;
+                    let count = u8::try_from(row.int(&format!("item{n}count")).unwrap_or(0)).ok().filter(|&c| c > 0)?;
+                    let location = row.get(&format!("item{n}loc")).filter(|l| !l.is_empty()).map(str::to_string);
+                    Some(StartItem { code: items::code(code), location, count })
+                })
+                .collect();
+            start_skills[id] = row.get("StartSkill").filter(|s| !s.is_empty()).map(str::to_string);
         }
 
         let mut levels = Vec::new();
@@ -455,6 +495,8 @@ impl GameData {
         }
         Ok(Self {
             classes,
+            start_items,
+            start_skills,
             experience: levels,
             levels: Levels::default(),
             lvl_prests: LvlPrests::default(),

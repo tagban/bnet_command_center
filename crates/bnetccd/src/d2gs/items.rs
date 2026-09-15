@@ -75,7 +75,7 @@ pub(super) fn lifted(held: &Held, from: Place) -> Item {
 }
 
 /// A body location's `BodyLocs.txt` row by its code.
-fn body_location(code: &str) -> Option<u8> {
+pub(super) fn body_location(code: &str) -> Option<u8> {
     ["head", "neck", "tors", "rarm", "larm", "rrin", "lrin", "belt", "feet", "glov"].iter().position(|c| *c == code).map(|i| i as u8 + 1)
 }
 
