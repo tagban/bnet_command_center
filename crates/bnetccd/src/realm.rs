@@ -303,8 +303,11 @@ impl Mcp {
         Some(Frame::new(frame.id, w.finish()))
     }
 
-    /// `MCP_CHARCREATE`: `u32 class, u16 status, cstr name`. Reply: `u32 result`.
-    async fn char_create(&self, frame: &Frame) -> Option<Frame> {
+    /// `MCP_CHARCREATE`: `u32 class, u16 status, cstr name`. Reply: `u32 result`. A character made
+    /// is the one the connection plays: the retail client goes straight on to `MCP_MOTD`, chat and
+    /// `MCP_CREATEGAME`/`MCP_JOINGAME` without an `MCP_CHARLOGON` (seen with a real client,
+    /// 2026-09-15).
+    async fn char_create(&mut self, frame: &Frame) -> Option<Frame> {
         let reply = |result: u32| {
             let mut w = Writer::with_capacity(4);
             w.u32(result);
@@ -357,6 +360,7 @@ impl Mcp {
                     status = %format!("{status:#04x}"),
                     "character created"
                 );
+                self.selected = Some(name);
                 reply(char_create_result::OK)
             }
             Err(CreateCharacterError::NameTaken) => reply(char_create_result::NAME_TAKEN),

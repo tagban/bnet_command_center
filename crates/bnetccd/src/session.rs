@@ -4397,8 +4397,8 @@ mod tests {
         let addr = spawn_node(Arc::new(node)).await;
         let mut bncs = d2_login(addr, product::D2XP, "Runner", 9201).await;
         let mut mcp = enter_realm(&mut bncs, "Runner").await;
+        // As the retail client does, it plays the character it has just made without logging on as it.
         assert_eq!(create_char(&mut mcp, 4, 0x20, "Wirt").await, 0x00);
-        assert_eq!(char_logon(&mut mcp, "Wirt").await, 0x00);
 
         let create = |id: u16, name: &[u8]| {
             let mut w = Writer::new();
