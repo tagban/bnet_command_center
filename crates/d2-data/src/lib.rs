@@ -27,6 +27,7 @@ pub mod lvlsub;
 pub mod monlvl;
 pub mod monsters;
 pub mod presets;
+pub mod skills;
 pub mod stat;
 pub mod strings;
 pub mod tiles;
@@ -131,6 +132,7 @@ pub struct GameData {
     item_stats: item_stats::ItemStats,
     item_ratios: item_stats::ItemRatios,
     affixes: affixes::Affixes,
+    skills: skills::Skills,
     treasure: treasure::TreasureClasses,
     /// `ArmType.txt`'s tokens, by body armour weight.
     armor_types: Vec<Code>,
@@ -183,7 +185,9 @@ impl GameData {
             &read("lowqualityitems.txt")?,
             &read("uniqueitems.txt")?,
             &read("setitems.txt")?,
+            &read("sets.txt")?,
         );
+        data.skills = skills::Skills::from_table(&read("skills.txt")?);
         data.treasure = treasure::TreasureClasses::from_table(&read("treasureclassex.txt")?)?;
         data.treasure.add_item_classes(&data.items);
         data.archives = Some(Arc::new(archives));
@@ -248,6 +252,17 @@ impl GameData {
     /// Replace the affix tables — for tests.
     pub fn set_affixes(&mut self, affixes: affixes::Affixes) {
         self.affixes = affixes;
+    }
+
+    /// `Skills.txt`.
+    #[must_use]
+    pub fn skills(&self) -> &skills::Skills {
+        &self.skills
+    }
+
+    /// Replace the skills table — for tests.
+    pub fn set_skills(&mut self, skills: skills::Skills) {
+        self.skills = skills;
     }
 
     /// Replace the item stat and ratio tables — for tests.
@@ -457,6 +472,7 @@ impl GameData {
             item_stats: item_stats::ItemStats::default(),
             item_ratios: item_stats::ItemRatios::default(),
             affixes: affixes::Affixes::default(),
+            skills: skills::Skills::default(),
             treasure: treasure::TreasureClasses::default(),
             armor_types: Vec::new(),
             archives: None,

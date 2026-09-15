@@ -1,6 +1,6 @@
 //! What magic, rare, set and unique items are made of: `MagicPrefix.txt`, `MagicSuffix.txt`,
 //! `AutoMagic.txt`, `RarePrefix.txt`, `RareSuffix.txt`, `Properties.txt`, `QualityItems.txt`,
-//! `LowQualityItems.txt`, `UniqueItems.txt` and `SetItems.txt`.
+//! `LowQualityItems.txt`, `UniqueItems.txt`, `SetItems.txt` and `Sets.txt`.
 //!
 //! Ids on the wire count rows from 1 within each table (`Expansion` markers skipped), as
 //! `0x0062FFF0` writes them: the engine keeps suffixes, prefixes and auto-affixes in one table and
@@ -123,6 +123,12 @@ pub struct SetItem {
     pub name: String,
     /// `set`: the `Sets.txt` index.
     pub set: String,
+    /// The set's `Sets.txt` row (-1 when the set is not there).
+    pub set_row: i32,
+    /// The set's `version`: 100 for Lord of Destruction only.
+    pub version: i32,
+    /// `add func`: 0 when the bonuses are always on, else they count worn pieces.
+    pub add_func: i32,
     /// `item`: the base item's code.
     pub code: Code,
     /// `rarity`.
@@ -226,7 +232,10 @@ impl Affixes {
         low_quality: &Table,
         uniques: &Table,
         set_items: &Table,
+        sets: &Table,
     ) -> Self {
+        let set_rows: Vec<(String, i32)> =
+            sets.rows().map(|row| (row.get("index").unwrap_or_default().to_string(), row.int("version").unwrap_or(0) as i32)).collect();
         let properties = properties
             .rows()
             .filter_map(|row| {
@@ -295,9 +304,14 @@ impl Affixes {
                         .collect();
                     mods(&row, &names)
                 };
+                let set = row.get("set").unwrap_or_default().to_string();
+                let set_row = set_rows.iter().position(|(name, _)| *name == set);
                 SetItem {
                     name: row.get("index").unwrap_or_default().to_string(),
-                    set: row.get("set").unwrap_or_default().to_string(),
+                    set_row: set_row.map_or(-1, |i| i as i32),
+                    version: set_row.map_or(0, |i| set_rows[i].1),
+                    add_func: int("add func"),
+                    set,
                     code: code(row.get("item").unwrap_or_default()),
                     rarity: int("rarity"),
                     level: int("lvl"),
@@ -343,8 +357,9 @@ mod tests {
         let quality = Table::parse(b"nummods\tmod1code\tmod1param\tmod1min\tmod1max\tmod2code\tmod2param\tmod2min\tmod2max\tarmor\tweapon\r\n1\tatt\t0\t1\t3\tdmg%\t0\t5\t15\t0\t1\r\n");
         let low = Table::parse(b"Name\r\nCrude\r\nCracked\r\n");
         let uniques = Table::parse(b"index\tversion\tenabled\trarity\tnolimit\tlvl\tlvl req\tcode\tprop1\tpar1\tmin1\tmax1\r\nThe Gnasher\t0\t1\t1\t\t7\t5\thax\tdmg%\t\t60\t70\r\n");
-        let sets = Table::parse(b"index\tset\titem\trarity\tlvl\tprop1\tmin1\tmax1\taprop1a\tamin1a\tamax1a\r\nCiverb's Ward\tCiverb's Vestments\tlrg\t7\t9\tac\t15\t15\tmana\t21\t21\r\n");
-        let a = Affixes::from_tables(&prefix, &prefix, &empty, &empty, &empty, &props, &quality, &low, &uniques, &sets);
+        let set_items = Table::parse(b"index\tset\titem\trarity\tlvl\tadd func\tprop1\tmin1\tmax1\taprop1a\tamin1a\tamax1a\r\nCiverb's Ward\tCiverb's Vestments\tlrg\t7\t9\t1\tac\t15\t15\tmana\t21\t21\r\n");
+        let sets = Table::parse(b"index\tversion\r\nCleglaw's Brace\t0\r\nCiverb's Vestments\t0\r\n");
+        let a = Affixes::from_tables(&prefix, &prefix, &empty, &empty, &empty, &props, &quality, &low, &uniques, &set_items, &sets);
         assert_eq!(a.prefixes.len(), 2, "the marker takes no row");
         let snake = &a.prefixes[1];
         assert_eq!((snake.level, snake.max_level, snake.group, snake.itypes.as_slice(), snake.etypes.as_slice()), (6, 0, 102, &["shld".to_string(), "amul".into()][..], &["amaz".to_string()][..]));
@@ -354,5 +369,6 @@ mod tests {
         assert_eq!((a.superior[0].mods.len(), a.superior[0].applies[1], a.low_quality), (1, true, 2), "nummods 1 keeps one mod");
         assert_eq!((a.uniques[0].code, a.uniques[0].level, a.uniques[0].props[0].max), (*b"hax ", 7, 70));
         assert_eq!((a.set_items[0].code, a.set_items[0].bonuses[0][0].code.as_str()), (*b"lrg ", "mana"));
+        assert_eq!((a.set_items[0].set_row, a.set_items[0].add_func), (1, 1));
     }
 }

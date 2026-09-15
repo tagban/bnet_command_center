@@ -31,6 +31,12 @@ pub fn code_str(c: &Code) -> String {
     String::from_utf8_lossy(c).trim_end().to_string()
 }
 
+/// A class's index from its three-letter code (`ama` 0 … `ass` 6), as the tables name classes.
+#[must_use]
+pub fn class_index(code: &str) -> Option<u8> {
+    ["ama", "sor", "nec", "pal", "bar", "dru", "ass"].iter().position(|c| *c == code).map(|i| i as u8)
+}
+
 /// Item types the appearance rules test, by code. `Game.exe` names them by id — in 1.14d's table
 /// `tors` is 3, `helm` 37, `weap` 45, `armo` 50, `shld` 51 and `circ` 75.
 pub mod types {
@@ -59,6 +65,13 @@ pub struct ItemType {
     pub body_locations: Vec<String>,
     /// `Beltable`: whether an item of the type goes in a belt.
     pub beltable: bool,
+    /// `Throwable` (`+0x10`).
+    pub throwable: bool,
+    /// `StaffMods` (`+0x1F`): the class whose skills a normal, superior, magic or rare item of the
+    /// type may carry.
+    pub staff_mods: Option<u8>,
+    /// `Class` (`+0x21`): the class an item of the type is for.
+    pub class: Option<u8>,
     /// `Magic`: an item of the type is always magic (`+0x14`).
     pub always_magic: bool,
     /// `Rare`: an item of the type can be rare (`+0x15`).
@@ -107,6 +120,9 @@ impl ItemTypes {
                     code: text("Code"),
                     body_locations,
                     beltable: int("Beltable") != 0,
+                    throwable: int("Throwable") != 0,
+                    staff_mods: row.get("StaffMods").and_then(class_index),
+                    class: row.get("Class").and_then(class_index),
                     always_magic: int("Magic") != 0,
                     can_be_rare: int("Rare") != 0,
                     always_normal: int("Normal") != 0,

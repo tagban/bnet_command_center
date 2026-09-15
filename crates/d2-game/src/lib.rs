@@ -11,6 +11,7 @@
 pub mod battle;
 pub mod clock;
 pub mod inventory;
+pub mod loot;
 pub mod path;
 pub mod population;
 pub mod spawn;
