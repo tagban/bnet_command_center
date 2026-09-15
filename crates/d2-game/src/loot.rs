@@ -381,9 +381,13 @@ impl Maker<'_> {
 
     // --- the qualities -----------------------------------------------------------------------
 
-    /// Normal (`0x00556E80`): the type's class skills.
+    /// Normal (`0x00556E80`): a tome's or scroll's `Books.txt` row (`0x005C2540`: Town Portal
+    /// 0, Identify 1), and the type's class skills.
     fn normal(&mut self) {
         self.item.quality = Quality::Normal;
+        if self.is("book") || self.is("scro") {
+            self.item.book = u8::from(matches!(&self.def.code, b"ibk " | b"isc "));
+        }
         self.staff_mods();
     }
 

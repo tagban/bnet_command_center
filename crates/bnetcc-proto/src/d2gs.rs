@@ -67,6 +67,9 @@ pub mod sc {
     pub const ITEM_ACTION_WORLD: u8 = 0x9C;
     /// An item action naming the unit that owns the item (variable; size at `+2`).
     pub const ITEM_ACTION_OWNED: u8 = 0x9D;
+    /// An item spell waits for its target: `[icon u8][item guid u32][skill u16]` (8 bytes; builder
+    /// `0x0053D220`) — an identify scroll turns the cursor to pick what it identifies.
+    pub const ITEM_SPELL_READY: u8 = 0x3F;
     /// An object's mode changed (12 bytes).
     pub const OBJECT_STATE: u8 = 0x0E;
     /// Which unit is the client's own player (6 bytes).
@@ -195,6 +198,9 @@ pub mod cs {
     /// Put the cursor item into a grid in place of the item there: `[cursor guid u32][grid item
     /// guid u32][x u32][y u32]` (17 bytes; `0x0054B0F0` → `0x00561B00`).
     pub const SWAP_GRID_ITEM: u8 = 0x1F;
+    /// Identify an item with the scroll or tome made ready: `[item guid u32][scroll guid u32]` (9
+    /// bytes; `0x0054B280` → `0x00561ED0`).
+    pub const IDENTIFY_ITEM: u8 = 0x27;
     /// Put the cursor item in the belt: `[item guid u32][slot u32]` (9 bytes; `0x0054B3E0` →
     /// `0x0055E9B0`).
     pub const BELT_ITEM: u8 = 0x23;
@@ -749,6 +755,8 @@ pub mod item_action {
     pub const EQUIP: u8 = 0x06;
     /// `0x9D`: taken off onto the cursor (`0x004C3380`).
     pub const UNEQUIP: u8 = 0x08;
+    /// `0x9D`: an item's bits again, for the client to rebuild it (`0x004C4C70`; after identifying).
+    pub const UPDATE: u8 = 0x15;
     /// `0x9D`: a worn item and the cursor item trade places, one packet each: item flag `0x40` on
     /// the one worn, `0x80` on the one lifted (`0x004C3920`).
     pub const SWAP_BODY: u8 = 0x09;
@@ -862,6 +870,16 @@ fn item_packet_bytes(opcode: u8, action: u8, category: u8, guid: u32, owner: Opt
     }
     p.extend_from_slice(bits);
     p[2] = p.len().min(255) as u8;
+    p
+}
+
+/// `0x3F`: an item spell (`icon`, the `Books.txt` `SpellIcon`) waits for its target; `skill` is the
+/// book's skill (`0x005BE130`).
+#[must_use]
+pub fn item_spell_ready(icon: u8, guid: u32, skill: u16) -> Vec<u8> {
+    let mut p = vec![sc::ITEM_SPELL_READY, icon];
+    p.extend_from_slice(&guid.to_le_bytes());
+    p.extend_from_slice(&skill.to_le_bytes());
     p
 }
 

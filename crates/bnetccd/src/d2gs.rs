@@ -210,6 +210,8 @@ enum Loot {
 struct Carried {
     inventory: Inventory,
     complete: bool,
+    /// The identify scroll made ready, waiting for the item it identifies.
+    identify_with: Option<u32>,
 }
 
 /// Why the realm could not create a game.
@@ -990,6 +992,12 @@ impl GameServer {
         if !in_place {
             return Vec::new();
         }
+        if &held.code() == b"isc " {
+            // `pSpell` 1 (`0x005BE130`): the scroll waits for its target; the client turns its cursor.
+            carried.identify_with = Some(guid);
+            let skill = (0..rules.skills().len() as i32).find(|&id| rules.skills().get(id).is_some_and(|s| s.name == "Book of Identify")).unwrap_or(218);
+            return vec![d2gs::item_spell_ready(0, guid, skill as u16)];
+        }
         let Some(potion) = rules.items().get(held.class).filter(|d| d.useable).and_then(battle::Potion::of) else {
             debug!(game_id, player = name, item = %d2_data::items::code_str(&held.code()), "item use not ported");
             return Vec::new();
@@ -999,6 +1007,39 @@ impl GameServer {
         info!(game_id, player = name, guid, item = %d2_data::items::code_str(&held.code()), "potion drunk");
         let mut out: Vec<Vec<u8>> = items::held_packet(rules, &held, true).into_iter().collect();
         out.extend(changed.iter().filter_map(|e| battle_packet(e, name)));
+        out
+    }
+
+    /// A player identifies an item it holds with the scroll it made ready (`0x27` → `0x00561ED0`):
+    /// the scroll is used up (`0x9D` 5 from the inventory, `0x9C` `0x0F` from the belt, flagged
+    /// used), then the item comes back whole (`0x9D` `0x15`, `0x0055E0D0`/`0x00562590`). Nothing
+    /// for an item already identified or a scroll not made ready.
+    ///
+    /// Not ported: tomes, and the book skill's charge count (`0x22`).
+    fn identify_item(&self, game_id: u16, name: &str, item: u32, scroll: u32) -> Vec<Vec<u8>> {
+        let Some(rules) = &self.rules else { return Vec::new() };
+        let mut g = self.lock();
+        let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
+        let Some(carried) = game.carried.get_mut(name).filter(|c| c.complete) else { return Vec::new() };
+        if carried.identify_with != Some(scroll) {
+            return Vec::new();
+        }
+        let inv = &mut carried.inventory;
+        let (Some(used), Some(target)) = (inv.get(scroll).cloned(), inv.get(item).cloned()) else { return Vec::new() };
+        if target.item.identified() || !matches!(target.place, Place::Grid { .. } | Place::Body(_)) || !matches!(used.place, Place::Grid { .. } | Place::Belt(_)) {
+            return Vec::new();
+        }
+        carried.identify_with = None;
+        inv.remove(scroll);
+        let Some(mut known) = inv.remove(item) else { return Vec::new() };
+        known.item.flags |= item_bits::flags::IDENTIFIED;
+        let mut shown = known.placed();
+        shown.flags |= items::REBUILD;
+        inv.insert(known);
+        info!(game_id, player = name, item, "item identified");
+        let mut out: Vec<Vec<u8>> = items::held_packet(rules, &used, true).into_iter().collect();
+        out.push(items::owned(rules, item_action::UPDATE, item, &shown));
+        refresh_gear(rules, game, name);
         out
     }
 
@@ -1141,7 +1182,7 @@ impl GameServer {
                 }
             },
         };
-        let mut carried = Carried { inventory: Inventory::default(), complete: saved.is_some() };
+        let mut carried = Carried { inventory: Inventory::default(), complete: saved.is_some(), identify_with: None };
         for item in saved.unwrap_or_default() {
             let (Some(place), Some(class)) = (items::saved_place(&item), rules.items().class_of(&item.code)) else {
                 carried.complete = false;
@@ -2008,6 +2049,17 @@ async fn run(
                         server.save_character(p).await;
                     }
                 }
+                (Stage::InGame, cs::IDENTIFY_ITEM) => {
+                    let Some(p) = player.as_mut() else { continue };
+                    let replies = server.identify_item(p.game_id, &p.character.name, u32_at(1), u32_at(5));
+                    if !replies.is_empty() {
+                        for packet in &replies {
+                            outbox.push(packet);
+                        }
+                        flush(stream, peer, tables, &mut outbox).await?;
+                        server.save_character(p).await;
+                    }
+                }
                 (
                     Stage::InGame,
                     op @ (cs::DROP_ITEM
@@ -2369,6 +2421,7 @@ pub(crate) mod tests {
         assert_eq!((size(cs::PICK_UP_ITEM), size(cs::USE_ITEM), size(cs::USE_BELT_ITEM)), (13, 13, 13), "the item packets' lengths");
         let moves = [cs::DROP_ITEM, cs::INSERT_ITEM, cs::LIFT_ITEM, cs::EQUIP_ITEM, cs::UNEQUIP_ITEM, cs::SWAP_EQUIPPED, cs::SWAP_GRID_ITEM, cs::BELT_ITEM, cs::UNBELT_ITEM, cs::SWAP_BELT_ITEM];
         assert_eq!(moves.map(size), [5, 17, 5, 9, 3, 9, 17, 9, 5, 9], "the item move packets' lengths");
+        assert_eq!((size(cs::IDENTIFY_ITEM), engine.server_packet_sizes[usize::from(d2gs::sc::ITEM_SPELL_READY)]), (9, 8), "identify and its cursor");
     }
 
     #[test]
@@ -3010,6 +3063,47 @@ pub(crate) mod tests {
         .unwrap();
         rules.set_item_rules(stats, d2_data::item_stats::ItemRatios::default());
         rules
+    }
+
+    /// An identify scroll used turns the cursor (`0x3F`); pointed at an unidentified axe it is
+    /// used up and the axe comes back identified, its stats and all.
+    #[test]
+    fn a_scroll_identifies_an_item() {
+        let (rules, town) = test_town();
+        let mut rules = item_rules(rules);
+        let misc = d2_formats::excel::Table::parse(b"name\tcode\ttype\tcompactsave\tcomponent\tuseable\r\nScroll of Identify\tisc\tgem\t1\t16\t1\r\n");
+        let itemtypes = d2_formats::excel::Table::parse(
+            b"ItemType\tCode\tEquiv1\tBeltable\tBodyLoc1\tBodyLoc2\r\nGem\tgem\t\t0\t\t\r\nWeapon\tweap\t\t0\t\t\r\nAxe\taxe\tweap\t0\trarm\tlarm\r\n",
+        );
+        let weapons = d2_formats::excel::Table::parse(b"name\tcode\ttype\tcompactsave\tcomponent\tinvwidth\tinvheight\tdurability\r\nHand Axe\thax\taxe\t0\t5\t1\t3\t28\r\n");
+        let empty = d2_formats::excel::Table::parse(b"name\tcode\ttype\r\n");
+        rules.set_items(d2_data::items::Items::from_tables(&itemtypes, &weapons, &empty, &misc).unwrap(), Vec::new());
+        let (hax, isc) = (rules.items().class_of(b"hax ").unwrap(), rules.items().class_of(b"isc ").unwrap());
+        let gs = GameServer::new(test_tables(), Some(rules)).with_town(town);
+        let id = gs.create("sage", "", 0).unwrap();
+        let p = Player::new(id, character("Hero", 0, 0x20), 0, 0, (0, 0));
+        let stats = p.join_stats(gs.rules.as_ref().unwrap()).unwrap();
+        gs.join_battle(id, "Hero", 0, &stats);
+        gs.join_items(&p);
+        {
+            let mut g = gs.lock();
+            let inv = &mut g.by_id.get_mut(&id).unwrap().carried.get_mut("Hero").unwrap().inventory;
+            let mut axe = Item::new(*b"hax ", 101, 9, Location::Stored { col: 0, row: 0, page: 0 });
+            axe.quality = item_bits::Quality::Magic { prefix: 0, suffix: 1 };
+            axe.flags &= !item_bits::flags::IDENTIFIED;
+            axe.stats = vec![item_bits::ItemStat { id: 19, param: 0, value: 12 }];
+            assert!(inv.insert(Held { guid: 50, class: hax, size: (1, 3), place: Place::Grid { col: 0, row: 0 }, item: axe }));
+            assert!(inv.insert(Held { guid: 51, class: isc, size: (1, 1), place: Place::Grid { col: 5, row: 0 }, item: *simple_item(b"isc ", 101) }));
+        }
+        assert!(gs.identify_item(id, "Hero", 50, 51).is_empty(), "not made ready");
+        assert_eq!(gs.use_item(id, "Hero", 51, false), [d2gs::item_spell_ready(0, 51, 218)]);
+        let done = gs.identify_item(id, "Hero", 50, 51);
+        assert_eq!((done.len(), done[0][1], done[1][0], done[1][1]), (2, item_action::REMOVE_FROM_CONTAINER, 0x9D, item_action::UPDATE));
+        let rules = gs.rules.as_ref().unwrap();
+        let (axe, _) = item_bits::read(&done[1][13..], rules.items(), rules.item_stats(), item_bits::Target::Network).unwrap();
+        assert!(axe.identified());
+        assert_eq!(axe.stats, [item_bits::ItemStat { id: 19, param: 0, value: 12 }], "the stats go out once identified");
+        assert!(gs.identify_item(id, "Hero", 50, 51).is_empty(), "once");
     }
 
     /// A hand axe picked up is worn in the empty right hand; a second, which an Amazon cannot

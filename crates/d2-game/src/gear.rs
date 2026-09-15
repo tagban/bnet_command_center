@@ -90,7 +90,8 @@ pub fn gear(data: &GameData, worn: &[(u8, &Item)]) -> Gear {
     let (flat_min, flat_max) = if two_handed { (stat::SECONDARY_MINDAMAGE, stat::SECONDARY_MAXDAMAGE) } else { (stat::MINDAMAGE, stat::MAXDAMAGE) };
     for &(_, item) in worn {
         let Some(def) = items.class_of(&item.code).and_then(|c| items.get(c)) else { continue };
-        let s = |id| sum(data, item, id);
+        // An unidentified item's magic is not on yet.
+        let s = |id| if item.identified() { sum(data, item, id) } else { 0 };
         for (slot, id) in [stat::STRENGTH, stat::ENERGY, stat::DEXTERITY, stat::VITALITY].into_iter().enumerate() {
             g.attributes[slot] += s(id);
         }
