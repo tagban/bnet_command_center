@@ -69,8 +69,6 @@ Practical consequences that are visible in this ecosystem today:
 - PvPGN is developed and hosted largely outside the United States.
 - Blizzard has issued takedowns against emulation projects in this space; the D2R
   emulation threads on the PvPGN forums reference exactly this.
-- You are running a hub in a jurisdiction you should identify
-  deliberately rather than by default.
 
 Things that reduce (not eliminate) exposure and are worth doing anyway:
 
@@ -90,10 +88,10 @@ Things that reduce (not eliminate) exposure and are worth doing anyway:
 ### Decision: the Diablo II game server is built from decompilation (2026-09-13)
 
 **Made by tagban (project owner), 2026-09-13**, as `docs/D2GS-RUST.md` §4 asked before any
-ported code lands. The Diablo II game server is written from decompiling the retail 1.14d
+ported code lands. The Diablo II game server is written from decompiling the retail 1.13
 `Game.exe` in Ghidra and from porting `jaenster/libd2` (MIT), which is itself
 decompilation-derived. tagban's reasoning: a working server needs it, and this version of the
-game is no longer supported.
+game is no longer supported. Specifically for Mac OS 9 and Early MacOSX.
 
 This records the choice. It does not change the exposure described above. What the project
 still keeps to:
