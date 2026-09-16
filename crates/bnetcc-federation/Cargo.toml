@@ -1,0 +1,16 @@
+[package]
+name = "bnetcc-federation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The message set a Command Center node and its hub speak (see docs/FEDERATION.md)."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
