@@ -18,10 +18,12 @@
 //! depending on each other.
 
 pub mod frame;
+pub mod link;
 
 use serde::{Deserialize, Serialize};
 
 pub use frame::{decode, encode, FrameError, MAX_FRAME};
+pub use link::{Link, LinkError};
 
 /// The protocol version a `Hello` announces. Bumped when a peer that does not understand a
 /// change would behave wrongly — not merely when a field is added, since an added field is
