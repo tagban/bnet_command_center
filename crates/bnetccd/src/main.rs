@@ -324,10 +324,19 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
     // Optional PvPGN-compatible tracking: advertise this server to public trackers, and/or
     // host our own tracker (UDP beacon receiver) + public server-list page.
     if !cfg.tracker.advertise_to.is_empty() {
+        // What to say we serve. When version checking is restricted, the products it names are
+        // exactly the clients that can get in; otherwise the server admits every product it
+        // speaks. Either way the operator writes nothing.
+        let products: Vec<String> = if cfg.versions.restrict {
+            cfg.versions.allowed.keys().cloned().collect()
+        } else {
+            status::KNOWN_PRODUCTS.iter().map(|(code, _)| (*code).to_string()).collect()
+        };
         tokio::spawn(tracker::advertise(
             Arc::clone(&node),
             cfg.listen.bncs.port(),
             cfg.tracker.clone(),
+            tracker::Offered { products, closed_realm: cfg.diablo2.realm },
         ));
     }
     if !cfg.tracker.host_listen.trim().is_empty() || !cfg.tracker.list_listen.trim().is_empty() {

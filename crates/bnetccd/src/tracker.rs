@@ -151,9 +151,45 @@ fn be_u32(buf: &[u8], o: usize) -> u32 {
 // Advertise (outbound beacon)
 // ---------------------------------------------------------------------------
 
+/// What this server offers, worked out rather than configured.
+///
+/// A tracking packet carries no field for it, so operators have always hand-written codes into
+/// the description — which means knowing a table, and keeping it right as the server changes.
+/// Ours reads what the server is actually set up to serve, so an operator who configures
+/// nothing is still listed correctly. Setting `[tracker] description` overrides all of this.
+#[derive(Debug, Clone, Default)]
+pub struct Offered {
+    /// Product codes this server will admit, e.g. `W2BN`.
+    pub products: Vec<String>,
+    /// Whether the Diablo II realm is offered — a closed realm, not open play.
+    pub closed_realm: bool,
+}
+
+impl Offered {
+    /// The description to beacon: the short codes public list sites render as game icons,
+    /// then the server's name. Products those sites have no icon for are left out rather than
+    /// printed as noise beside the name; our own tracker reads product codes as well, so
+    /// nothing is lost on a listing that understands them.
+    fn describe(&self, name: &str) -> String {
+        let mut codes = String::new();
+        for product in &self.products {
+            // Brood War draws the StarCraft icon on those sites — there is no separate
+            // picture — so asking for both only prints StarCraft twice.
+            if product == "SEXP" && self.products.iter().any(|p| p == "STAR") {
+                continue;
+            }
+            if let Some((_, code)) = ICON_CODES.iter().find(|(p, _)| p == product) {
+                codes.push_str(code);
+            }
+        }
+        codes.push_str(if self.closed_realm { "CLOLDR" } else { "OPELDR" });
+        format!("{codes} {name}")
+    }
+}
+
 /// Beacon this server to the configured trackers on an interval. Returns immediately if no
 /// targets are configured.
-pub async fn advertise(node: Arc<Node>, bncs_port: u16, cfg: TrackerConfig) {
+pub async fn advertise(node: Arc<Node>, bncs_port: u16, cfg: TrackerConfig, offered: Offered) {
     if cfg.advertise_to.is_empty() {
         return;
     }
@@ -169,7 +205,7 @@ pub async fn advertise(node: Arc<Node>, bncs_port: u16, cfg: TrackerConfig) {
     let mut tick = tokio::time::interval(period);
     loop {
         tick.tick().await;
-        let packet = build_beacon(&node, bncs_port, &cfg).encode();
+        let packet = build_beacon(&node, bncs_port, &cfg, &offered).encode();
         for target in &cfg.advertise_to {
             let target = if target.contains(':') { target.clone() } else { format!("{target}:6114") };
             match sock.send_to(&packet, &target).await {
@@ -194,15 +230,18 @@ fn field(s: &str) -> String {
     if s.is_empty() { UNSET.to_string() } else { s.to_string() }
 }
 
-fn build_beacon(node: &Node, bncs_port: u16, cfg: &TrackerConfig) -> TrackPacket {
+fn build_beacon(node: &Node, bncs_port: u16, cfg: &TrackerConfig, offered: &Offered) -> TrackPacket {
     let uptime = u32::try_from(node.uptime_secs()).unwrap_or(u32::MAX);
+    // An operator who writes a description gets exactly that; everyone else gets one worked
+    // out from what the server serves, so being listed properly needs no configuration.
+    let described = offered.describe(&node.name);
     TrackPacket {
         server_port: bncs_port,
         flags: 0,
         software: "Command Center".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         platform: std::env::consts::OS.to_string(),
-        server_desc: field(if cfg.description.trim().is_empty() { &node.name } else { &cfg.description }),
+        server_desc: field(if cfg.description.trim().is_empty() { &described } else { &cfg.description }),
         location: field(&cfg.location),
         url: field(&cfg.url),
         contact_name: field(&cfg.contact_name),
@@ -268,6 +307,22 @@ const OFFERINGS: &[(&str, Offering)] = &[
     ("SC", Offering { code: "STAR", name: "StarCraft", game: true }),
     ("D1", Offering { code: "DRTL", name: "Diablo", game: true }),
     ("D2", Offering { code: "D2DV", name: "Diablo II", game: true }),
+];
+
+/// The short code a public list site draws an icon for, per product. `JSTR` is absent on
+/// purpose: those sites have no picture for it, and an unrecognised code is printed as text
+/// beside the server's name rather than quietly ignored.
+const ICON_CODES: &[(&str, &str)] = &[
+    ("STAR", "SC"),
+    ("SEXP", "SBW"),
+    ("SSHR", "SSHR"),
+    ("DRTL", "D1"),
+    ("DSHR", "DHR"),
+    ("D2DV", "D2"),
+    ("D2XP", "LOD"),
+    ("W2BN", "WC2"),
+    ("WAR3", "WC3"),
+    ("W3XP", "WCX"),
 ];
 
 /// Split one word into offerings, or `None` if any part of it is not a code. Whole-word only:
@@ -548,6 +603,26 @@ mod tests {
         assert_eq!(d.url, "https://bnet.cc");
         assert_eq!(d.active_users, 12);
         assert_eq!(d.uptime, 3600);
+    }
+
+    #[test]
+    fn a_server_describes_itself_without_being_configured() {
+        let offered = Offered {
+            products: ["STAR", "SEXP", "D2DV", "D2XP", "W2BN", "WAR3", "W3XP", "JSTR"].iter().map(|p| (*p).to_string()).collect(),
+            closed_realm: true,
+        };
+        let described = offered.describe("Command Center");
+        // Brood War would only draw StarCraft's icon again, and JSTR has no icon at all.
+        assert_eq!(described, "SCD2LODWC2WC3WCXCLOLDR Command Center");
+        assert!(described.len() <= 64, "the description field is 64 bytes");
+        // And it reads back as the games it was built from.
+        let (offers, name) = read_offerings(&described);
+        assert_eq!(name, "Command Center");
+        assert_eq!(offers.iter().filter(|o| o.game).map(|o| o.code).collect::<Vec<_>>(), ["STAR", "D2DV", "D2XP", "W2BN", "WAR3", "W3XP"]);
+        assert_eq!(offers.iter().filter(|o| !o.game).map(|o| o.code).collect::<Vec<_>>(), ["CLOSED", "LADDER"]);
+
+        let open = Offered { products: vec!["STAR".to_string()], closed_realm: false };
+        assert_eq!(open.describe("Small"), "SCOPELDR Small");
     }
 
     #[test]

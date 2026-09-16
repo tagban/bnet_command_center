@@ -399,7 +399,7 @@ const USERS_PAGE_SIZE: u32 = 50;
 /// A fixed pick-list keeps the editor typo-proof: no hand-typed FourCCs (which is how a bad
 /// value like "TELNET" once got in). Telnet/chat clients are limited by the gateway per-IP
 /// field, not here.
-const KNOWN_PRODUCTS: &[(&str, &str)] = &[
+pub(crate) const KNOWN_PRODUCTS: &[(&str, &str)] = &[
     ("STAR", "StarCraft"),
     ("SEXP", "Brood War"),
     ("SSHR", "StarCraft Shareware"),
