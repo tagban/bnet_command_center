@@ -42,6 +42,9 @@ const EXTENSION_MAGIC: &[u8; 4] = b"BNCC";
 /// Keeps a beacon inside one datagram on any normal path, without fragmenting.
 const MAX_BEACON: usize = 1200;
 
+/// How long after starting the list is first pushed to a website. See `push_list`.
+const FIRST_PUSH_DELAY: Duration = Duration::from_secs(15);
+
 /// What a Command Center server can say that the standard packet cannot.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Extension {
@@ -543,7 +546,10 @@ async fn push_list(registry: Registry, cfg: crate::config::TrackerPushConfig, pr
     let period = Duration::from_secs(cfg.interval_secs.max(30));
     let bearer = (!cfg.token.trim().is_empty()).then(|| cfg.token.clone());
     info!(interval_secs = period.as_secs(), "tracker: pushing the server list to a site");
-    let mut tick = tokio::time::interval(period);
+    // Not at the instant the server starts: the list is empty then, even of this server's own
+    // beacon, and a site shown an empty list keeps showing it for a whole interval. A few
+    // seconds lets the servers already beaconing at us — this one included — arrive first.
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + FIRST_PUSH_DELAY, period);
     loop {
         tick.tick().await;
         let servers = snapshot(&registry, prune_after);
