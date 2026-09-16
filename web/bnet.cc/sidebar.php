@@ -74,6 +74,7 @@ require_once __DIR__ . '/bnetcc/server.php';
 <?php endif; ?>
 </table>
 <a class="tiny" href="/server.php">Server details &raquo;</a>
+<a class="tiny" href="/tracker.php">Server list &raquo;</a>
 <?php
 })();
 ?>

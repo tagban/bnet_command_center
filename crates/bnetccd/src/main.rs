@@ -344,6 +344,7 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
             cfg.tracker.host_listen.clone(),
             cfg.tracker.list_listen.clone(),
             cfg.tracker.prune_after_secs,
+            cfg.tracker_push.clone(),
         ));
     }
 

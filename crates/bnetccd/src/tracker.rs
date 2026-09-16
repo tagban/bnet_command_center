@@ -457,11 +457,17 @@ struct TrackedServer {
 
 type Registry = Arc<Mutex<HashMap<(IpAddr, u16), TrackedServer>>>;
 
-/// Run our own tracker: a UDP receiver plus an HTTP list page. `udp_listen`/`http_listen`
-/// come from config; either empty disables that half.
-pub async fn host(udp_listen: String, http_listen: String, prune_after_secs: u64) {
+/// Run our own tracker: a UDP receiver, an HTTP list page, and an outbound push of the same
+/// list to a website. `udp_listen`/`http_listen` come from config; either empty disables that
+/// half, as does a push with no URL.
+pub async fn host(udp_listen: String, http_listen: String, prune_after_secs: u64, push: crate::config::TrackerPushConfig) {
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
     let prune_after = Duration::from_secs(prune_after_secs.max(60));
+
+    if !push.url.trim().is_empty() {
+        let registry = Arc::clone(&registry);
+        tokio::spawn(async move { push_list(registry, push, prune_after).await });
+    }
 
     if let Ok(addr) = udp_listen.parse::<SocketAddr>() {
         let registry = Arc::clone(&registry);
@@ -524,6 +530,23 @@ async fn receive_beacons(addr: SocketAddr, registry: Registry, prune_after: Dura
         let mut reg = registry.lock().expect("tracker registry");
         reg.insert((ip, pkt.server_port), entry);
         reg.retain(|_, s| s.last_seen.elapsed() < prune_after);
+    }
+}
+
+/// Send the list to a website on an interval, so the page can be served from there rather than
+/// from us. Best-effort, on its own task: a failed post is logged and dropped.
+async fn push_list(registry: Registry, cfg: crate::config::TrackerPushConfig, prune_after: Duration) {
+    let period = Duration::from_secs(cfg.interval_secs.max(30));
+    let bearer = (!cfg.token.trim().is_empty()).then(|| cfg.token.clone());
+    info!(interval_secs = period.as_secs(), "tracker: pushing the server list to a site");
+    let mut tick = tokio::time::interval(period);
+    loop {
+        tick.tick().await;
+        let servers = snapshot(&registry, prune_after);
+        let body = serde_json::to_string(&servers).unwrap_or_else(|_| "[]".into());
+        if let Err(e) = crate::outbound::post_json(&cfg.url, &body, bearer.as_deref()).await {
+            warn!(error = %e, "tracker: pushing the server list failed");
+        }
     }
 }
 

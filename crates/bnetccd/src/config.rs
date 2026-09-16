@@ -47,6 +47,8 @@ pub struct Config {
     pub ladder_push: LadderPushConfig,
     /// Optional PvPGN-compatible server tracking (advertise us / host a list).
     pub tracker: TrackerConfig,
+    #[serde(default)]
+    pub tracker_push: TrackerPushConfig,
     /// The Diablo II closed realm (private characters).
     pub diablo2: Diablo2Config,
 }
@@ -168,6 +170,26 @@ pub struct StatsPushConfig {
 impl Default for StatsPushConfig {
     fn default() -> Self {
         Self { url: String::new(), interval_secs: 60, token: String::new(), include_users: false }
+    }
+}
+
+/// Push the tracked server list to an external site, the same way the stats and ladder pushes
+/// work: outbound only, so a server behind NAT needs no forwarded port and the list page does
+/// not depend on reaching us. Disabled unless `url` is set.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TrackerPushConfig {
+    /// The `https://` endpoint on your site that receives the list POST. Empty disables it.
+    pub url: String,
+    /// Seconds between pushes (minimum 30).
+    pub interval_secs: u64,
+    /// Optional bearer token; sent as `Authorization: Bearer <token>` if set. A secret.
+    pub token: String,
+}
+
+impl Default for TrackerPushConfig {
+    fn default() -> Self {
+        Self { url: String::new(), interval_secs: 300, token: String::new() }
     }
 }
 

@@ -59,3 +59,15 @@ define('DOWNLOADS_NAMES', [
 // Before the first push arrives, the sidebar reads the public status feed directly (at most every
 // 30 seconds).
 define('SERVER_STATUS_URL', 'http://us.bnet.cc:6116/status.json');
+
+// The token the server sends with its tracker push ([tracker_push] token in bnetccd.toml), for
+// tracker-push.php. Long and random.
+define('TRACKER_PUSH_TOKEN', '');
+
+// The address other operators point their servers at to be listed, shown on the tracker page.
+define('TRACKER_ADDRESS', 'us.bnet.cc');
+
+// Game icons for the tracker page, taken from icons.bni. A game with no icon here shows its
+// name instead, so this is optional.
+define('TRACKER_ICON_DIR', __DIR__ . '/icons');
+define('TRACKER_ICON_URL', '/icons');
