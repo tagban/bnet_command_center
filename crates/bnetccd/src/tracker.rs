@@ -17,7 +17,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tracing::{info, warn};
@@ -29,6 +29,36 @@ use crate::node::Node;
 const PACKET_VERSION: u16 = 2;
 /// Total wire size of a tracking packet.
 const PACKET_SIZE: usize = 464;
+
+/// Marks our own additions, which follow a complete and unchanged tracking packet.
+///
+/// The 1999 packet has nowhere to say the name players dial, and its one free-text field is 64
+/// bytes shared with the server's name — so a game with no icon on the old list sites has to be
+/// dropped to avoid printing a bare code beside it. Rather than bend that packet, the standard
+/// one is sent exactly as before and this is appended: a tracker that predates us reads the
+/// fixed struct it expects and never looks further, while ours reads the rest.
+const EXTENSION_MAGIC: &[u8; 4] = b"BNCC";
+
+/// Keeps a beacon inside one datagram on any normal path, without fragmenting.
+const MAX_BEACON: usize = 1200;
+
+/// What a Command Center server can say that the standard packet cannot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Extension {
+    /// The name players dial — `us.bnet.cc`, not an address someone has to copy digit by
+    /// digit. Listed in place of the beacon's source address when it is present.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    host: String,
+    /// Every product this server admits, named the way its clients name themselves. Not
+    /// limited to the games the old list sites happen to have pictures for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    products: Vec<String>,
+    /// Other servers reachable through this one, each as an address a client can connect to.
+    /// Empty until federation ships; carried here so the list can show them under their server
+    /// rather than as strangers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    links: Vec<String>,
+}
 
 /// A decoded tracking packet (the dynamic stats plus the server's identity strings).
 #[derive(Debug, Clone)]
@@ -93,6 +123,32 @@ impl TrackPacket {
         }
         debug_assert_eq!(b.len(), PACKET_SIZE);
         b
+    }
+
+    /// The packet, followed by our own block when there is anything in it to send. Dropped
+    /// silently if it would not fit in one datagram — being listed matters more than the
+    /// extras, and every tracker gets the standard packet regardless.
+    fn encode_with(&self, extension: &Extension) -> Vec<u8> {
+        let mut b = self.encode();
+        if extension == &Extension::default() {
+            return b;
+        }
+        let Ok(json) = serde_json::to_vec(extension) else { return b };
+        if b.len() + EXTENSION_MAGIC.len() + json.len() > MAX_BEACON {
+            warn!("tracker: our own additions are too large for one datagram; sending without them");
+            return b;
+        }
+        b.extend_from_slice(EXTENSION_MAGIC);
+        b.extend_from_slice(&json);
+        b
+    }
+
+    /// Our own block, if this beacon carried one. Anything we cannot read is ignored: the
+    /// standard packet has already been accepted by then.
+    fn extension(buf: &[u8]) -> Option<Extension> {
+        let rest = buf.get(PACKET_SIZE..)?;
+        let json = rest.strip_prefix(EXTENSION_MAGIC.as_slice())?;
+        serde_json::from_slice(json).ok()
     }
 
     fn decode(buf: &[u8]) -> Option<Self> {
@@ -185,6 +241,12 @@ impl Offered {
         codes.push_str(if self.closed_realm { "CLOLDR" } else { "OPELDR" });
         format!("{codes} {name}")
     }
+
+    /// The same facts without the 64-byte squeeze: every product, named outright, for trackers
+    /// that read our own block. Nothing is dropped here for want of a picture.
+    fn extension(&self, host: &str) -> Extension {
+        Extension { host: host.trim().to_string(), products: self.products.clone(), links: Vec::new() }
+    }
 }
 
 /// Beacon this server to the configured trackers on an interval. Returns immediately if no
@@ -201,11 +263,12 @@ pub async fn advertise(node: Arc<Node>, bncs_port: u16, cfg: TrackerConfig, offe
         }
     };
     let period = Duration::from_secs(cfg.advertise_interval_secs.max(30));
-    info!(targets = ?cfg.advertise_to, interval_secs = period.as_secs(), "tracker: advertising this server");
+    let ours = offered.extension(&cfg.public_host);
+    info!(targets = ?cfg.advertise_to, interval_secs = period.as_secs(), host = %cfg.public_host, "tracker: advertising this server");
     let mut tick = tokio::time::interval(period);
     loop {
         tick.tick().await;
-        let packet = build_beacon(&node, bncs_port, &cfg, &offered).encode();
+        let packet = build_beacon(&node, bncs_port, &cfg, &offered).encode_with(&ours);
         for target in &cfg.advertise_to {
             let target = if target.contains(':') { target.clone() } else { format!("{target}:6114") };
             match sock.send_to(&packet, &target).await {
@@ -325,6 +388,12 @@ const ICON_CODES: &[(&str, &str)] = &[
     ("W3XP", "WCX"),
 ];
 
+/// What a product code means, for a server that could name its games outright instead of
+/// smuggling short codes through its description.
+fn offering_by_code(code: &str) -> Option<Offering> {
+    OFFERINGS.iter().find(|(_, o)| o.code == code && o.game).map(|(_, o)| *o)
+}
+
 /// Split one word into offerings, or `None` if any part of it is not a code. Whole-word only:
 /// a name that merely contains a code (`DISCO`) must not be eaten, so every character has to
 /// be accounted for.
@@ -374,6 +443,8 @@ struct TrackedServer {
     description: String,
     /// The games and notes read out of the description, which no longer contains them.
     offers: Vec<Offering>,
+    /// Other servers reachable through this one, once federation ships.
+    links: Vec<String>,
     url: String,
     users: u32,
     channels: u32,
@@ -420,9 +491,20 @@ async fn receive_beacons(addr: SocketAddr, registry: Registry, prune_after: Dura
         let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
         let Some(pkt) = TrackPacket::decode(&buf[..n]) else { continue };
         let ip = from.ip();
-        let (offers, description) = read_offerings(&pkt.server_desc);
+        let ours = TrackPacket::extension(&buf[..n]).unwrap_or_default();
+        let (mut offers, description) = read_offerings(&pkt.server_desc);
+        // A server that named its games outright is believed over codes squeezed into its
+        // description: that list is complete, and includes games the old sites have no icon
+        // for. The notes read from the description — open or closed play, ladder — still stand.
+        if !ours.products.is_empty() {
+            let notes: Vec<Offering> = offers.iter().copied().filter(|o| !o.game).collect();
+            offers = ours.products.iter().filter_map(|p| offering_by_code(p)).chain(notes).collect();
+        }
+        // The name players dial, when the server told us one; otherwise where it beaconed from.
+        let dialled = if ours.host.is_empty() { format!("{ip}:{}", pkt.server_port) } else { format!("{}:{}", ours.host, pkt.server_port) };
         let entry = TrackedServer {
-            address: format!("{ip}:{}", pkt.server_port),
+            address: dialled,
+            links: ours.links,
             software: pkt.software,
             version: pkt.version,
             platform: pkt.platform,
@@ -524,8 +606,16 @@ fn list_html(servers: &[TrackedServer]) -> String {
                     .map(|o| format!("<span class=\"tag{}\">{}</span>", if o.game { "" } else { " note" }, esc(o.name)))
                     .collect::<Vec<_>>()
                     .join("");
+                let links = if s.links.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "<div class=\"links\">Also reachable here: {}</div>",
+                        s.links.iter().map(|l| esc(l)).collect::<Vec<_>>().join(" · ")
+                    )
+                };
                 format!(
-                    "<tr><td><b>{}</b><div class=\"sub\">{} · {} {}</div><div class=\"tags\">{offers}</div></td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}s ago</td></tr>",
+                    "<tr><td><b>{}</b><div class=\"sub\">{} · {} {}</div><div class=\"tags\">{offers}</div>{links}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}s ago</td></tr>",
                     esc(&s.description),
                     esc(&s.address),
                     esc(&s.software),
@@ -556,6 +646,7 @@ tr:last-child td {{ border-bottom:none; }}
 .tag {{ font-size:11px; padding:1px 7px; border-radius:999px; background:rgba(90,169,230,.14);
   border:1px solid var(--line); color:var(--fg); }}
 .tag.note {{ background:transparent; color:var(--muted); }}
+.links {{ margin-top:6px; color:var(--muted); font-size:12px; }}
 .empty {{ color:var(--muted); }} .foot {{ color:var(--muted); font-size:12px; margin-top:16px; }}
 </style></head><body><div class="wrap">
 <h1>Battle.net Server List</h1>
@@ -603,6 +694,47 @@ mod tests {
         assert_eq!(d.url, "https://bnet.cc");
         assert_eq!(d.active_users, 12);
         assert_eq!(d.uptime, 3600);
+    }
+
+    #[test]
+    fn our_additions_ride_along_without_disturbing_the_old_packet() {
+        let base = TrackPacket {
+            server_port: 6112,
+            flags: 0,
+            software: "Command Center".into(),
+            version: "0.2.3".into(),
+            platform: "linux".into(),
+            server_desc: "SCD2LODCLOLDR Command Center".into(),
+            location: "US".into(),
+            url: "bnet.cc".into(),
+            contact_name: "op".into(),
+            contact_email: "none".into(),
+            active_users: 1,
+            active_channels: 2,
+            active_games: 0,
+            uptime: 60,
+            total_games: 3,
+            total_logins: 4,
+        };
+        let ours = Extension {
+            host: "us.bnet.cc".into(),
+            products: ["STAR", "JSTR", "D2DV"].iter().map(|p| (*p).to_string()).collect(),
+            links: vec!["eu.bnet.cc:6112".into()],
+        };
+        let bytes = base.encode_with(&ours);
+        assert!(bytes.len() > PACKET_SIZE, "our block follows the packet");
+        assert!(bytes.len() <= MAX_BEACON, "and still fits one datagram");
+        // A tracker that predates us reads its fixed struct and is none the wiser.
+        let old = TrackPacket::decode(&bytes).expect("the standard packet still decodes");
+        assert_eq!(old.software, "Command Center");
+        assert_eq!(old.total_logins, 4);
+        assert_eq!(&bytes[..PACKET_SIZE], &base.encode()[..], "the first 464 bytes are untouched");
+        assert_eq!(TrackPacket::extension(&bytes).unwrap(), ours);
+        // Japanese StarCraft has no icon on the old sites, so it can only arrive this way.
+        assert_eq!(offering_by_code("JSTR").unwrap().name, "StarCraft (Japan)");
+        // A plain beacon carries nothing extra, and is not mistaken for one that does.
+        assert_eq!(base.encode_with(&Extension::default()).len(), PACKET_SIZE);
+        assert!(TrackPacket::extension(&base.encode()).is_none());
     }
 
     #[test]

@@ -117,6 +117,10 @@ pub struct TrackerConfig {
     pub contact_email: String,
     /// Where this server is, as you want it listed, e.g. `"US"` or `"US - Dallas"`.
     pub location: String,
+    /// The address players actually dial for this server, e.g. `"us.bnet.cc"`. Trackers that
+    /// understand it list this instead of the bare address the beacon arrived from, so nobody
+    /// has to copy digits. Empty falls back to that address.
+    pub public_host: String,
     /// Seconds between beacons (minimum 30; default 300).
     pub advertise_interval_secs: u64,
     /// UDP address to receive other servers' beacons on, e.g. `"0.0.0.0:6114"`. Empty = off.
@@ -137,6 +141,7 @@ impl Default for TrackerConfig {
             contact_name: String::new(),
             contact_email: String::new(),
             location: String::new(),
+            public_host: String::new(),
             advertise_interval_secs: 300,
             host_listen: String::new(),
             list_listen: String::new(),
