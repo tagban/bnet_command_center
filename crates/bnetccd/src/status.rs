@@ -273,8 +273,10 @@ async fn route(req: &Request, peer_ip: IpAddr, panel: &Panel) -> Response {
 }
 
 /// `POST /restart` — signal the daemon to exit with the restart code. Whether it actually
-/// comes back depends on being run under the launcher-supervisor; a standalone daemon just
-/// stops. The reply is a self-refreshing page that polls until the panel answers again.
+/// comes back depends on what is supervising it: the launcher relaunches on that code, and a
+/// systemd unit with `Restart=always` (as on a VPS) relaunches on any exit. A daemon started by
+/// hand with nothing watching it just stops. The reply is a self-refreshing page that polls
+/// until the panel answers again.
 fn do_restart(restart: &Arc<Notify>) -> Response {
     // The main task is selecting on this; it exits the process with RESTART_EXIT_CODE, and
     // the launcher (if supervising) relaunches. notify_one is enough — one waiter.
