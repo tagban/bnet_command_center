@@ -372,15 +372,19 @@ const OFFERINGS: &[(&str, Offering)] = &[
     ("D2", Offering { code: "D2DV", name: "Diablo II", game: true }),
 ];
 
-/// The short code a public list site draws an icon for, per product. `JSTR` is absent on
-/// purpose: those sites have no picture for it, and an unrecognised code is printed as text
-/// beside the server's name rather than quietly ignored.
+/// The short code a public list site draws an icon for, per product.
+///
+/// Two products are absent on purpose, both because of how those sites fail rather than what
+/// they lack. `JSTR` has no picture at all, and an unrecognised code is printed as text beside
+/// the server's name. `DSHR`'s code is worse: at least one site turns it into a broken image
+/// tag that swallows the rest of the description, so a server sending it is listed with its
+/// name replaced by the tail of that tag — which is exactly what happened to us, and to
+/// another server on the same list. Both games are named properly in our own block instead.
 const ICON_CODES: &[(&str, &str)] = &[
     ("STAR", "SC"),
     ("SEXP", "SBW"),
     ("SSHR", "SSHR"),
     ("DRTL", "D1"),
-    ("DSHR", "DHR"),
     ("D2DV", "D2"),
     ("D2XP", "LOD"),
     ("W2BN", "WC2"),
@@ -772,6 +776,10 @@ mod tests {
         let described = offered.describe("Command Center");
         // Brood War would only draw StarCraft's icon again, and JSTR has no icon at all.
         assert_eq!(described, "SCD2LODWC2WC3WCXCLOLDR Command Center");
+        // Diablo's shareware code is left out too: a site that mangles it into a broken image
+        // tag takes the server's name down with it. See ICON_CODES.
+        let shareware = Offered { products: vec!["DSHR".into(), "DRTL".into()], closed_realm: false };
+        assert_eq!(shareware.describe("Command Center"), "D1OPELDR Command Center");
         assert!(described.len() <= 64, "the description field is 64 bytes");
         // And it reads back as the games it was built from.
         let (offers, name) = read_offerings(&described);
