@@ -220,6 +220,95 @@ fn build_beacon(node: &Node, bncs_port: u16, cfg: &TrackerConfig) -> TrackPacket
 // Host (receive beacons + serve the list)
 // ---------------------------------------------------------------------------
 
+/// What a server says it offers, written into its description because the tracking packet has
+/// nowhere else to put it.
+///
+/// Two spellings mean the same thing. The PvPGN list sites have always used their own short
+/// codes, run together with no separator (`WC2WC3D2LODSC`), and servers in the wild are full of
+/// them — so we read those. But a Battle.net server already names its games precisely, with the
+/// product codes its clients log on with, so `W2BN WAR3 D2DV` is read as well and is the
+/// spelling worth telling an operator about: no table to look up, and it matches what they see
+/// everywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Offering {
+    /// Product code (`W2BN`), or our own short name for something that is not a game.
+    pub code: &'static str,
+    /// What to show a reader: `Warcraft II BNE`, not `WC2`.
+    pub name: &'static str,
+    /// False for the notes that ride along in the same field — open/closed play, ladder.
+    pub game: bool,
+}
+
+/// Every spelling we accept, longest token first so `SSHR` is not read as `SC` plus leftovers.
+/// Several tokens deliberately land on one product: `WC2` and `W2BN` are the same game.
+const OFFERINGS: &[(&str, Offering)] = &[
+    ("SSHR", Offering { code: "SSHR", name: "StarCraft Shareware", game: true }),
+    ("JSTR", Offering { code: "JSTR", name: "StarCraft (Japan)", game: true }),
+    ("W2BN", Offering { code: "W2BN", name: "Warcraft II BNE", game: true }),
+    ("WAR3", Offering { code: "WAR3", name: "Warcraft III", game: true }),
+    ("W3XP", Offering { code: "W3XP", name: "Warcraft III: TFT", game: true }),
+    ("D2DV", Offering { code: "D2DV", name: "Diablo II", game: true }),
+    ("D2XP", Offering { code: "D2XP", name: "Diablo II: LoD", game: true }),
+    ("DRTL", Offering { code: "DRTL", name: "Diablo", game: true }),
+    ("DSHR", Offering { code: "DSHR", name: "Diablo Shareware", game: true }),
+    ("STAR", Offering { code: "STAR", name: "StarCraft", game: true }),
+    ("SEXP", Offering { code: "SEXP", name: "Brood War", game: true }),
+    ("CHAT", Offering { code: "CHAT", name: "Chat client", game: true }),
+    ("SPW", Offering { code: "SPWN", name: "StarCraft Spawn", game: true }),
+    ("DHR", Offering { code: "DSHR", name: "Diablo Shareware", game: true }),
+    ("SBW", Offering { code: "SEXP", name: "Brood War", game: true }),
+    ("WC2", Offering { code: "W2BN", name: "Warcraft II BNE", game: true }),
+    ("WC3", Offering { code: "WAR3", name: "Warcraft III", game: true }),
+    ("WCX", Offering { code: "W3XP", name: "Warcraft III: TFT", game: true }),
+    ("LOD", Offering { code: "D2XP", name: "Diablo II: LoD", game: true }),
+    ("ALL", Offering { code: "ALL", name: "All Blizzard games", game: true }),
+    ("OPE", Offering { code: "OPEN", name: "Open play", game: false }),
+    ("CLO", Offering { code: "CLOSED", name: "Closed realm", game: false }),
+    ("LDR", Offering { code: "LADDER", name: "Ladder", game: false }),
+    ("SC", Offering { code: "STAR", name: "StarCraft", game: true }),
+    ("D1", Offering { code: "DRTL", name: "Diablo", game: true }),
+    ("D2", Offering { code: "D2DV", name: "Diablo II", game: true }),
+];
+
+/// Split one word into offerings, or `None` if any part of it is not a code. Whole-word only:
+/// a name that merely contains a code (`DISCO`) must not be eaten, so every character has to
+/// be accounted for.
+fn split_codes(word: &str) -> Option<Vec<Offering>> {
+    if word.is_empty() {
+        return Some(Vec::new());
+    }
+    OFFERINGS.iter().find_map(|(token, offering)| {
+        let rest = word.strip_prefix(token)?;
+        let mut found = split_codes(rest)?;
+        found.insert(0, *offering);
+        Some(found)
+    })
+}
+
+/// Read a description into what the server offers and the words left over — its actual name.
+///
+/// A word counts as codes only if all of it does, and only if it is written in capitals, as
+/// every list site spells them. Both rules are there to protect the name: without the first,
+/// `DISCO` would be eaten for the `SC` inside it; without the second, a server describing
+/// itself as open to "all" would be read as offering every Blizzard game.
+fn read_offerings(description: &str) -> (Vec<Offering>, String) {
+    let mut offerings: Vec<Offering> = Vec::new();
+    let mut words: Vec<&str> = Vec::new();
+    for word in description.split_whitespace() {
+        match split_codes(word) {
+            Some(found) if !found.is_empty() => {
+                for one in found {
+                    if !offerings.iter().any(|o| o.code == one.code) {
+                        offerings.push(one);
+                    }
+                }
+            }
+            _ => words.push(word),
+        }
+    }
+    (offerings, words.join(" "))
+}
+
 /// One tracked server, as last reported.
 #[derive(Clone, Serialize)]
 struct TrackedServer {
@@ -228,6 +317,8 @@ struct TrackedServer {
     version: String,
     platform: String,
     description: String,
+    /// The games and notes read out of the description, which no longer contains them.
+    offers: Vec<Offering>,
     url: String,
     users: u32,
     channels: u32,
@@ -274,12 +365,14 @@ async fn receive_beacons(addr: SocketAddr, registry: Registry, prune_after: Dura
         let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
         let Some(pkt) = TrackPacket::decode(&buf[..n]) else { continue };
         let ip = from.ip();
+        let (offers, description) = read_offerings(&pkt.server_desc);
         let entry = TrackedServer {
             address: format!("{ip}:{}", pkt.server_port),
             software: pkt.software,
             version: pkt.version,
             platform: pkt.platform,
-            description: pkt.server_desc,
+            description,
+            offers,
             url: pkt.url,
             users: pkt.active_users,
             channels: pkt.active_channels,
@@ -370,8 +463,14 @@ fn list_html(servers: &[TrackedServer]) -> String {
         servers
             .iter()
             .map(|s| {
+                let offers = s
+                    .offers
+                    .iter()
+                    .map(|o| format!("<span class=\"tag{}\">{}</span>", if o.game { "" } else { " note" }, esc(o.name)))
+                    .collect::<Vec<_>>()
+                    .join("");
                 format!(
-                    "<tr><td><b>{}</b><div class=\"sub\">{} · {} {}</div></td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}s ago</td></tr>",
+                    "<tr><td><b>{}</b><div class=\"sub\">{} · {} {}</div><div class=\"tags\">{offers}</div></td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}s ago</td></tr>",
                     esc(&s.description),
                     esc(&s.address),
                     esc(&s.software),
@@ -398,6 +497,10 @@ td,th {{ text-align:left; padding:10px 14px; border-bottom:1px solid var(--line)
 th {{ color:var(--muted); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }}
 tr:last-child td {{ border-bottom:none; }}
 .sub {{ color:var(--muted); font-size:12px; }} .num {{ font-variant-numeric:tabular-nums; }}
+.tags {{ margin-top:6px; display:flex; flex-wrap:wrap; gap:4px; }}
+.tag {{ font-size:11px; padding:1px 7px; border-radius:999px; background:rgba(90,169,230,.14);
+  border:1px solid var(--line); color:var(--fg); }}
+.tag.note {{ background:transparent; color:var(--muted); }}
 .empty {{ color:var(--muted); }} .foot {{ color:var(--muted); font-size:12px; margin-top:16px; }}
 </style></head><body><div class="wrap">
 <h1>Battle.net Server List</h1>
@@ -445,6 +548,33 @@ mod tests {
         assert_eq!(d.url, "https://bnet.cc");
         assert_eq!(d.active_users, 12);
         assert_eq!(d.uptime, 3600);
+    }
+
+    #[test]
+    fn both_spellings_of_a_game_list_read_the_same() {
+        // The old list sites run their codes together with no separator; product codes are
+        // written the way an operator already knows them. Either way, the same games.
+        let (old, name) = read_offerings("SCSBWWC2D2LODCHATCLOLDR Command Center");
+        assert_eq!(name, "Command Center", "the name is what is left after the codes");
+        let games: Vec<&str> = old.iter().filter(|o| o.game).map(|o| o.code).collect();
+        assert_eq!(games, ["STAR", "SEXP", "W2BN", "D2DV", "D2XP", "CHAT"]);
+        assert_eq!(old.iter().filter(|o| !o.game).map(|o| o.code).collect::<Vec<_>>(), ["CLOSED", "LADDER"]);
+
+        let (new, name) = read_offerings("STAR SEXP W2BN D2DV D2XP CHAT CLO LDR Command Center");
+        assert_eq!(name, "Command Center");
+        assert_eq!(new, old, "both spellings describe the same server");
+    }
+
+    #[test]
+    fn a_name_that_merely_contains_a_code_is_left_alone() {
+        // "DISCO" starts with D1? no — but a careless matcher would find SC inside it.
+        let (offers, name) = read_offerings("[- DISCO Realm -] D2");
+        assert_eq!(name, "[- DISCO Realm -]", "prose is not eaten");
+        assert_eq!(offers.iter().map(|o| o.code).collect::<Vec<_>>(), ["D2DV"]);
+        // "all" is a word here, not the ALL code — only capitals are read as codes.
+        let (none, name) = read_offerings("a server with no codes at all");
+        assert!(none.is_empty());
+        assert_eq!(name, "a server with no codes at all");
     }
 
     #[test]
