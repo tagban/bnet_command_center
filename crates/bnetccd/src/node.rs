@@ -375,6 +375,12 @@ pub struct Node {
     connections: AtomicU64,
     /// Highest live connection count seen since startup, for the status UI.
     peak_connections: AtomicU64,
+    /// Successful logons since startup. Trackers show this as "total logins"; like PvPGN,
+    /// it counts from server start rather than for all time, so a restart begins again.
+    total_logins: AtomicU64,
+    /// Games advertised since startup, shown by trackers as "total games". A host
+    /// re-advertising its own live game is the same game, so it is only counted once.
+    total_games: AtomicU64,
     /// Accounts live behind this actor, not the `Mutex<Inner>` above — persistence is a
     /// disk write, and a disk write must never happen inside a lock that channel fanout
     /// also takes. See `crate::storage`.
@@ -538,6 +544,8 @@ impl Node {
             admission: Mutex::new(admission),
             connections: AtomicU64::new(0),
             peak_connections: AtomicU64::new(0),
+            total_logins: AtomicU64::new(0),
+            total_games: AtomicU64::new(0),
             storage,
             // 500ms matches observed real-Battle.net behaviour — see KeyRegistry's docs.
             key_registry: Mutex::new(KeyRegistry::new(500)),
@@ -648,7 +656,20 @@ impl Node {
 
     /// Record a successful logon time (fire-and-forget).
     pub fn record_login(&self, account_id: AccountId, when_secs: u64) {
+        self.total_logins.fetch_add(1, Ordering::Relaxed);
         self.storage.record_login(account_id, when_secs);
+    }
+
+    /// Successful logons since startup, for trackers.
+    #[must_use]
+    pub fn total_logins(&self) -> u64 {
+        self.total_logins.load(Ordering::Relaxed)
+    }
+
+    /// Games advertised since startup, for trackers.
+    #[must_use]
+    pub fn total_games(&self) -> u64 {
+        self.total_games.load(Ordering::Relaxed)
     }
 
     /// Claim a server-wide-unique display name for a new session: `base` if it is free,
@@ -1190,6 +1211,9 @@ impl Node {
             if existing.host != ad.host {
                 return false; // name taken by another host's live game
             }
+        } else {
+            // A name that was free is a new game; a host refreshing its own is not.
+            self.total_games.fetch_add(1, Ordering::Relaxed);
         }
         inner.games.insert(key, ad);
         true

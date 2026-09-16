@@ -185,7 +185,7 @@ fn build_beacon(node: &Node, bncs_port: u16, cfg: &TrackerConfig) -> TrackPacket
     TrackPacket {
         server_port: bncs_port,
         flags: 0,
-        software: "bnetccd".to_string(),
+        software: "Command Center".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         platform: std::env::consts::OS.to_string(),
         server_desc: if cfg.description.is_empty() { node.name.clone() } else { cfg.description.clone() },
@@ -197,8 +197,8 @@ fn build_beacon(node: &Node, bncs_port: u16, cfg: &TrackerConfig) -> TrackPacket
         active_channels: u32::try_from(node.channel_names().len()).unwrap_or(u32::MAX),
         active_games: u32::try_from(node.games().len()).unwrap_or(u32::MAX),
         uptime,
-        total_games: 0,
-        total_logins: 0,
+        total_games: u32::try_from(node.total_games()).unwrap_or(u32::MAX),
+        total_logins: u32::try_from(node.total_logins()).unwrap_or(u32::MAX),
     }
 }
 
