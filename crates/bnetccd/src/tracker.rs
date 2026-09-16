@@ -180,6 +180,20 @@ pub async fn advertise(node: Arc<Node>, bncs_port: u16, cfg: TrackerConfig) {
     }
 }
 
+/// Stand-in for a text field we have nothing for. A tracker writes its list as `##`-separated
+/// records, and a real one in the wild drops an empty field instead of keeping the gap: every
+/// later field then slides a column left, so our version was published as the software name,
+/// our platform as the description, and the game icons we asked for never rendered because the
+/// codes had landed in a numeric column. Sending a placeholder keeps the record aligned. Other
+/// listed servers use this same word, so it reads as intended rather than as a mistake.
+const UNSET: &str = "none";
+
+/// A text field as it should go on the wire: trimmed, and never empty.
+fn field(s: &str) -> String {
+    let s = s.trim();
+    if s.is_empty() { UNSET.to_string() } else { s.to_string() }
+}
+
 fn build_beacon(node: &Node, bncs_port: u16, cfg: &TrackerConfig) -> TrackPacket {
     let uptime = u32::try_from(node.uptime_secs()).unwrap_or(u32::MAX);
     TrackPacket {
@@ -188,11 +202,11 @@ fn build_beacon(node: &Node, bncs_port: u16, cfg: &TrackerConfig) -> TrackPacket
         software: "Command Center".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         platform: std::env::consts::OS.to_string(),
-        server_desc: if cfg.description.is_empty() { node.name.clone() } else { cfg.description.clone() },
-        location: String::new(),
-        url: cfg.url.clone(),
-        contact_name: cfg.contact_name.clone(),
-        contact_email: cfg.contact_email.clone(),
+        server_desc: field(if cfg.description.trim().is_empty() { &node.name } else { &cfg.description }),
+        location: field(&cfg.location),
+        url: field(&cfg.url),
+        contact_name: field(&cfg.contact_name),
+        contact_email: field(&cfg.contact_email),
         active_users: u32::try_from(node.online_count()).unwrap_or(u32::MAX),
         active_channels: u32::try_from(node.channel_names().len()).unwrap_or(u32::MAX),
         active_games: u32::try_from(node.games().len()).unwrap_or(u32::MAX),
@@ -431,6 +445,16 @@ mod tests {
         assert_eq!(d.url, "https://bnet.cc");
         assert_eq!(d.active_users, 12);
         assert_eq!(d.uptime, 3600);
+    }
+
+    #[test]
+    fn a_field_we_have_nothing_for_still_goes_out_filled() {
+        // A blank field is dropped rather than kept by at least one tracker in the wild, which
+        // shifts every later field a column left — the server's version ends up published as
+        // its software name. Nothing we send may be empty.
+        assert_eq!(field(""), "none");
+        assert_eq!(field("   "), "none");
+        assert_eq!(field(" bnet.cc "), "bnet.cc", "and a real value is trimmed, not padded");
     }
 
     #[test]

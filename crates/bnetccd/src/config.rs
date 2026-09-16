@@ -109,10 +109,14 @@ pub struct TrackerConfig {
     /// don't advertise. e.g. `["tracker.pvpgn.org", "track.muleslow.net"]`.
     pub advertise_to: Vec<String>,
     /// Description/URL/contact sent in our beacon (description defaults to the server name).
+    /// Anything left empty is sent as `none`, because a blank field mis-aligns some trackers'
+    /// records — see `crate::tracker`.
     pub description: String,
     pub url: String,
     pub contact_name: String,
     pub contact_email: String,
+    /// Where this server is, as you want it listed, e.g. `"US"` or `"US - Dallas"`.
+    pub location: String,
     /// Seconds between beacons (minimum 30; default 300).
     pub advertise_interval_secs: u64,
     /// UDP address to receive other servers' beacons on, e.g. `"0.0.0.0:6114"`. Empty = off.
@@ -132,6 +136,7 @@ impl Default for TrackerConfig {
             url: String::new(),
             contact_name: String::new(),
             contact_email: String::new(),
+            location: String::new(),
             advertise_interval_secs: 300,
             host_listen: String::new(),
             list_listen: String::new(),
