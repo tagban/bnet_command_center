@@ -231,18 +231,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bnetcc-winbot"
-version = "0.2.3"
-dependencies = [
- "bnetcc-crypto",
- "bnetcc-proto",
- "clap",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "bnetccd"
 version = "0.2.3"
 dependencies = [

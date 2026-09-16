@@ -66,7 +66,8 @@ The milestone is a screenshot of Brood War sitting in a channel. Nothing else co
       lists, `SID_STOPADV`/`SID_LEAVEGAME`/disconnect withdraw. Verified with a game test
       client (`session.rs` tests: create → list → visible to another client → end → gone,
       plus auto-withdraw on host disconnect). ⚠️ The `SID_GETADVLISTEX` game-entry wire
-      layout is unverified against a real client — confirm with a WinBot create/list cycle.
+      layout is unverified against a real client — confirm with a WinBot create/list cycle
+      (WinBot now lives in its own repository, `tagban/bnetcc-winbot`).
 - [x] **Admin/sysop accounts** — done 2026-09-09. `[admins] accounts` grants the Battle.net
       Administrator flag + Blizzard-rep tag on login (both modern and legacy logon paths).
 - [x] **Username rules** — done 2026-09-09. 2-char minimum, any letters/digits/symbols that
@@ -170,7 +171,7 @@ These are captured so they are not lost; each needs real design work, not just a
       (`bnetcc_core::ladder::war3`). **Decided:** ranks run 1 (best) to 500, everyone below
       unranked, on every ladder; a result counts only for a game longer than two minutes,
       ladder or not, so a surrender past two minutes is the other side's win (tagban,
-      2026-09-14). `winbot` (`docs/WINBOT.md`) plays two accounts against each other to test it. **Open for tagban:** the SC/W2 rating formula
+      2026-09-14). WinBot (its own repository, `tagban/bnetcc-winbot`) plays two accounts against each other to test it. **Open for tagban:** the SC/W2 rating formula
       (provisional Elo, start 1000, K 32), whether and how to enforce the 10-win rule, and the
       WC3 readings in `war3`'s module notes.
       - **Eligibility, as classic Battle.net had it:** StarCraft/Brood War and Warcraft II need

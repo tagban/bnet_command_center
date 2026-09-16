@@ -13,7 +13,6 @@ members = [
     "crates/d2-data",
     "crates/d2-drlg",
     "crates/d2-game",
-    "crates/winbot",
     "crates/pvpgn-import",
     "crates/bnetcc-federation",
     "crates/bnetcc-icons",
