@@ -21,9 +21,14 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
     header('Allow: POST');
     finish(405, 'POST only');
 }
+// The list comes from the same server as the stats push, so it may use the same token: a site
+// that already accepts that push needs no new secret for this one.
 $token = defined('TRACKER_PUSH_TOKEN') ? (string) TRACKER_PUSH_TOKEN : '';
+if ($token === '' && defined('SERVER_PUSH_TOKEN')) {
+    $token = (string) SERVER_PUSH_TOKEN;
+}
 if (strlen($token) < 16) {
-    finish(500, 'TRACKER_PUSH_TOKEN is not set in site-config.php (16 characters or more)');
+    finish(500, 'neither TRACKER_PUSH_TOKEN nor SERVER_PUSH_TOKEN is set in site-config.php (16 characters or more)');
 }
 // Some hosts drop the Authorization header before PHP sees it; the site's .htaccess puts it
 // back, and these are the names it can arrive under.

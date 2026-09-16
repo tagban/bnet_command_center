@@ -61,7 +61,8 @@ define('DOWNLOADS_NAMES', [
 define('SERVER_STATUS_URL', 'http://us.bnet.cc:6116/status.json');
 
 // The token the server sends with its tracker push ([tracker_push] token in bnetccd.toml), for
-// tracker-push.php. Long and random.
+// tracker-push.php. Leave empty to accept SERVER_PUSH_TOKEN, when both pushes come from the
+// same server.
 define('TRACKER_PUSH_TOKEN', '');
 
 // The address other operators point their servers at to be listed, shown on the tracker page.

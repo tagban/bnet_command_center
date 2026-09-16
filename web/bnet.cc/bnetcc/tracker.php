@@ -99,7 +99,7 @@ function tracker_icon_url(string $code): string
         return '';
     }
     $dir = defined('TRACKER_ICON_DIR') ? (string) TRACKER_ICON_DIR : __DIR__ . '/../icons';
-    $base = defined('TRACKER_ICON_URL') ? (string) TRACKER_ICON_URL : 'icons';
+    $base = defined('TRACKER_ICON_URL') ? (string) TRACKER_ICON_URL : '/icons';
     return is_file($dir . '/' . $code . '.png') ? $base . '/' . $code . '.png' : '';
 }
 
