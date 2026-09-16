@@ -486,7 +486,10 @@ async fn receive_beacons(addr: SocketAddr, registry: Registry, prune_after: Dura
         }
     };
     info!(%addr, "tracker: receiving server beacons");
-    let mut buf = [0u8; PACKET_SIZE + 64];
+    // Room for the standard packet and anything appended to it. A datagram is truncated to
+    // whatever this holds, so a buffer sized for the packet alone would silently cut our own
+    // block off mid-way and leave it unreadable.
+    let mut buf = [0u8; MAX_BEACON];
     loop {
         let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
         let Some(pkt) = TrackPacket::decode(&buf[..n]) else { continue };
