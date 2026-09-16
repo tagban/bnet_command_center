@@ -1,0 +1,18 @@
+[package]
+name = "bnetcc-icons"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Write the icons in an icons.bni out as PNGs, for the tracker page."
+
+[[bin]]
+name = "bnetcc-icons"
+path = "src/main.rs"
+
+[dependencies]
+bnetcc-proto = { path = "../bnetcc-proto" }
+
+[lints.rust]
+unsafe_code = "forbid"

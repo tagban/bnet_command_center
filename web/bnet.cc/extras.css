@@ -83,6 +83,6 @@ svg.chart .chart-dot { fill: #00C0FF; }
 .trk-notes { color: #00C0FF; font-size: 10px; margin-top: 3px; background-color: transparent; }
 .trk-links { color: #BBBBBB; font-size: 11px; margin-top: 4px; background-color: transparent; }
 .trk-links code { color: #FFAC04; font-size: 11px; }
-.trk-icon { vertical-align: middle; margin-right: 2px; border: 0; }
+.trk-icon { vertical-align: middle; margin-right: 2px; border: 0; max-height: 14px; width: auto; }
 .trk-none { color: #666666; font-size: 11px; }
 .trk-conf { color: #CCCCCC; font-size: 11px; background-color: #0e1a1f; border: 1px solid #1f4a5a; padding: 6px 8px; margin: 4px 0 10px; overflow-x: auto; }

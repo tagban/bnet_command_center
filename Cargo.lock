@@ -177,6 +177,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bnetcc-icons"
+version = "0.2.3"
+dependencies = [
+ "bnetcc-proto",
+]
+
+[[package]]
 name = "bnetcc-launcher"
 version = "0.2.3"
 dependencies = [

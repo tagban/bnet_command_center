@@ -16,6 +16,7 @@ members = [
     "crates/winbot",
     "crates/pvpgn-import",
     "crates/bnetcc-federation",
+    "crates/bnetcc-icons",
 ]
 
 [workspace.package]

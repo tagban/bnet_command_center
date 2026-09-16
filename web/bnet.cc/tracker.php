@@ -60,7 +60,7 @@ echo site_extras_css();
                     <?php else: ?>
                         <?php foreach ($games as $game): $icon = tracker_icon_url($game['code']); ?>
                             <?php if ($icon !== ''): ?>
-                                <img src="<?= h($icon) ?>" alt="<?= h($game['name']) ?>" title="<?= h($game['name']) ?>" width="16" height="16" class="trk-icon">
+                                <img src="<?= h($icon) ?>" alt="<?= h($game['name']) ?>" title="<?= h($game['name']) ?>" class="trk-icon">
                             <?php endif; ?>
                         <?php endforeach; ?>
                         <div class="trk-sub"><?= h(implode(', ', array_column($games, 'name'))) ?></div>
@@ -114,6 +114,11 @@ trackaddr = "<?= h($trackerAddress) ?>"</pre>
 <p class="post-body">
     Beacons are UDP on port <b>6114</b>. Allow it outbound. The list here updates every few
     minutes, so give it a little time before checking.
+</p>
+<p class="post-body">
+    The icons beside each server are the real ones — the artwork the games themselves use in
+    chat, taken from an <code>icons.bni</code> rather than redrawn. They are generated from a
+    copy of the game files and are not distributed with the server.
 </p>
 <?php
 site_template('footer');
