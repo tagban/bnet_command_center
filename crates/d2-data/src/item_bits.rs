@@ -25,6 +25,9 @@ pub mod flags {
     pub const USED: u32 = 0x20;
     /// Has sockets: the socket count is written.
     pub const SOCKETED: u32 = 0x800;
+    /// Slid down a belt column to close the gap an item taken out of it left (`0x0055EDC0`); the
+    /// client plays the belt's sound for it (`0x004C50F1`). The engine never clears it again.
+    pub const SLID_IN_BELT: u32 = 0x400;
     /// Just placed in the world: the client plays the fall.
     pub const DROPPED: u32 = 0x2000;
     /// An ear.
