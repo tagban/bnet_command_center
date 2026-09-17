@@ -192,6 +192,107 @@ impl Inventory {
 
 /// How snugly a `size` item sits at (`col`, `row`) in a `width` × `height` grid (`0x0063B340`):
 /// the occupied cells and grid edges along its four sides, or 255 when every side is closed.
+/// A standalone item grid — the stash, or the Horadric Cube.
+///
+/// The backpack is the richer [`Inventory`], which also holds the belt, the worn items and the
+/// cursor; a `Grid` holds only items in its cells. Its size comes from `Inventory.txt` (the
+/// stash `6 × 4` before the expansion and `6 × 8` with it, the cube `3 × 4`). `page` is the
+/// item-location page its items carry — `4` the stash, `3` the cube — so a client shows them in
+/// the right panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grid {
+    width: u8,
+    height: u8,
+    page: u8,
+    items: Vec<Held>,
+}
+
+impl Grid {
+    /// An empty grid of `width` × `height` whose items carry `page`.
+    #[must_use]
+    pub fn new(width: u8, height: u8, page: u8) -> Self {
+        Self { width, height, page, items: Vec::new() }
+    }
+
+    /// Cells across.
+    #[must_use]
+    pub fn width(&self) -> u8 {
+        self.width
+    }
+
+    /// Cells down.
+    #[must_use]
+    pub fn height(&self) -> u8 {
+        self.height
+    }
+
+    /// The item-location page its items carry (4 the stash, 3 the cube).
+    #[must_use]
+    pub fn page(&self) -> u8 {
+        self.page
+    }
+
+    /// Everything in it.
+    #[must_use]
+    pub fn items(&self) -> &[Held] {
+        &self.items
+    }
+
+    /// An item by guid.
+    #[must_use]
+    pub fn get(&self, guid: u32) -> Option<&Held> {
+        self.items.iter().find(|h| h.guid == guid)
+    }
+
+    /// The item covering a cell.
+    #[must_use]
+    pub fn covering(&self, col: u8, row: u8) -> Option<&Held> {
+        self.items.iter().find(|h| h.covers(col, row))
+    }
+
+    /// Take an item out.
+    pub fn remove(&mut self, guid: u32) -> Option<Held> {
+        let at = self.items.iter().position(|h| h.guid == guid)?;
+        Some(self.items.remove(at))
+    }
+
+    /// Whether a `size` item fits at `col, row`: inside the grid and over nothing.
+    #[must_use]
+    pub fn fits_at(&self, col: u8, row: u8, size: (u8, u8)) -> bool {
+        col.checked_add(size.0).is_some_and(|r| r <= self.width)
+            && row.checked_add(size.1).is_some_and(|b| b <= self.height)
+            && (col..col + size.0).all(|c| (row..row + size.1).all(|r| self.covering(c, r).is_none()))
+    }
+
+    /// A free spot for a `size` item, chosen as the backpack chooses one.
+    #[must_use]
+    pub fn free_spot(&self, size: (u8, u8)) -> Option<(u8, u8)> {
+        free_spot(self.width, self.height, size, &|c, r| self.covering(c, r).is_some())
+    }
+
+    /// Put a held item at the grid cell its `place` names; `false` if that is not a grid place
+    /// or it does not fit.
+    pub fn insert(&mut self, held: Held) -> bool {
+        let Place::Grid { col, row } = held.place else { return false };
+        if !self.fits_at(col, row, held.size) {
+            return false;
+        }
+        self.items.push(held);
+        true
+    }
+
+    /// The item as it should go on the wire and into the save: stored at its cell, on this
+    /// grid's page, so a client and the `.d2s` place it in the right panel.
+    #[must_use]
+    pub fn stored(&self, held: &Held) -> Item {
+        let mut item = held.item.clone();
+        if let Place::Grid { col, row } = held.place {
+            item.location = Location::Stored { col, row, page: self.page };
+        }
+        item
+    }
+}
+
 fn snugness(width: u8, height: u8, occupied: &dyn Fn(u8, u8) -> bool, col: u8, row: u8, (w, h): (u8, u8)) -> u32 {
     let side = |cells: &mut dyn Iterator<Item = (u8, u8)>| cells.filter(|&(c, r)| occupied(c, r)).count() as u32;
     let left = if col == 0 { u32::from(h) } else { side(&mut (row..row + h).map(|r| (col - 1, r))) };
@@ -246,6 +347,38 @@ mod tests {
 
     fn held(guid: u32, size: (u8, u8), place: Place) -> Held {
         Held { guid, class: 0, size, place, item: Item::new(*b"hp1 ", 101, 1, Location::Cursor { body: 0, col: 0, row: 0, page: None }) }
+    }
+
+    #[test]
+    fn a_grid_holds_items_within_its_bounds_and_on_its_page() {
+        // The Lord of Destruction stash: 6 wide, 8 tall, page 4.
+        let mut stash = Grid::new(6, 8, 4);
+        assert!(stash.insert(held(1, (2, 2), Place::Grid { col: 0, row: 0 })));
+        assert!(!stash.insert(held(2, (1, 1), Place::Grid { col: 1, row: 1 })), "over the first item");
+        assert!(!stash.insert(held(3, (1, 1), Place::Grid { col: 6, row: 0 })), "off the right edge");
+        assert!(stash.fits_at(2, 0, (4, 8)), "the rest of the 6x8 grid is free beside the 2x2");
+        assert!(stash.insert(held(4, (1, 1), Place::Grid { col: 5, row: 7 })), "the far corner is inside 6x8");
+
+        assert_eq!(stash.covering(0, 0).map(|h| h.guid), Some(1));
+        assert!(!stash.fits_at(0, 0, (1, 1)), "taken");
+        assert!(!stash.fits_at(2, 0, (4, 8)), "now the far corner item blocks that region");
+
+        // Its items go out on page 4, so the client shows them in the stash.
+        let held = stash.get(4).unwrap().clone();
+        match stash.stored(&held).location {
+            Location::Stored { col, row, page } => assert_eq!((col, row, page), (5, 7, 4)),
+            other => panic!("wanted a stored item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_grid_finds_a_snug_spot_and_removes() {
+        let mut cube = Grid::new(3, 4, 3);
+        let (c, r) = cube.free_spot((2, 2)).expect("a 2x2 fits an empty cube");
+        assert!(cube.insert(held(9, (2, 2), Place::Grid { col: c, row: r })));
+        assert!(cube.free_spot((3, 1)).is_some(), "a 3-wide row still fits below");
+        assert!(cube.remove(9).is_some());
+        assert!(cube.get(9).is_none());
     }
 
     #[test]
