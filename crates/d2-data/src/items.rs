@@ -480,6 +480,23 @@ impl Items {
         self.get(class).is_some_and(|d| d.tiers[0] != *b"    " && d.code != d.tiers[0])
     }
 
+    /// The potion families a belt column stacks, as the lists at `DAT_00744660` name them.
+    const BELT_FAMILIES: [&[&[u8; 4]]; 3] =
+        [&[b"hp1 ", b"hp2 ", b"hp3 ", b"hp4 ", b"hp5 "], &[b"mp1 ", b"mp2 ", b"mp3 ", b"mp4 ", b"mp5 "], &[b"rvs ", b"rvl "]];
+
+    /// Whether a picked-up item of class `new` stacks on top of one of class `belted` in a belt
+    /// column (`0x00628A40`): the same item, or two potions of one family — any two healing
+    /// potions, any two mana potions, or the two rejuvenation potions. Anything else, an antidote
+    /// or a scroll among them, only matches its own kind.
+    #[must_use]
+    pub fn same_belt_kind(&self, new: i32, belted: i32) -> bool {
+        if new == belted {
+            return true;
+        }
+        let (Some(a), Some(b)) = (self.get(new), self.get(belted)) else { return false };
+        Self::BELT_FAMILIES.iter().any(|family| family.contains(&&a.code) && family.contains(&&b.code))
+    }
+
     /// Whether item `class` is of a beltable type.
     #[must_use]
     pub fn beltable(&self, class: i32) -> bool {
@@ -569,5 +586,25 @@ mod tests {
         assert!(!items.beltable(ruby) && items.get(ruby).unwrap().effects.is_empty());
         assert!(!items.get(items.class_of(&code("key")).unwrap()).unwrap().compact);
         assert_eq!(items.class_of(&code("zzz")), None);
+    }
+
+    #[test]
+    fn a_belt_column_stacks_potions_of_one_family() {
+        let itemtypes = Table::parse(b"ItemType\tCode\tEquiv1\tBeltable\r\nPotion\tpoti\t\t1\r\n");
+        let empty = Table::parse(b"name\tcode\ttype\r\n");
+        let misc = Table::parse(
+            b"name\tcode\ttype\r\nMinor Healing Potion\thp1\tpoti\r\nGreater Healing Potion\thp4\tpoti\r\n\
+              Minor Mana Potion\tmp1\tpoti\r\nRejuvenation Potion\trvs\tpoti\r\n\
+              Full Rejuvenation Potion\trvl\tpoti\r\nAntidote Potion\typs\tpoti\r\n",
+        );
+        let items = Items::from_tables(&itemtypes, &empty, &empty, &misc).unwrap();
+        let class = |c: &str| items.class_of(&code(c)).unwrap();
+        assert!(items.same_belt_kind(class("hp1"), class("hp4")), "any two healing potions");
+        assert!(items.same_belt_kind(class("rvs"), class("rvl")), "both rejuvenations");
+        assert!(items.same_belt_kind(class("yps"), class("yps")), "an antidote on its own kind");
+        assert!(!items.same_belt_kind(class("hp1"), class("mp1")), "healing does not stack on mana");
+        assert!(!items.same_belt_kind(class("rvs"), class("hp1")), "nor rejuvenation on healing");
+        assert!(!items.same_belt_kind(class("yps"), class("hp1")));
+        assert!(!items.same_belt_kind(-1, class("hp1")), "no such item");
     }
 }

@@ -17,6 +17,7 @@ use d2_formats::mpq::{self, ArchiveSet, DATA_ARCHIVES};
 
 pub mod affixes;
 pub mod appearance;
+pub mod belts;
 pub mod character;
 pub mod engine;
 pub mod item_bits;
@@ -148,6 +149,7 @@ pub struct GameData {
     objects: Objects,
     shrines: Shrines,
     panels: panels::Panels,
+    belts: belts::Belts,
     items: Items,
     item_stats: item_stats::ItemStats,
     item_ratios: item_stats::ItemRatios,
@@ -197,6 +199,7 @@ impl GameData {
         data.objects = Objects::from_table(&read("objects.txt")?);
         data.shrines = Shrines::from_table(&read("shrines.txt")?);
         data.panels = panels::Panels::from_table(&read("inventory.txt")?);
+        data.belts = belts::Belts::from_table(&read("belts.txt")?);
         data.items = Items::from_tables(&read("itemtypes.txt")?, &read("weapons.txt")?, &read("armor.txt")?, &read("misc.txt")?)?;
         data.armor_types = read("armtype.txt")?.rows().filter_map(|r| r.get("Token").map(items::code)).collect();
         data.item_stats = item_stats::ItemStats::from_table(&read("itemstatcost.txt")?)?;
@@ -352,6 +355,29 @@ impl GameData {
     pub fn set_items(&mut self, items: Items, armor_types: Vec<Code>) {
         self.items = items;
         self.armor_types = armor_types;
+    }
+
+    /// `Belts.txt`: how many boxes each kind of belt gives.
+    #[must_use]
+    pub fn belts(&self) -> &belts::Belts {
+        &self.belts
+    }
+
+    /// Replace `Belts.txt` — for building rules from tables in tests.
+    pub fn set_belts(&mut self, belts: belts::Belts) {
+        self.belts = belts;
+    }
+
+    /// The belt slots a player has, with `worn` the class of the belt it wears (`None` with none):
+    /// the `numboxes` of the belt's `Belts.txt` row, four with no belt on (`0x0063C600`). An item
+    /// that is not a belt, or a row the table does not have, also gives four.
+    #[must_use]
+    pub fn belt_boxes(&self, worn: Option<i32>) -> u8 {
+        let kind = worn
+            .filter(|&class| self.items.is(class, "belt"))
+            .and_then(|class| self.items.get(class))
+            .map_or(belts::NO_BELT_KIND, |def| def.belt);
+        self.belts.boxes(kind).or_else(|| self.belts.boxes(belts::NO_BELT_KIND)).unwrap_or(belts::ROW_WIDTH)
     }
 
     /// `LvlPrest.txt`.
@@ -559,6 +585,7 @@ impl GameData {
             objects: Objects::default(),
             shrines: Shrines::default(),
             panels: panels::Panels::default(),
+            belts: belts::Belts::default(),
             items: Items::default(),
             item_stats: item_stats::ItemStats::default(),
             item_ratios: item_stats::ItemRatios::default(),
