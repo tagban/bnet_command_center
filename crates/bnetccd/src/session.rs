@@ -4437,15 +4437,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_the_game_server_test_on_a_realm_client_creates_a_game_and_logs_on_to_it() {
-        use crate::d2gs::tests::{logon_packet, read_frame, spawn, test_rules, test_tables};
+    async fn a_realm_client_creates_and_joins_games_through_the_linked_game_server() {
+        use bnetcc_gslink::{CreateError, FromGameServer, JoinError, Joined, ToGameServer};
         use bnetcc_proto::mcp::{create_game_result, join_result, msg};
 
-        let game_server = Arc::new(crate::d2gs::GameServer::new(test_tables(), Some(test_rules())));
-        let game_addr = spawn(Arc::clone(&game_server)).await;
+        let (link, link_addr) = crate::gslink::tests::listening("s3cret").await;
         let node = crate::node::test_node_with(|c| {
             if let Some(realm) = c.d2_realm.as_mut() {
-                realm.game_server = Some(Arc::clone(&game_server));
+                realm.game_server = Some(Arc::clone(&link));
             }
         });
         let addr = spawn_node(Arc::new(node)).await;
@@ -4459,14 +4458,40 @@ mod tests {
             w.u16(id).u32(0x1000).u8(1).u8(0xFF).u8(8).cstr(name).cstr(b"moo").cstr(b"");
             w.finish()
         };
+        let result = |body: &[u8]| u32::from_le_bytes(body[6..10].try_into().unwrap());
+        // No game server linked yet: the client's own "Server Down".
+        mcp_send(&mut mcp, msg::CREATEGAME, create(2, b"cows")).await;
+        assert_eq!(result(&mcp_recv(&mut mcp).await.body), create_game_result::SERVERS_DOWN);
+
+        let _gs = crate::gslink::tests::fake_game_server(link_addr, "s3cret", |request| match request {
+            ToGameServer::Create { id, name, difficulty, .. } => Some(FromGameServer::Created {
+                id,
+                result: if name.eq_ignore_ascii_case("cows") && difficulty == 1 { Ok(7) } else { Err(CreateError::NameTaken) },
+            }),
+            ToGameServer::Join { id, password, character, .. } => Some(FromGameServer::Joined {
+                id,
+                result: match (password.as_str(), character.as_str()) {
+                    ("moo", "Wirt") => Ok(Joined { token: 7, hash: 0xC0FF_EE00 }),
+                    (_, "Wirt") => Err(JoinError::BadPassword),
+                    _ => Err(JoinError::NoSuchCharacter),
+                },
+            }),
+            _ => None,
+        })
+        .await;
+        for _ in 0..200 {
+            if link.connected() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
         mcp_send(&mut mcp, msg::CREATEGAME, create(3, b"cows")).await;
         let created = mcp_recv(&mut mcp).await.body;
-        let token = u16::from_le_bytes([created[2], created[3]]);
-        assert_eq!(u32::from_le_bytes(created[6..10].try_into().unwrap()), create_game_result::OK);
-        assert_ne!(token, 0);
-        mcp_send(&mut mcp, msg::CREATEGAME, create(4, b"COWS")).await;
-        let taken = mcp_recv(&mut mcp).await.body;
-        assert_eq!(u32::from_le_bytes(taken[6..10].try_into().unwrap()), create_game_result::NAME_TAKEN);
+        assert_eq!(result(&created), create_game_result::OK);
+        assert_eq!(u16::from_le_bytes([created[2], created[3]]), 7, "the game server's token");
+        mcp_send(&mut mcp, msg::CREATEGAME, create(4, b"pigs")).await;
+        assert_eq!(result(&mcp_recv(&mut mcp).await.body), create_game_result::NAME_TAKEN);
 
         let join = |password: &[u8]| {
             let mut w = Writer::new();
@@ -4481,20 +4506,11 @@ mod tests {
         let joined = mcp_recv(&mut mcp).await;
         let mut jr = joined.reader();
         assert_eq!(jr.u16().unwrap(), 5);
-        assert_eq!(jr.u16().unwrap(), token, "the join token is the created game's id");
+        assert_eq!(jr.u16().unwrap(), 7, "the join token is the game server's");
         jr.u16().unwrap();
         assert_eq!(jr.array::<4>().unwrap(), [127, 0, 0, 1], "the game server's address, network order");
-        let hash = jr.u32().unwrap();
+        assert_eq!(jr.u32().unwrap(), 0xC0FF_EE00);
         assert_eq!(jr.u32().unwrap(), join_result::OK);
-
-        // The client drops the realm and dials the game server with the token and hash.
-        let mut game = TcpStream::connect(game_addr).await.unwrap();
-        let mut greeting = [0u8; 2];
-        game.read_exact(&mut greeting).await.unwrap();
-        assert_eq!(greeting, [0xAF, 0x01]);
-        game.write_all(&logon_packet(token, hash, 4, 0x0E, "Wirt")).await.unwrap();
-        let flags = read_frame(&mut game, &test_tables().huffman).await;
-        assert_eq!(flags, vec![0x01, 1, 0x04, 0x10, 0x10, 0x00, 1, 0, 0x00], "nightmare, expansion");
     }
 
     #[tokio::test]

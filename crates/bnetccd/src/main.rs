@@ -6,7 +6,7 @@ mod admin;
 mod config;
 mod d2_characters;
 mod d2_equipment;
-mod d2gs;
+mod gslink;
 mod discord;
 mod moderation;
 mod node;
@@ -250,8 +250,24 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
     // The realm shares warnet mode's rule for the WarCraft III listeners: a chat-only server
     // offers no game infrastructure at all.
     let offer_d2_realm = cfg.diablo2.realm && policy.mode != bnetcc_core::policy::ServerMode::Warnet;
-    let d2_game_server = if offer_d2_realm && cfg.diablo2.game_server_probe {
-        d2gs::GameServer::start(&cfg.diablo2.data_dir, cfg.listen.bncs.ip(), storage.clone()).await
+    if cfg.diablo2.game_server_probe {
+        warn!("diablo2.game_server_probe is no longer used: the game server is its own program now; remove the line and set diablo2.game_server_link");
+    }
+    let link_addr = cfg.diablo2.game_server_link.trim();
+    let d2_game_server = if offer_d2_realm && !link_addr.is_empty() {
+        let addr: std::net::SocketAddr = link_addr.parse().map_err(|_| format!("diablo2.game_server_link {link_addr:?} is not an address"))?;
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                let link = gslink::GameServerLink::new(cfg.diablo2.game_server_token.trim());
+                tokio::spawn(std::sync::Arc::clone(&link).serve(listener));
+                info!(%addr, "waiting for the Diablo II game server to link");
+                Some(link)
+            }
+            Err(e) => {
+                warn!(%addr, error = %e, "cannot listen for the Diablo II game server; games will answer Server Down");
+                None
+            }
+        }
     } else {
         None
     };

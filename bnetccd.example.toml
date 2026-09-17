@@ -199,8 +199,8 @@ dir = ""
 
 [diablo2]
 # The Diablo II closed realm: the client's "Battle.net" button, with characters stored in this
-# server's database. It shares the BNCS port (no extra port to forward). Creating a game needs
-# a Diablo II game server, which is not built in yet — the lobby answers "Server Down". Never
+# server's database. It shares the BNCS port (no extra port to forward). Games run on the separate
+# Diablo II game server (game_server_link below); without it the lobby answers "Server Down". Never
 # offered in warnet mode. The realm's name is server.realm. See docs/DIABLO2.md.
 realm = true
 description = "Diablo II closed realm"
@@ -210,11 +210,12 @@ address = ""
 max_characters = 18         # per account, 1..=18
 # Your Diablo II 1.14d install folder. Game.exe is read from it at startup (nothing is copied).
 data_dir = ""
-# EXPERIMENTAL test, off by default: let clients create and join games against the game-server
-# handshake test on TCP port 4000 (forward it for internet players). A joining client gets
-# Blizzard's join sequence and stands in the Rogue Encampment — no stats, NPCs or actions. Needs
-# data_dir. Every game packet is logged. See docs/D2GS-114D-WIRE.md.
-game_server_probe = false
+# The Diablo II game server is a separate program; it dials this address to link to the realm.
+# While none is linked, Create Game answers "Server Down". Empty listens for none. Keep it on
+# loopback unless the game server runs on another machine. See docs/DIABLO2.md §2.
+game_server_link = ""        # e.g. "127.0.0.1:6119"
+# The secret the game server proves itself with: the same value as link_token in its d2gs.toml.
+game_server_token = ""
 # With data_dir and [files] dir both set, the server writes this file into the files directory at
 # startup: a JSON map from the equipment bytes of a realm character's chat statstring (helm, body
 # armour, weapons, shield) to the items they show, for chat bots to download over BNFTP like

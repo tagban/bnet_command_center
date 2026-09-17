@@ -13,11 +13,10 @@
 //! handle into [`Node`]'s ticket table rather than anything cryptographic — see
 //! [`crate::node::RealmTicket`].
 //!
-//! **Games are not here yet.** Creating or joining one needs a Diablo II game server, which
-//! this does not include; the lobby answers "server down" / "game does not exist", which the
-//! client shows as ordinary messages. Characters, selection and chat all work without it.
-//! With `diablo2.game_server_probe` on, games can be created and joined against the
-//! handshake test in [`crate::d2gs`] — the client reaches the Rogue Encampment and no further.
+//! **Games are played on a separate game server.** Create and join are passed over the link
+//! (`crate::gslink`) to the Diablo II game server, its own program; while none is linked the lobby
+//! answers "Server Down" / "game does not exist", which the client shows as ordinary messages.
+//! Characters, selection and chat all work without it.
 //!
 //! Wire layouts are from BNETDocs, cross-checked against the MIT-licensed
 //! `jaenster/d2-dedicated-server` realm (a retail 1.14d client renders its replies) — see
@@ -39,7 +38,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-use crate::d2gs::{CreateError, JoinError};
 use crate::node::{D2Realm, Node, RealmTicket};
 use crate::session::SessionLimits;
 use crate::storage::CreateCharacterError;
@@ -215,7 +213,7 @@ impl Mcp {
                 w.u16(request_id).u32(0xFFFF_FFFF).bytes(&[0; 8]);
                 Some(Frame::new(msg::GAMEINFO, w.finish()))
             }
-            msg::CREATEGAME => Some(self.create_game(frame)),
+            msg::CREATEGAME => Some(self.create_game(frame).await),
             msg::JOINGAME => Some(self.join_game(frame).await),
             msg::REQUESTLADDERDATA => Some(self.ladder_data(frame).await),
             // Neither has a reply: the client gave up on a create, or asked a character's rank
@@ -466,7 +464,7 @@ impl Mcp {
     /// `MCP_CREATEGAME`: `u16 request id, u32 flags, u8, u8, u8, cstr name, cstr password,
     /// cstr description`, difficulty in `(flags >> 12) & 3`. Reply: `u16 request id, u16 token,
     /// u16 unknown, u32 result`.
-    fn create_game(&self, frame: &Frame) -> Frame {
+    async fn create_game(&self, frame: &Frame) -> Frame {
         let mut r = frame.reader();
         let request_id = r.u16().unwrap_or(0);
         let (flags, name) = (|| {
@@ -479,13 +477,17 @@ impl Mcp {
         let (token, result) = if name.is_empty() || name.len() > 15 {
             (0, create_game_result::INVALID_NAME)
         } else if let Some(game_server) = &self.realm.game_server {
-            match game_server.create(&name, &password, ((flags >> 12) & 3) as u8) {
-                Ok(id) => {
+            match game_server.create(&name, &password, ((flags >> 12) & 3) as u8).await {
+                Ok(Ok(id)) => {
                     info!(peer = %self.peer, character = ?self.selected, game = %name, "game created");
                     (id, create_game_result::OK)
                 }
-                Err(CreateError::NameTaken) => (0, create_game_result::NAME_TAKEN),
-                Err(CreateError::Full) => (0, create_game_result::SERVERS_DOWN),
+                Ok(Err(bnetcc_gslink::CreateError::NameTaken)) => (0, create_game_result::NAME_TAKEN),
+                Ok(Err(bnetcc_gslink::CreateError::Full)) => (0, create_game_result::SERVERS_DOWN),
+                Err(crate::gslink::LinkError::Down) => {
+                    info!(peer = %self.peer, game = %name, "game creation requested; the Diablo II game server is not linked");
+                    (0, create_game_result::SERVERS_DOWN)
+                }
             }
         } else {
             info!(
@@ -518,14 +520,15 @@ impl Mcp {
             None => None,
         };
         let staged = match (&self.realm.game_server, character, ip) {
-            (Some(game_server), Some(character), Some(ip)) => game_server
-                .stage_join(&name, &password, character)
-                .map(|(id, hash)| (id, hash, ip))
-                .map_err(|e| match e {
-                    JoinError::NoSuchGame => join_result::NO_SUCH_GAME,
-                    JoinError::BadPassword => join_result::BAD_PASSWORD,
-                    JoinError::Full => join_result::FULL,
+            (Some(game_server), Some(character), Some(ip)) => match game_server.join(&name, &password, character.account, &character.name).await {
+                Ok(Ok(joined)) => Ok((joined.token, joined.hash, ip)),
+                Ok(Err(e)) => Err(match e {
+                    bnetcc_gslink::JoinError::NoSuchGame | bnetcc_gslink::JoinError::NoSuchCharacter => join_result::NO_SUCH_GAME,
+                    bnetcc_gslink::JoinError::BadPassword => join_result::BAD_PASSWORD,
+                    bnetcc_gslink::JoinError::Full => join_result::FULL,
                 }),
+                Err(crate::gslink::LinkError::Down) => Err(join_result::NO_SUCH_GAME),
+            },
             _ => Err(join_result::NO_SUCH_GAME),
         };
         let mut w = Writer::with_capacity(18);

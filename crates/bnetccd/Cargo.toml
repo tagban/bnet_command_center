@@ -14,8 +14,7 @@ bnetcc-storage = { path = "../bnetcc-storage" }
 bnetcc-storage-sqlite = { path = "../bnetcc-storage-sqlite" }
 d2-data = { path = "../d2-data" }
 d2-formats = { path = "../d2-formats" }
-d2-drlg = { path = "../d2-drlg" }
-d2-game = { path = "../d2-game" }
+bnetcc-gslink = { path = "../bnetcc-gslink" }
 tokio.workspace = true
 socket2.workspace = true
 tracing.workspace = true

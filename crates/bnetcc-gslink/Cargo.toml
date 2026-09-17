@@ -1,0 +1,16 @@
+[package]
+name = "bnetcc-gslink"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The link between the Command Center realm and a Diablo II game server"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

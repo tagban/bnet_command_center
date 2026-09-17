@@ -177,6 +177,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bnetcc-gslink"
+version = "0.2.3"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "bnetcc-icons"
 version = "0.2.3"
 dependencies = [
@@ -237,14 +246,13 @@ dependencies = [
  "argon2",
  "bnetcc-core",
  "bnetcc-crypto",
+ "bnetcc-gslink",
  "bnetcc-proto",
  "bnetcc-storage",
  "bnetcc-storage-sqlite",
  "clap",
  "d2-data",
- "d2-drlg",
  "d2-formats",
- "d2-game",
  "rand",
  "rcgen",
  "rustls",
@@ -367,25 +375,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "d2-drlg"
-version = "0.2.3"
-dependencies = [
- "d2-data",
- "d2-formats",
-]
-
-[[package]]
 name = "d2-formats"
 version = "0.2.3"
-
-[[package]]
-name = "d2-game"
-version = "0.2.3"
-dependencies = [
- "d2-data",
- "d2-drlg",
- "d2-formats",
-]
 
 [[package]]
 name = "deranged"

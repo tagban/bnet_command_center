@@ -11,7 +11,7 @@ Resurrected* for the true Battle.net experience (see the README's *Purpose*).
 | Button in the client | What it is | Status |
 |---|---|---|
 | **Open Battle.net** | BNCS login + chat; characters live on the player's PC; games are peer-to-peer | Login and chat work through the same path as StarCraft |
-| **Battle.net** (closed realm) | BNCS login, then a *realm* connection (MCP) for server-side characters | **Characters: verified with a real LoD 1.14d client (2026-09-13).** Games: need a game server — not yet |
+| **Battle.net** (closed realm) | BNCS login, then a *realm* connection (MCP) for server-side characters | **Characters: verified with a real LoD 1.14d client (2026-09-13).** Games: on the separate game server (§2, *Games*) |
 
 ---
 
@@ -111,115 +111,26 @@ address or hostname. A client on the LAN is always handed the LAN address it con
 client from outside is handed the configured address, or the LAN address if none is set —
 which it cannot reach.
 
-### Game-server handshake test (experimental, off by default)
+### Games: the game server
 
-This checks the riskiest part of the future game server — Blizzard's compression and join
-sequence (`docs/D2GS-114D-WIRE.md`) — against a real client, with no world behind it.
+Games run on the **Diablo II game server**, a separate program kept in its own private repository
+(it is built from decompilation of the 1.14d `Game.exe`; see `docs/LEGAL.md` §2). This server's
+realm hands it create and join requests over a small local link, and the client then plays on
+port 4000:
 
 ```toml
 [diablo2]
-data_dir = "/path/to/Diablo II"   # the folder holding a 1.14d Game.exe
-game_server_probe = true
+game_server_link = "127.0.0.1:6119"   # where the game server dials in
+game_server_token = "..."             # the same secret as link_token in its d2gs.toml
 ```
 
-Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is not (wrong
-`Game.exe`, port 4000 taken). Internet players also need TCP 4000 forwarded; LAN clients don't.
-
-1. Select a character and **Create Game** (Normal). *Expect:* the client loads into the Rogue
-   Encampment, standing on the waypoint. *Before:* "Server Down". (Verified 2026-09-13.)
-   Each game has its own map seed, so the camp's layout — and the side its exit is on —
-   changes from game to game (with the MPQs; without them every game is the same camp).
-   (Verified 2026-09-13.)
-2. *Expect, around the waypoint* (the 3×3 rooms around it, when `data_dir` holds the MPQs):
-   the NPCs and objects nearby standing still — in the camp tagban tested, Warriv, Kashya, Akara,
-   Charsi, Gheed and five rogue guards — the torches lit, the bonfire, the stash and the
-   waypoint (active, blue). What is near depends on the layout. Chickens wander as before —
-   the client spawns those itself. (Verified 2026-09-13.)
-   *Expect to talk and use things:* clicking Akara, Kashya, Charsi, Gheed or Warriv opens their
-   menu (Talk has nothing to say yet; Trade, Hire and the rest do nothing), clicking the stash
-   opens it (empty), clicking the waypoint opens its menu with the Rogue Encampment ticked
-   (see step 3 for travel). (NPC menus verified 2026-09-13.) *Expect the day to pass:* the bonfire burns low by day and lights up
-   at dusk, about 14 minutes after the game was created.
-3. *Expect walking to load the world:* the server follows your character, so NPCs and
-   objects further from the waypoint appear as you approach, and walking out of the camp
-   shows Blood Moor's ground as you go (`player entered a level level=2` in the log), on to
-   Cold Plains, Stony Field, Dark Wood, Black Marsh and Tamoe Highland, cliffs and borders
-   included up to the black beyond them. Cold Plains, Stony Field, Dark Wood and Black Marsh
-   have their waypoint standing on its pad (the big pads with two lit torches), dark: clicking
-   it turns it on, and clicking again opens the menu with that area ticked. Choosing another
-   area you have ticked takes you to its waypoint (`waypoint travel level=…` in the log;
-   verified 2026-09-13).
-   Shrines and wells stand where they should, with their names (using them does nothing yet;
-   verified 2026-09-13). Cold Plains' waypoint is always beside the way in from Blood Moor.
-   *Expect monsters:* each area fills with its own kinds as you approach — Blood Moor's
-   zombies, quill rats and packs of fallen, Cold Plains' brutes, dark ones and shamans with
-   their fallen, and so on, 50–160 an area. They notice you, come for you and hit; clicking one
-   swings at it with the weapon you wear (bare-handed without one), and a kill pays experience.
-4. *Expect loot:* a kill sometimes drops a gold pile, a potion, a scroll, a gem, a rune, or a
-   weapon, armour, ring or amulet — white, grey (low quality), superior, blue (magic), yellow
-   (rare), green (set) or gold (unique), magic and better ones unidentified. Clicking gold adds
-   it to your gold (up to 10,000 a level). Clicking a healing, mana or rejuvenation potion puts it
-   in the first free of the belt's four slots; an identified weapon or armour you can use goes
-   straight on when its place is empty; anything else goes in the inventory, filling from the
-   right-hand column up; with no room it stays on the ground. Belt keys 1–4, or right-clicking a
-   potion in the inventory, drinks it. Items can be picked up onto the cursor, moved about the
-   inventory and belt, worn, swapped with what you wear, taken off and dropped. Right-clicking a
-   Scroll of Identify and then clicking an unidentified item identifies it. What you wear
-   counts: a weapon's damage (with strength), armour's defence, and life, mana, attributes and
-   attack rating from magic items. What you carry and wear is saved and is back next game. *A
-   new character* starts with its class's items (a weapon, a buckler for most, four minor
-   healing potions in the belt, a Town Portal and an Identify scroll); characters made before
-   2026-09-15 that have been saved keep what they had.
-   *Expect the stash and cube:* clicking the stash in town opens it; drag items in and out and
-   they stay between games, an expansion character's stash `6 × 8` and a classic one's `6 × 4`.
-   If you carry the Horadric Cube, opening it holds items the same way, `3 × 4`. What is in each
-   is saved. *Not yet:* the cube's transmute recipes (it is storage only for now), sockets filled, tomes, Town Portal, stamina, antidote and
-   thawing potions, repair, and other players seeing what you wear.
-5. *Expect shops:* talk to Akara, Charsi or Gheed and pick **Trade**. Their goods fill the tabs:
-   Charsi's weapons and armour, Akara's staves, wands, potions, scrolls, tomes and keys, Gheed's
-   mix — some white, some superior, some blue, priced as the game prices them. Right-clicking to
-   buy takes the gold and puts the item in your belt (potions, when there is a free slot) or
-   inventory; weapons and armour leave the vendor's stock, potions and scrolls never run out.
-   Shift and right-click a potion to fill your belt. Selling an item of yours (drop it on the
-   vendor's goods) adds the gold and puts the item in the vendor's stock. A vendor restocks when
-   you open Trade alone more than four minutes after the stock was made. *Not yet:* gambling, repair,
-   hiring, identifying at Cain, and buying scrolls straight into a tome.
-6. *Expect skills:* a new level gives a skill point; the skill tree takes it (a skill of your
-   class whose level and required skills you have) and the level shows. Put a skill on a mouse
-   button and use it: Attack and melee skills swing at a monster as Attack does, and missile
-   skills — Fire Bolt, Ice Bolt, Charged Bolt, Fire Ball, Teeth, Magic Arrow and the like —
-   cost their mana, fly, and hurt what they reach for their elemental damage less the monster's
-   resistance (Fire Ball hurts everything around where it lands). What you learned and
-   what is on your buttons is saved. *Not yet:* melee skills' own effects (Bash still hits as
-   Attack), auras, curses, summons, novas, Holy Bolt, cold slowing and poison over time, and other
-   players seeing your casts.
-7. *Expect nothing else to work:* NPCs never move and there is no travel to other acts.
-   Esc → Save and Exit returns to chat (verified).
-8. Send the log from the moment you clicked Create Game (`item picked up`, `item moved`,
-   `item dropped`, `item identified`, `potion drunk`, `item move refused`, `no room to pick it
-   up`, `vendor stocked`, `bought`, `sold` and `skill point spent` lines say what the server did).
-
-What it shows, in order:
-
-```
-game created game=… id=…                       realm accepted MCP_CREATEGAME
-test game created … map_seed=… map=… spawn=…   the camp this game got
-sending client to the game server id=… ip=…    MCP_JOINGAME
-game connection; sending AF 01                 client reached port 4000
-D2GS packet in op=0x68 …  /  GAMELOGON …       the client's logon, every field
-D2GS packets out packets=01… 00                GameFlags + loading
-D2GS packets out packets=02                    load success
-D2GS packet in op=0x6b                         ENTERGAME: the client accepted our compression
-D2GS packets out packets=59… 5e… 28… 29… 0b… 23… 23… 03… 53… 07… 07… 51… ac… aa… 6d… 15… 7e…
-                                               player, act, rooms and their units, placement
-D2GS packets out packets=04                    load complete
-D2GS packet in op=…                            whatever the client asks for next
-```
-
-The last lines are the point: how far down this list the client gets, and what it sends after
-`04`. No `0x6b` means it did not accept the first frames; a disconnect right after a
-`packets out` line names the packet it rejected. `Rogue Encampment built` at start-up and
-`room_packets=…` on the join line say the town was sent; without them the MPQs did not load.
+- **Game server not running:** chat, the realm and characters work as normal; *Create Game*
+  answers "Server Down" and joins answer "game does not exist" (the client's own messages).
+  The game server links back by itself when it starts.
+- **Restarting either one leaves the other up:** a game server update does not drop chat, and a
+  realm restart does not end games in progress. Both processes open the same database, so the
+  game server saves characters while the realm is down.
+- Internet players need TCP 4000 forwarded to the game server; LAN clients don't.
 
 ## 3. How it fits together
 
@@ -272,6 +183,8 @@ max_characters = 18
 data_dir = ""                         # your 1.14d install: Game.exe and the MPQs
 equipment_file = "d2-equipment.json"  # written into [files] dir for bots; "" disables
 character_pack = "d2-characters.zip"  # the character animations as layers, for bots; "" disables
+game_server_link = ""                 # e.g. "127.0.0.1:6119": where the game server links in
+game_server_token = ""                # its link_token
 ```
 
 The realm's *name* is `server.realm`.
@@ -288,20 +201,11 @@ under wine, or a native Linux port of the macOS 1.14d build — and has a retail
 creating, joining and playing games. Its realm (`realmd`) and game servers meet in Redis rather
 than over a socket; characters are `.d2s` saves the game server reads and writes.
 
-**Decided 2026-09-13: a native Rust engine instead** — port `jaenster/libd2` (MIT, a Zig
-reimplementation of the 1.14d engine) and host the game server inside `bnetccd`, so it runs on
-macOS, Linux and Windows. Plan in [`docs/D2GS-RUST.md`](D2GS-RUST.md). The earlier sketch of
-using jaenster's game server as-is, kept for reference (it survives only as a test oracle):
-
-1. Run its `d2gs` (Linux containers; on this Mac that means a Linux VM — Apple Silicon adds
-   x86-64 emulation).
-2. Teach `bnetccd`'s realm its Redis contract (`docs/redis.md` in that repo): publish create/join
-   requests to a game server's queue, stage the character's `.d2s` for it, read its game events
-   back, and hand the client a join token and the game server address.
-3. Store the `.d2s` it writes in `characters.save` (the column exists for this).
-
-That is a project of its own; the character work above is the prerequisite for it and is
-useful without it.
+**Decided 2026-09-13: a native Rust engine instead** — a port of `jaenster/libd2` (MIT, a Zig
+reimplementation of the 1.14d engine) that runs on macOS, Linux and Windows. **Since 2026-09-17
+it is its own program in a private repository**, linked to this realm (§2, *Games*), so its
+frequent updates restart only the game server. Jaenster's game server survives only as a test
+oracle for it.
 
 ## 6. Sources
 

@@ -462,9 +462,9 @@ pub struct D2Realm {
     pub address: Option<String>,
     /// Characters per account.
     pub max_characters: usize,
-    /// The game-server handshake test, when `diablo2.game_server_probe` is on and it
-    /// started; `None` answers game creation with "Server Down".
-    pub game_server: Option<Arc<crate::d2gs::GameServer>>,
+    /// The link to the Diablo II game server (a separate program), when `diablo2.game_server_link`
+    /// is set. With none, or none connected, game creation answers "Server Down".
+    pub game_server: Option<Arc<crate::gslink::GameServerLink>>,
 }
 
 /// What `SID_LOGONREALMEX` hands a client to present on its realm connection.

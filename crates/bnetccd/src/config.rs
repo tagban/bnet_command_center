@@ -74,10 +74,17 @@ pub struct Diablo2Config {
     /// The operator's Diablo II 1.14d install folder. `Game.exe` is read from it at startup
     /// for the engine's wire tables; nothing from it is copied into this server's files.
     pub data_dir: String,
-    /// **Experimental test.** Let clients create and join games against the game-server
-    /// handshake test on port 4000 (`crate::d2gs`): a joining client gets Blizzard's join
-    /// sequence and stands in the Rogue Encampment with no stats, NPCs or actions. Needs `data_dir`.
+    /// No longer used: the game server is its own program now (`game_server_link`). Still read so
+    /// an older config loads; a warning at startup says to remove it.
     pub game_server_probe: bool,
+    /// Where the realm listens for its Diablo II game server, e.g. `"127.0.0.1:6119"`. The game
+    /// server is a separate program that dials this address; while none is connected, game
+    /// creation answers "Server Down". Empty (the default) listens for none. Keep it on loopback
+    /// unless the game server runs on another machine.
+    pub game_server_link: String,
+    /// The secret the game server proves itself with — the same value as `link_token` in its
+    /// `d2gs.toml`. Required when `game_server_link` is set.
+    pub game_server_token: String,
     /// File name, in `[files] dir`, of the map from a realm character's statstring equipment
     /// bytes to the items they show (`crate::d2_equipment`), built from `data_dir` at startup for
     /// chat bots to fetch over BNFTP. Needs both directories; empty disables it.
@@ -97,6 +104,8 @@ impl Default for Diablo2Config {
             max_characters: 18,
             data_dir: String::new(),
             game_server_probe: false,
+            game_server_link: String::new(),
+            game_server_token: String::new(),
             equipment_file: "d2-equipment.json".into(),
             character_pack: "d2-characters.zip".into(),
         }
@@ -852,8 +861,13 @@ impl Config {
         if !(1..=18).contains(&self.diablo2.max_characters) {
             return Err("diablo2.max_characters must be between 1 and 18".into());
         }
-        if self.diablo2.game_server_probe && self.diablo2.data_dir.trim().is_empty() {
-            return Err("diablo2.game_server_probe needs diablo2.data_dir (the folder holding Game.exe)".into());
+        if !self.diablo2.game_server_link.trim().is_empty() {
+            self.diablo2.game_server_link.trim().parse::<SocketAddr>().map_err(|_| {
+                format!("diablo2.game_server_link {:?} is not an address and port, e.g. \"127.0.0.1:6119\"", self.diablo2.game_server_link)
+            })?;
+            if self.diablo2.game_server_token.trim().is_empty() {
+                return Err("diablo2.game_server_link needs diablo2.game_server_token (the game server's link_token)".into());
+            }
         }
         Ok(())
     }

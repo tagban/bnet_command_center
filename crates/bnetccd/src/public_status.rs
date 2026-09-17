@@ -346,11 +346,11 @@ fn fill_activity(node: &Node, show_users: bool, snap: &mut PublicSnapshot) {
         snap.diablo2_games = server
             .public_games()
             .into_iter()
-            .map(|(name, private, difficulty, players, age)| Diablo2Game {
-                name: (!private).then_some(name),
-                difficulty: ["Normal", "Nightmare", "Hell"].get(usize::from(difficulty)).copied().unwrap_or("Normal"),
-                players,
-                minutes: age / 60,
+            .map(|g| Diablo2Game {
+                name: (!g.private).then_some(g.name),
+                difficulty: ["Normal", "Nightmare", "Hell"].get(usize::from(g.difficulty)).copied().unwrap_or("Normal"),
+                players: g.players,
+                minutes: g.age_secs / 60,
             })
             .collect();
     }
