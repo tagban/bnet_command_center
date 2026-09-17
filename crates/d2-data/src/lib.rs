@@ -27,6 +27,7 @@ pub mod lvlsub;
 pub mod missiles;
 pub mod monlvl;
 pub mod monsters;
+pub mod panels;
 pub mod presets;
 pub mod skills;
 pub mod stat;
@@ -146,6 +147,7 @@ pub struct GameData {
     anim_data: AnimData,
     objects: Objects,
     shrines: Shrines,
+    panels: panels::Panels,
     items: Items,
     item_stats: item_stats::ItemStats,
     item_ratios: item_stats::ItemRatios,
@@ -194,6 +196,7 @@ impl GameData {
         data.anim_data = AnimData::parse(&anim).map_err(|e| Error::BadTable { table: "animdata.d2", problem: e.to_string() })?;
         data.objects = Objects::from_table(&read("objects.txt")?);
         data.shrines = Shrines::from_table(&read("shrines.txt")?);
+        data.panels = panels::Panels::from_table(&read("inventory.txt")?);
         data.items = Items::from_tables(&read("itemtypes.txt")?, &read("weapons.txt")?, &read("armor.txt")?, &read("misc.txt")?)?;
         data.armor_types = read("armtype.txt")?.rows().filter_map(|r| r.get("Token").map(items::code)).collect();
         data.item_stats = item_stats::ItemStats::from_table(&read("itemstatcost.txt")?)?;
@@ -399,6 +402,12 @@ impl GameData {
         &self.shrines
     }
 
+    /// `Inventory.txt`: the grid sizes of the stash, cube and backpack.
+    #[must_use]
+    pub fn panels(&self) -> &panels::Panels {
+        &self.panels
+    }
+
     /// Replace the shrine table — for building rules from tables in tests.
     pub fn set_shrines(&mut self, shrines: Shrines) {
         self.shrines = shrines;
@@ -549,6 +558,7 @@ impl GameData {
             anim_data: AnimData::default(),
             objects: Objects::default(),
             shrines: Shrines::default(),
+            panels: panels::Panels::default(),
             items: Items::default(),
             item_stats: item_stats::ItemStats::default(),
             item_ratios: item_stats::ItemRatios::default(),
