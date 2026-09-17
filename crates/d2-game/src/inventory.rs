@@ -199,7 +199,7 @@ impl Inventory {
 /// stash `6 × 4` before the expansion and `6 × 8` with it, the cube `3 × 4`). `page` is the
 /// item-location page its items carry — `4` the stash, `3` the cube — so a client shows them in
 /// the right panel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Grid {
     width: u8,
     height: u8,

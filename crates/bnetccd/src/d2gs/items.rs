@@ -12,7 +12,7 @@
 use bnetcc_proto::d2gs::{self, item_action};
 use d2_data::item_bits::{self, flags, Item, Location, Target};
 use d2_data::GameData;
-use d2_game::inventory::{Held, Inventory, Place, BODY_LOCATIONS, GRID_HEIGHT, GRID_WIDTH};
+use d2_game::inventory::{Grid, Held, Inventory, Place, BODY_LOCATIONS, GRID_HEIGHT, GRID_WIDTH};
 
 use super::PLAYER_GUID;
 
@@ -60,6 +60,16 @@ pub(super) fn held_packet(rules: &GameData, held: &Held, used: bool) -> Option<V
         (Place::Body(_), _) => owned(rules, item_action::EQUIP, held.guid, &item),
         (Place::Cursor, _) => return None,
     })
+}
+
+/// A grid item lifted onto the cursor, remembering the page (panel) it came from — the stash
+/// or the cube — so the client removes it from the right one.
+pub(super) fn lifted_from(held: &Held, page: u8) -> Item {
+    let mut item = held.item.clone();
+    if let Place::Grid { col, row } = held.place {
+        item.location = Location::Cursor { body: 0, col, row, page: Some(page) };
+    }
+    item
 }
 
 /// A held item on the cursor, keeping the fields of where it was lifted from.
@@ -160,9 +170,15 @@ pub(super) fn auto_equip(rules: &GameData, inventory: &Inventory, class: i32, it
     body_locations(rules, class).into_iter().find(|&body| inventory.at(Place::Body(body)).is_none() && wearable_at(rules, inventory, class, body, wearer.class))
 }
 
-/// A player's items as its `.d2s` lists them. An item on the cursor is written into a free
-/// inventory spot (left out when there is none).
-pub(super) fn save_list(inventory: &Inventory) -> Vec<Item> {
+/// The item-location page the stash and the Horadric Cube keep their items on. A stored item's
+/// page picks the panel a client files it under and the `.d2s` keeps it in; the backpack is 0.
+pub(super) const PAGE_STASH: u8 = 4;
+pub(super) const PAGE_CUBE: u8 = 3;
+
+/// A player's items as its `.d2s` lists them: the backpack, then the stash and the cube — one
+/// list, each item carrying the page that says where it lives. An item on the cursor is written
+/// into a free backpack spot (left out when there is none).
+pub(super) fn save_list(inventory: &Inventory, stash: &Grid, cube: &Grid) -> Vec<Item> {
     let mut out: Vec<Item> = inventory.items().iter().filter(|h| h.place != Place::Cursor).map(Held::placed).collect();
     if let Some(cursor) = inventory.at(Place::Cursor) {
         let spot = (0..GRID_HEIGHT).flat_map(|row| (0..GRID_WIDTH).map(move |col| (col, row))).find(|&(col, row)| {
@@ -176,16 +192,35 @@ pub(super) fn save_list(inventory: &Inventory) -> Vec<Item> {
             out.push(item);
         }
     }
+    out.extend(stash.items().iter().map(|h| stash.stored(h)));
+    out.extend(cube.items().iter().map(|h| cube.stored(h)));
     out
 }
 
-/// Where a saved item is held: the inventory, the belt or worn. `None` for anywhere else (the
-/// stash, the cube, a socket), which is not modelled.
-pub(super) fn saved_place(item: &Item) -> Option<Place> {
+/// Which of a player's containers a saved item belongs to, and where in it.
+pub(super) enum SavedIn {
+    /// The backpack, belt or worn.
+    Inventory(Place),
+    /// The stash, at a cell.
+    Stash(u8, u8),
+    /// The Horadric Cube, at a cell.
+    Cube(u8, u8),
+}
+
+/// Where a saved item is held. `None` for anywhere not modelled (a socket, the trade panel).
+pub(super) fn saved_where(item: &Item) -> Option<SavedIn> {
     match item.location {
-        Location::Stored { col, row, page: 0 } => Some(Place::Grid { col, row }),
-        Location::Belt { slot } => Some(Place::Belt(slot)),
-        Location::Equipped { body } if BODY_LOCATIONS.contains(&body) => Some(Place::Body(body)),
+        Location::Stored { col, row, page: 0 } => Some(SavedIn::Inventory(Place::Grid { col, row })),
+        Location::Stored { col, row, page: PAGE_STASH } => Some(SavedIn::Stash(col, row)),
+        Location::Stored { col, row, page: PAGE_CUBE } => Some(SavedIn::Cube(col, row)),
+        Location::Belt { slot } => Some(SavedIn::Inventory(Place::Belt(slot))),
+        Location::Equipped { body } if BODY_LOCATIONS.contains(&body) => Some(SavedIn::Inventory(Place::Body(body))),
         _ => None,
     }
+}
+
+/// `0x9C` action 4 for an item put into a grid at its stored place — the stash or the cube on
+/// its own page, as a join sends it.
+pub(super) fn container_packet(rules: &GameData, guid: u32, item: &Item) -> Vec<u8> {
+    world(rules, item_action::PUT_IN_CONTAINER, guid, item)
 }

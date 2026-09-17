@@ -32,7 +32,7 @@ use d2_drlg::preset::PresetLevel;
 use d2_drlg::world::{RoomId, World};
 use d2_game::battle::{self, Battle, Event};
 use d2_game::clock::ActClock;
-use d2_game::inventory::{Held, Inventory, Place};
+use d2_game::inventory::{Grid, Held, Inventory, Place};
 use d2_game::loot;
 use d2_game::population::{unit_type, waypoint_spawn, MonsterRoom, Population, Spawned, SUBCLASS_WAYPOINT};
 use rand::Rng;
@@ -212,6 +212,10 @@ enum Loot {
 #[derive(Debug, Clone, Default)]
 struct Carried {
     inventory: Inventory,
+    /// The stash: its own grid, in town, kept between games.
+    stash: Grid,
+    /// The Horadric Cube's grid, usable once the cube itself is carried.
+    cube: Grid,
     complete: bool,
     /// The identify scroll made ready, waiting for the item it identifies.
     identify_with: Option<u32>,
@@ -263,7 +267,7 @@ impl GameServer {
         let (stats, items, skills) = {
             let g = self.lock();
             let game = g.by_id.get(&p.game_id)?;
-            let items = game.carried.get(&p.character.name).filter(|c| c.complete).map(|c| items::save_list(&c.inventory));
+            let items = game.carried.get(&p.character.name).filter(|c| c.complete).map(|c| items::save_list(&c.inventory, &c.stash, &c.cube));
             (game.battle.player_stats(&p.character.name)?, items, game.battle.player_skills(&p.character.name))
         };
         let now = u32::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs()).unwrap_or(0);
@@ -1066,6 +1070,14 @@ impl GameServer {
         let Some(game) = g.by_id.get_mut(&game_id) else { return Vec::new() };
         let wearer = game.battle.player_requirements(name);
         let Some(carried) = game.carried.get_mut(name).filter(|c| c.complete) else { return Vec::new() };
+        // A move into or out of the stash or the cube: storage, so no worn gear changes and
+        // nothing below runs. Anything else falls through to the backpack handling.
+        if let Some(out) = container_move(rules, carried, &request) {
+            if !out.is_empty() {
+                info!(game_id, player = name, ?request, "item moved");
+            }
+            return out;
+        }
         let inv = &mut carried.inventory;
         let cursor_is = |inv: &Inventory, guid: u32| inv.at(Place::Cursor).is_some_and(|h| h.guid == guid);
         let out = match request {
@@ -1196,9 +1208,20 @@ impl GameServer {
                 }
             },
         };
-        let mut carried = Carried { inventory: Inventory::default(), complete: saved.is_some(), identify_with: None };
+        // The stash grows with the expansion; the cube is always the same. Their sizes come from
+        // Inventory.txt (`crate::rules().panels()`).
+        let expansion = p.character.status & status::EXPANSION != 0;
+        let stash_grid = rules.panels().stash(expansion);
+        let cube_grid = rules.panels().cube;
+        let mut carried = Carried {
+            inventory: Inventory::default(),
+            stash: Grid::new(stash_grid.width.max(1), stash_grid.height.max(1), items::PAGE_STASH),
+            cube: Grid::new(cube_grid.width.max(1), cube_grid.height.max(1), items::PAGE_CUBE),
+            complete: saved.is_some(),
+            identify_with: None,
+        };
         for item in saved.unwrap_or_default() {
-            let (Some(place), Some(class)) = (items::saved_place(&item), rules.items().class_of(&item.code)) else {
+            let (Some(where_), Some(class)) = (items::saved_where(&item), rules.items().class_of(&item.code)) else {
                 carried.complete = false;
                 break;
             };
@@ -1214,14 +1237,27 @@ impl GameServer {
                     game.spare_item_guid
                 }
             };
-            let mut held = Held { guid, class, size, place, item };
-            if p.save.is_none() && !carried.inventory.fits(&held) {
-                // A starting item finds its spot as a pickup does.
-                let belts = rules.items().get(class).is_some_and(|d| d.auto_belt) && rules.items().beltable(class);
-                let Some(spot) = carried.inventory.place_for(size, belts) else { continue };
-                held.place = spot;
-            }
-            if !carried.inventory.insert(held) {
+            let placed = match where_ {
+                items::SavedIn::Stash(col, row) => {
+                    carried.stash.insert(Held { guid, class, size, place: Place::Grid { col, row }, item })
+                }
+                items::SavedIn::Cube(col, row) => {
+                    carried.cube.insert(Held { guid, class, size, place: Place::Grid { col, row }, item })
+                }
+                items::SavedIn::Inventory(place) => {
+                    let mut held = Held { guid, class, size, place, item };
+                    if p.save.is_none() && !carried.inventory.fits(&held) {
+                        // A starting item finds its spot as a pickup does.
+                        let belts = rules.items().get(class).is_some_and(|d| d.auto_belt) && rules.items().beltable(class);
+                        match carried.inventory.place_for(size, belts) {
+                            Some(spot) => held.place = spot,
+                            None => continue,
+                        }
+                    }
+                    carried.inventory.insert(held)
+                }
+            };
+            if !placed {
                 carried.complete = false;
                 break;
             }
@@ -1229,8 +1265,13 @@ impl GameServer {
         if !carried.complete {
             warn!(character = %p.character.name, "its saved items are not all ones the server places; it carries nothing this game");
             carried.inventory = Inventory::default();
+            carried.stash = Grid::new(stash_grid.width.max(1), stash_grid.height.max(1), items::PAGE_STASH);
+            carried.cube = Grid::new(cube_grid.width.max(1), cube_grid.height.max(1), items::PAGE_CUBE);
         }
-        let packets = carried.inventory.items().iter().filter_map(|held| items::held_packet(rules, held, false)).collect();
+        let mut packets: Vec<Vec<u8>> = carried.inventory.items().iter().filter_map(|held| items::held_packet(rules, held, false)).collect();
+        // The stash and cube items go out on their own pages, so the client files them there.
+        packets.extend(carried.stash.items().iter().map(|h| items::container_packet(rules, h.guid, &carried.stash.stored(h))));
+        packets.extend(carried.cube.items().iter().map(|h| items::container_packet(rules, h.guid, &carried.cube.stored(h))));
         game.carried.insert(p.character.name.clone(), carried);
         refresh_gear(rules, game, &p.character.name);
         packets
@@ -1488,6 +1529,66 @@ enum ItemMove {
     SwapBelt { guid: u32, other: u32 },
     /// `0x17`: the cursor item dropped.
     Drop { guid: u32 },
+}
+
+/// A move into or out of the stash (grid page 4) or the Horadric Cube (page 3), which the client
+/// asks for by naming the container in an `Insert`, or by the item being in one on a `Lift`
+/// (`0x0054ABB0` maps the grid field to a container, `0x00560200` places the item). `None` when
+/// the request is neither, so [`Game::move_item`]'s backpack handling runs instead.
+///
+/// The cursor bridges the two: an item lifted from the stash goes onto the cursor (held in the
+/// backpack model), and an item put into the stash comes off the cursor. Both are storage — the
+/// worn gear does not change — so no stats are rebuilt here.
+fn container_move(rules: &GameData, carried: &mut Carried, request: &ItemMove) -> Option<Vec<Vec<u8>>> {
+    let stash_page = u32::from(items::PAGE_STASH);
+    let cube_page = u32::from(items::PAGE_CUBE);
+    match *request {
+        ItemMove::Insert { guid, col, row, grid } if grid == stash_page || grid == cube_page => {
+            let (Ok(col), Ok(row)) = (u8::try_from(col), u8::try_from(row)) else { return Some(Vec::new()) };
+            let Some(cursor) = carried.inventory.at(Place::Cursor).filter(|h| h.guid == guid).cloned() else {
+                return Some(Vec::new());
+            };
+            let into_stash = grid == stash_page;
+            let fits = if into_stash { carried.stash.fits_at(col, row, cursor.size) } else { carried.cube.fits_at(col, row, cursor.size) };
+            if !fits {
+                return Some(Vec::new());
+            }
+            carried.inventory.remove(guid);
+            let mut moved = cursor;
+            moved.place = Place::Grid { col, row };
+            let stored = if into_stash {
+                let stored = carried.stash.stored(&moved);
+                carried.stash.insert(moved);
+                stored
+            } else {
+                let stored = carried.cube.stored(&moved);
+                carried.cube.insert(moved);
+                stored
+            };
+            Some(vec![items::container_packet(rules, guid, &stored)])
+        }
+        ItemMove::Lift { guid } => {
+            let from_stash = carried.stash.get(guid).is_some();
+            if !from_stash && carried.cube.get(guid).is_none() {
+                return None; // not in a container — the backpack handling lifts it
+            }
+            if carried.inventory.at(Place::Cursor).is_some() {
+                return Some(Vec::new()); // a hand is not free
+            }
+            let (held, page) = if from_stash {
+                (carried.stash.remove(guid), items::PAGE_STASH)
+            } else {
+                (carried.cube.remove(guid), items::PAGE_CUBE)
+            };
+            let Some(held) = held else { return Some(Vec::new()) };
+            let lifted = items::lifted_from(&held, page);
+            let mut on_cursor = held;
+            on_cursor.place = Place::Cursor;
+            carried.inventory.insert(on_cursor);
+            Some(vec![items::owned(rules, item_action::REMOVE_FROM_CONTAINER, guid, &lifted)])
+        }
+        _ => None,
+    }
 }
 
 /// The cursor item dropped at the player's feet (`0x00563C00`: the spot as [`drop_spot`] finds
@@ -2459,6 +2560,41 @@ pub(crate) mod tests {
     /// A simple item as treasure makes it.
     fn simple_item(code: &[u8; 4], version: u16) -> Box<Item> {
         Box::new(Item::new(*code, version, 1, Location::Ground { x: 0, y: 0 }))
+    }
+
+    #[test]
+    fn the_stash_and_cube_are_saved_and_come_back_to_the_right_container() {
+        let held = |guid: u32, place| Held {
+            guid,
+            class: 0,
+            size: (1, 1),
+            place,
+            item: Item::new(*b"rvs ", 101, 1, Location::Cursor { body: 0, col: 0, row: 0, page: None }),
+        };
+        let mut inventory = Inventory::default();
+        inventory.insert(held(1, Place::Grid { col: 0, row: 0 }));
+        let mut stash = Grid::new(6, 8, items::PAGE_STASH);
+        stash.insert(held(2, Place::Grid { col: 2, row: 3 }));
+        let mut cube = Grid::new(3, 4, items::PAGE_CUBE);
+        cube.insert(held(3, Place::Grid { col: 1, row: 1 }));
+
+        // Saved as one list, each item carrying the page that says where it lives.
+        let saved = items::save_list(&inventory, &stash, &cube);
+        assert_eq!(saved.len(), 3);
+        let mut in_inventory = 0;
+        let mut in_stash = None;
+        let mut in_cube = None;
+        for item in &saved {
+            match items::saved_where(item) {
+                Some(items::SavedIn::Inventory(_)) => in_inventory += 1,
+                Some(items::SavedIn::Stash(col, row)) => in_stash = Some((col, row)),
+                Some(items::SavedIn::Cube(col, row)) => in_cube = Some((col, row)),
+                None => panic!("an item was saved somewhere it cannot be loaded from"),
+            }
+        }
+        assert_eq!(in_inventory, 1, "the backpack item");
+        assert_eq!(in_stash, Some((2, 3)), "the stash item, at its cell");
+        assert_eq!(in_cube, Some((1, 1)), "the cube item, at its cell");
     }
 
     /// Tables shaped like the engine's for the packets the join uses, with a made-up

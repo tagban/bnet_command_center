@@ -170,7 +170,10 @@ Restart. The log says `Diablo II game server HANDSHAKE TEST is on`, or why it is
    new character* starts with its class's items (a weapon, a buckler for most, four minor
    healing potions in the belt, a Town Portal and an Identify scroll); characters made before
    2026-09-15 that have been saved keep what they had.
-   *Not yet:* the stash and cube, sockets filled, tomes, Town Portal, stamina, antidote and
+   *Expect the stash and cube:* clicking the stash in town opens it; drag items in and out and
+   they stay between games, an expansion character's stash `6 × 8` and a classic one's `6 × 4`.
+   If you carry the Horadric Cube, opening it holds items the same way, `3 × 4`. What is in each
+   is saved. *Not yet:* the cube's transmute recipes (it is storage only for now), sockets filled, tomes, Town Portal, stamina, antidote and
    thawing potions, repair, and other players seeing what you wear.
 5. *Expect shops:* talk to Akara, Charsi or Gheed and pick **Trade**. Their goods fill the tabs:
    Charsi's weapons and armour, Akara's staves, wands, potions, scrolls, tomes and keys, Gheed's
