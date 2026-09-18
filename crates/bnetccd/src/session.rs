@@ -992,7 +992,7 @@ impl Bncs {
         self.product = Some(product);
         self.platform = Some(platform);
         self.version_byte = Some(version_byte);
-        self.statstring = statstring::build_default(product);
+        self.set_statstring(statstring::build_default(product));
         // Whether this is *enforced* depends on config (versions.restrict); either way it
         // is logged, so an operator can see what real client builds are connecting before
         // deciding what to allow. Enforcement itself happens in `auth_check`.
@@ -1519,7 +1519,7 @@ impl Bncs {
             self.platform = Some(platform);
             self.product = Some(product);
             self.version_byte = Some(version_byte);
-            self.statstring = statstring::build_default(product);
+            self.set_statstring(statstring::build_default(product));
             if product::always_no_udp(product) {
                 // Diablo (DRTL/DSHR) never runs the UDP check, so its users always carry the
                 // No-UDP flag. This is the legacy-flow counterpart to the same line in
@@ -1837,6 +1837,29 @@ impl Bncs {
         crate::realm::client_facing_ipv4(self.peer, self.local, realm).await
     }
 
+    /// Set the statstring this session is advertised with, refusing one that would corrupt a
+    /// Diablo II client.
+    ///
+    /// Every channel occupant's statstring is put in front of every other occupant, so one
+    /// malformed D2 statstring is a heap overflow in *each* 1.14d client in the channel, not a
+    /// cosmetic fault in the user it describes — see [`statstring::d2_is_safe`] for the copy
+    /// loops that make it one. This is the single place a session's statstring changes, so it
+    /// is the place to hold the invariant. Falling back to the bare product tag keeps a user
+    /// visible (the client's own "no character" form) rather than dropping them from the list.
+    fn set_statstring(&mut self, statstring: Vec<u8>) {
+        if !statstring::d2_is_safe(&statstring) {
+            let fallback = statstring.get(..4).map(<[u8]>::to_vec).unwrap_or_default();
+            warn!(
+                peer = %self.peer,
+                statstring = %String::from_utf8_lossy(&statstring),
+                "refusing a Diablo II statstring that would overflow a 1.14d client; sending the bare product tag"
+            );
+            self.statstring = fallback;
+            return;
+        }
+        self.statstring = statstring;
+    }
+
     /// A Diablo II client entering chat as a closed-realm character names it in its
     /// `SID_ENTERCHAT` statstring (`Realm,Character`). Adopt it: the statstring becomes the
     /// character's portrait, and the chat name `Character*Account` — the form Battle.net used
@@ -1865,8 +1888,7 @@ impl Bncs {
                 return;
             }
         };
-        self.statstring =
-            crate::realm::portrait(&character).chat_statstring(product, &realm.name, &character.name);
+        self.set_statstring(crate::realm::portrait(&character).chat_statstring(product, &realm.name, &character.name));
         let chat_name = format!("{}*{}", character.name, account.name);
         if base_name(&self.display_name).eq_ignore_ascii_case(&chat_name) {
             return;
@@ -1928,7 +1950,7 @@ impl Bncs {
         if record.rating > 0 {
             record.high_rating = number(2).unwrap_or(record.rating);
         }
-        self.statstring = statstring::build_starcraft(product, record);
+        self.set_statstring(statstring::build_starcraft(product, record));
     }
 
     fn join_channel(&mut self, frame: &Frame) -> Step {

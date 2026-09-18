@@ -113,6 +113,11 @@ impl<'a> Statstring<'a> {
 /// sends this exact line for an empty statstring; the all-zero form makes other clients
 /// render a level-0 character with no attributes. See `docs/PROTOCOL-NOTES.md` §8 and
 /// [`layout::DIABLO_DEFAULT`] (which `build_default(DRTL)` reproduces).
+///
+/// **Diablo II (`D2DV`/`D2XP`) gets the bare tag**, for the reason [`d2_is_safe`] gives: the
+/// 1.14d client's parser copies a D2 statstring's first two fields by scanning for commas with
+/// no bound of any kind, so the nine-zero shape above walks off the packet and over its own
+/// user list. The bare tag is the client's own "a Diablo II user with no character" form.
 #[must_use]
 pub fn build_default(product: FourCc) -> Vec<u8> {
     let a = product.as_ascii();
@@ -121,6 +126,10 @@ pub fn build_default(product: FourCc) -> Vec<u8> {
     // tag), none of which a fresh account has — the bare tag is the safe minimum. ⚠️ The
     // exact bytes a real server returns are unconfirmed (docs/WARCRAFT3.md §4.3).
     if product == crate::product::WAR3 || product == crate::product::W3XP {
+        return reversed.to_vec();
+    }
+    // Diablo II without a realm character: see this function's note and `d2_is_safe`.
+    if product == crate::product::D2DV || product == crate::product::D2XP {
         return reversed.to_vec();
     }
     let mut s = Vec::with_capacity(29);
@@ -132,6 +141,41 @@ pub fn build_default(product: FourCc) -> Vec<u8> {
         s.extend_from_slice(&reversed);
     }
     s
+}
+
+/// The reversed product tags that make a Diablo II client parse a statstring as one of its own:
+/// `D2DV`, `D2XP` and the Japanese `D2ST`, each reversed.
+const D2_TAGS: [&[u8; 4]; 3] = [b"VD2D", b"PX2D", b"TS2D"];
+
+/// Whether a statstring is safe to put in front of a Diablo II 1.14d client.
+///
+/// **This is a memory-safety check, not a cosmetic one.** `Game.exe` 1.14d recognises the three
+/// tags in [`D2_TAGS`] and, when a byte follows the tag, copies the next two comma-delimited
+/// fields into a channel-user node at `+0x46` and `+0x36`. Both copy loops (`0x00446EE0` and
+/// `0x00446F00`) end **only** on a comma — they test neither the source length nor the
+/// destination. The node is `0xB4` bytes with its list `next` pointer at `+0xB0`, 106 bytes past
+/// the first destination, so a D2-tagged statstring with fewer than two commas makes the client
+/// overwrite its own user list — and then the channel's sort at `0x00447BB0` follows the wreckage
+/// and dies at `0x00447BE1`. It is a server-controlled heap overflow in every client in the
+/// channel, so nothing we emit may reach it.
+///
+/// Two shapes are safe, and they are the only two the client itself produces:
+///
+/// - **exactly the four tag bytes** — the "no character" form, which takes the NUL branch at
+///   `0x00446E6A` and never reaches a copy loop;
+/// - **tag + realm + `,` + name + `,` + portrait** — [`crate::d2::Portrait::chat_statstring`],
+///   whose two commas bound both copies.
+///
+/// A statstring under any other tag is not this client's business and passes.
+#[must_use]
+pub fn d2_is_safe(statstring: &[u8]) -> bool {
+    let Some(tag) = statstring.get(..4) else {
+        return true; // too short to carry a tag at all
+    };
+    if !D2_TAGS.iter().any(|t| t.as_slice() == tag) {
+        return true;
+    }
+    statstring.len() == 4 || statstring[4..].iter().filter(|&&b| b == b',').count() >= 2
 }
 
 /// A StarCraft or Warcraft II player's record, as its chat statstring shows it.
@@ -273,6 +317,62 @@ pub mod layout {
 mod tests {
     use super::*;
     use crate::product;
+
+    /// Every product a user can log in with. The safety test below has to cover all of them,
+    /// so a product added later is caught rather than quietly skipped.
+    const EVERY_PRODUCT: &[FourCc] = &[
+        product::STAR,
+        product::SEXP,
+        product::SSHR,
+        product::JSTR,
+        product::W2BN,
+        product::DRTL,
+        product::DSHR,
+        product::D2DV,
+        product::D2XP,
+        product::WAR3,
+        product::W3XP,
+    ];
+
+    #[test]
+    fn nothing_we_advertise_can_overflow_a_diablo_two_client() {
+        // The invariant `d2_is_safe` documents, held over everything we build. A D2-tagged
+        // statstring that is neither the bare tag nor twice-comma'd is a heap overflow in
+        // every 1.14d client in the channel, so this is the test that must never be relaxed.
+        for &p in EVERY_PRODUCT {
+            let s = build_default(p);
+            assert!(d2_is_safe(&s), "build_default({p}) = {:?} would overflow a D2 client", String::from_utf8_lossy(&s));
+        }
+        // And over a real realm character, whose two commas are what bound the client's copies.
+        let portrait = crate::d2::Portrait { class: crate::d2::class::SORCERESS, status: crate::d2::status::EXPANSION, level: 1, progression: 0 };
+        assert!(d2_is_safe(&portrait.chat_statstring(product::D2XP, "bncc", "Tyrael")));
+    }
+
+    #[test]
+    fn a_diablo_two_user_with_no_character_is_just_the_tag() {
+        // The client's own "no character" form: the NUL right after the tag takes the branch
+        // at 0x00446E6A, which never reaches a copy loop.
+        assert_eq!(build_default(product::D2DV), b"VD2D");
+        assert_eq!(build_default(product::D2XP), b"PX2D");
+    }
+
+    #[test]
+    fn the_shape_that_crashed_a_real_client_is_refused() {
+        // What we used to send. It reached a real 1.14d client on 2026-09-18 and took it down
+        // on sight: a D2 tag, a byte after it, and not one comma to stop the copy.
+        assert!(!d2_is_safe(b"VD2D 0 0 0 0 0 0 0 0 VD2D"));
+        assert!(!d2_is_safe(b"PX2D 0 0 0 0 0 0 0 0 PX2D"));
+        // One comma is not enough — the client runs two copy loops, and the second one is
+        // what walks the furthest.
+        assert!(!d2_is_safe(b"PX2Dbncc,Tyrael"));
+        assert!(d2_is_safe(b"PX2Dbncc,Tyrael,anything"));
+        // The Japanese tag parses down the same branch, so it is held to the same rule.
+        assert!(!d2_is_safe(b"TS2D 0 0"));
+        // Other products never enter that parser and are none of this check's business.
+        assert!(d2_is_safe(b"RATS 0 0 0 0 0 0 0 0 RATS"));
+        assert!(d2_is_safe(build_default(product::DRTL).as_slice()));
+        assert!(d2_is_safe(b""), "too short to carry a tag");
+    }
 
     #[test]
     fn diablo_gets_its_documented_default_statstring() {

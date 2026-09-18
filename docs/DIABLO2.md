@@ -207,7 +207,64 @@ it is its own program in a private repository**, linked to this realm (§2, *Gam
 frequent updates restart only the game server. Jaenster's game server survives only as a test
 oracle for it.
 
-## 6. Sources
+## 6. The statstring a Diablo II client will accept
+
+A 1.14d client parses every *other* user's chat statstring, so one bad statstring is a fault in
+every client in the channel rather than in the user it describes. **Its parser has no bounds of
+any kind**, and we crashed a real client with it on 2026-09-18.
+
+`FUN_00446D90` fills a channel-user node from a user's flags and statstring. If the first four
+bytes are a reversed Diablo II tag — `VD2D`, `PX2D` or the Japanese `TS2D` (`0x00446E40`,
+`0x00446E56`, `0x00446E5E`) — **and a non-`NUL` byte follows the tag**, it copies the next two
+comma-delimited fields into the node at `+0x46` and `+0x36`:
+
+```
+00446ee0  ADD ESI,0x1
+00446ee3  MOV byte ptr [EAX],CL      ; *dest++ = *src++
+00446ee5  MOV CL,byte ptr [ESI]
+00446ee7  ADD EAX,0x1
+00446eea  CMP CL,0x2c
+00446eed  JNZ 0x00446ee0             ; ends on ',' and on nothing else
+```
+
+Neither loop tests the source length, the destination length, or `NUL`. The node is `0xB4` bytes
+(`0x004490D7`, `memset` at `0x004490F7`) and its list `next` pointer is at `+0xB0` — 106 bytes
+past the first destination. So **a D2-tagged statstring with fewer than two commas walks out of
+the receive buffer and overwrites the client's own channel list**, along with `+0x90` (the flags),
+`+0x86`/`+0x8A` (class and level) and `+0x9C` (the UI control). The node is then linked in at
+`0x00449291` and the list is sorted at `0x00449308`, which follows the wrecked `next` and dies at
+`0x00447BE1`, `MOV EAX,[EDX+0x90]`.
+
+It is nondeterministic: the run has to reach 107 bytes without meeting a `0x2C`, so whatever is
+left in the client's `0x124`-byte receive buffer decides whether it crashes, corrupts silently, or
+survives.
+
+**Two shapes are safe, and they are the only two the client itself produces:**
+
+| Shape | Bytes | Why it is safe |
+|---|---|---|
+| No character | exactly `VD2D` / `PX2D` | The `NUL` after the tag takes `0x00446E6A`, which writes `UNKN`, picks icon `0x18` and returns without reaching a copy loop |
+| A character | `<tag><realm>,<name>,<33-byte portrait>` | Its two commas bound both copies; `push14` guarantees the portrait holds no `NUL` |
+
+`statstring::d2_is_safe` holds exactly that invariant and `Session::set_statstring` is the single
+place a session's statstring changes, so nothing we advertise can reach the loop.
+
+⚠️ **Three further limits, all load-bearing for the client's memory safety rather than for looks:**
+
+- The user **name** is copied into the node at `+0x04`, a `0x32`-byte field, with no bound
+  (`0x00449107`, and `FUN_004135D0(..., 0x7FFFFFFF)` at `0x00447FE8`). `USERNAME_MAX` is 15 and
+  `Character*Account` tops out near 31, so we are clear — but that cap now protects the client,
+  not just the chat display.
+- Flags `0x08`, `0x01`, `0x04` and `0x101000` each skip the statstring parse entirely
+  (`0x00446DCA` onward). Flag `0x02` sets its icon and **falls through** into it. So an admin's
+  statstring is never parsed and a moderator's is — which is why a bad statstring appears to
+  crash on some users and not others, and why the flag is a red herring.
+- `EID_USERFLAGS` (`0x09`) reaches the same parser through `0x004480D0` → `0x00447FD0` →
+  `0x00446D90`, on a live list. It is only safe to implement once the invariant above holds, and
+  it must carry the user's **full** statstring: an empty one takes `0x00446E1E`, which blanks the
+  portrait.
+
+## 7. Sources
 
 - [BNETDocs](https://bnetdocs.org/) — packet formats, the portrait byte table ("Chat
   Statstrings"), `SID_ENTERCHAT` semantics.
