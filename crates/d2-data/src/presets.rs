@@ -141,6 +141,15 @@ pub enum PresetMonster {
     Unknown(String),
 }
 
+/// A `SuperUniques.txt` row: one named monster a map places by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuperUnique {
+    /// `Superunique`: the name a `MonPreset.txt` `Place` matches.
+    pub key: String,
+    /// `Class`: the `MonStats.txt` row it is made from, as a class id.
+    pub class: i32,
+}
+
 /// `MonPreset.txt` resolved against `MonStats`, `SuperUniques` and `MonPlace`, as
 /// `DATATBLS_LinkerMonsterPreset` (`0x006597E0`) resolves it at load.
 #[derive(Debug, Clone, Default)]
@@ -149,6 +158,8 @@ pub struct MonPresets {
     per_act: [Vec<PresetMonster>; 5],
     /// `MonStats.txt` rows, where the engine's class ids for super uniques and placements start.
     monstats_rows: i32,
+    /// `SuperUniques.txt` in row order, so a [`PresetMonster::SuperUnique`] index resolves.
+    super_uniques: Vec<SuperUnique>,
 }
 
 impl MonPresets {
@@ -199,7 +210,14 @@ impl MonPresets {
                 PresetMonster::Unknown(name)
             });
         }
-        Ok(Self { per_act, monstats_rows: monstats.rows().count() as i32 })
+        let super_uniques = superuniques
+            .rows()
+            .map(|r| SuperUnique {
+                key: r.get("Superunique").unwrap_or_default().to_string(),
+                class: r.get("Class").and_then(|c| classes.get(&c.to_ascii_lowercase()).copied()).unwrap_or(-1),
+            })
+            .collect();
+        Ok(Self { per_act, monstats_rows: monstats.rows().count() as i32, super_uniques })
     }
 
     /// What DS1 monster id `ds1_id` places in `act` (0-based).
@@ -220,6 +238,12 @@ impl MonPresets {
             Some(PresetMonster::SuperUnique { index, .. } | PresetMonster::Placement { index, .. }) => index + self.monstats_rows,
             Some(PresetMonster::Unknown(_)) => self.monstats_rows,
         }
+    }
+
+    /// The `SuperUniques.txt` row a [`PresetMonster::SuperUnique`] names.
+    #[must_use]
+    pub fn super_unique(&self, index: i32) -> Option<&SuperUnique> {
+        usize::try_from(index).ok().and_then(|i| self.super_uniques.get(i))
     }
 
     /// `MonStats.txt` rows.
