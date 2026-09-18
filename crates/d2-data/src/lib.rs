@@ -760,6 +760,9 @@ mod tests {
         // Town Portal. The engine keys "this is a portal" on SubClass bit 2 and "what operating it
         // does" on OperateFn 15, never on the class id, so assert the bits rather than the rows —
         // and print them, because being wrong here points every portal at the wrong act.
+        // The anvil in the Barracks' forge, which gives up the Horadric Malus.
+        let anvil = data.objects().get(108).expect("objects.txt row 108");
+        println!("objects row 108 {:20} InitFn {} OperateFn {} PreOperate {} SubClass {:#04x} Parm0 {}", anvil.name, anvil.init_fn, anvil.operate_fn, anvil.pre_operate, anvil.sub_class, anvil.parm0);
         for class in [59, 60] {
             let o = data.objects().get(class).expect("a portal class");
             println!("objects row {class:3} {:20} SubClass {:#04x} OperateFn {}", o.name, o.sub_class, o.operate_fn);
