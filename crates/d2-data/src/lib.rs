@@ -729,6 +729,11 @@ mod tests {
         let town = data.levels().get(1).expect("Rogue Encampment");
         assert_eq!((town.act, town.drlg_type, town.waypoint), (0, levels::DrlgType::Preset, Some(0)));
         assert_eq!(data.levels().get(2).unwrap().waypoint, None, "Blood Moor has none");
+        // Which levels keep their monsters when a room leaves every player's view. Printed rather
+        // than asserted: the answer decides whether a deactivated room comes back populated, and
+        // nothing but the operator's own table can settle it.
+        let kept: Vec<(i32, bool)> = (1..=40).filter_map(|id| data.levels().get(id).map(|l| (id, l.save_monsters))).collect();
+        println!("SaveMonsters by level: {kept:?}");
         assert_eq!(data.lvl_prests().for_level(1).unwrap().files.len(), 4, "TownN1/E1/S1/W1");
         assert!(matches!(data.mon_presets().get(0, 2), Some(presets::PresetMonster::Class { name, .. }) if name == "akara"));
         let chicken = data.monsters().get(149).expect("chicken");

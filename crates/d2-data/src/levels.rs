@@ -57,6 +57,11 @@ pub struct LevelDef {
     /// `WarpDist`: monsters do not spawn closer than its square root, in subtiles, to where
     /// players arrive (`0x0054DB50`).
     pub warp_dist: i32,
+    /// `SaveMonsters` (record `+0x94`): whether a room keeps its monsters when it leaves every
+    /// player's view (`0x005431F0` via `0x00642820`). Without it the room's units are freed as it
+    /// deactivates; with it they are set aside and come back. A corpse needs this **and** a
+    /// one-in-three roll of the room's own seed to survive.
+    pub save_monsters: bool,
     /// What monsters its rooms spawn.
     pub monsters: LevelMonsters,
 }
@@ -136,6 +141,7 @@ impl Levels {
                 sub_waypoint: row.int("SubWaypoint").map_or(-1, |v| v as i32),
                 sub_shrine: row.int("SubShrine").map_or(-1, |v| v as i32),
                 warp_dist: int("WarpDist"),
+                save_monsters: int("SaveMonsters") != 0,
                 monsters: LevelMonsters {
                     types: int("NumMon"),
                     ranged_first: int("rangedspawn") != 0,
