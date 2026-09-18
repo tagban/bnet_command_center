@@ -226,17 +226,39 @@ impl MonPresets {
         self.per_act.get(usize::from(act))?.get(usize::try_from(ds1_id).ok()?)
     }
 
+    /// `SuperUniques.txt` rows, where placement rows' class ids start.
+    #[must_use]
+    pub fn super_unique_rows(&self) -> i32 {
+        i32::try_from(self.super_uniques.len()).unwrap_or(0)
+    }
+
+    /// What a `MonPlace.txt` row places (`0x0054E600`'s switch on the row). The engine compiles
+    /// this in: the table has only a `code` column, and the row's position is all it contributes.
+    /// `None` is a row that spawns nothing, or one we have not ported — the rows that roll a class
+    /// out of the level's own roster, and the later-act rows that pick by level.
+    #[must_use]
+    pub fn placement_class(row: i32) -> Option<i32> {
+        match row {
+            4 => Some(266),
+            // Blood Raven, whom the Sisters' Burial Grounds is about (`0x0054E808`).
+            5 => Some(267),
+            8 => Some(284),
+            _ => None,
+        }
+    }
+
     /// The class id the engine gives a DS1 monster unit (`ParsePresetsOfDrlgFile`): the
-    /// `MonStats` row, or a super unique's or placement's row past the `MonStats` rows; the raw
-    /// id when the act's block has no such entry.
+    /// `MonStats` row, then a super unique's row past those, then a placement's row past both.
     #[must_use]
     pub fn engine_class(&self, act: i32, ds1_id: i32) -> i32 {
         let Some(block) = usize::try_from(act).ok().and_then(|a| self.per_act.get(a)) else { return ds1_id };
         match usize::try_from(ds1_id).ok().and_then(|i| block.get(i)) {
             None => ds1_id,
             Some(PresetMonster::Class { class, .. }) => *class,
-            Some(PresetMonster::SuperUnique { index, .. } | PresetMonster::Placement { index, .. }) => index + self.monstats_rows,
-            Some(PresetMonster::Unknown(_)) => self.monstats_rows,
+            Some(PresetMonster::SuperUnique { index, .. }) => index + self.monstats_rows,
+            Some(PresetMonster::Placement { index, .. }) => index + self.monstats_rows + self.super_unique_rows(),
+            // An unmatched name links as placement row 0, which spawns nothing.
+            Some(PresetMonster::Unknown(_)) => self.monstats_rows + self.super_unique_rows(),
         }
     }
 

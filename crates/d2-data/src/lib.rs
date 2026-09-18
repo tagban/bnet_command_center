@@ -734,6 +734,8 @@ mod tests {
         // nothing but the operator's own table can settle it.
         let kept: Vec<(i32, bool)> = (1..=40).filter_map(|id| data.levels().get(id).map(|l| (id, l.save_monsters))).collect();
         println!("SaveMonsters by level: {kept:?}");
+        let belts: Vec<(i32, Option<u8>)> = (0..8).map(|k| (k, data.belts().boxes(k))).collect();
+        println!("Belts.txt boxes by kind: {belts:?}; with no belt worn: {}", data.belt_boxes(None));
         assert_eq!(data.lvl_prests().for_level(1).unwrap().files.len(), 4, "TownN1/E1/S1/W1");
         assert!(matches!(data.mon_presets().get(0, 2), Some(presets::PresetMonster::Class { name, .. }) if name == "akara"));
         let chicken = data.monsters().get(149).expect("chicken");
