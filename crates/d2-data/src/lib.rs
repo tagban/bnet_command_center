@@ -734,6 +734,18 @@ mod tests {
         // nothing but the operator's own table can settle it.
         let kept: Vec<(i32, bool)> = (1..=40).filter_map(|id| data.levels().get(id).map(|l| (id, l.save_monsters))).collect();
         println!("SaveMonsters by level: {kept:?}");
+        for id in [7, 26, 27, 28, 29] {
+            if let Some(l) = data.levels().get(id) {
+                let files = data.lvl_prests().for_level(id).map_or(0, |p| p.files.len());
+                let links: Vec<(i32, i32)> = (0..8).map(|i| (l.vis[i], l.warp[i])).filter(|&(v, _)| v != 0).collect();
+                println!("level {id:3} {:22} drlg {:?} depend {} prest files {files} vis/warp {links:?}", l.name, l.drlg_type, l.depend);
+            }
+        }
+        let restores: Vec<(i32, String, u8)> = [148, 150, 154, 147, 155, 267, 0]
+            .into_iter()
+            .filter_map(|c| data.monsters().get(c).map(|m| (c, m.id.clone(), m.restore)))
+            .collect();
+        println!("restore by class: {restores:?}");
         let belts: Vec<(i32, Option<u8>)> = (0..8).map(|k| (k, data.belts().boxes(k))).collect();
         println!("Belts.txt boxes by kind: {belts:?}; with no belt worn: {}", data.belt_boxes(None));
         assert_eq!(data.lvl_prests().for_level(1).unwrap().files.len(), 4, "TownN1/E1/S1/W1");

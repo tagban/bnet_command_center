@@ -39,6 +39,11 @@ pub struct MonsterClass {
     /// `MonStats2.txt` `spawnCol` (record `+0xA`): which collision bits keep it from standing
     /// somewhere (`0x005B2A00`).
     pub spawn_collision: u8,
+    /// `MonStats2.txt` `restore` (record `+0x130`): whether the unit is kept when its room is
+    /// released (`0x005431F0`, the last word on it). **0 never**, **2 always**, 1 leaves the
+    /// decision to the level's `SaveMonsters` and, for a corpse, its roll. Town NPCs are 2, which
+    /// is why they survive a town whose `SaveMonsters` is 0.
+    pub restore: u8,
     /// How the class spawns in a level's rooms.
     pub spawn: SpawnRules,
     /// How it fights.
@@ -136,7 +141,10 @@ impl Monsters {
             .rows()
             .filter_map(|row| Some((row.get("Id")?.to_ascii_lowercase(), row.get("BaseW").unwrap_or("hth").to_string())))
             .collect();
-        let display: HashMap<String, (bool, [u8; 16], u8, u8, i32)> = monstats2
+        /// What `MonStats2.txt` contributes to a class: critter, component variants, size,
+        /// spawn collision, melee range, and whether a released room keeps the unit.
+        type Display = (bool, [u8; 16], u8, u8, i32, u8);
+        let display: HashMap<String, Display> = monstats2
             .rows()
             .filter_map(|row| {
                 let mut components = [0u8; 16];
@@ -146,7 +154,19 @@ impl Monsters {
                 }
                 let byte = |c: &str| u8::try_from(row.int(c).unwrap_or(0)).unwrap_or(0);
                 let melee = row.int("MeleeRng").unwrap_or(0) as i32;
-                Some((row.get("Id")?.to_ascii_lowercase(), (row.int("critter").unwrap_or(0) != 0, components, byte("SizeX"), byte("spawnCol"), melee)))
+                Some((
+                    row.get("Id")?.to_ascii_lowercase(),
+                    (
+                        row.int("critter").unwrap_or(0) != 0,
+                        components,
+                        byte("SizeX"),
+                        byte("spawnCol"),
+                        melee,
+                        // A table without the column leaves the decision to the level; only a
+                        // table that says 0 means "never keep this".
+                        row.int("restore").map_or(1, |v| u8::try_from(v).unwrap_or(1)),
+                    ),
+                ))
             })
             .collect();
         let by_name: HashMap<String, i32> = monstats
@@ -160,7 +180,7 @@ impl Monsters {
                 let class = i32::try_from(row.int("hcIdx")?).ok()?;
                 let id = row.get("Id")?.to_string();
                 let ex = row.get("MonStatsEx")?.to_ascii_lowercase();
-                let &(critter, components, size, spawn_collision, melee_range) = display.get(&ex)?;
+                let &(critter, components, size, spawn_collision, melee_range, restore) = display.get(&ex)?;
                 let flag = |c: &str| row.int(c).unwrap_or(0) != 0;
                 let int = |c: &str| row.int(c).unwrap_or(0) as i32;
                 let spawn = SpawnRules {
@@ -194,7 +214,7 @@ impl Monsters {
                     treasure: ["TreasureClass1", "TreasureClass1(N)", "TreasureClass1(H)"].map(|c| row.get(c).unwrap_or_default().to_string()),
                     resistances: ["", "(N)", "(H)"].map(|d| ["ResDm", "ResMa", "ResFi", "ResLi", "ResCo", "ResPo"].map(|r| int(&format!("{r}{d}")))),
                 };
-                Some((class, MonsterClass { id, critter, components, interact: flag("interact"), npc: flag("npc"), align: int("Align") as u8, size, spawn_collision, spawn, combat }))
+                Some((class, MonsterClass { id, critter, components, restore, interact: flag("interact"), npc: flag("npc"), align: int("Align") as u8, size, spawn_collision, spawn, combat }))
             })
             .collect();
         Ok(Self { by_class, by_name })
