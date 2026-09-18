@@ -757,6 +757,24 @@ mod tests {
         let torch = data.objects().get(37).expect("objects.txt row 37");
         assert_eq!(torch.init_fn, 8);
         assert_eq!(data.objects().get(267).unwrap().operate_fn, 32, "the stash");
+        // Town Portal. The engine keys "this is a portal" on SubClass bit 2 and "what operating it
+        // does" on OperateFn 15, never on the class id, so assert the bits rather than the rows —
+        // and print them, because being wrong here points every portal at the wrong act.
+        for class in [59, 60] {
+            let o = data.objects().get(class).expect("a portal class");
+            println!("objects row {class:3} {:20} SubClass {:#04x} OperateFn {}", o.name, o.sub_class, o.operate_fn);
+            assert_eq!(o.sub_class & 0x04, 0x04, "row {class} should carry the portal bit");
+            assert_eq!(o.operate_fn, 15, "row {class} should operate as a portal");
+        }
+        for (i, b) in data.books().iter().enumerate() {
+            println!("Books.txt row {i} {:24} pSpell {} bookskill {} cost/charge {}", b.name, b.spell, b.book_skill, b.cost_per_charge);
+        }
+        assert!(data.books().iter().any(|b| b.spell > 0), "some book must name a spell to cast");
+        // Which levels a follower needs a quest bit for. Printed, not asserted: only the
+        // operator's own table can settle it, and a wrong guess silently locks people out.
+        let gated: Vec<(i32, (i32, i32))> =
+            (1..=40).filter_map(|id| data.levels().get(id).map(|l| (id, l.quest_flag))).filter(|&(_, q)| q != (0, 0)).collect();
+        println!("levels behind a quest flag (classic, expansion): {gated:?}");
         assert!(data.monsters().get(148).unwrap().interact, "Akara talks");
         assert!(!data.monsters().get(152).unwrap().interact, "town rogues do not");
         assert!(data.read_file("data\\global\\tiles\\Act1\\Town\\TownN1.ds1").unwrap().is_some());

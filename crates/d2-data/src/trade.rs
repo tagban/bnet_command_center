@@ -63,13 +63,29 @@ pub struct Book {
     pub name: String,
     /// `CostPerCharge` (`+0x14`): what each scroll in the tome adds to its price.
     pub cost_per_charge: i32,
+    /// `pSpell` (`+0x04`): what using a scroll or tome of this row does, as a row of the engine's
+    /// 31-entry spell table (`0x00741790`). **Only used when above 0** — the engine falls back to
+    /// the item's own [`crate::items::ItemDef::spell`] otherwise, so this does not override, it
+    /// wins only when set. Town Portal is the reason we read it.
+    pub spell: i32,
+    /// `bookskill` (`+0x0C`): the argument handed to that spell function.
+    pub book_skill: i32,
 }
 
 /// `Books.txt`, by row: Town Portal 0, Identify 1.
+///
+/// ⚠️ **Rows are identified by index, never by name.** Every row's `Name` in the shipped table is
+/// the literal string `unused`; what tells them apart is [`Book::spell`] — row 0 is `pSpell` 2
+/// (the engine's Town Portal function `0x005BE290`), row 1 is `pSpell` 1 (Identify), row 2 is 0.
 #[must_use]
 pub fn books_from_table(t: &Table) -> Vec<Book> {
     t.rows()
-        .map(|row| Book { name: row.get("Name").unwrap_or_default().to_string(), cost_per_charge: row.int("CostPerCharge").unwrap_or(0) as i32 })
+        .map(|row| Book {
+            name: row.get("Name").unwrap_or_default().to_string(),
+            cost_per_charge: row.int("CostPerCharge").unwrap_or(0) as i32,
+            spell: row.int("pSpell").unwrap_or(0) as i32,
+            book_skill: row.int("bookskill").unwrap_or(0) as i32,
+        })
         .collect()
 }
 
@@ -93,5 +109,20 @@ mod tests {
         assert!(trades.get(154).is_none(), "Charsi has no row here");
         let books = books_from_table(&Table::parse(b"Name\tCostPerCharge\r\nTome of Town Portal\t25\r\n"));
         assert_eq!(books[0].cost_per_charge, 25);
+    }
+
+    #[test]
+    fn a_book_names_the_spell_using_it_casts() {
+        // Row 0 is the Tome of Town Portal, and `pSpell` is how the engine finds what to cast —
+        // it is never keyed on the item code. `bookskill` is the argument that goes with it.
+        let books = books_from_table(&Table::parse(
+            b"Name\tCostPerCharge\tpSpell\tbookskill\r\nTome of Town Portal\t25\t2\t-1\r\nTome of Identify\t15\t1\t-1\r\n",
+        ));
+        assert_eq!((books[0].spell, books[0].book_skill), (2, -1), "Town Portal");
+        assert_eq!(books[1].spell, 1, "Identify");
+        // A table without the columns must read 0, not refuse to load: 0 means "no book spell",
+        // which is the engine's own fallback to the item's own pSpell.
+        let bare = books_from_table(&Table::parse(b"Name\tCostPerCharge\r\nTome of Town Portal\t25\r\n"));
+        assert_eq!(bare[0].spell, 0);
     }
 }

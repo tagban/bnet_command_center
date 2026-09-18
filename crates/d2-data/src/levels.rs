@@ -62,6 +62,11 @@ pub struct LevelDef {
     /// deactivates; with it they are set aside and come back. A corpse needs this **and** a
     /// one-in-three roll of the room's own seed to survive.
     pub save_monsters: bool,
+    /// `QuestFlag`, and `QuestFlagEx` for an expansion game (per-level record `+0x00`/`+0x04`,
+    /// chosen by the game's expansion flag): the quest bit a player must hold to take **someone
+    /// else's** portal here (`0x005849D0`). 0 for a level anyone may enter. Their own portal
+    /// skips the test, so this gates followers, not the caster.
+    pub quest_flag: (i32, i32),
     /// What monsters its rooms spawn.
     pub monsters: LevelMonsters,
 }
@@ -142,6 +147,7 @@ impl Levels {
                 sub_shrine: row.int("SubShrine").map_or(-1, |v| v as i32),
                 warp_dist: int("WarpDist"),
                 save_monsters: int("SaveMonsters") != 0,
+                quest_flag: (int("QuestFlag"), int("QuestFlagEx")),
                 monsters: LevelMonsters {
                     types: int("NumMon"),
                     ranged_first: int("rangedspawn") != 0,
