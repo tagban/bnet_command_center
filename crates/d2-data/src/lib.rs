@@ -770,6 +770,19 @@ mod tests {
             println!("Books.txt row {i} {:24} pSpell {} bookskill {} cost/charge {}", b.name, b.spell, b.book_skill, b.cost_per_charge);
         }
         assert!(data.books().iter().any(|b| b.spell > 0), "some book must name a spell to cast");
+        // What a Town Portal scroll and tome actually say, since the engine picks the spell from
+        // the table and never from the code. Printed so the port is built on the real numbers.
+        for code in [b"tsc ", b"tbk ", b"isc ", b"ibk "] {
+            if let Some(def) = data.items().class_of(code).and_then(|c| data.items().get(c)) {
+                // A tome is what a player buys to get home, and it is worth nothing empty: each
+                // cast spends one of its scrolls, so the stack columns matter as much as pSpell.
+                let akara = items::VENDORS.iter().position(|v| *v == "Akara").map(|i| def.vendors[i]);
+                println!(
+                    "item {} {:20} type {} useable {} pSpell {} stackable {} stack {:?} akara {akara:?}",
+                    items::code_str(code), def.name, def.item_type, def.useable, def.spell, def.stackable, def.stack
+                );
+            }
+        }
         // Which levels a follower needs a quest bit for. Printed, not asserted: only the
         // operator's own table can settle it, and a wrong guess silently locks people out.
         let gated: Vec<(i32, (i32, i32))> =
