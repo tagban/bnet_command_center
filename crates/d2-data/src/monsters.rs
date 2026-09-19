@@ -91,6 +91,10 @@ pub struct CombatStats {
     /// `ResDm`, `ResMa`, `ResFi`, `ResLi`, `ResCo`, `ResPo` by difficulty: percent resistance to
     /// physical, magic, fire, lightning, cold and poison damage.
     pub resistances: [[i32; 6]; 3],
+    /// `coldeffect` by difficulty (record `+0x168`): the percent a chill leaves of its speeds
+    /// (negative, −50 half); 0 cannot be chilled, and only a negative one can be frozen
+    /// (`0x0057AF80`, `0x0057B230`).
+    pub cold_effect: [i32; 3],
 }
 
 /// The `MonStats.txt` columns room population reads, class names resolved to class ids (-1 for
@@ -219,6 +223,7 @@ impl Monsters {
                     weapon_class: weapon_classes.get(&ex).cloned().unwrap_or_else(|| "hth".into()),
                     treasure: ["TreasureClass1", "TreasureClass1(N)", "TreasureClass1(H)"].map(|c| row.get(c).unwrap_or_default().to_string()),
                     resistances: ["", "(N)", "(H)"].map(|d| ["ResDm", "ResMa", "ResFi", "ResLi", "ResCo", "ResPo"].map(|r| int(&format!("{r}{d}")))),
+                    cold_effect: ["coldeffect", "coldeffect(N)", "coldeffect(H)"].map(int),
                 };
                 Some((class, MonsterClass {
                     id,

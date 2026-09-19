@@ -18,6 +18,7 @@ use d2_formats::mpq::{self, ArchiveSet, DATA_ARCHIVES};
 pub mod affixes;
 pub mod appearance;
 pub mod belts;
+pub mod difficulty;
 pub mod character;
 pub mod engine;
 pub mod item_bits;
@@ -113,6 +114,9 @@ pub struct ClassStats {
     pub per_point: (i32, i32, i32),
     /// `WalkVelocity`, `RunVelocity`.
     pub velocity: (i32, i32),
+    /// `ManaRegen` (record `+0x3A`): seconds to regenerate the whole of the mana pool
+    /// (`0x005806F0`; 300 when blank).
+    pub mana_regen: i32,
 }
 
 /// An item a new character starts with: `charstats.txt` `item1`…`item10` with their `loc` and
@@ -157,6 +161,7 @@ pub struct GameData {
     affixes: affixes::Affixes,
     skills: skills::Skills,
     states: states::States,
+    difficulties: difficulty::Difficulties,
     missiles: missiles::Missiles,
     treasure: treasure::TreasureClasses,
     /// `Npc.txt`: vendors' price multipliers.
@@ -221,6 +226,7 @@ impl GameData {
         );
         data.skills = skills::Skills::from_table(&read("skills.txt")?);
         data.states = states::States::from_table(&read("states.txt")?);
+        data.difficulties = difficulty::Difficulties::from_table(&read("difficultylevels.txt")?);
         data.missiles = missiles::Missiles::from_table(&read("missiles.txt")?);
         data.books = trade::books_from_table(&read("books.txt")?);
         data.treasure = treasure::TreasureClasses::from_table(&read("treasureclassex.txt")?)?;
@@ -346,6 +352,12 @@ impl GameData {
     #[must_use]
     pub fn states(&self) -> &states::States {
         &self.states
+    }
+
+    /// `DifficultyLevels.txt`'s row for a difficulty (0 Normal, 1 Nightmare, 2 Hell).
+    #[must_use]
+    pub fn difficulty(&self, difficulty: u8) -> difficulty::Difficulty {
+        self.difficulties.get(difficulty)
     }
 
     /// Replace the skill table — for building rules from tables in tests.
@@ -517,6 +529,7 @@ impl GameData {
             stat_per_level: 0,
             per_point: (0, 0, 0),
             velocity: (0, 0),
+            mana_regen: 0,
         }; 7];
         for (id, name) in CLASSES.iter().enumerate() {
             let row = charstats
@@ -549,6 +562,7 @@ impl GameData {
                     row.int("ManaPerMagic").unwrap_or(0) as i32,
                 ),
                 velocity: (row.int("WalkVelocity").unwrap_or(0) as i32, row.int("RunVelocity").unwrap_or(0) as i32),
+                mana_regen: row.int("ManaRegen").unwrap_or(0) as i32,
             };
             start_items[id] = (1..=10)
                 .filter_map(|n| {
@@ -606,6 +620,7 @@ impl GameData {
             affixes: affixes::Affixes::default(),
             skills: skills::Skills::default(),
             states: states::States::default(),
+            difficulties: difficulty::Difficulties::default(),
             missiles: missiles::Missiles::default(),
             treasure: treasure::TreasureClasses::default(),
             npc_trades: trade::NpcTrades::default(),

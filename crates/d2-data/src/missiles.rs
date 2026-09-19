@@ -33,6 +33,19 @@ pub struct Missile {
     pub skill: String,
     /// `Pierce`: may pass through what it hits.
     pub pierce: bool,
+    /// `pSrvDoFunc`: what it does each frame on the server (1 flies, 5 burns where it lies, …).
+    pub server_do_func: i32,
+    /// `pSrvDmgFunc`: what its damage does besides (3 burns, 4 freezes, …).
+    pub server_damage_func: i32,
+    /// `Param1`–`Param5`: its do function's own numbers.
+    pub params: [i32; 5],
+    /// `NextHit` and `NextDelay`: it may hit again, and after how many frames a unit it hit may be
+    /// hit by it again.
+    pub next_hit: (bool, i32),
+    /// `SubMissile1`–`SubMissile3`: what its do function makes as it goes.
+    pub sub_missiles: [String; 3],
+    /// `HitSubMissile1`–`HitSubMissile4`: what its hit function makes.
+    pub hit_sub_missiles: [String; 4],
 }
 
 /// Every missile, by id.
@@ -63,6 +76,12 @@ impl Missiles {
                     server_hit_params: [int("sHitPar1"), int("sHitPar2"), int("sHitPar3")],
                     skill: row.get("Skill").unwrap_or_default().to_string(),
                     pierce: int("Pierce") != 0,
+                    server_do_func: int("pSrvDoFunc"),
+                    server_damage_func: int("pSrvDmgFunc"),
+                    params: [int("Param1"), int("Param2"), int("Param3"), int("Param4"), int("Param5")],
+                    next_hit: (int("NextHit") != 0, int("NextDelay")),
+                    sub_missiles: ["SubMissile1", "SubMissile2", "SubMissile3"].map(|c| row.get(c).unwrap_or_default().to_string()),
+                    hit_sub_missiles: ["HitSubMissile1", "HitSubMissile2", "HitSubMissile3", "HitSubMissile4"].map(|c| row.get(c).unwrap_or_default().to_string()),
                 }
             })
             .collect();
