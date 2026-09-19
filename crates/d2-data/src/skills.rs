@@ -108,6 +108,15 @@ pub struct Skill {
     pub aura_state: Option<String>,
     /// `pettype` (`+0xBE`): the kind of pet a summon is, by `PetType.txt` name.
     pub pet_type: Option<String>,
+    /// `summon` (`+0xBC`): the `MonStats.txt` row a summon makes.
+    pub summon: Option<String>,
+    /// `petmax` (`+0xC0`): how many of its pets a player may have at once, as a calc.
+    pub pet_max: String,
+    /// `summode` (`+0xBF`): the mode a summon appears in.
+    pub summon_mode: Option<String>,
+    /// `sumskill1`–`5` with `sumsk1calc`–`5`: skills a summon is given, by name, and their level
+    /// calcs, evaluated on its owner (`0x005C4470`).
+    pub summon_skills: Vec<(String, String)>,
     /// `auratargetstate`: the state on whoever it reaches.
     pub aura_target_state: Option<String>,
     /// `auralencalc`: how long those states last, frames, as a calc.
@@ -191,6 +200,12 @@ impl Skills {
                 passive_stats: (1..=5).filter_map(|i| Some((text(&row, &format!("passivestat{i}"))?, row.get(&format!("passivecalc{i}")).unwrap_or_default().to_string()))).collect(),
                 aura_state: text(&row, "aurastate"),
                 pet_type: text(&row, "pettype"),
+                summon: text(&row, "summon"),
+                pet_max: row.get("petmax").unwrap_or_default().to_string(),
+                summon_mode: text(&row, "summode"),
+                summon_skills: (1..=5)
+                    .filter_map(|n| Some((text(&row, &format!("sumskill{n}"))?, row.get(&format!("sumsk{n}calc")).unwrap_or_default().to_string())))
+                    .collect(),
                 aura_target_state: text(&row, "auratargetstate"),
                 aura_length: row.get("auralencalc").unwrap_or_default().to_string(),
                 aura_range: row.get("aurarangecalc").unwrap_or_default().to_string(),

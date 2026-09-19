@@ -95,6 +95,9 @@ pub struct CombatStats {
     /// (negative, −50 half); 0 cannot be chilled, and only a negative one can be frozen
     /// (`0x0057AF80`, `0x0057B230`).
     pub cold_effect: [i32; 3],
+    /// `noRatio`: its life, defence, attack rating and damage are its own numbers, not
+    /// percentages of `MonLvl.txt` — a player's summons.
+    pub no_ratio: bool,
 }
 
 /// The `MonStats.txt` columns room population reads, class names resolved to class ids (-1 for
@@ -224,6 +227,7 @@ impl Monsters {
                     treasure: ["TreasureClass1", "TreasureClass1(N)", "TreasureClass1(H)"].map(|c| row.get(c).unwrap_or_default().to_string()),
                     resistances: ["", "(N)", "(H)"].map(|d| ["ResDm", "ResMa", "ResFi", "ResLi", "ResCo", "ResPo"].map(|r| int(&format!("{r}{d}")))),
                     cold_effect: ["coldeffect", "coldeffect(N)", "coldeffect(H)"].map(int),
+                    no_ratio: int("noRatio") != 0,
                 };
                 Some((class, MonsterClass {
                     id,

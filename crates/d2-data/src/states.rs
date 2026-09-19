@@ -16,13 +16,19 @@ pub struct State {
     pub name: String,
     /// `nosend`: the client is never told of it.
     pub no_send: bool,
+    /// `group` (`+0x1E`): a state that takes over one of the same group removes it — one armour
+    /// at a time, one of Quickness and Fade (`0x0056C740`). 0 for none.
+    pub group: i32,
 }
 
 impl States {
     /// Parse the table.
     #[must_use]
     pub fn from_table(t: &Table) -> Self {
-        let rows = t.rows().map(|r| State { name: r.get("state").unwrap_or_default().to_string(), no_send: r.int("nosend").unwrap_or(0) != 0 }).collect();
+        let rows = t
+            .rows()
+            .map(|r| State { name: r.get("state").unwrap_or_default().to_string(), no_send: r.int("nosend").unwrap_or(0) != 0, group: r.int("group").unwrap_or(0) as i32 })
+            .collect();
         Self { rows }
     }
 
