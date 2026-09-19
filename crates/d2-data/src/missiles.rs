@@ -46,6 +46,18 @@ pub struct Missile {
     pub sub_missiles: [String; 3],
     /// `HitSubMissile1`–`HitSubMissile4`: what its hit function makes.
     pub hit_sub_missiles: [String; 4],
+    /// `EType`: the element of its own damage, for a missile with no `Skill` to take it from.
+    pub element: String,
+    /// `EMin` and `MinELev1`–`MinELev5`: its own elemental minimum and its level brackets.
+    pub element_min: (i32, [i32; 5]),
+    /// `Emax` and `MaxELev1`–`MaxELev5`.
+    pub element_max: (i32, [i32; 5]),
+    /// `EDmgSymPerCalc`: the synergy percent on its own elemental damage.
+    pub element_synergy: String,
+    /// `HitShift`: its own damage's shift into 256ths.
+    pub hit_shift: i32,
+    /// `DamageRate`: how much of the target's damage reduction applies, in 1024ths.
+    pub damage_rate: i32,
 }
 
 /// Every missile, by id.
@@ -82,6 +94,12 @@ impl Missiles {
                     next_hit: (int("NextHit") != 0, int("NextDelay")),
                     sub_missiles: ["SubMissile1", "SubMissile2", "SubMissile3"].map(|c| row.get(c).unwrap_or_default().to_string()),
                     hit_sub_missiles: ["HitSubMissile1", "HitSubMissile2", "HitSubMissile3", "HitSubMissile4"].map(|c| row.get(c).unwrap_or_default().to_string()),
+                    element: row.get("EType").unwrap_or_default().to_string(),
+                    element_min: (int("EMin"), ["MinELev1", "MinELev2", "MinELev3", "MinELev4", "MinELev5"].map(int)),
+                    element_max: (int("Emax"), ["MaxELev1", "MaxELev2", "MaxELev3", "MaxELev4", "MaxELev5"].map(int)),
+                    element_synergy: row.get("EDmgSymPerCalc").unwrap_or_default().to_string(),
+                    hit_shift: int("HitShift"),
+                    damage_rate: int("DamageRate"),
                 }
             })
             .collect();
