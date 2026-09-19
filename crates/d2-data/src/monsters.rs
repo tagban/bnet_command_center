@@ -95,6 +95,10 @@ pub struct CombatStats {
     /// (negative, −50 half); 0 cannot be chilled, and only a negative one can be frozen
     /// (`0x0057AF80`, `0x0057B230`).
     pub cold_effect: [i32; 3],
+    /// `Skill1`–`Skill8`: the skills it uses, by name, with their levels (`Sk1lvl`…).
+    pub skills: Vec<(String, i32)>,
+    /// `aip1`–`aip8` by difficulty: its AI's own numbers (a trap's reach is `aip4`).
+    pub ai_params: [[i32; 3]; 8],
     /// `Drain` by difficulty: the percent of what is struck from it that a life steal takes.
     pub drain: [i32; 3],
     /// `noRatio`: its life, defence, attack rating and damage are its own numbers, not
@@ -231,6 +235,8 @@ impl Monsters {
                     cold_effect: ["coldeffect", "coldeffect(N)", "coldeffect(H)"].map(int),
                     no_ratio: int("noRatio") != 0,
                     drain: ["Drain", "Drain(N)", "Drain(H)"].map(int),
+                    skills: (1..=8).filter_map(|n| Some((row.get(&format!("Skill{n}")).filter(|s| !s.is_empty())?.to_string(), int(&format!("Sk{n}lvl"))))).collect(),
+                    ai_params: std::array::from_fn(|n| [format!("aip{}", n + 1), format!("aip{}(N)", n + 1), format!("aip{}(H)", n + 1)].map(|c| int(&c))),
                 };
                 Some((class, MonsterClass {
                     id,

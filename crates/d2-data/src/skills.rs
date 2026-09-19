@@ -108,6 +108,16 @@ pub struct Skill {
     pub aura_state: Option<String>,
     /// `pettype` (`+0xBE`): the kind of pet a summon is, by `PetType.txt` name.
     pub pet_type: Option<String>,
+    /// `prgcalc1`–`prgcalc3` (`+0x38`…): a charge-up skill's charges, and some skills' counts
+    /// (Shock Web's webs), as calcs.
+    pub progress_calcs: [String; 3],
+    /// `progressive`: a charge-up skill (Tiger Strike, Fists of Fire…).
+    pub progressive: bool,
+    /// `srvprgfunc1`–`srvprgfunc3`: what each held charge does when a finisher lets it go (by the
+    /// `srvdofunc` table).
+    pub progress_funcs: [i32; 3],
+    /// `prgstack`: a finisher lets every held charge's go, not only the last's.
+    pub progress_stack: bool,
     /// `summon` (`+0xBC`): the `MonStats.txt` row a summon makes.
     pub summon: Option<String>,
     /// `petmax` (`+0xC0`): how many of its pets a player may have at once, as a calc.
@@ -200,6 +210,10 @@ impl Skills {
                 passive_stats: (1..=5).filter_map(|i| Some((text(&row, &format!("passivestat{i}"))?, row.get(&format!("passivecalc{i}")).unwrap_or_default().to_string()))).collect(),
                 aura_state: text(&row, "aurastate"),
                 pet_type: text(&row, "pettype"),
+                progress_calcs: ["prgcalc1", "prgcalc2", "prgcalc3"].map(|c| row.get(c).unwrap_or_default().to_string()),
+                progressive: row.int("progressive").unwrap_or(0) != 0,
+                progress_funcs: ["srvprgfunc1", "srvprgfunc2", "srvprgfunc3"].map(|c| row.int(c).unwrap_or(0) as i32),
+                progress_stack: row.int("prgstack").unwrap_or(0) != 0,
                 summon: text(&row, "summon"),
                 pet_max: row.get("petmax").unwrap_or_default().to_string(),
                 summon_mode: text(&row, "summode"),
