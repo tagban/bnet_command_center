@@ -268,6 +268,10 @@ pub struct ItemDef {
     pub useable: bool,
     /// `quest`: a quest item.
     pub quest: bool,
+    /// `questdiffcheck`: a quest item that remembers the difficulty it was made in (stat 356,
+    /// `0x00557AB0`) — a quest takes it only in that difficulty or a lower one (`0x00558110`) —
+    /// and, when simple, carries that stat after its code (`0x0062AF80`).
+    pub quest_diff_check: bool,
     /// `pSpell`: what using it does (3 a healing or mana potion, 5 a rejuvenation potion).
     pub spell: i32,
     /// `len`: frames its effect lasts, 0 for at once.
@@ -392,6 +396,7 @@ impl Items {
                     stackable: int("stackable") != 0,
                     useable: int("useable") != 0,
                     quest: int("quest") != 0,
+                    quest_diff_check: int("questdiffcheck") != 0,
                     spell: int("pSpell"),
                     duration: int("len"),
                     effects: (1..=3)

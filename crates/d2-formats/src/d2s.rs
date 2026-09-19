@@ -249,7 +249,9 @@ impl Save {
 
     /// The player's own items (the first `JM` list) when every one is simple, and where the list
     /// ends in [`Self::items`]; `None` when an item is not simple or the list does not read to a
-    /// whole (a real item body is not modelled).
+    /// whole (a real item body is not modelled). Without the item tables it cannot know a quest
+    /// item whose row has `questdiffcheck` carries two more bits after its code (`d2-data`'s
+    /// `item_bits` does); it is for potions, gems and the like.
     #[must_use]
     pub fn simple_items(&self) -> Option<(Vec<SimpleItem>, usize)> {
         let data = &self.items;

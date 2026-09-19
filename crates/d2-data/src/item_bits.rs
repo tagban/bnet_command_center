@@ -4,8 +4,9 @@
 //!
 //! Common head: flags 32 (a save prefixes `JM`), version 10, mode 3, then x and y 16 each on the
 //! ground (modes 3 and 5) or body location 4, column 4, row 4 and page + 1 3, then the code 32.
-//! A simple item (`compactsave`, flag `0x200000`) ends there bar gold's amount and a save's realm
-//! bit. A full item goes on: socketed items 3, the item's seed 32 (saves only), item level 7,
+//! A simple item (`compactsave`, flag `0x200000`) ends there bar gold's amount, a quest item's
+//! difficulty (stat 356 in its 2 bits, for rows with `quest` and `questdiffcheck`) and a save's
+//! realm bit. A full item goes on: socketed items 3, the item's seed 32 (saves only), item level 7,
 //! quality 4, a picture index behind a present bit, an auto-affix id behind a present bit, the
 //! quality's ids (gated on identified in packets), a runeword id, a personalised name, a save's
 //! realm bit, defence and durability for armour and weapons, a stack's quantity, the socket count,
@@ -47,6 +48,10 @@ pub mod flags {
     /// A runeword: its id and a stat list follow.
     pub const RUNEWORD: u32 = 0x400_0000;
 }
+
+/// `questitemdifficulty`: the difficulty a quest item was made in (0 normal, 1 nightmare, 2 hell).
+/// The engine names it by number (`0x0062AF80` fails when `ItemStatCost.txt` is shorter).
+pub const QUEST_DIFFICULTY: u16 = 356;
 
 /// Where an item is (the mode and the location fields).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,6 +363,8 @@ struct Kind {
     body_part: bool,
     /// The type picks among inventory pictures (`VarInvGfx`, `0x0062E8D0`).
     pictures: bool,
+    /// `quest` and `questdiffcheck`: a simple one carries its difficulty after its code.
+    quest_difficulty: bool,
 }
 
 fn kind(items: &Items, code: &Code) -> Option<Kind> {
@@ -374,6 +381,7 @@ fn kind(items: &Items, code: &Code) -> Option<Kind> {
         charm: is("char"),
         body_part: is("body") && !is("play"),
         pictures: items.types().get(def.item_type).is_some_and(|t| t.var_inv_gfx > 0),
+        quest_difficulty: def.quest && def.quest_diff_check,
     })
 }
 
@@ -489,6 +497,10 @@ pub fn write(item: &Item, items: &Items, stats: &ItemStats, target: Target) -> V
             let big = item.gold > 0xFFF;
             w.put(u32::from(big), 1);
             w.put(item.gold, if big { 32 } else { 12 });
+        }
+        if kind.quest_difficulty {
+            let made_in = item.stats.iter().find(|s| s.id == QUEST_DIFFICULTY).map_or(0, |s| s.value);
+            write_value(&mut w, stats, QUEST_DIFFICULTY, made_in);
         }
         if save {
             write_realm(&mut w, item.realm);
@@ -662,6 +674,13 @@ pub fn read(bytes: &[u8], items: &Items, stats: &ItemStats, target: Target) -> R
         if kind.gold {
             let big = r.get(1)? != 0;
             item.gold = r.get(if big { 32 } else { 12 })?;
+        }
+        // Read for a 1.10 or later item (`0x0062A970` above version 92), as every item here is.
+        if kind.quest_difficulty {
+            let made_in = read_value(&mut r, stats, QUEST_DIFFICULTY)?;
+            if made_in != 0 {
+                item.stats.push(ItemStat { id: QUEST_DIFFICULTY, param: 0, value: made_in });
+            }
         }
         if save {
             item.realm = read_realm(&mut r)?;
@@ -841,14 +860,16 @@ mod tests {
         let weapons = Table::parse(b"name\tcode\ttype\tcompactsave\tstackable\r\nLarge Axe\tlax\taxe\t0\t0\r\n");
         let armor = Table::parse(b"name\tcode\ttype\tcompactsave\tstackable\r\nCap\tcap\thelm\t0\t0\r\nBuckler\tbuc\tshie\t0\t0\r\n");
         let misc = Table::parse(
-            b"name\tcode\ttype\tcompactsave\tstackable\r\nTown Portal Book\ttbk\tbook\t0\t1\r\nIdentify Book\tibk\tbook\t0\t1\r\nSkeleton Key\tkey\tkey\t0\t1\r\ngold\tgld\tgold\t1\t1\r\nRing\trin\tring\t0\t0\r\n",
+            b"name\tcode\ttype\tcompactsave\tstackable\tquest\tquestdiffcheck\r\nTown Portal Book\ttbk\tbook\t0\t1\t\t\r\nIdentify Book\tibk\tbook\t0\t1\t\t\r\n\
+              Skeleton Key\tkey\tkey\t0\t1\t\t\r\ngold\tgld\tgold\t1\t1\t\t\r\nRing\trin\tring\t0\t0\t\t\r\nBark Scroll\tbks\tques\t1\t0\t5\t1\r\n",
         );
         let items = Items::from_tables(&itemtypes, &weapons, &armor, &misc).unwrap();
         let stats = ItemStats::from_table(&Table::parse(
             b"Stat\tID\tSave Bits\tSave Add\tSave Param Bits\tValShift\r\n\
               strength\t0\t8\t32\t\t\r\nmaxmana\t9\t8\t32\t\t8\r\nitem_maxdamage_percent\t17\t9\t0\t\t\r\nitem_mindamage_percent\t18\t9\t0\t\t\r\n\
               tohit\t19\t10\t\t\t\r\narmorclass\t31\t11\t10\t\t\r\ndurability\t72\t9\t\t\t\r\nmaxdurability\t73\t8\t\t\t\r\n\
-              item_lightradius\t89\t4\t4\t\t\r\nitem_addclassskills\t83\t3\t\t3\t\r\nitem_numsockets\t194\t4\t\t\t\r\n",
+              item_lightradius\t89\t4\t4\t\t\r\nitem_addclassskills\t83\t3\t\t3\t\r\nitem_numsockets\t194\t4\t\t\t\r\n\
+              questitemdifficulty\t356\t2\t0\t\t\r\n",
         ))
         .unwrap();
         (items, stats)
@@ -927,6 +948,16 @@ mod tests {
         let gold = write(&plain, &items, &stats, Target::Network);
         assert_eq!(&gold[..5], &[0x10, 0x20, 0xA0, 0x00, 0x65], "a compact item keeps the simple layout");
         assert_eq!(read(&gold, &items, &stats, Target::Network).unwrap().0.gold, 37);
+        // A quest item's difficulty rides after a simple item's code: 76 bits of head and code,
+        // then Nightmare's 1 in two bits.
+        let mut scroll = Item::new(code("bks"), 101, 1, Location::Stored { col: 0, row: 0, page: 0 });
+        scroll.stats.push(ItemStat { id: QUEST_DIFFICULTY, param: 0, value: 1 });
+        let sent = write(&scroll, &items, &stats, Target::Network);
+        assert_eq!((sent.len(), sent[11] >> 4 & 3), (12, 1), "the difficulty follows the code");
+        assert_eq!(read(&sent, &items, &stats, Target::Network).unwrap().0.stats, scroll.stats);
+        let saved = write_save_list(&[scroll.clone(), plain.clone()], &items, &stats);
+        let (back, _) = read_save_list(&saved, &items, &stats).unwrap();
+        assert_eq!((back[0].stats.clone(), back[1].gold), (scroll.stats.clone(), 37), "and in a save, before the realm bit");
         let mut list = write_save_list(&[ring.clone(), Item::new(code("rin"), 101, 5, Location::Stored { col: 2, row: 1, page: 0 })], &items, &stats);
         list.extend_from_slice(b"JM\0\0");
         let (read_back, end) = read_save_list(&list, &items, &stats).unwrap();
