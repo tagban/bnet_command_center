@@ -70,6 +70,57 @@ pub struct Skill {
     pub params: [i32; 8],
     /// `calc1`–`calc4`.
     pub calcs: [String; 4],
+    /// `srvstfunc` (`+0x2C`): what starting the skill does on the server (table `0x00732140`).
+    pub srv_start_func: i32,
+    /// `ToHitCalc`: the attack rating percent a swing with it adds, as a calc; when blank,
+    /// `ToHit` + `LevToHit` × (level − 1).
+    pub to_hit_calc: String,
+    /// `ELen`, `ELevLen1`–`3`: frames an elemental effect lasts (a stun's, a freeze's).
+    pub element_length: (i32, [i32; 3]),
+    /// `ELenSymPerCalc`: the percent other skills add to that length.
+    pub element_length_synergy: String,
+    /// `DmgSymPerCalc`: the percent other skills add to its physical damage.
+    pub damage_synergy: String,
+    /// `ResultFlags`: what a hit does besides damage (8 knocks back).
+    pub result_flags: i32,
+    /// `HitClass`: the hit's sound and overlay class.
+    pub hit_class: i32,
+    /// `AttackNoMana`: short of mana, it swings as Attack instead of refusing.
+    pub attack_no_mana: bool,
+    /// `weapsel`: which hand swings — 2 both at once (Whirlwind), 3 alternating (Double Swing,
+    /// Frenzy, Double Throw), 4 none (Kick).
+    pub weapon_select: i32,
+    /// `itypeb1`: the item type the other hand needs.
+    pub item_type_b: Option<String>,
+    /// `srvmissileb`, `srvmissilec`.
+    pub missile_b: Option<String>,
+    /// `srvmissilec`.
+    pub missile_c: Option<String>,
+    /// `TargetCorpse`: aimed at a body.
+    pub target_corpse: bool,
+    /// `passivestate` (`+0x94`), by `States.txt` name.
+    pub passive_state: Option<String>,
+    /// `passiveitype` (`+0x96`): the weapon type a passive's stats count for.
+    pub passive_item_type: Option<String>,
+    /// `passivestat1`–`5` with `passivecalc1`–`5`: `ItemStatCost.txt` name and calc.
+    pub passive_stats: Vec<(String, String)>,
+    /// `aurastate` (`+0x80`): the state on the user.
+    pub aura_state: Option<String>,
+    /// `auratargetstate`: the state on whoever it reaches.
+    pub aura_target_state: Option<String>,
+    /// `auralencalc`: how long those states last, frames, as a calc.
+    pub aura_length: String,
+    /// `aurarangecalc`: how far it reaches, as a calc.
+    pub aura_range: String,
+    /// `aurastat1`–`6` with `aurastatcalc1`–`6`: the stats those states carry.
+    pub aura_stats: Vec<(String, String)>,
+    /// `aurafilter`: which units it reaches.
+    pub aura_filter: i32,
+}
+
+/// A column's text, `None` when blank.
+fn text(row: &d2_formats::excel::Row<'_>, column: &str) -> Option<String> {
+    row.get(column).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
 /// A five-column per-level progression: `<prefix>1`…`<prefix>5`.
@@ -120,6 +171,28 @@ impl Skills {
                 element_synergy: row.get("EDmgSymPerCalc").unwrap_or_default().to_string(),
                 params: [1, 2, 3, 4, 5, 6, 7, 8].map(|i| row.int(&format!("Param{i}")).unwrap_or(0) as i32),
                 calcs: [1, 2, 3, 4].map(|i| row.get(&format!("calc{i}")).unwrap_or_default().to_string()),
+                srv_start_func: row.int("srvstfunc").unwrap_or(0) as i32,
+                to_hit_calc: row.get("ToHitCalc").unwrap_or_default().to_string(),
+                element_length: (row.int("ELen").unwrap_or(0) as i32, [1, 2, 3].map(|i| row.int(&format!("ELevLen{i}")).unwrap_or(0) as i32)),
+                element_length_synergy: row.get("ELenSymPerCalc").unwrap_or_default().to_string(),
+                damage_synergy: row.get("DmgSymPerCalc").unwrap_or_default().to_string(),
+                result_flags: row.int("ResultFlags").unwrap_or(0) as i32,
+                hit_class: row.int("HitClass").unwrap_or(0) as i32,
+                attack_no_mana: row.int("AttackNoMana").unwrap_or(0) != 0,
+                weapon_select: row.int("weapsel").unwrap_or(0) as i32,
+                item_type_b: text(&row, "itypeb1"),
+                missile_b: text(&row, "srvmissileb"),
+                missile_c: text(&row, "srvmissilec"),
+                target_corpse: row.int("TargetCorpse").unwrap_or(0) != 0,
+                passive_state: text(&row, "passivestate"),
+                passive_item_type: text(&row, "passiveitype"),
+                passive_stats: (1..=5).filter_map(|i| Some((text(&row, &format!("passivestat{i}"))?, row.get(&format!("passivecalc{i}")).unwrap_or_default().to_string()))).collect(),
+                aura_state: text(&row, "aurastate"),
+                aura_target_state: text(&row, "auratargetstate"),
+                aura_length: row.get("auralencalc").unwrap_or_default().to_string(),
+                aura_range: row.get("aurarangecalc").unwrap_or_default().to_string(),
+                aura_stats: (1..=6).filter_map(|i| Some((text(&row, &format!("aurastat{i}"))?, row.get(&format!("aurastatcalc{i}")).unwrap_or_default().to_string()))).collect(),
+                aura_filter: row.int("aurafilter").unwrap_or(0) as i32,
             })
             .collect();
         Self { rows }

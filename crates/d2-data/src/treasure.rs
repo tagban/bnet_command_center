@@ -241,12 +241,20 @@ impl TreasureClasses {
     /// Roll `class` for a game of `players`, classic or expansion.
     pub fn roll_for(&self, class: &TreasureClass, players: u32, expansion: bool, pick: &mut dyn FnMut(u32) -> u32) -> Vec<Drop> {
         let mut drops = Vec::new();
-        self.roll_into(class, players, expansion, class.mods, pick, &mut drops, 0);
+        self.roll_into(class, players, expansion, true, class.mods, pick, &mut drops, 0);
+        drops
+    }
+
+    /// Roll `class` as Find Item does (`0x0055A6D0` with its fifth argument set): `NoDrop` is
+    /// ignored at every level, so every pick yields something.
+    pub fn roll_found(&self, class: &TreasureClass, players: u32, expansion: bool, pick: &mut dyn FnMut(u32) -> u32) -> Vec<Drop> {
+        let mut drops = Vec::new();
+        self.roll_into(class, players, expansion, false, class.mods, pick, &mut drops, 0);
         drops
     }
 
     #[allow(clippy::too_many_arguments)] // the recursion's own state
-    fn roll_into(&self, class: &TreasureClass, players: u32, expansion: bool, mods: QualityMods, pick: &mut dyn FnMut(u32) -> u32, drops: &mut Vec<Drop>, depth: usize) {
+    fn roll_into(&self, class: &TreasureClass, players: u32, expansion: bool, with_no_drop: bool, mods: QualityMods, pick: &mut dyn FnMut(u32) -> u32, drops: &mut Vec<Drop>, depth: usize) {
         if depth > 63 {
             return;
         }
@@ -264,7 +272,7 @@ impl TreasureClasses {
                     running > taken
                 })
             } else {
-                let no_drop = class.no_drop_in(players, expansion);
+                let no_drop = if with_no_drop { class.no_drop_in(players, expansion) } else { 0 };
                 let total: u32 = entries.iter().map(|e| e.prob).sum::<u32>() + no_drop;
                 if total == 0 {
                     continue;
@@ -282,7 +290,7 @@ impl TreasureClasses {
             };
             let Some(entry) = entry else { continue };
             if let Some(sub) = self.get(&entry.name) {
-                self.roll_into(sub, players, expansion, mods.max(sub.mods), pick, drops, depth + 1);
+                self.roll_into(sub, players, expansion, with_no_drop, mods.max(sub.mods), pick, drops, depth + 1);
             } else if entry.name.eq_ignore_ascii_case("gld") {
                 drops.push(Drop::Gold { mul: entry.mul });
             } else {

@@ -44,6 +44,12 @@ pub struct MonsterClass {
     /// decision to the level's `SaveMonsters` and, for a corpse, its roll. Town NPCs are 2, which
     /// is why they survive a town whose `SaveMonsters` is 0.
     pub restore: u8,
+    /// `MonStats.txt` `boss`: an act boss — never stunned, terrified or taunted (`0x0057AAE0`,
+    /// `0x00623470`).
+    pub boss: bool,
+    /// `MonStats.txt` `SwitchAI`: whether a skill may change its mind — Howl's terror and Taunt
+    /// need it (`0x00623470`).
+    pub switch_ai: bool,
     /// How the class spawns in a level's rooms.
     pub spawn: SpawnRules,
     /// How it fights.
@@ -214,7 +220,21 @@ impl Monsters {
                     treasure: ["TreasureClass1", "TreasureClass1(N)", "TreasureClass1(H)"].map(|c| row.get(c).unwrap_or_default().to_string()),
                     resistances: ["", "(N)", "(H)"].map(|d| ["ResDm", "ResMa", "ResFi", "ResLi", "ResCo", "ResPo"].map(|r| int(&format!("{r}{d}")))),
                 };
-                Some((class, MonsterClass { id, critter, components, restore, interact: flag("interact"), npc: flag("npc"), align: int("Align") as u8, size, spawn_collision, spawn, combat }))
+                Some((class, MonsterClass {
+                    id,
+                    critter,
+                    components,
+                    restore,
+                    interact: flag("interact"),
+                    npc: flag("npc"),
+                    align: int("Align") as u8,
+                    size,
+                    spawn_collision,
+                    boss: flag("boss"),
+                    switch_ai: flag("SwitchAI"),
+                    spawn,
+                    combat,
+                }))
             })
             .collect();
         Ok(Self { by_class, by_name })

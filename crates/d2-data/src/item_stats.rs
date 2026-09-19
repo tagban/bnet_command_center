@@ -28,6 +28,11 @@ pub struct StatCost {
     /// `Encode` (`+0x30`): how the parameter is packed — 1 a skill, 2 a skill cast on an event
     /// with its level, 3 a charged skill, 4 a value by time of day.
     pub encode: u8,
+    /// `Send Bits`: its width when a state's stat list goes to a client (`0xA8`, `0xAA`); 0 for a
+    /// stat never sent.
+    pub send_bits: u8,
+    /// `Send Param Bits`: the width of its parameter (a mastery's item type) there.
+    pub send_param_bits: u8,
 }
 
 /// Every stat, by id.
@@ -60,6 +65,8 @@ impl ItemStats {
                 cost_multiply: int("Multiply") as i32,
                 cost_add: int("Add") as i32,
                 encode: u8::try_from(int("Encode")).unwrap_or(0),
+                send_bits: u8::try_from(int("Send Bits")).unwrap_or(0),
+                send_param_bits: u8::try_from(int("Send Param Bits")).unwrap_or(0),
             };
             let at = usize::from(id);
             if stats.by_id.len() <= at {

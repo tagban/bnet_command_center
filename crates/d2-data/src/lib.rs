@@ -31,6 +31,7 @@ pub mod monsters;
 pub mod panels;
 pub mod presets;
 pub mod skills;
+pub mod states;
 pub mod stat;
 pub mod strings;
 pub mod tiles;
@@ -155,6 +156,7 @@ pub struct GameData {
     item_ratios: item_stats::ItemRatios,
     affixes: affixes::Affixes,
     skills: skills::Skills,
+    states: states::States,
     missiles: missiles::Missiles,
     treasure: treasure::TreasureClasses,
     /// `Npc.txt`: vendors' price multipliers.
@@ -218,6 +220,7 @@ impl GameData {
             &read("sets.txt")?,
         );
         data.skills = skills::Skills::from_table(&read("skills.txt")?);
+        data.states = states::States::from_table(&read("states.txt")?);
         data.missiles = missiles::Missiles::from_table(&read("missiles.txt")?);
         data.books = trade::books_from_table(&read("books.txt")?);
         data.treasure = treasure::TreasureClasses::from_table(&read("treasureclassex.txt")?)?;
@@ -334,7 +337,18 @@ impl GameData {
         self.missiles = missiles;
     }
 
-    /// Replace the skills table — for tests.
+    /// Replace the state table — for tests.
+    pub fn set_states(&mut self, states: states::States) {
+        self.states = states;
+    }
+
+    /// `States.txt`.
+    #[must_use]
+    pub fn states(&self) -> &states::States {
+        &self.states
+    }
+
+    /// Replace the skill table — for building rules from tables in tests.
     pub fn set_skills(&mut self, skills: skills::Skills) {
         self.skills = skills;
     }
@@ -591,6 +605,7 @@ impl GameData {
             item_ratios: item_stats::ItemRatios::default(),
             affixes: affixes::Affixes::default(),
             skills: skills::Skills::default(),
+            states: states::States::default(),
             missiles: missiles::Missiles::default(),
             treasure: treasure::TreasureClasses::default(),
             npc_trades: trade::NpcTrades::default(),
