@@ -58,6 +58,10 @@ pub struct Missile {
     pub hit_shift: i32,
     /// `DamageRate`: how much of the target's damage reduction applies, in 1024ths.
     pub damage_rate: i32,
+    /// `MinDamage` and `MaxDamage`: its own physical damage, before `HitShift`.
+    pub physical: (i32, i32),
+    /// `ELen` and `ELevLen1`–`ELevLen3`: how long its own cold chills or its poison lasts.
+    pub element_length: (i32, [i32; 3]),
 }
 
 /// Every missile, by id.
@@ -100,6 +104,8 @@ impl Missiles {
                     element_synergy: row.get("EDmgSymPerCalc").unwrap_or_default().to_string(),
                     hit_shift: int("HitShift"),
                     damage_rate: int("DamageRate"),
+                    physical: (int("MinDamage"), int("MaxDamage")),
+                    element_length: (int("ELen"), ["ELevLen1", "ELevLen2", "ELevLen3"].map(int)),
                 }
             })
             .collect();
