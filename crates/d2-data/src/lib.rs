@@ -21,6 +21,7 @@ pub mod belts;
 pub mod difficulty;
 pub mod character;
 pub mod engine;
+pub mod gems;
 pub mod item_bits;
 pub mod item_stats;
 pub mod items;
@@ -164,6 +165,8 @@ pub struct GameData {
     difficulties: difficulty::Difficulties,
     /// `PetType.txt`'s names, by index.
     pet_types: Vec<String>,
+    /// `Gems.txt`.
+    gems: gems::Gems,
     missiles: missiles::Missiles,
     treasure: treasure::TreasureClasses,
     /// `Npc.txt`: vendors' price multipliers.
@@ -231,6 +234,7 @@ impl GameData {
         data.difficulties = difficulty::Difficulties::from_table(&read("difficultylevels.txt")?);
         // Only summons need it; an install without it still loads.
         data.pet_types = read("pettype.txt").map(|t| t.rows().map(|row| row.get("pet type").unwrap_or_default().to_string()).collect()).unwrap_or_default();
+        data.gems = gems::Gems::from_table(&read("gems.txt")?);
         data.missiles = missiles::Missiles::from_table(&read("missiles.txt")?);
         data.books = trade::books_from_table(&read("books.txt")?);
         data.treasure = treasure::TreasureClasses::from_table(&read("treasureclassex.txt")?)?;
@@ -356,6 +360,12 @@ impl GameData {
     #[must_use]
     pub fn states(&self) -> &states::States {
         &self.states
+    }
+
+    /// `Gems.txt`: what gems and runes lend the items holding them.
+    #[must_use]
+    pub fn gems(&self) -> &gems::Gems {
+        &self.gems
     }
 
     /// A pet type's index in `PetType.txt` by name, any case: what `0x7A` carries.
@@ -632,6 +642,7 @@ impl GameData {
             states: states::States::default(),
             difficulties: difficulty::Difficulties::default(),
             pet_types: Vec::new(),
+            gems: gems::Gems::default(),
             missiles: missiles::Missiles::default(),
             treasure: treasure::TreasureClasses::default(),
             npc_trades: trade::NpcTrades::default(),

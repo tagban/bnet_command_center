@@ -178,7 +178,7 @@ pub struct Affixes {
     properties: HashMap<String, Vec<PropertyFunc>>,
 }
 
-fn mods(row: &d2_formats::excel::Row, names: &[(String, String, String, String)]) -> Vec<Mod> {
+pub(crate) fn mods(row: &d2_formats::excel::Row, names: &[(String, String, String, String)]) -> Vec<Mod> {
     names
         .iter()
         .filter_map(|(c, p, lo, hi)| {

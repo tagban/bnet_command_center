@@ -20,6 +20,8 @@ use crate::items::{Code, Items};
 
 /// Item flags.
 pub mod flags {
+    /// On an item sent as sitting in another's socket, after it (`0x0053EA50`).
+    pub const IN_SOCKET: u32 = 0x8;
     /// Identified.
     pub const IDENTIFIED: u32 = 0x10;
     /// On the packet taking out an item used up (`0x00561E70`, `0x0055E000`).
@@ -101,8 +103,11 @@ pub enum Location {
         /// World subtiles.
         y: u16,
     },
-    /// Mode 6: in another item's socket.
-    Socketed,
+    /// Mode 6: in another item's socket, its column the socket (0 first) (`0x0063B210`).
+    Socketed {
+        /// Which socket.
+        slot: u8,
+    },
 }
 
 impl Location {
@@ -116,7 +121,7 @@ impl Location {
             Self::Ground { .. } => 3,
             Self::Cursor { .. } => 4,
             Self::Dropping { .. } => 5,
-            Self::Socketed => 6,
+            Self::Socketed { .. } => 6,
         }
     }
 }
@@ -201,7 +206,8 @@ pub struct Item {
     pub location: Location,
     /// Its code, space-padded.
     pub code: Code,
-    /// Items in its sockets.
+    /// How many items are in its sockets, as the bits carry it: [`Self::filled`]'s length when
+    /// that holds them, else what was read (a packet carries the items in sockets apart).
     pub socketed: u8,
     /// Its seed (written in saves only).
     pub seed: u32,
@@ -242,6 +248,13 @@ pub struct Item {
     pub set_stats: [Vec<ItemStat>; 5],
     /// A runeword's stats.
     pub runeword_stats: Vec<ItemStat>,
+    /// The items in its sockets, in socket order, each at [`Location::Socketed`]: written after it
+    /// in a save (`0x006312B0`), sent after it in packets of their own.
+    pub filled: Vec<Item>,
+    /// The unit guid a game gave it, where that must stay with the item — a gem put in a socket
+    /// keeps the guid it had on the cursor, which is how the client moves it there; 0 otherwise.
+    /// Never written.
+    pub unit: u32,
 }
 
 impl Item {
@@ -273,6 +286,8 @@ impl Item {
             stats: Vec::new(),
             set_stats: Default::default(),
             runeword_stats: Vec::new(),
+            filled: Vec::new(),
+            unit: 0,
         }
     }
 
@@ -480,7 +495,7 @@ pub fn write(item: &Item, items: &Items, stats: &ItemStats, target: Target) -> V
             let (body, col, row, page) = match other {
                 Location::Stored { col, row, page } => (0, col, row, page + 1),
                 Location::Equipped { body } => (body, 0, 0, 0),
-                Location::Belt { slot } => (0, slot, 0, 0),
+                Location::Belt { slot } | Location::Socketed { slot } => (0, slot, 0, 0),
                 Location::Cursor { body, col, row, page } => (body, col, row, page.map_or(0, |p| p + 1)),
                 _ => (0, 0, 0, 0),
             };
@@ -508,7 +523,8 @@ pub fn write(item: &Item, items: &Items, stats: &ItemStats, target: Target) -> V
         return w.bytes;
     }
     let identified = save || item.identified();
-    w.clamped(u32::from(item.socketed), 3);
+    let socketed = if item.filled.is_empty() { item.socketed } else { u8::try_from(item.filled.len()).unwrap_or(u8::MAX) };
+    w.clamped(u32::from(socketed), 3);
     if save {
         w.put(item.seed, 32);
     }
@@ -662,7 +678,7 @@ pub fn read(bytes: &[u8], items: &Items, stats: &ItemStats, target: Target) -> R
             1 => Location::Equipped { body },
             2 => Location::Belt { slot: col },
             4 => Location::Cursor { body, col, row, page: page.checked_sub(1) },
-            _ => Location::Socketed,
+            _ => Location::Socketed { slot: col },
         }
     };
     let code = r.get(32)?.to_le_bytes();
@@ -806,7 +822,8 @@ fn read_realm(r: &mut Reader) -> Result<Option<(u32, u32)>, ReadError> {
 }
 
 /// A `.d2s` item list (`JM`, a count, the items): what it holds and the bytes it took. The count
-/// leaves out items in sockets, which follow the item holding them.
+/// leaves out items in sockets, which follow the item holding them and are read into its
+/// [`Item::filled`].
 ///
 /// # Errors
 ///
@@ -821,25 +838,29 @@ pub fn read_save_list(bytes: &[u8], items: &Items, stats: &ItemStats) -> Result<
     for _ in 0..count {
         let (item, used) = read(&bytes[at..], items, stats, Target::Save)?;
         at += used;
-        let socketed = item.socketed;
-        list.push(item);
-        for _ in 0..socketed {
+        let mut item = item;
+        for _ in 0..item.socketed {
             let (inside, used) = read(&bytes[at..], items, stats, Target::Save)?;
             at += used;
-            list.push(inside);
+            item.filled.push(inside);
         }
+        list.push(item);
     }
     Ok((list, at))
 }
 
-/// A `.d2s` item list of `list`, items in sockets after the item holding them.
+/// A `.d2s` item list of `list`, each item's [`Item::filled`] after it, at its socket.
 #[must_use]
 pub fn write_save_list(list: &[Item], items: &Items, stats: &ItemStats) -> Vec<u8> {
-    let count = list.iter().filter(|i| i.location != Location::Socketed).count() as u16;
     let mut out = b"JM".to_vec();
-    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&(list.len() as u16).to_le_bytes());
     for item in list {
         out.extend_from_slice(&write(item, items, stats, Target::Save));
+        for (slot, inside) in item.filled.iter().enumerate() {
+            let mut inside = inside.clone();
+            inside.location = Location::Socketed { slot: slot as u8 };
+            out.extend_from_slice(&write(&inside, items, stats, Target::Save));
+        }
     }
     out
 }
@@ -861,7 +882,7 @@ mod tests {
         let armor = Table::parse(b"name\tcode\ttype\tcompactsave\tstackable\r\nCap\tcap\thelm\t0\t0\r\nBuckler\tbuc\tshie\t0\t0\r\n");
         let misc = Table::parse(
             b"name\tcode\ttype\tcompactsave\tstackable\tquest\tquestdiffcheck\r\nTown Portal Book\ttbk\tbook\t0\t1\t\t\r\nIdentify Book\tibk\tbook\t0\t1\t\t\r\n\
-              Skeleton Key\tkey\tkey\t0\t1\t\t\r\ngold\tgld\tgold\t1\t1\t\t\r\nRing\trin\tring\t0\t0\t\t\r\nBark Scroll\tbks\tques\t1\t0\t5\t1\r\n",
+              Skeleton Key\tkey\tkey\t0\t1\t\t\r\ngold\tgld\tgold\t1\t1\t\t\r\nRing\trin\tring\t0\t0\t\t\r\nBark Scroll\tbks\tques\t1\t0\t5\t1\r\nChipped Ruby\tgcr\tgema\t1\t0\t\t\r\n",
         );
         let items = Items::from_tables(&itemtypes, &weapons, &armor, &misc).unwrap();
         let stats = ItemStats::from_table(&Table::parse(
@@ -958,6 +979,15 @@ mod tests {
         let saved = write_save_list(&[scroll.clone(), plain.clone()], &items, &stats);
         let (back, _) = read_save_list(&saved, &items, &stats).unwrap();
         assert_eq!((back[0].stats.clone(), back[1].gold), (scroll.stats.clone(), 37), "and in a save, before the realm bit");
+        // A shield with a gem in its second socket's place: the gem follows it, outside the count.
+        let mut shield = Item::new(code("buc"), 101, 5, Location::Stored { col: 0, row: 0, page: 0 });
+        shield.flags |= flags::SOCKETED;
+        shield.sockets = 2;
+        shield.filled.push(Item::new(code("gcr"), 101, 1, Location::Cursor { body: 0, col: 0, row: 0, page: None }));
+        let saved = write_save_list(&[shield.clone()], &items, &stats);
+        assert_eq!(&saved[2..4], &[1, 0], "the gem is not counted");
+        let (back, used) = read_save_list(&saved, &items, &stats).unwrap();
+        assert_eq!((back.len(), back[0].socketed, back[0].filled.len(), back[0].filled[0].location, used), (1, 1, 1, Location::Socketed { slot: 0 }, saved.len()));
         let mut list = write_save_list(&[ring.clone(), Item::new(code("rin"), 101, 5, Location::Stored { col: 2, row: 1, page: 0 })], &items, &stats);
         list.extend_from_slice(b"JM\0\0");
         let (read_back, end) = read_save_list(&list, &items, &stats).unwrap();

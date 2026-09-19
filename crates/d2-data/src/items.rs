@@ -319,6 +319,9 @@ pub struct ItemDef {
     pub two_handed: bool,
     /// `belt`: the `Belts.txt` row a belt uses.
     pub belt: i32,
+    /// `gemapplytype`: which of a gem's or rune's mods it takes in a socket — 0 a weapon's, 1 a
+    /// helm's, 2 a shield's (`+0x13E`, `0x0055C2C0`).
+    pub gem_apply_type: i32,
     /// `hasinv`: the item can have sockets (`+0x137`).
     pub has_inv: bool,
     /// `magic lvl`: added to the item level for its affix level (`+0x140`).
@@ -426,6 +429,7 @@ impl Items {
                     two_handed: int("2handed") != 0,
                     belt: int("belt"),
                     has_inv: int("hasinv") != 0,
+                    gem_apply_type: int("gemapplytype"),
                     magic_level: int("magic lvl"),
                     str_bonus: int("StrBonus"),
                     dex_bonus: int("DexBonus"),
