@@ -361,6 +361,14 @@ pub struct Shrine {
     pub effect_class: i32,
     /// `LevelMin`: the lowest level id the shrine may appear in.
     pub level_min: i32,
+    /// `Code`: what it does (`0x006E1850[Code]`, `0x00583C70`).
+    pub code: i32,
+    /// `Arg0`, `Arg1`: its amounts.
+    pub args: (i32, i32),
+    /// `Duration in frames`: how long a boost lasts.
+    pub frames: i32,
+    /// `reset time in minutes`: when it may be used again; 0 never.
+    pub reset_minutes: i32,
 }
 
 /// `Shrines.txt`, by row (the shrine type).
@@ -375,7 +383,14 @@ impl Shrines {
     pub fn from_table(t: &Table) -> Self {
         let rows = t
             .rows()
-            .map(|r| Shrine { effect_class: r.int("effectclass").unwrap_or(0) as i32, level_min: r.int("LevelMin").unwrap_or(0) as i32 })
+            .map(|r| Shrine {
+                effect_class: r.int("effectclass").unwrap_or(0) as i32,
+                level_min: r.int("LevelMin").unwrap_or(0) as i32,
+                code: r.int("Code").unwrap_or(0) as i32,
+                args: (r.int("Arg0").unwrap_or(0) as i32, r.int("Arg1").unwrap_or(0) as i32),
+                frames: r.int("Duration in frames").unwrap_or(0) as i32,
+                reset_minutes: r.int("reset time in minutes").unwrap_or(0) as i32,
+            })
             .collect();
         Self { rows }
     }
