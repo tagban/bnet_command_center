@@ -299,6 +299,20 @@ pub struct ObjectClass {
     pub parm0: i32,
     /// `Parm2` (record `+0x180`), e.g. a well's refill.
     pub parm2: i32,
+    /// `Parm0`–`Parm7` (record `+0x178`…): a well's refill time, share and what it fills, a
+    /// shrine's kind.
+    pub parms: [i32; 8],
+    /// `Mode0`–`Mode7` (record `+0x13F`…): which modes it has — a chest with no `Mode1` opens
+    /// straight to 2 (`0x00585F60`).
+    pub modes: [bool; 8],
+    /// `Selectable0`–`Selectable7` (record `+0xC4`…): whether a player may click it in each mode.
+    pub selectable: [bool; 8],
+    /// `Lockable` (record `+0x171`): a chest may be locked (`0x0054FCB0`).
+    pub lockable: bool,
+    /// `IsDoor` (record `+0x13A`).
+    pub is_door: bool,
+    /// `SizeX`, `SizeY` (record `+0xD0`, `+0xD4`): its footprint in subtiles.
+    pub size: (i32, i32),
 }
 
 impl Objects {
@@ -315,6 +329,12 @@ impl Objects {
                 sub_class: r.int("SubClass").and_then(|v| u8::try_from(v).ok()).unwrap_or(0),
                 parm0: r.int("Parm0").unwrap_or(0) as i32,
                 parm2: r.int("Parm2").unwrap_or(0) as i32,
+                parms: std::array::from_fn(|i| r.int(&format!("Parm{i}")).unwrap_or(0) as i32),
+                modes: std::array::from_fn(|i| r.int(&format!("Mode{i}")).unwrap_or(0) != 0),
+                selectable: std::array::from_fn(|i| r.int(&format!("Selectable{i}")).unwrap_or(0) != 0),
+                lockable: r.int("Lockable").unwrap_or(0) != 0,
+                is_door: r.int("IsDoor").unwrap_or(0) != 0,
+                size: (r.int("SizeX").unwrap_or(0) as i32, r.int("SizeY").unwrap_or(0) as i32),
             })
             .collect();
         Self { rows }
