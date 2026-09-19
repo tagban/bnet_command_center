@@ -162,6 +162,8 @@ pub struct GameData {
     skills: skills::Skills,
     states: states::States,
     difficulties: difficulty::Difficulties,
+    /// `PetType.txt`'s names, by index.
+    pet_types: Vec<String>,
     missiles: missiles::Missiles,
     treasure: treasure::TreasureClasses,
     /// `Npc.txt`: vendors' price multipliers.
@@ -227,6 +229,8 @@ impl GameData {
         data.skills = skills::Skills::from_table(&read("skills.txt")?);
         data.states = states::States::from_table(&read("states.txt")?);
         data.difficulties = difficulty::Difficulties::from_table(&read("difficultylevels.txt")?);
+        // Only summons need it; an install without it still loads.
+        data.pet_types = read("pettype.txt").map(|t| t.rows().map(|row| row.get("pet type").unwrap_or_default().to_string()).collect()).unwrap_or_default();
         data.missiles = missiles::Missiles::from_table(&read("missiles.txt")?);
         data.books = trade::books_from_table(&read("books.txt")?);
         data.treasure = treasure::TreasureClasses::from_table(&read("treasureclassex.txt")?)?;
@@ -352,6 +356,12 @@ impl GameData {
     #[must_use]
     pub fn states(&self) -> &states::States {
         &self.states
+    }
+
+    /// A pet type's index in `PetType.txt` by name, any case: what `0x7A` carries.
+    #[must_use]
+    pub fn pet_type(&self, name: &str) -> Option<u8> {
+        self.pet_types.iter().position(|n| n.eq_ignore_ascii_case(name)).and_then(|i| u8::try_from(i).ok())
     }
 
     /// `DifficultyLevels.txt`'s row for a difficulty (0 Normal, 1 Nightmare, 2 Hell).
@@ -621,6 +631,7 @@ impl GameData {
             skills: skills::Skills::default(),
             states: states::States::default(),
             difficulties: difficulty::Difficulties::default(),
+            pet_types: Vec::new(),
             missiles: missiles::Missiles::default(),
             treasure: treasure::TreasureClasses::default(),
             npc_trades: trade::NpcTrades::default(),

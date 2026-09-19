@@ -106,6 +106,8 @@ pub struct Skill {
     pub passive_stats: Vec<(String, String)>,
     /// `aurastate` (`+0x80`): the state on the user.
     pub aura_state: Option<String>,
+    /// `pettype` (`+0xBE`): the kind of pet a summon is, by `PetType.txt` name.
+    pub pet_type: Option<String>,
     /// `auratargetstate`: the state on whoever it reaches.
     pub aura_target_state: Option<String>,
     /// `auralencalc`: how long those states last, frames, as a calc.
@@ -188,6 +190,7 @@ impl Skills {
                 passive_item_type: text(&row, "passiveitype"),
                 passive_stats: (1..=5).filter_map(|i| Some((text(&row, &format!("passivestat{i}"))?, row.get(&format!("passivecalc{i}")).unwrap_or_default().to_string()))).collect(),
                 aura_state: text(&row, "aurastate"),
+                pet_type: text(&row, "pettype"),
                 aura_target_state: text(&row, "auratargetstate"),
                 aura_length: row.get("auralencalc").unwrap_or_default().to_string(),
                 aura_range: row.get("aurarangecalc").unwrap_or_default().to_string(),
