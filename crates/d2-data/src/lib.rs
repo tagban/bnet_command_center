@@ -32,6 +32,7 @@ pub mod monlvl;
 pub mod monsters;
 pub mod panels;
 pub mod presets;
+pub mod runewords;
 pub mod skills;
 pub mod states;
 pub mod stat;
@@ -168,6 +169,8 @@ pub struct GameData {
     pet_types: Vec<String>,
     /// `Gems.txt`.
     gems: gems::Gems,
+    /// `Runes.txt`.
+    runewords: runewords::Runewords,
     /// `MonUMod.txt`.
     unique_mods: umods::UniqueMods,
     /// `MonType.txt`.
@@ -240,6 +243,7 @@ impl GameData {
         // Only summons need it; an install without it still loads.
         data.pet_types = read("pettype.txt").map(|t| t.rows().map(|row| row.get("pet type").unwrap_or_default().to_string()).collect()).unwrap_or_default();
         data.gems = gems::Gems::from_table(&read("gems.txt")?);
+        data.runewords = runewords::Runewords::from_table(&read("runes.txt")?);
         data.unique_mods = umods::UniqueMods::from_table(&read("monumod.txt")?);
         data.mon_types = umods::MonTypes::from_table(&read("montype.txt")?);
         data.missiles = missiles::Missiles::from_table(&read("missiles.txt")?);
@@ -247,6 +251,9 @@ impl GameData {
         data.treasure = treasure::TreasureClasses::from_table(&read("treasureclassex.txt")?)?;
         data.treasure.add_item_classes(&data.items);
         data.archives = Some(Arc::new(archives));
+        // A runeword's name goes out as its string id; every language numbers its strings alike.
+        let strings = data.strings("eng").unwrap_or_default();
+        data.runewords.name_ids(&strings);
         Ok(data)
     }
 
@@ -275,10 +282,10 @@ impl GameData {
             if let Some(bytes) = self.read_file(&format!("data\\local\\lng\\{language}\\{name}"))? {
                 let table = d2_formats::tbl::StringTable::parse(&bytes)
                     .ok_or(Error::BadTable { table: name, problem: "not a string table".into() })?;
-                tables.push(table);
+                tables.push((name, table));
             }
         }
-        Ok(Strings::from_tables(tables))
+        Ok(Strings::from_named(tables))
     }
 
     /// `Weapons.txt`, `Armor.txt` and `Misc.txt`, with `ItemTypes.txt`.
@@ -379,6 +386,12 @@ impl GameData {
     #[must_use]
     pub fn mon_types(&self) -> &umods::MonTypes {
         &self.mon_types
+    }
+
+    /// `Runes.txt`: runewords.
+    #[must_use]
+    pub fn runewords(&self) -> &runewords::Runewords {
+        &self.runewords
     }
 
     /// `Gems.txt`: what gems and runes lend the items holding them.
@@ -662,6 +675,7 @@ impl GameData {
             difficulties: difficulty::Difficulties::default(),
             pet_types: Vec::new(),
             gems: gems::Gems::default(),
+            runewords: runewords::Runewords::default(),
             unique_mods: umods::UniqueMods::default(),
             mon_types: umods::MonTypes::default(),
             missiles: missiles::Missiles::default(),

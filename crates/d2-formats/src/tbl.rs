@@ -1,7 +1,8 @@
 //! String tables — `data\local\lng\<language>\*.tbl`.
 //!
 //! Every name the game shows is kept here, keyed both by number and by a short key the excel
-//! tables use (an item's `namestr`, e.g. `cap`). This reader serves the key lookup.
+//! tables use (an item's `namestr`, e.g. `cap`). This reader serves the key lookup, and a key's
+//! number for the few places the game sends one (a runeword's name).
 //!
 //! ```text
 //! 0x00 u16 crc
@@ -24,10 +25,10 @@ use std::collections::HashMap;
 const HEADER_LEN: usize = 0x15;
 const ENTRY_LEN: usize = 17;
 
-/// A parsed table: every used entry, key to string.
+/// A parsed table: every used entry, key to its number and string.
 #[derive(Debug, Clone, Default)]
 pub struct StringTable {
-    by_key: HashMap<String, String>,
+    by_key: HashMap<String, (u16, String)>,
 }
 
 impl StringTable {
@@ -57,7 +58,8 @@ impl StringTable {
                 continue;
             }
             let (Some(key), Some(value)) = (cstr(u32_at(at + 7)?), cstr(u32_at(at + 11)?)) else { continue };
-            by_key.entry(key).or_insert(value);
+            let index = u16_at(at + 1)?;
+            by_key.entry(key).or_insert((index, value));
         }
         Some(Self { by_key })
     }
@@ -65,7 +67,13 @@ impl StringTable {
     /// The string for a key.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.by_key.get(key).map(String::as_str)
+        self.by_key.get(key).map(|(_, s)| s.as_str())
+    }
+
+    /// A key's number within this table.
+    #[must_use]
+    pub fn index(&self, key: &str) -> Option<u16> {
+        self.by_key.get(key).map(|&(i, _)| i)
     }
 
     /// Entries with a key.
@@ -121,6 +129,7 @@ mod tests {
     #[test]
     fn keys_find_their_strings() {
         let t = StringTable::parse(&build(&[("cap", "Cap"), ("skp", "Skull Cap")])).unwrap();
+        assert_eq!(t.index("skp"), Some(1));
         assert_eq!(t.get("cap"), Some("Cap"));
         assert_eq!(t.get("skp"), Some("Skull Cap"));
         assert_eq!(t.get("hlm"), None);
