@@ -117,6 +117,31 @@ pub struct CombatStats {
     /// `noRatio`: its life, defence, attack rating and damage are its own numbers, not
     /// percentages of `MonLvl.txt` — a player's summons.
     pub no_ratio: bool,
+    /// `El1`–`El3`: the elemental damage its attacks of a mode carry (`0x005A4F50`).
+    pub elements: Vec<ElementAttack>,
+    /// `Crit`: the percent of its hits that do double (`0x005A5560`).
+    pub crit: i32,
+    /// `inTown`: it may hurt a player in town (`0x0057C6C0`).
+    pub in_town: bool,
+    /// `MonStats2.txt` `HitClass`: how hard its blows land, which sets how easily they make a
+    /// player flinch (`0x0057CB00`).
+    pub hit_class: i32,
+}
+
+/// One of a class's `El1`–`El3`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ElementAttack {
+    /// `ElnMode`: the mode whose attacks carry it (`A1`, `A2`, `S1`…).
+    pub mode: String,
+    /// `ElnType`: `fire`, `ltng`, `mag`, `cold`, `pois`, `life`, `mana`, `stam`, `stun`, `rand`,
+    /// `burn`.
+    pub kind: String,
+    /// `ElnPct` by difficulty: the percent of those attacks that carry it.
+    pub percent: [i32; 3],
+    /// `ElnMinD`, `ElnMaxD` by difficulty, as percentages of the monster level's damage.
+    pub damage: [(i32, i32); 3],
+    /// `ElnDur` by difficulty, frames.
+    pub length: [i32; 3],
 }
 
 /// The `MonStats.txt` columns room population reads, class names resolved to class ids (-1 for
@@ -179,7 +204,7 @@ impl Monsters {
             .collect();
         /// What `MonStats2.txt` contributes to a class: critter, component variants, size,
         /// spawn collision, melee range, and whether a released room keeps the unit.
-        type Display = (bool, [u8; 16], u8, u8, i32, u8);
+        type Display = (bool, [u8; 16], u8, u8, i32, u8, i32);
         let display: HashMap<String, Display> = monstats2
             .rows()
             .filter_map(|row| {
@@ -201,6 +226,7 @@ impl Monsters {
                         // A table without the column leaves the decision to the level; only a
                         // table that says 0 means "never keep this".
                         row.int("restore").map_or(1, |v| u8::try_from(v).unwrap_or(1)),
+                        row.int("HitClass").unwrap_or(0) as i32,
                     ),
                 ))
             })
@@ -216,7 +242,7 @@ impl Monsters {
                 let class = i32::try_from(row.int("hcIdx")?).ok()?;
                 let id = row.get("Id")?.to_string();
                 let ex = row.get("MonStatsEx")?.to_ascii_lowercase();
-                let &(critter, components, size, spawn_collision, melee_range, restore) = display.get(&ex)?;
+                let &(critter, components, size, spawn_collision, melee_range, restore, hit_class) = display.get(&ex)?;
                 let flag = |c: &str| row.int(c).unwrap_or(0) != 0;
                 let int = |c: &str| row.int(c).unwrap_or(0) as i32;
                 let spawn = SpawnRules {
@@ -260,6 +286,23 @@ impl Monsters {
                     drain: ["Drain", "Drain(N)", "Drain(H)"].map(int),
                     skills: (1..=8).filter_map(|n| Some((row.get(&format!("Skill{n}")).filter(|s| !s.is_empty())?.to_string(), int(&format!("Sk{n}lvl"))))).collect(),
                     ai_params: std::array::from_fn(|n| [format!("aip{}", n + 1), format!("aip{}(N)", n + 1), format!("aip{}(H)", n + 1)].map(|c| int(&c))),
+                    elements: (1..=3)
+                        .filter_map(|n| {
+                            let mode = row.get(&format!("El{n}Mode")).filter(|s| !s.is_empty())?.to_string();
+                            let each = |c: &str| ["", "(N)", "(H)"].map(|d| int(&format!("El{n}{c}{d}")));
+                            let (lo, hi) = (each("MinD"), each("MaxD"));
+                            Some(ElementAttack {
+                                mode,
+                                kind: row.get(&format!("El{n}Type")).unwrap_or_default().to_string(),
+                                percent: each("Pct"),
+                                damage: [(lo[0], hi[0]), (lo[1], hi[1]), (lo[2], hi[2])],
+                                length: each("Dur"),
+                            })
+                        })
+                        .collect(),
+                    crit: int("Crit"),
+                    in_town: flag("inTown"),
+                    hit_class,
                 };
                 Some((class, MonsterClass {
                     id,

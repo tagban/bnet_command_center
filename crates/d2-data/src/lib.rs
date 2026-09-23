@@ -120,6 +120,8 @@ pub struct ClassStats {
     /// `ManaRegen` (record `+0x3A`): seconds to regenerate the whole of the mana pool
     /// (`0x005806F0`; 300 when blank).
     pub mana_regen: i32,
+    /// `BlockFactor`: added to a shield's chance to block (`0x00622720`).
+    pub block_factor: i32,
 }
 
 /// An item a new character starts with: `charstats.txt` `item1`…`item10` with their `loc` and
@@ -582,6 +584,7 @@ impl GameData {
             per_point: (0, 0, 0),
             velocity: (0, 0),
             mana_regen: 0,
+            block_factor: 0,
         }; 7];
         for (id, name) in CLASSES.iter().enumerate() {
             let row = charstats
@@ -615,6 +618,7 @@ impl GameData {
                 ),
                 velocity: (row.int("WalkVelocity").unwrap_or(0) as i32, row.int("RunVelocity").unwrap_or(0) as i32),
                 mana_regen: row.int("ManaRegen").unwrap_or(0) as i32,
+                block_factor: row.int("BlockFactor").unwrap_or(0) as i32,
             };
             start_items[id] = (1..=10)
                 .filter_map(|n| {
