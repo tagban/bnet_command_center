@@ -137,6 +137,12 @@ pub struct Skill {
     pub aura_stats: Vec<(String, String)>,
     /// `aurafilter`: which units it reaches.
     pub aura_filter: i32,
+    /// `aura`: selected on the right button it runs by itself, ticking every `perdelay` frames.
+    pub aura: bool,
+    /// `immediate`: an aura that works the moment it is selected.
+    pub immediate: bool,
+    /// `perdelay`: an aura's tick, frames (a calc).
+    pub per_delay: String,
 }
 
 /// A column's text, `None` when blank.
@@ -225,6 +231,9 @@ impl Skills {
                 aura_range: row.get("aurarangecalc").unwrap_or_default().to_string(),
                 aura_stats: (1..=6).filter_map(|i| Some((text(&row, &format!("aurastat{i}"))?, row.get(&format!("aurastatcalc{i}")).unwrap_or_default().to_string()))).collect(),
                 aura_filter: row.int("aurafilter").unwrap_or(0) as i32,
+                aura: row.int("aura").unwrap_or(0) != 0,
+                immediate: row.int("immediate").unwrap_or(0) != 0,
+                per_delay: row.get("perdelay").unwrap_or_default().to_string(),
             })
             .collect();
         Self { rows }
