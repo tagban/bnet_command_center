@@ -148,6 +148,18 @@ pub struct SuperUnique {
     pub key: String,
     /// `Class`: the `MonStats.txt` row it is made from, as a class id.
     pub class: i32,
+    /// `hcIdx`.
+    pub hc_idx: i32,
+    /// `Mod1`–`Mod3`: its fixed `MonUMod.txt` modifiers (0 for none).
+    pub mods: [i32; 3],
+    /// `MinGrp`, `MaxGrp`: how many minions come with it.
+    pub group: (i32, i32),
+    /// `AutoPos`: it stands on a random free spot of its room, not its map's.
+    pub auto_pos: bool,
+    /// `Stacks`: it may be made more than once a game.
+    pub stacks: bool,
+    /// `TC` by difficulty: what it drops.
+    pub treasure: [String; 3],
 }
 
 /// `MonPreset.txt` resolved against `MonStats`, `SuperUniques` and `MonPlace`, as
@@ -215,6 +227,12 @@ impl MonPresets {
             .map(|r| SuperUnique {
                 key: r.get("Superunique").unwrap_or_default().to_string(),
                 class: r.get("Class").and_then(|c| classes.get(&c.to_ascii_lowercase()).copied()).unwrap_or(-1),
+                hc_idx: r.int("hcIdx").unwrap_or(-1) as i32,
+                mods: ["Mod1", "Mod2", "Mod3"].map(|c| r.int(c).unwrap_or(0) as i32),
+                group: (r.int("MinGrp").unwrap_or(0) as i32, r.int("MaxGrp").unwrap_or(0) as i32),
+                auto_pos: r.int("AutoPos").unwrap_or(0) != 0,
+                stacks: r.int("Stacks").unwrap_or(0) != 0,
+                treasure: ["TC", "TC(N)", "TC(H)"].map(|c| r.get(c).unwrap_or_default().to_string()),
             })
             .collect();
         Ok(Self { per_act, monstats_rows: monstats.rows().count() as i32, super_uniques })

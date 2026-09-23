@@ -39,6 +39,7 @@ pub mod strings;
 pub mod tiles;
 pub mod trade;
 pub mod treasure;
+pub mod umods;
 
 use items::{Code, Items};
 use levels::Levels;
@@ -167,6 +168,10 @@ pub struct GameData {
     pet_types: Vec<String>,
     /// `Gems.txt`.
     gems: gems::Gems,
+    /// `MonUMod.txt`.
+    unique_mods: umods::UniqueMods,
+    /// `MonType.txt`.
+    mon_types: umods::MonTypes,
     missiles: missiles::Missiles,
     treasure: treasure::TreasureClasses,
     /// `Npc.txt`: vendors' price multipliers.
@@ -235,6 +240,8 @@ impl GameData {
         // Only summons need it; an install without it still loads.
         data.pet_types = read("pettype.txt").map(|t| t.rows().map(|row| row.get("pet type").unwrap_or_default().to_string()).collect()).unwrap_or_default();
         data.gems = gems::Gems::from_table(&read("gems.txt")?);
+        data.unique_mods = umods::UniqueMods::from_table(&read("monumod.txt")?);
+        data.mon_types = umods::MonTypes::from_table(&read("montype.txt")?);
         data.missiles = missiles::Missiles::from_table(&read("missiles.txt")?);
         data.books = trade::books_from_table(&read("books.txt")?);
         data.treasure = treasure::TreasureClasses::from_table(&read("treasureclassex.txt")?)?;
@@ -360,6 +367,18 @@ impl GameData {
     #[must_use]
     pub fn states(&self) -> &states::States {
         &self.states
+    }
+
+    /// `MonUMod.txt`: boss monsters' modifiers.
+    #[must_use]
+    pub fn unique_mods(&self) -> &umods::UniqueMods {
+        &self.unique_mods
+    }
+
+    /// `MonType.txt`: monster types.
+    #[must_use]
+    pub fn mon_types(&self) -> &umods::MonTypes {
+        &self.mon_types
     }
 
     /// `Gems.txt`: what gems and runes lend the items holding them.
@@ -643,6 +662,8 @@ impl GameData {
             difficulties: difficulty::Difficulties::default(),
             pet_types: Vec::new(),
             gems: gems::Gems::default(),
+            unique_mods: umods::UniqueMods::default(),
+            mon_types: umods::MonTypes::default(),
             missiles: missiles::Missiles::default(),
             treasure: treasure::TreasureClasses::default(),
             npc_trades: trade::NpcTrades::default(),

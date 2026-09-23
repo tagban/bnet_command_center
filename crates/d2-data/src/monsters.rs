@@ -88,6 +88,19 @@ pub struct CombatStats {
     pub weapon_class: String,
     /// `TreasureClass1` by difficulty: what it drops.
     pub treasure: [String; 3],
+    /// `TreasureClass2` by difficulty: what it drops as a champion.
+    pub treasure_champion: [String; 3],
+    /// `TreasureClass3` by difficulty: what it drops as a unique (`0x005A6600`).
+    pub treasure_unique: [String; 3],
+    /// `MonType`: the type a boss modifier's `exclude` columns are matched against.
+    pub mon_type: String,
+    /// `isMelee`: a boss of it cannot have multiple shots.
+    pub is_melee: bool,
+    /// `noMultiShot`.
+    pub no_multishot: bool,
+    /// `MonStats2.txt` `mA1`, `mWL`: it has an attack mode, a walk mode (the modifiers that need
+    /// them, `0x005A03E0`).
+    pub modes: (bool, bool),
     /// `ResDm`, `ResMa`, `ResFi`, `ResLi`, `ResCo`, `ResPo` by difficulty: percent resistance to
     /// physical, magic, fire, lightning, cold and poison damage.
     pub resistances: [[i32; 6]; 3],
@@ -156,6 +169,10 @@ impl Monsters {
                 return Err(Error::BadTable { table, problem: format!("no {column} column") });
             }
         }
+        let mode_flags: HashMap<String, (bool, bool)> = monstats2
+            .rows()
+            .filter_map(|row| Some((row.get("Id")?.to_ascii_lowercase(), (row.int("mA1").unwrap_or(0) != 0, row.int("mWL").unwrap_or(0) != 0))))
+            .collect();
         let weapon_classes: HashMap<String, String> = monstats2
             .rows()
             .filter_map(|row| Some((row.get("Id")?.to_ascii_lowercase(), row.get("BaseW").unwrap_or("hth").to_string())))
@@ -231,6 +248,12 @@ impl Monsters {
                     token: row.get("Code").unwrap_or_default().to_string(),
                     weapon_class: weapon_classes.get(&ex).cloned().unwrap_or_else(|| "hth".into()),
                     treasure: ["TreasureClass1", "TreasureClass1(N)", "TreasureClass1(H)"].map(|c| row.get(c).unwrap_or_default().to_string()),
+                    treasure_champion: ["TreasureClass2", "TreasureClass2(N)", "TreasureClass2(H)"].map(|c| row.get(c).unwrap_or_default().to_string()),
+                    treasure_unique: ["TreasureClass3", "TreasureClass3(N)", "TreasureClass3(H)"].map(|c| row.get(c).unwrap_or_default().to_string()),
+                    mon_type: row.get("MonType").unwrap_or_default().to_string(),
+                    is_melee: flag("isMelee"),
+                    no_multishot: flag("noMultiShot"),
+                    modes: mode_flags.get(&ex).copied().unwrap_or((true, true)),
                     resistances: ["", "(N)", "(H)"].map(|d| ["ResDm", "ResMa", "ResFi", "ResLi", "ResCo", "ResPo"].map(|r| int(&format!("{r}{d}")))),
                     cold_effect: ["coldeffect", "coldeffect(N)", "coldeffect(H)"].map(int),
                     no_ratio: int("noRatio") != 0,
