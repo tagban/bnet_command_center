@@ -126,7 +126,27 @@ pub struct CombatStats {
     /// `MonStats2.txt` `HitClass`: how hard its blows land, which sets how easily they make a
     /// player flinch (`0x0057CB00`).
     pub hit_class: i32,
+    /// `A2MinD`/`A2MaxD` by difficulty.
+    pub damage_a2: [(i32, i32); 3],
+    /// `A2TH` by difficulty.
+    pub to_hit_a2: [i32; 3],
+    /// `S1MinD`/`S1MaxD` by difficulty (`SC` and `S1` attacks).
+    pub damage_s1: [(i32, i32); 3],
+    /// `S1TH` by difficulty.
+    pub to_hit_s1: [i32; 3],
+    /// `MissA1`, `MissA2`, `MissS1`: the missile an attack in that mode looses, by name.
+    pub mode_missiles: [String; 3],
+    /// `Sk1mode`–`Sk8mode`, beside [`Self::skills`]' order: the mode each skill is used in (a
+    /// `seq_…` sequence plays in `SQ`).
+    pub skill_modes: Vec<String>,
+    /// `MonStats2.txt` `mDT`…`mRN`: the modes it has an animation for, bit `i` for mode `i` (DT,
+    /// NU, WL, GH, A1, A2, BL, SC, S1, S2, S3, S4, DD, KB, SQ, RN); all of them for a class the
+    /// table lacks.
+    pub mode_bits: u16,
 }
+
+/// `MonStats2.txt`'s mode columns, in mode order.
+const MODE_COLUMNS: [&str; 16] = ["mDT", "mNU", "mWL", "mGH", "mA1", "mA2", "mBL", "mSC", "mS1", "mS2", "mS3", "mS4", "mDD", "mKB", "mSQ", "mRN"];
 
 /// One of a class's `El1`–`El3`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -194,10 +214,14 @@ impl Monsters {
                 return Err(Error::BadTable { table, problem: format!("no {column} column") });
             }
         }
-        let mode_flags: HashMap<String, (bool, bool)> = monstats2
+        let mode_bits: HashMap<String, u16> = monstats2
             .rows()
-            .filter_map(|row| Some((row.get("Id")?.to_ascii_lowercase(), (row.int("mA1").unwrap_or(0) != 0, row.int("mWL").unwrap_or(0) != 0))))
+            .filter_map(|row| {
+                let bits = MODE_COLUMNS.iter().enumerate().fold(0u16, |acc, (i, c)| if row.int(c).unwrap_or(0) != 0 { acc | 1 << i } else { acc });
+                Some((row.get("Id")?.to_ascii_lowercase(), bits))
+            })
             .collect();
+        let mode_flags: HashMap<String, (bool, bool)> = mode_bits.iter().map(|(id, &bits)| (id.clone(), (bits & 1 << 4 != 0, bits & 1 << 2 != 0))).collect();
         let weapon_classes: HashMap<String, String> = monstats2
             .rows()
             .filter_map(|row| Some((row.get("Id")?.to_ascii_lowercase(), row.get("BaseW").unwrap_or("hth").to_string())))
@@ -303,6 +327,13 @@ impl Monsters {
                     crit: int("Crit"),
                     in_town: flag("inTown"),
                     hit_class,
+                    damage_a2: range(["A2MinD", "A2MinD(N)", "A2MinD(H)"], ["A2MaxD", "A2MaxD(N)", "A2MaxD(H)"]),
+                    to_hit_a2: per("A2TH", "A2TH(N)", "A2TH(H)"),
+                    damage_s1: range(["S1MinD", "S1MinD(N)", "S1MinD(H)"], ["S1MaxD", "S1MaxD(N)", "S1MaxD(H)"]),
+                    to_hit_s1: per("S1TH", "S1TH(N)", "S1TH(H)"),
+                    mode_missiles: ["MissA1", "MissA2", "MissS1"].map(|c| row.get(c).unwrap_or_default().to_string()),
+                    mode_bits: mode_bits.get(&ex).copied().unwrap_or(0xFFFF),
+                    skill_modes: (1..=8).filter(|n| row.get(&format!("Skill{n}")).is_some_and(|s| !s.is_empty())).map(|n| row.get(&format!("Sk{n}mode")).unwrap_or_default().to_string()).collect(),
                 };
                 Some((class, MonsterClass {
                     id,

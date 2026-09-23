@@ -62,6 +62,14 @@ pub struct Missile {
     pub physical: (i32, i32),
     /// `ELen` and `ELevLen1`–`ELevLen3`: how long its own cold chills or its poison lasts.
     pub element_length: (i32, [i32; 3]),
+    /// `MinLevDam1`–`5` and `MaxLevDam1`–`5`: its own physical damage's level brackets.
+    pub physical_levels: ([i32; 5], [i32; 5]),
+    /// `SrcDamage`: 128ths of its shooter's damage it carries (a monster's arrow its whole A1).
+    pub source_damage: i32,
+    /// `ToHit`: it rolls to hit what it meets, and ends on a miss.
+    pub to_hit: bool,
+    /// `VelLev`: eighths of a sixteenth of a subtile a frame faster a level.
+    pub velocity_per_level: i32,
 }
 
 /// Every missile, by id.
@@ -106,6 +114,13 @@ impl Missiles {
                     damage_rate: int("DamageRate"),
                     physical: (int("MinDamage"), int("MaxDamage")),
                     element_length: (int("ELen"), ["ELevLen1", "ELevLen2", "ELevLen3"].map(int)),
+                    physical_levels: (
+                        ["MinLevDam1", "MinLevDam2", "MinLevDam3", "MinLevDam4", "MinLevDam5"].map(int),
+                        ["MaxLevDam1", "MaxLevDam2", "MaxLevDam3", "MaxLevDam4", "MaxLevDam5"].map(int),
+                    ),
+                    source_damage: int("SrcDamage"),
+                    to_hit: int("ToHit") != 0,
+                    velocity_per_level: int("VelLev"),
                 }
             })
             .collect();

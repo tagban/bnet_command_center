@@ -21,11 +21,13 @@ pub struct Difficulty {
     pub champion_damage_bonus: i32,
     /// `MonsterCEDamagePercent` (`+0x3C`): a Fire Enchanted death blast's share of its life.
     pub ce_damage_percent: i32,
+    /// `MonsterSkillBonus` (`+0x10`): levels a monster's skills and missiles gain.
+    pub monster_skill_bonus: i32,
 }
 
 impl Default for Difficulty {
     fn default() -> Self {
-        Self { resist_penalty: 0, cold_divisor: 1, freeze_divisor: 1, curse_divisor: 1, static_field_min: 0, champion_damage_bonus: 100, ce_damage_percent: 0 }
+        Self { resist_penalty: 0, cold_divisor: 1, freeze_divisor: 1, curse_divisor: 1, static_field_min: 0, champion_damage_bonus: 100, ce_damage_percent: 0, monster_skill_bonus: 0 }
     }
 }
 
@@ -51,6 +53,7 @@ impl Difficulties {
                     static_field_min: r.int("StaticFieldMin").unwrap_or(0) as i32,
                     champion_damage_bonus: r.int("ChampionDamageBonus").unwrap_or(100) as i32,
                     ce_damage_percent: r.int("MonsterCEDamagePercent").unwrap_or(0) as i32,
+                    monster_skill_bonus: r.int("MonsterSkillBonus").unwrap_or(0) as i32,
                 }
             })
             .collect();
@@ -72,7 +75,7 @@ mod tests {
     fn rows_are_the_difficulties_in_order() {
         let t = Table::parse(b"Name\tResistPenalty\tMonsterColdDivisor\tMonsterFreezeDivisor\tAiCurseDivisor\r\nNormal\t0\t1\t1\t1\r\nNightmare\t-40\t2\t2\t2\r\nHell\t-100\t4\t4\t4\r\n");
         let d = Difficulties::from_table(&t);
-        assert_eq!(d.get(1), Difficulty { resist_penalty: -40, cold_divisor: 2, freeze_divisor: 2, curse_divisor: 2, static_field_min: 0, champion_damage_bonus: 100, ce_damage_percent: 0 });
+        assert_eq!(d.get(1), Difficulty { resist_penalty: -40, cold_divisor: 2, freeze_divisor: 2, curse_divisor: 2, static_field_min: 0, champion_damage_bonus: 100, ce_damage_percent: 0, monster_skill_bonus: 0 });
         assert_eq!(d.get(9), Difficulty::default());
     }
 }
