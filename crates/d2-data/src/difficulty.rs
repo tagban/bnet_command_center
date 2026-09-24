@@ -35,6 +35,11 @@ pub struct Difficulty {
     pub gamble_uber: i32,
     /// See [`Self::gamble_uber`].
     pub gamble_ultra: i32,
+    /// `LifeStealDivisor`, `ManaStealDivisor`: what a player's life and mana steal are divided by
+    /// (`0x0057C420`); 1 when blank.
+    pub life_steal_divisor: i32,
+    /// See [`Self::life_steal_divisor`].
+    pub mana_steal_divisor: i32,
 }
 
 impl Default for Difficulty {
@@ -53,6 +58,8 @@ impl Default for Difficulty {
             gamble_unique: 0,
             gamble_uber: 0,
             gamble_ultra: 0,
+            life_steal_divisor: 1,
+            mana_steal_divisor: 1,
         }
     }
 }
@@ -85,6 +92,8 @@ impl Difficulties {
                     gamble_unique: r.int("GambleUnique").unwrap_or(0) as i32,
                     gamble_uber: r.int("GambleUber").unwrap_or(0) as i32,
                     gamble_ultra: r.int("GambleUltra").unwrap_or(0) as i32,
+                    life_steal_divisor: int("LifeStealDivisor", 1),
+                    mana_steal_divisor: int("ManaStealDivisor", 1),
                 }
             })
             .collect();

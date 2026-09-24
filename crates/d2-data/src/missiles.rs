@@ -10,6 +10,9 @@ pub struct Missile {
     pub name: String,
     /// `ReturnFire` (flags bit 9): Chilling Armor answers it.
     pub return_fire: bool,
+    /// `dParam1`, `dParam2`: its damage function's numbers (Blessed Hammer's percent more on the
+    /// undead and on demons).
+    pub damage_params: [i32; 2],
     /// `Vel` (`+0x178`): speed in sixteenths of a subtile a frame, as a unit's velocity (`<< 8`,
     /// `0x004CD540`).
     pub velocity: i32,
@@ -124,6 +127,7 @@ impl Missiles {
                     to_hit: int("ToHit") != 0,
                     velocity_per_level: int("VelLev"),
                     return_fire: int("ReturnFire") != 0,
+                    damage_params: [int("dParam1"), int("dParam2")],
                 }
             })
             .collect();
