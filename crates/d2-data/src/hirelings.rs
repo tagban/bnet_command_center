@@ -6,6 +6,7 @@
 
 use d2_formats::excel::Table;
 
+use crate::skills::Skills;
 use crate::strings::Strings;
 
 /// One row.
@@ -47,6 +48,9 @@ pub struct Hireling {
     pub damage: (i32, i32, i32),
     /// `Resist`, `Resist/Lvl` (quarters).
     pub resist: (i32, i32),
+    /// `DefaultChance`: out of it and the skills' chances, the share a pick falls to the plain
+    /// attack (`0x005E4D30`).
+    pub default_chance: i32,
     /// `Skill1`…`Skill6` with their `Mode`, `Chance`, `ChancePerLvl`, `Level`, `LvlPerLvl`.
     pub skills: Vec<HirelingSkill>,
 }
@@ -54,7 +58,7 @@ pub struct Hireling {
 /// One of a hireling row's skills.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HirelingSkill {
-    /// `Skill`n: a `Skills.txt` row.
+    /// `Skill`n: a `Skills.txt` row, named in the table by its `skill` (0 for a name no row has).
     pub skill: i32,
     /// `Mode`n.
     pub mode: i32,
@@ -71,9 +75,9 @@ pub struct Hirelings {
 }
 
 impl Hirelings {
-    /// Parse the table, its names resolved through `strings`.
+    /// Parse the table, its names resolved through `strings` and its skills through `skills`.
     #[must_use]
-    pub fn from_table(t: &Table, strings: &Strings) -> Self {
+    pub fn from_table(t: &Table, strings: &Strings, skills: &Skills) -> Self {
         let rows = t
             .rows()
             .filter(|r| r.int("Id").is_some())
@@ -99,14 +103,17 @@ impl Hirelings {
                     share: int("Share"),
                     damage: (int("Dmg-Min"), int("Dmg-Max"), int("Dmg/Lvl")),
                     resist: (int("Resist"), int("Resist/Lvl")),
+                    default_chance: int("DefaultChance"),
                     skills: (1..=6)
                         .map(|n| HirelingSkill {
-                            skill: int(&format!("Skill{n}")),
+                            skill: r.get(&format!("Skill{n}")).filter(|k| !k.is_empty()).and_then(|k| skills.id(k)).unwrap_or(0),
                             mode: int(&format!("Mode{n}")),
                             chance: (int(&format!("Chance{n}")), int(&format!("ChancePerLvl{n}"))),
                             level: (int(&format!("Level{n}")), int(&format!("LvlPerLvl{n}"))),
                         })
-                        .filter(|s| s.skill > 0)
+                        // The engine reads them in order and stops at the first with no skill, or a
+                        // mode past 15 (`0x00572840`).
+                        .take_while(|s| s.skill > 0 && s.mode <= 15)
                         .collect(),
                 }
             })

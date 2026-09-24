@@ -272,7 +272,7 @@ impl GameData {
         let strings = data.strings("eng").unwrap_or_default();
         data.runewords.name_ids(&strings);
         // Hirelings' names go out as their string ids too.
-        data.hirelings = hireling_table.map(|t| hirelings::Hirelings::from_table(&t, &strings)).unwrap_or_default();
+        data.hirelings = hireling_table.map(|t| hirelings::Hirelings::from_table(&t, &strings, &data.skills)).unwrap_or_default();
         Ok(data)
     }
 
