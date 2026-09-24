@@ -305,6 +305,9 @@ pub struct ItemDef {
     pub two_hand_damage: (i32, i32),
     /// `minmisdam`, `maxmisdam` (`+0x100`, `+0x101`).
     pub missile_damage: (i32, i32),
+    /// `missiletype` (`+0xFA`): the missile a thrown weapon flies as (a `Missiles.txt` row), 0 for
+    /// none.
+    pub missile_type: i32,
     /// `reqstr`, `reqdex`.
     pub requirements: (i32, i32),
     /// `gemsockets`: most sockets the base item takes.
@@ -421,6 +424,7 @@ impl Items {
                     damage: (int("mindam"), int("maxdam")),
                     two_hand_damage: (int("2handmindam"), int("2handmaxdam")),
                     missile_damage: (int("minmisdam"), int("maxmisdam")),
+                    missile_type: int("missiletype"),
                     requirements: (int("reqstr"), int("reqdex")),
                     gem_sockets: int("gemsockets"),
                     stack: (int("minstack"), int("maxstack"), int("spawnstack")),
