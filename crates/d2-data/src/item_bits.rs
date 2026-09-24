@@ -26,6 +26,8 @@ pub mod flags {
     pub const IDENTIFIED: u32 = 0x10;
     /// On the packet taking out an item used up (`0x00561E70`, `0x0055E000`).
     pub const USED: u32 = 0x20;
+    /// Broken (`0x0055F850`): its durability ran out, and its stats count for nothing.
+    pub const BROKEN: u32 = 0x100;
     /// Has sockets: the socket count is written.
     pub const SOCKETED: u32 = 0x800;
     /// Slid down a belt column to close the gap an item taken out of it left (`0x0055EDC0`); the

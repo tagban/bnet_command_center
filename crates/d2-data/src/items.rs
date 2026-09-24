@@ -67,6 +67,10 @@ pub struct ItemType {
     pub beltable: bool,
     /// `Throwable` (`+0x10`).
     pub throwable: bool,
+    /// `Reload`: a stack of the type run out is replaced from the inventory (`0x0062E7E0`).
+    pub reload: bool,
+    /// `ReEquip`: failing that, the player's swapped-out item goes back on (`0x0062E830`).
+    pub re_equip: bool,
     /// `StaffMods` (`+0x1F`): the class whose skills a normal, superior, magic or rare item of the
     /// type may carry.
     pub staff_mods: Option<u8>,
@@ -151,6 +155,8 @@ impl ItemTypes {
                     body_locations,
                     beltable: int("Beltable") != 0,
                     throwable: int("Throwable") != 0,
+                    reload: int("Reload") != 0,
+                    re_equip: int("ReEquip") != 0,
                     staff_mods: row.get("StaffMods").and_then(class_index),
                     class: row.get("Class").and_then(class_index),
                     always_magic: int("Magic") != 0,
