@@ -143,6 +143,13 @@ pub struct Skill {
     pub immediate: bool,
     /// `perdelay`: an aura's tick, frames (a calc).
     pub per_delay: String,
+    /// `restrict` (`+0x228`): 0 usable only out of a restricting state (a Druid's wolf or bear
+    /// form), 1 always, 2 only in one and in one of [`Self::restrict_states`] (`0x00644060`).
+    pub restrict: i32,
+    /// `State1`–`State3` (`+0x22A`): the restricting states a restrict-2 skill wants.
+    pub restrict_states: Vec<String>,
+    /// `delay` (`+0x190`): frames before any skill with a delay may be used again (a calc).
+    pub delay: String,
 }
 
 /// A column's text, `None` when blank.
@@ -234,6 +241,9 @@ impl Skills {
                 aura: row.int("aura").unwrap_or(0) != 0,
                 immediate: row.int("immediate").unwrap_or(0) != 0,
                 per_delay: row.get("perdelay").unwrap_or_default().to_string(),
+                restrict: row.int("restrict").unwrap_or(0) as i32,
+                restrict_states: (1..=3).filter_map(|i| text(&row, &format!("State{i}"))).collect(),
+                delay: row.get("delay").unwrap_or_default().to_string(),
             })
             .collect();
         Self { rows }

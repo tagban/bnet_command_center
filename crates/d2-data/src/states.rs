@@ -19,6 +19,11 @@ pub struct State {
     /// `group` (`+0x1E`): a state that takes over one of the same group removes it — one armour
     /// at a time, one of Quickness and Fade (`0x0056C740`). 0 for none.
     pub group: i32,
+    /// `restrict`: a state that bars the skills with `restrict` 0 (a Druid's wolf and bear forms).
+    pub restrict: bool,
+    /// `disguise`: a state that changes a unit's look (`+0x12` bit 0) — while one is on the unit
+    /// counts as transformed.
+    pub disguise: bool,
 }
 
 impl States {
@@ -27,7 +32,13 @@ impl States {
     pub fn from_table(t: &Table) -> Self {
         let rows = t
             .rows()
-            .map(|r| State { name: r.get("state").unwrap_or_default().to_string(), no_send: r.int("nosend").unwrap_or(0) != 0, group: r.int("group").unwrap_or(0) as i32 })
+            .map(|r| State {
+                name: r.get("state").unwrap_or_default().to_string(),
+                no_send: r.int("nosend").unwrap_or(0) != 0,
+                group: r.int("group").unwrap_or(0) as i32,
+                restrict: r.int("restrict").unwrap_or(0) != 0,
+                disguise: r.int("disguise").unwrap_or(0) != 0,
+            })
             .collect();
         Self { rows }
     }
