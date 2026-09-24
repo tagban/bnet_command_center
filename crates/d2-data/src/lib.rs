@@ -36,6 +36,7 @@ pub mod runewords;
 pub mod skills;
 pub mod states;
 pub mod stat;
+pub mod hirelings;
 pub mod strings;
 pub mod tiles;
 pub mod trade;
@@ -175,6 +176,8 @@ pub struct GameData {
     runewords: runewords::Runewords,
     /// `gamble.txt`'s item codes.
     gamble: Vec<items::Code>,
+    /// `Hireling.txt`.
+    hirelings: hirelings::Hirelings,
     /// `MonUMod.txt`.
     unique_mods: umods::UniqueMods,
     /// `MonType.txt`.
@@ -256,10 +259,13 @@ impl GameData {
         data.books = trade::books_from_table(&read("books.txt")?);
         data.treasure = treasure::TreasureClasses::from_table(&read("treasureclassex.txt")?)?;
         data.treasure.add_item_classes(&data.items);
+        let hireling_table = read("hireling.txt").ok();
         data.archives = Some(Arc::new(archives));
         // A runeword's name goes out as its string id; every language numbers its strings alike.
         let strings = data.strings("eng").unwrap_or_default();
         data.runewords.name_ids(&strings);
+        // Hirelings' names go out as their string ids too.
+        data.hirelings = hireling_table.map(|t| hirelings::Hirelings::from_table(&t, &strings)).unwrap_or_default();
         Ok(data)
     }
 
@@ -398,6 +404,12 @@ impl GameData {
     #[must_use]
     pub fn runewords(&self) -> &runewords::Runewords {
         &self.runewords
+    }
+
+    /// `Hireling.txt`: the mercenaries.
+    #[must_use]
+    pub fn hirelings(&self) -> &hirelings::Hirelings {
+        &self.hirelings
     }
 
     /// `gamble.txt`: the item codes a gambler's stock is picked from.
@@ -691,6 +703,7 @@ impl GameData {
             gems: gems::Gems::default(),
             runewords: runewords::Runewords::default(),
             gamble: Vec::new(),
+            hirelings: hirelings::Hirelings::default(),
             unique_mods: umods::UniqueMods::default(),
             mon_types: umods::MonTypes::default(),
             missiles: missiles::Missiles::default(),
