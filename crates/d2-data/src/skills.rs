@@ -150,6 +150,14 @@ pub struct Skill {
     pub restrict_states: Vec<String>,
     /// `delay` (`+0x190`): frames before any skill with a delay may be used again (a calc).
     pub delay: String,
+    /// `skilldesc`: its `SkillDesc.txt` row's name, whose `SkillPage` is the tab an item's
+    /// `item_addskill_tab` raises.
+    pub description: Option<String>,
+    /// Its tab, 1–3 (`SkillDesc.txt` `SkillPage`); 0 for none — set by [`Skills::set_pages`].
+    pub page: u8,
+    /// Its `EType` as an `ElemTypes.txt` row — the param of `item_elemskill` — 0 for none; set by
+    /// [`Skills::set_pages`].
+    pub element_type: u8,
 }
 
 /// A column's text, `None` when blank.
@@ -244,9 +252,27 @@ impl Skills {
                 restrict: row.int("restrict").unwrap_or(0) as i32,
                 restrict_states: (1..=3).filter_map(|i| text(&row, &format!("State{i}"))).collect(),
                 delay: row.get("delay").unwrap_or_default().to_string(),
+                description: text(&row, "skilldesc"),
+                page: 0,
+                element_type: 0,
             })
             .collect();
         Self { rows }
+    }
+
+    /// Each skill's tab from `SkillDesc.txt` (`SkillPage` of its `skilldesc` row) and its
+    /// `EType`'s row in `ElemTypes.txt` (the params of `item_addskill_tab` and `item_elemskill`,
+    /// `0x00644180`).
+    pub fn set_pages(&mut self, skilldesc: &Table, elemtypes: &Table) {
+        let pages: std::collections::HashMap<String, u8> = skilldesc
+            .rows()
+            .filter_map(|row| Some((row.get("skilldesc")?.to_ascii_lowercase(), row.int("SkillPage").unwrap_or(0).clamp(0, 255) as u8)))
+            .collect();
+        let elements: Vec<String> = elemtypes.rows().map(|row| row.get("Code").unwrap_or_default().to_ascii_lowercase()).collect();
+        for skill in &mut self.rows {
+            skill.page = skill.description.as_deref().and_then(|d| pages.get(&d.to_ascii_lowercase())).copied().unwrap_or(0);
+            skill.element_type = (!skill.element.is_empty()).then(|| elements.iter().position(|e| e.eq_ignore_ascii_case(&skill.element))).flatten().map_or(0, |i| i as u8);
+        }
     }
 
     /// A skill by id.

@@ -248,6 +248,9 @@ impl GameData {
             &read("sets.txt")?,
         );
         data.skills = skills::Skills::from_table(&read("skills.txt")?);
+        if let (Ok(desc), Ok(elements)) = (read("skilldesc.txt"), read("elemtypes.txt")) {
+            data.skills.set_pages(&desc, &elements);
+        }
         data.states = states::States::from_table(&read("states.txt")?);
         data.difficulties = difficulty::Difficulties::from_table(&read("difficultylevels.txt")?);
         // Only summons need it; an install without it still loads.
@@ -857,6 +860,9 @@ mod tests {
             assert!(c.vitality > 0 && c.stamina > 0, "{}: {c:?}", CLASSES[usize::from(class)]);
         }
         assert!(data.next_level_experience(0, 1).unwrap() > 0);
+        // Skills know their tab and element: Fire Bolt is the fire tab's, of fire.
+        let fire_bolt = data.skills().get(data.skills().id("Fire Bolt").unwrap()).unwrap();
+        assert!(fire_bolt.page != 0 && fire_bolt.element_type != 0, "{fire_bolt:?}");
         // Every CubeMain row names things the tables have; the first makes the Horadric Staff.
         let cube = data.cube().rows();
         assert!(cube.len() > 100 && cube.iter().all(|r| r.usable), "{:?}", cube.iter().filter(|r| !r.usable).map(|r| &r.description).collect::<Vec<_>>());
