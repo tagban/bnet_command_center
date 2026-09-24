@@ -92,6 +92,9 @@ pub struct CombatStats {
     pub treasure_champion: [String; 3],
     /// `TreasureClass3` by difficulty: what it drops as a unique (`0x005A6600`).
     pub treasure_unique: [String; 3],
+    /// `TreasureClass4`…: what a quest boss drops for a player still on its quest (Andariel's
+    /// `Andarielq`), by difficulty.
+    pub treasure_quest: [String; 3],
     /// `MonType`: the type a boss modifier's `exclude` columns are matched against.
     pub mon_type: String,
     /// `isMelee`: a boss of it cannot have multiple shots.
@@ -302,6 +305,7 @@ impl Monsters {
                     treasure: ["TreasureClass1", "TreasureClass1(N)", "TreasureClass1(H)"].map(|c| row.get(c).unwrap_or_default().to_string()),
                     treasure_champion: ["TreasureClass2", "TreasureClass2(N)", "TreasureClass2(H)"].map(|c| row.get(c).unwrap_or_default().to_string()),
                     treasure_unique: ["TreasureClass3", "TreasureClass3(N)", "TreasureClass3(H)"].map(|c| row.get(c).unwrap_or_default().to_string()),
+                    treasure_quest: ["TreasureClass4", "TreasureClass4(N)", "TreasureClass4(H)"].map(|c| row.get(c).unwrap_or_default().to_string()),
                     mon_type: row.get("MonType").unwrap_or_default().to_string(),
                     is_melee: flag("isMelee"),
                     no_multishot: flag("noMultiShot"),
