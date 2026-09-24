@@ -150,6 +150,10 @@ pub struct Skill {
     pub restrict_states: Vec<String>,
     /// `delay` (`+0x190`): frames before any skill with a delay may be used again (a calc).
     pub delay: String,
+    /// `seqtrans`: the mode a sequence counts as for speed (`SC` makes it a cast, `0x006216E0`).
+    pub seq_trans: String,
+    /// `UseAttackRate`: a sequence or special mode timed by the attack rate (`0x00621580`).
+    pub use_attack_rate: bool,
     /// `skilldesc`: its `SkillDesc.txt` row's name, whose `SkillPage` is the tab an item's
     /// `item_addskill_tab` raises.
     pub description: Option<String>,
@@ -253,6 +257,8 @@ impl Skills {
                 restrict_states: (1..=3).filter_map(|i| text(&row, &format!("State{i}"))).collect(),
                 delay: row.get("delay").unwrap_or_default().to_string(),
                 description: text(&row, "skilldesc"),
+                seq_trans: row.get("seqtrans").unwrap_or_default().to_string(),
+                use_attack_rate: row.int("UseAttackRate").unwrap_or(0) != 0,
                 page: 0,
                 element_type: 0,
             })
