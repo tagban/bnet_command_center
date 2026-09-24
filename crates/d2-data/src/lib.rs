@@ -20,6 +20,7 @@ pub mod appearance;
 pub mod belts;
 pub mod difficulty;
 pub mod character;
+pub mod cube;
 pub mod engine;
 pub mod gems;
 pub mod item_bits;
@@ -174,6 +175,8 @@ pub struct GameData {
     gems: gems::Gems,
     /// `Runes.txt`.
     runewords: runewords::Runewords,
+    /// `CubeMain.txt`.
+    cube: cube::CubeRecipes,
     /// `gamble.txt`'s item codes.
     gamble: Vec<items::Code>,
     /// `Hireling.txt`.
@@ -251,6 +254,7 @@ impl GameData {
         data.pet_types = read("pettype.txt").map(|t| t.rows().map(|row| row.get("pet type").unwrap_or_default().to_string()).collect()).unwrap_or_default();
         data.gems = gems::Gems::from_table(&read("gems.txt")?);
         data.runewords = runewords::Runewords::from_table(&read("runes.txt")?);
+        data.cube = cube::CubeRecipes::from_table(&read("cubemain.txt")?, &data.items, &data.affixes);
         // `gamble.txt`: only its codes are read (`0x00638AE0`).
         data.gamble = read("gamble.txt").map(|t| t.rows().filter_map(|row| row.get("code").filter(|c| !c.is_empty()).map(items::code)).collect()).unwrap_or_default();
         data.unique_mods = umods::UniqueMods::from_table(&read("monumod.txt")?);
@@ -404,6 +408,17 @@ impl GameData {
     #[must_use]
     pub fn runewords(&self) -> &runewords::Runewords {
         &self.runewords
+    }
+
+    /// `CubeMain.txt`: the Horadric Cube's recipes.
+    #[must_use]
+    pub fn cube(&self) -> &cube::CubeRecipes {
+        &self.cube
+    }
+
+    /// Replace the cube's recipes — for tests.
+    pub fn set_cube(&mut self, cube: cube::CubeRecipes) {
+        self.cube = cube;
     }
 
     /// `Hireling.txt`: the mercenaries.
@@ -702,6 +717,7 @@ impl GameData {
             pet_types: Vec::new(),
             gems: gems::Gems::default(),
             runewords: runewords::Runewords::default(),
+            cube: cube::CubeRecipes::default(),
             gamble: Vec::new(),
             hirelings: hirelings::Hirelings::default(),
             unique_mods: umods::UniqueMods::default(),
@@ -841,6 +857,11 @@ mod tests {
             assert!(c.vitality > 0 && c.stamina > 0, "{}: {c:?}", CLASSES[usize::from(class)]);
         }
         assert!(data.next_level_experience(0, 1).unwrap() > 0);
+        // Every CubeMain row names things the tables have; the first makes the Horadric Staff.
+        let cube = data.cube().rows();
+        assert!(cube.len() > 100 && cube.iter().all(|r| r.usable), "{:?}", cube.iter().filter(|r| !r.usable).map(|r| &r.description).collect::<Vec<_>>());
+        let staff = data.items().class_of(&items::code("hst")).unwrap();
+        assert_eq!(cube[0].outputs[0].as_ref().map(|o| o.kind), Some(cube::OutputKind::Class(staff)));
         let town = data.levels().get(1).expect("Rogue Encampment");
         assert_eq!((town.act, town.drlg_type, town.waypoint), (0, levels::DrlgType::Preset, Some(0)));
         assert_eq!(data.levels().get(2).unwrap().waypoint, None, "Blood Moor has none");

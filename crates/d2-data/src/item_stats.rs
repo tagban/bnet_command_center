@@ -89,6 +89,18 @@ impl ItemStats {
     pub fn id(&self, name: &str) -> Option<u16> {
         self.by_name.get(&name.to_ascii_lowercase()).copied()
     }
+
+    /// How many ids the table spans (`0x00744304+0xBD4`): an id past it is no stat at all.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
+    /// Whether the table is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
 }
 
 /// One quality's odds: `(ratio − (item level − quality level) / divisor) × 128`, but no better
