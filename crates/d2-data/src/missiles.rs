@@ -8,6 +8,8 @@ use d2_formats::excel::Table;
 pub struct Missile {
     /// `Missile`.
     pub name: String,
+    /// `ReturnFire` (flags bit 9): Chilling Armor answers it.
+    pub return_fire: bool,
     /// `Vel` (`+0x178`): speed in sixteenths of a subtile a frame, as a unit's velocity (`<< 8`,
     /// `0x004CD540`).
     pub velocity: i32,
@@ -121,6 +123,7 @@ impl Missiles {
                     source_damage: int("SrcDamage"),
                     to_hit: int("ToHit") != 0,
                     velocity_per_level: int("VelLev"),
+                    return_fire: int("ReturnFire") != 0,
                 }
             })
             .collect();
