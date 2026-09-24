@@ -60,6 +60,13 @@ mod address {
     /// `gaWallNeighborOrientTable`: a road edge cell's tile orientation by its eight
     /// neighbours (`DRLGOUTROOM_ComputeWallOrientations`, `0x00680B10`).
     pub const OUTDOOR_EDGE_ORIENTATIONS: u32 = 0x006F_2700;
+    /// The two desert border pieces an Act II open edge gets, `{a, b}` by `dx + 2·dy + 2`
+    /// (`PlaceAct1245OutdoorBorders`'s Act II branch, `0x00675AD7`).
+    pub const OUTDOOR_DESERT_OPENINGS: u32 = 0x006F_112C;
+    /// The desert's eight "big cliff" layouts, five `{preset, file, x, y}` each (`0x0067F5C0`).
+    pub const OUTDOOR_DESERT_CLIFFS: u32 = 0x006F_2390;
+    /// The Canyon of the Magi's ring of tomb pieces, nine `{preset, file, x, y}` (`0x0067F8D0`).
+    pub const OUTDOOR_CANYON: u32 = 0x006F_2610;
     /// The graphics codes a save's appearance bytes were first laid out for, `{code, item type}`
     /// by slot; the graphics table builder keeps weapons and armour out of each other's slots
     /// with it (`0x0063D710`).
@@ -193,6 +200,12 @@ pub struct OutdoorTables {
     /// A road edge cell's tile orientation (0 none) by the mask of its set neighbours: bit 7 NE,
     /// 6 E, 5 SE, 4 N, 3 S, 2 NW, 1 W, 0 SW.
     pub edge_orientations: [u8; 256],
+    /// Act II: the two border pieces of an open edge by `dx + 2·dy + 2`.
+    pub desert_openings: [(i32, i32); 5],
+    /// Act II: the eight cliff layouts, five `[preset, file, x, y]` pieces each.
+    pub desert_cliffs: [[[i32; 4]; 5]; 8],
+    /// Act II: the Canyon of the Magi's tomb ring, `[preset, file, x, y]`.
+    pub canyon: [[i32; 4]; 9],
 }
 
 /// One period of an act's day.
@@ -400,6 +413,9 @@ impl OutdoorTables {
         let (sy, sx): ([i32; 4], [i32; 4]) = (ints(image, address::OUTDOOR_SPIRAL_Y)?, ints(image, address::OUTDOOR_SPIRAL_X)?);
         let (jx, jy): ([i32; 4], [i32; 4]) = (ints(image, address::OUTDOOR_JITTER_X)?, ints(image, address::OUTDOOR_JITTER_Y)?);
         let deltas = signed(address::OUTDOOR_PATH_DELTAS, 24)?;
+        let openings: [i32; 10] = ints(image, address::OUTDOOR_DESERT_OPENINGS)?;
+        let cliffs: [i32; 160] = ints(image, address::OUTDOOR_DESERT_CLIFFS)?;
+        let canyon: [i32; 36] = ints(image, address::OUTDOOR_CANYON)?;
         Some(Self {
             link_offsets: std::array::from_fn(|i| (links[i * 2], links[i * 2 + 1])),
             road_presets: std::array::from_fn(|r| std::array::from_fn(|c| presets[r * 4 + c])),
@@ -414,6 +430,9 @@ impl OutdoorTables {
             jitter: std::array::from_fn(|i| (jx[i], jy[i])),
             path_deltas: std::array::from_fn(|i| deltas[i]),
             edge_orientations: image.bytes(address::OUTDOOR_EDGE_ORIENTATIONS, 256)?.try_into().ok()?,
+            desert_openings: std::array::from_fn(|i| (openings[i * 2], openings[i * 2 + 1])),
+            desert_cliffs: std::array::from_fn(|v| std::array::from_fn(|p| std::array::from_fn(|f| cliffs[v * 20 + p * 4 + f]))),
+            canyon: std::array::from_fn(|p| std::array::from_fn(|f| canyon[p * 4 + f])),
         })
     }
 }
@@ -438,6 +457,11 @@ mod tests {
         assert_eq!(engine.outdoor.shrine_styles, [0x1000, 0x2000, 0x4000, 0x8000]);
         assert_eq!(engine.outdoor.neighbours[0], (-1, 0));
         assert_eq!(&engine.outdoor.path_deltas[16..], &[0, 1, 0, -1, 1, 0, -1, 0], "y then x steps by direction");
+        // Act II: an open edge's two pieces are desert borders, every cliff layout ends in a
+        // cliff end, and the Canyon's ring starts and ends with its end pieces.
+        assert!(engine.outdoor.desert_openings.iter().filter(|p| p.0 != 0).all(|&(a, b)| (364..=375).contains(&a) && (364..=375).contains(&b)));
+        assert!(engine.outdoor.desert_cliffs.iter().all(|layout| layout.iter().any(|p| p[0] == 376 || p[0] == 379)));
+        assert_eq!((engine.outdoor.canyon[0][0], engine.outdoor.canyon[8][0]), (384, 386));
         if let Ok(libd2) = std::env::var("LIBD2_DIR") {
             let bin = std::fs::read(std::path::Path::new(&libd2).join("packages/drlg/src/excel/PresetObjectTable.bin")).unwrap();
             let theirs: Vec<i32> = bin.chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
