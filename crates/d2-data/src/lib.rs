@@ -173,6 +173,8 @@ pub struct GameData {
     gems: gems::Gems,
     /// `Runes.txt`.
     runewords: runewords::Runewords,
+    /// `gamble.txt`'s item codes.
+    gamble: Vec<items::Code>,
     /// `MonUMod.txt`.
     unique_mods: umods::UniqueMods,
     /// `MonType.txt`.
@@ -246,6 +248,8 @@ impl GameData {
         data.pet_types = read("pettype.txt").map(|t| t.rows().map(|row| row.get("pet type").unwrap_or_default().to_string()).collect()).unwrap_or_default();
         data.gems = gems::Gems::from_table(&read("gems.txt")?);
         data.runewords = runewords::Runewords::from_table(&read("runes.txt")?);
+        // `gamble.txt`: only its codes are read (`0x00638AE0`).
+        data.gamble = read("gamble.txt").map(|t| t.rows().filter_map(|row| row.get("code").filter(|c| !c.is_empty()).map(items::code)).collect()).unwrap_or_default();
         data.unique_mods = umods::UniqueMods::from_table(&read("monumod.txt")?);
         data.mon_types = umods::MonTypes::from_table(&read("montype.txt")?);
         data.missiles = missiles::Missiles::from_table(&read("missiles.txt")?);
@@ -394,6 +398,12 @@ impl GameData {
     #[must_use]
     pub fn runewords(&self) -> &runewords::Runewords {
         &self.runewords
+    }
+
+    /// `gamble.txt`: the item codes a gambler's stock is picked from.
+    #[must_use]
+    pub fn gamble_codes(&self) -> &[items::Code] {
+        &self.gamble
     }
 
     /// `Gems.txt`: what gems and runes lend the items holding them.
@@ -680,6 +690,7 @@ impl GameData {
             pet_types: Vec::new(),
             gems: gems::Gems::default(),
             runewords: runewords::Runewords::default(),
+            gamble: Vec::new(),
             unique_mods: umods::UniqueMods::default(),
             mon_types: umods::MonTypes::default(),
             missiles: missiles::Missiles::default(),

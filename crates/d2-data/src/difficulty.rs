@@ -23,11 +23,37 @@ pub struct Difficulty {
     pub ce_damage_percent: i32,
     /// `MonsterSkillBonus` (`+0x10`): levels a monster's skills and missiles gain.
     pub monster_skill_bonus: i32,
+    /// `GambleRare`, `GambleSet`, `GambleUnique` (`+0x44`…`+0x4C`): a gamble item's odds, out of
+    /// 100000, of each quality (`0x00578790`); the rest are magic.
+    pub gamble_rare: i32,
+    /// See [`Self::gamble_rare`].
+    pub gamble_set: i32,
+    /// See [`Self::gamble_rare`].
+    pub gamble_unique: i32,
+    /// `GambleUber`, `GambleUltra` (`+0x50`, `+0x54`): ten-thousandths per level past the tier's
+    /// that a gamble item is exceptional, or elite, in an expansion game (`0x005786A0`).
+    pub gamble_uber: i32,
+    /// See [`Self::gamble_uber`].
+    pub gamble_ultra: i32,
 }
 
 impl Default for Difficulty {
     fn default() -> Self {
-        Self { resist_penalty: 0, cold_divisor: 1, freeze_divisor: 1, curse_divisor: 1, static_field_min: 0, champion_damage_bonus: 100, ce_damage_percent: 0, monster_skill_bonus: 0 }
+        Self {
+            resist_penalty: 0,
+            cold_divisor: 1,
+            freeze_divisor: 1,
+            curse_divisor: 1,
+            static_field_min: 0,
+            champion_damage_bonus: 100,
+            ce_damage_percent: 0,
+            monster_skill_bonus: 0,
+            gamble_rare: 0,
+            gamble_set: 0,
+            gamble_unique: 0,
+            gamble_uber: 0,
+            gamble_ultra: 0,
+        }
     }
 }
 
@@ -54,6 +80,11 @@ impl Difficulties {
                     champion_damage_bonus: r.int("ChampionDamageBonus").unwrap_or(100) as i32,
                     ce_damage_percent: r.int("MonsterCEDamagePercent").unwrap_or(0) as i32,
                     monster_skill_bonus: r.int("MonsterSkillBonus").unwrap_or(0) as i32,
+                    gamble_rare: r.int("GambleRare").unwrap_or(0) as i32,
+                    gamble_set: r.int("GambleSet").unwrap_or(0) as i32,
+                    gamble_unique: r.int("GambleUnique").unwrap_or(0) as i32,
+                    gamble_uber: r.int("GambleUber").unwrap_or(0) as i32,
+                    gamble_ultra: r.int("GambleUltra").unwrap_or(0) as i32,
                 }
             })
             .collect();
@@ -75,7 +106,7 @@ mod tests {
     fn rows_are_the_difficulties_in_order() {
         let t = Table::parse(b"Name\tResistPenalty\tMonsterColdDivisor\tMonsterFreezeDivisor\tAiCurseDivisor\r\nNormal\t0\t1\t1\t1\r\nNightmare\t-40\t2\t2\t2\r\nHell\t-100\t4\t4\t4\r\n");
         let d = Difficulties::from_table(&t);
-        assert_eq!(d.get(1), Difficulty { resist_penalty: -40, cold_divisor: 2, freeze_divisor: 2, curse_divisor: 2, static_field_min: 0, champion_damage_bonus: 100, ce_damage_percent: 0, monster_skill_bonus: 0 });
+        assert_eq!(d.get(1), Difficulty { resist_penalty: -40, cold_divisor: 2, freeze_divisor: 2, curse_divisor: 2, ..Difficulty::default() });
         assert_eq!(d.get(9), Difficulty::default());
     }
 }

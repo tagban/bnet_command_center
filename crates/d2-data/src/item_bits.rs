@@ -467,7 +467,21 @@ fn read_list(r: &mut Reader, stats: &ItemStats) -> Result<Vec<ItemStat>, ReadErr
 /// leaves them out.
 #[must_use]
 pub fn write(item: &Item, items: &Items, stats: &ItemStats, target: Target) -> Vec<u8> {
+    write_as(item, items, stats, target, false)
+}
+
+/// A gamble stock item as a gambler's client sees it (`0x006312B0` with its gamble argument): the
+/// flags with ethereal hidden and `0x2000000` set, the place, and the base's **normal** tier
+/// (`normcode`) for its code — and nothing after, no quality, affixes or stats. Only for an
+/// unidentified magic-or-better item; anything else is written in full.
+#[must_use]
+pub fn write_gamble(item: &Item, items: &Items, stats: &ItemStats) -> Vec<u8> {
+    write_as(item, items, stats, Target::Network, true)
+}
+
+fn write_as(item: &Item, items: &Items, stats: &ItemStats, target: Target, gamble: bool) -> Vec<u8> {
     let save = target == Target::Save;
+    let gamble = gamble && !save && item.flags & flags::IDENTIFIED == 0 && (4..=9).contains(&item.quality.number());
     let mut w = Writer { bytes: Vec::new(), bit: 0 };
     let kind = kind(items, &item.code);
     let compact = kind.as_ref().is_some_and(|k| k.compact);
@@ -482,6 +496,9 @@ pub fn write(item: &Item, items: &Items, stats: &ItemStats, target: Target) -> V
     }
     if !save && item_flags & flags::IDENTIFIED == 0 {
         item_flags &= !flags::SOCKETED;
+    }
+    if gamble {
+        item_flags = (item_flags & !flags::ETHEREAL) | 0x0200_0000;
     }
     w.put(item_flags, 32);
     w.clamped(u32::from(item.version), 10);
@@ -504,6 +521,12 @@ pub fn write(item: &Item, items: &Items, stats: &ItemStats, target: Target) -> V
             w.clamped(u32::from(row), 4);
             w.clamped(u32::from(page), 3);
         }
+    }
+    if gamble {
+        let normal = items.class_of(&item.code).and_then(|c| items.get(c)).map_or(item.code, |d| d.tiers[0]);
+        let normal = if normal == *b"    " { item.code } else { normal };
+        w.put(u32::from_le_bytes(normal), 32);
+        return w.bytes;
     }
     w.put(u32::from_le_bytes(item.code), 32);
     let Some(kind) = kind else { return w.bytes };
