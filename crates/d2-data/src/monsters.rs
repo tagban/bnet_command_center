@@ -144,6 +144,8 @@ pub struct CombatStats {
     pub skill_modes: Vec<String>,
     /// `lUndead` or `hUndead`: an undead (Sanctuary's, Holy Bolt's and a blunt weapon's).
     pub undead: bool,
+    /// `lUndead`: a low undead — what a Greater Mummy raises (`+0xD & 8`).
+    pub low_undead: bool,
     /// `MonStats2.txt` `mDT`…`mRN`: the modes it has an animation for, bit `i` for mode `i` (DT,
     /// NU, WL, GH, A1, A2, BL, SC, S1, S2, S3, S4, DD, KB, SQ, RN); all of them for a class the
     /// table lacks.
@@ -340,6 +342,7 @@ impl Monsters {
                     mode_missiles: ["MissA1", "MissA2", "MissS1"].map(|c| row.get(c).unwrap_or_default().to_string()),
                     mode_bits: mode_bits.get(&ex).copied().unwrap_or(0xFFFF),
                     undead: flag("lUndead") || flag("hUndead"),
+                    low_undead: flag("lUndead"),
                     skill_modes: (1..=8).filter(|n| row.get(&format!("Skill{n}")).is_some_and(|s| !s.is_empty())).map(|n| row.get(&format!("Sk{n}mode")).unwrap_or_default().to_string()).collect(),
                 };
                 Some((class, MonsterClass {
