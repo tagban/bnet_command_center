@@ -79,6 +79,26 @@ mod address {
     pub const JUNGLE_CLEARING_OFFSETS: u32 = 0x006F_2240;
     /// Act III's jungle: the six orders of three clearing files (`0x0067E910`).
     pub const JUNGLE_FILE_ORDERS: u32 = 0x006F_2328;
+    /// Act IV: each Mesa level's second set of pieces (`0x0067E6A0`), levels 104..=106.
+    pub const HELL_SECOND_SETS: u32 = 0x006F_22A4;
+    /// Act IV: each Mesa level's first set of pieces (`0x0067E6A0`), levels 104..=106.
+    pub const HELL_FIRST_SETS: u32 = 0x006F_22B0;
+    /// Act IV: the Chaos Sanctuary's 5×5 pieces, row by row (`0x0067E840`).
+    pub const HELL_CHAOS: u32 = 0x006F_22C0;
+    /// Act V: the barricade border pieces, 12 rows (`road_presets` rows 1..=12) of 2 styles
+    /// (`0x006755C0`, `0x00675600`, style 4 and 5).
+    pub const SIEGE_BORDERS: u32 = 0x006F_06F0;
+    /// Act V: the transitions to the ice caves, 3 × `{level, file, side, tall piece, wide
+    /// piece}` (`0x0067DA70`).
+    pub const SIEGE_TRANSITIONS: u32 = 0x006F_1F9C;
+    /// Act V: the frame walk's step per border piece, 12 × `{dx, dy}` (`0x0067DEF0`).
+    pub const SIEGE_FRAME_STEPS: u32 = 0x006F_1FD8;
+    /// Act V: the barricade rules' tile mapping, 10 × `{main index, low, high, piece, snow
+    /// piece}` (`0x0067E000`).
+    pub const SIEGE_RULES: u32 = 0x006F_2038;
+    /// Act V: the levels' set pieces, 15 × `{level, tall piece, wide piece, file, -, count,
+    /// required}` (`0x0067E160`).
+    pub const SIEGE_PRESETS: u32 = 0x006F_2100;
     /// The graphics codes a save's appearance bytes were first laid out for, `{code, item type}`
     /// by slot; the graphics table builder keeps weapons and armour out of each other's slots
     /// with it (`0x0063D710`).
@@ -142,6 +162,36 @@ pub struct EngineData {
     pub tiles: TileTables,
     /// What Act III's jungle generator looks up.
     pub jungle: JungleTables,
+    /// What Act IV's wilderness generator looks up.
+    pub hell: HellTables,
+    /// What Act V's wilderness generator looks up.
+    pub siege: SiegeTables,
+}
+
+/// Act IV's wilderness tables (`0x0067E6A0`, `0x0067E840`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HellTables {
+    /// Levels 104, 105, 106: the first preset of each of their two sets of pieces (each set a
+    /// run of consecutive `LvlPrest.txt` ids).
+    pub mesa_sets: [(i32, i32); 3],
+    /// The Chaos Sanctuary's pieces, 5×5 blocks of 3×3 cells, row by row.
+    pub chaos: [i32; 25],
+}
+
+/// Act V's wilderness tables (`0x0067E600` and the routines it calls).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiegeTables {
+    /// The border pieces by `road_presets` row (1..=12 at index 0..=11) and style (0, or 1 for
+    /// the Frozen Tundra).
+    pub borders: [[i32; 2]; 12],
+    /// `{level, file, side, tall piece, wide piece}`.
+    pub transitions: [[i32; 5]; 3],
+    /// The frame walk's `(dx, dy)` by border piece (`id - borders[0][style]`).
+    pub frame_steps: [(i32, i32); 12],
+    /// `{main index, low, high, piece, snow piece}`.
+    pub rules: [[i32; 5]; 10],
+    /// `{level, tall piece, wide piece, file, -, count, required}`.
+    pub presets: [[i32; 7]; 15],
 }
 
 /// Act III's jungle generator's lookup tables (`0x00677880`, `0x0067E910`).
@@ -293,6 +343,8 @@ impl EngineData {
         let front_end = FrontEndTables::read(&image).ok_or_else(|| out_of_range("front-end tables"))?;
         let tiles = TileTables::read(&image).ok_or_else(|| out_of_range("room tile tables"))?;
         let jungle = JungleTables::read(&image).ok_or_else(|| out_of_range("jungle tables"))?;
+        let hell = HellTables::read(&image).ok_or_else(|| out_of_range("Act IV tables"))?;
+        let siege = SiegeTables::read(&image).ok_or_else(|| out_of_range("Act V tables"))?;
 
         // GAMELOGON 37, ENTERGAME 1, ping 13; GameFlags 8, LoadAct 12, AssignPlayer 26.
         let sizes_ok = client_packet_sizes[0x68] == 37
@@ -333,7 +385,14 @@ impl EngineData {
         // permutation of three.
         let jungle_ok = jungle.pieces.iter().flatten().chain(&jungle.dead_ends[1..]).all(|&p| p == 0 || (545..=584).contains(&p))
             && jungle.file_orders.iter().all(|o| { let mut s = *o; s.sort_unstable(); s == [0, 1, 2] });
-        if !sizes_ok || !presets_ok || !clock_ok || !outdoor_ok || !graphics_ok || !tiles_ok || !jungle_ok {
+        // Act IV's pieces are its `LvlPrest.txt` rows 798..=862, Act V's 865..=1002; every frame
+        // step is one side.
+        let hell_ok = hell.chaos.iter().chain(hell.mesa_sets.iter().flat_map(|s| [&s.0, &s.1])).all(|p| (798..=862).contains(p));
+        let siege_ok = siege.borders.iter().flatten().chain(siege.transitions.iter().flat_map(|t| &t[3..])).all(|p| (865..=1002).contains(p))
+            && siege.frame_steps.iter().all(|&(x, y)| x.abs() + y.abs() == 1)
+            && siege.rules.iter().all(|r| r[0] == 0x30 || r[0] == 0x31)
+            && siege.presets.iter().all(|p| (110..=120).contains(&p[0]));
+        if !sizes_ok || !presets_ok || !clock_ok || !outdoor_ok || !graphics_ok || !tiles_ok || !jungle_ok || !hell_ok || !siege_ok {
             return Err(bad("tables do not look like 1.14d's".into()));
         }
         Ok(Self {
@@ -348,6 +407,8 @@ impl EngineData {
             front_end,
             tiles,
             jungle,
+            hell,
+            siege,
         })
     }
 
@@ -490,6 +551,38 @@ impl JungleTables {
     }
 }
 
+impl HellTables {
+    fn read(image: &Image) -> Option<Self> {
+        let (mut first, mut second, mut chaos) = ([0i32; 3], [0i32; 3], [0i32; 25]);
+        image.i32s(address::HELL_FIRST_SETS, &mut first)?;
+        image.i32s(address::HELL_SECOND_SETS, &mut second)?;
+        image.i32s(address::HELL_CHAOS, &mut chaos)?;
+        Some(Self { mesa_sets: std::array::from_fn(|i| (first[i], second[i])), chaos })
+    }
+}
+
+impl SiegeTables {
+    fn read(image: &Image) -> Option<Self> {
+        fn ints<const N: usize>(image: &Image, at: u32) -> Option<[i32; N]> {
+            let mut out = [0i32; N];
+            image.i32s(at, &mut out)?;
+            Some(out)
+        }
+        let borders: [i32; 24] = ints(image, address::SIEGE_BORDERS)?;
+        let transitions: [i32; 15] = ints(image, address::SIEGE_TRANSITIONS)?;
+        let steps: [i32; 24] = ints(image, address::SIEGE_FRAME_STEPS)?;
+        let rules: [i32; 50] = ints(image, address::SIEGE_RULES)?;
+        let presets: [i32; 105] = ints(image, address::SIEGE_PRESETS)?;
+        Some(Self {
+            borders: std::array::from_fn(|r| [borders[r * 2], borders[r * 2 + 1]]),
+            transitions: std::array::from_fn(|r| std::array::from_fn(|c| transitions[r * 5 + c])),
+            frame_steps: std::array::from_fn(|i| (steps[i * 2], steps[i * 2 + 1])),
+            rules: std::array::from_fn(|r| std::array::from_fn(|c| rules[r * 5 + c])),
+            presets: std::array::from_fn(|r| std::array::from_fn(|c| presets[r * 7 + c])),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,6 +611,10 @@ mod tests {
         // Act III: the Spider Forest's clearings are the first, the Flayer Jungle's two sets on.
         assert_eq!(engine.jungle.clearing_offsets, [0, 10, 20]);
         assert_eq!(engine.jungle.pieces[0], [0; 4], "a cell without path links has no path piece");
+        // Act IV: the Chaos Sanctuary's middle block is its heart; Act V: the frame walk's steps
+        // follow the border ring.
+        assert_eq!(engine.hell.chaos[12], 862);
+        assert_eq!(engine.siege.frame_steps[0], (-1, 0));
         if let Ok(libd2) = std::env::var("LIBD2_DIR") {
             let bin = std::fs::read(std::path::Path::new(&libd2).join("packages/drlg/src/excel/PresetObjectTable.bin")).unwrap();
             let theirs: Vec<i32> = bin.chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
