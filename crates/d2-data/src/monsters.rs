@@ -197,6 +197,8 @@ pub struct SpawnRules {
     pub sparse: i32,
     /// `BaseId`.
     pub base: i32,
+    /// `NextInClass` (record `+4`): the next class of its kind, -1 at the end.
+    pub next_in_class: i32,
 }
 
 /// Monster classes by id (`hcIdx`).
@@ -289,6 +291,7 @@ impl Monsters {
                     place_spawn: flag("placespawn"),
                     sparse: int("sparsePopulate"),
                     base: class_of(row.get("BaseId")),
+                    next_in_class: class_of(row.get("NextInClass")),
                 };
                 let per = |a: &str, b: &str, c: &str| [int(a), int(b), int(c)];
                 let range = |lo: [&str; 3], hi: [&str; 3]| [(int(lo[0]), int(hi[0])), (int(lo[1]), int(hi[1])), (int(lo[2]), int(hi[2]))];

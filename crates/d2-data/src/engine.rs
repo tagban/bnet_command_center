@@ -67,6 +67,18 @@ mod address {
     pub const OUTDOOR_DESERT_CLIFFS: u32 = 0x006F_2390;
     /// The Canyon of the Magi's ring of tomb pieces, nine `{preset, file, x, y}` (`0x0067F8D0`).
     pub const OUTDOOR_CANYON: u32 = 0x006F_2610;
+    /// Act III's jungle: the dead-end piece of a cell whose only links are clearing bits, by
+    /// `flags >> 4` (`0x00677880`'s last pass, `OutPlace.cpp`); 16 entries, the last three being
+    /// the first row of [`JUNGLE_PIECES`].
+    pub const JUNGLE_DEAD_ENDS: u32 = 0x006F_13BC;
+    /// Act III's jungle: a path cell's piece by its path links (row, `flags & 0xF`) and one
+    /// clearing bit (column: 0x10, 0x20, 0x40, 0x80), 16 rows of 4.
+    pub const JUNGLE_PIECES: u32 = 0x006F_13F0;
+    /// Act III's jungle: the clearing preset offset per level, indexed by level id from here
+    /// (`0x0067E910`); levels 76..=78 are read.
+    pub const JUNGLE_CLEARING_OFFSETS: u32 = 0x006F_2240;
+    /// Act III's jungle: the six orders of three clearing files (`0x0067E910`).
+    pub const JUNGLE_FILE_ORDERS: u32 = 0x006F_2328;
     /// The graphics codes a save's appearance bytes were first laid out for, `{code, item type}`
     /// by slot; the graphics table builder keeps weapons and armour out of each other's slots
     /// with it (`0x0063D710`).
@@ -128,6 +140,22 @@ pub struct EngineData {
     pub front_end: FrontEndTables,
     /// What a room's tiles are built with.
     pub tiles: TileTables,
+    /// What Act III's jungle generator looks up.
+    pub jungle: JungleTables,
+}
+
+/// Act III's jungle generator's lookup tables (`0x00677880`, `0x0067E910`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JungleTables {
+    /// A dead-end cell's piece by `flags >> 4` (0 none).
+    pub dead_ends: [i32; 16],
+    /// A path cell's piece: `[flags & 0xF][clearing bit 0x10 / 0x20 / 0x40 / 0x80]`, each lookup's
+    /// answer the next one's row (0 none).
+    pub pieces: [[i32; 4]; 16],
+    /// Levels 76, 77 and 78: what their clearing pieces add to the preset id.
+    pub clearing_offsets: [i32; 3],
+    /// The six orders a level's up to three clearings take their files in.
+    pub file_orders: [[i32; 3]; 6],
 }
 
 /// The room tile builder's tables.
@@ -264,6 +292,7 @@ impl EngineData {
             .collect();
         let front_end = FrontEndTables::read(&image).ok_or_else(|| out_of_range("front-end tables"))?;
         let tiles = TileTables::read(&image).ok_or_else(|| out_of_range("room tile tables"))?;
+        let jungle = JungleTables::read(&image).ok_or_else(|| out_of_range("jungle tables"))?;
 
         // GAMELOGON 37, ENTERGAME 1, ping 13; GameFlags 8, LoadAct 12, AssignPlayer 26.
         let sizes_ok = client_packet_sizes[0x68] == 37
@@ -300,7 +329,11 @@ impl EngineData {
             && tiles.warp_tile_offsets == [(0, 0), (1, 0), (0, 1), (1, 1)]
             && tiles.mapping_by_type[0] == -1
             && tiles.mapping_transitions[42] == 7;
-        if !sizes_ok || !presets_ok || !clock_ok || !outdoor_ok || !graphics_ok || !tiles_ok {
+        // The jungle's pieces are its `LvlPrest.txt` rows 545..=584; every file order is a
+        // permutation of three.
+        let jungle_ok = jungle.pieces.iter().flatten().chain(&jungle.dead_ends[1..]).all(|&p| p == 0 || (545..=584).contains(&p))
+            && jungle.file_orders.iter().all(|o| { let mut s = *o; s.sort_unstable(); s == [0, 1, 2] });
+        if !sizes_ok || !presets_ok || !clock_ok || !outdoor_ok || !graphics_ok || !tiles_ok || !jungle_ok {
             return Err(bad("tables do not look like 1.14d's".into()));
         }
         Ok(Self {
@@ -314,6 +347,7 @@ impl EngineData {
             reserved_graphics,
             front_end,
             tiles,
+            jungle,
         })
     }
 
@@ -437,6 +471,25 @@ impl OutdoorTables {
     }
 }
 
+impl JungleTables {
+    fn read(image: &Image) -> Option<Self> {
+        let mut dead_ends = [0i32; 16];
+        image.i32s(address::JUNGLE_DEAD_ENDS, &mut dead_ends)?;
+        let mut pieces = [0i32; 64];
+        image.i32s(address::JUNGLE_PIECES, &mut pieces)?;
+        let mut clearing_offsets = [0i32; 3];
+        image.i32s(address::JUNGLE_CLEARING_OFFSETS + 76 * 4, &mut clearing_offsets)?;
+        let mut orders = [0i32; 18];
+        image.i32s(address::JUNGLE_FILE_ORDERS, &mut orders)?;
+        Some(Self {
+            dead_ends,
+            pieces: std::array::from_fn(|r| std::array::from_fn(|c| pieces[r * 4 + c])),
+            clearing_offsets,
+            file_orders: std::array::from_fn(|r| std::array::from_fn(|c| orders[r * 3 + c])),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +515,9 @@ mod tests {
         assert!(engine.outdoor.desert_openings.iter().filter(|p| p.0 != 0).all(|&(a, b)| (364..=375).contains(&a) && (364..=375).contains(&b)));
         assert!(engine.outdoor.desert_cliffs.iter().all(|layout| layout.iter().any(|p| p[0] == 376 || p[0] == 379)));
         assert_eq!((engine.outdoor.canyon[0][0], engine.outdoor.canyon[8][0]), (384, 386));
+        // Act III: the Spider Forest's clearings are the first, the Flayer Jungle's two sets on.
+        assert_eq!(engine.jungle.clearing_offsets, [0, 10, 20]);
+        assert_eq!(engine.jungle.pieces[0], [0; 4], "a cell without path links has no path piece");
         if let Ok(libd2) = std::env::var("LIBD2_DIR") {
             let bin = std::fs::read(std::path::Path::new(&libd2).join("packages/drlg/src/excel/PresetObjectTable.bin")).unwrap();
             let theirs: Vec<i32> = bin.chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
