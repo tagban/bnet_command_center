@@ -106,6 +106,13 @@ mod address {
     /// The distance between two units under 8 subtiles apart on both axes, by `dx + dy * 8`
     /// (`0x00641530`; -1 for touching).
     pub const UNIT_DISTANCES: u32 = 0x006E_B180;
+    /// The townsfolk's NPC bits, `{class, bit}` pairs (`0x00572360`, `0x00572420`), and their
+    /// count before them.
+    pub const NPC_BITS: u32 = 0x0073_2738;
+    pub const NPC_BITS_COUNT: u32 = 0x0073_2734;
+    /// The townsfolk an act's end marks (`0x00544FA0`) and its town's arrival asks after
+    /// (`0x00545100`), by act: the list and the count each routine pushes (Act IV has none).
+    pub const ACT_END_NPCS: [(u32, usize); 5] = [(0x0073_18B0, 6), (0x0073_18C8, 11), (0x0073_18F4, 7), (0, 0), (0x0073_1910, 7)];
     /// The front end's own copy of that list, `{code, hand class, item type}` by slot, which the
     /// character-select screen draws from (`D2Comp.cpp`, `0x00506000`).
     pub const FRONT_END_GRAPHICS: u32 = 0x0072_E1E0;
@@ -179,6 +186,11 @@ pub struct EngineData {
     pub unit_distances: [i32; 64],
     /// The Gloams' dance (`0x005F39B0`).
     pub wisp_dance: WispDance,
+    /// Each townsperson's bit in a player's NPC bitfields, `(MonStats class, bit)`; a class not
+    /// listed takes bit 0 (`0x00572360`).
+    pub npc_bits: Vec<(i32, i32)>,
+    /// The townsfolk each act's end marks, by act (`0x00544FA0`); Act IV's is empty.
+    pub act_end_npcs: [Vec<i32>; 5],
 }
 
 /// The Gloams' dance figures, offsets from the target in subtiles, as `0x005F39B0` builds them
@@ -437,6 +449,22 @@ impl EngineData {
         image.i32s(address::UNIT_DISTANCES, &mut unit_distances).ok_or_else(|| out_of_range("unit distances"))?;
         // Touching close up, growing along both axes.
         let wisp_dance = image.bytes(address::WISP_DANCE_CODE, address::WISP_DANCE_CODE_LEN).and_then(WispDance::read).ok_or_else(|| out_of_range("the Gloams' dance"))?;
+        let mut npc_count = [0i32; 1];
+        image.i32s(address::NPC_BITS_COUNT, &mut npc_count).ok_or_else(|| out_of_range("NPC bit count"))?;
+        let [npc_count] = npc_count;
+        let mut npc_pairs = vec![0i32; usize::try_from(npc_count).unwrap_or(0).min(64) * 2];
+        image.i32s(address::NPC_BITS, &mut npc_pairs).ok_or_else(|| out_of_range("NPC bits"))?;
+        let npc_bits: Vec<(i32, i32)> = npc_pairs.chunks_exact(2).map(|p| (p[0], p[1])).collect();
+        let mut act_end_npcs: [Vec<i32>; 5] = Default::default();
+        for (list, &(at, count)) in act_end_npcs.iter_mut().zip(&address::ACT_END_NPCS) {
+            *list = vec![0; count];
+            if count > 0 {
+                image.i32s(at, list).ok_or_else(|| out_of_range("act-end townsfolk"))?;
+            }
+        }
+        // The bits run 0..count in table order (row 0 is the "no class" row); the Act I list
+        // starts with Akara.
+        let npcs_ok = npc_count == 35 && npc_bits.iter().enumerate().all(|(i, &(_, bit))| bit == i as i32) && act_end_npcs[0].first() == Some(&148);
         let distances_ok = unit_distances[0] == -1 && (0..7).all(|i| unit_distances[i] <= unit_distances[i + 1] && unit_distances[i * 8] <= unit_distances[i * 8 + 8]);
 
         // GAMELOGON 37, ENTERGAME 1, ping 13; GameFlags 8, LoadAct 12, AssignPlayer 26.
@@ -485,7 +513,7 @@ impl EngineData {
             && siege.frame_steps.iter().all(|&(x, y)| x.abs() + y.abs() == 1)
             && siege.rules.iter().all(|r| r[0] == 0x30 || r[0] == 0x31)
             && siege.presets.iter().all(|p| (110..=120).contains(&p[0]));
-        if !sizes_ok || !presets_ok || !clock_ok || !outdoor_ok || !graphics_ok || !tiles_ok || !jungle_ok || !hell_ok || !siege_ok || !distances_ok {
+        if !sizes_ok || !presets_ok || !clock_ok || !outdoor_ok || !graphics_ok || !tiles_ok || !jungle_ok || !hell_ok || !siege_ok || !distances_ok || !npcs_ok {
             return Err(bad("tables do not look like 1.14d's".into()));
         }
         Ok(Self {
@@ -504,6 +532,8 @@ impl EngineData {
             siege,
             unit_distances,
             wisp_dance,
+            npc_bits,
+            act_end_npcs,
         })
     }
 

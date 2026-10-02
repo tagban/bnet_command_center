@@ -331,6 +331,11 @@ pub struct ObjectClass {
     pub is_door: bool,
     /// `SizeX`, `SizeY` (record `+0xD0`, `+0xD4`): its footprint in subtiles.
     pub size: (i32, i32),
+    /// `FrameCnt0`–`FrameCnt7` (record `+0xD8`…): each mode's length in 256ths of a frame.
+    pub frame_counts: [i32; 8],
+    /// `Damage` (record `+0x19C`): a trap's share, in percent, of the damage it rolls
+    /// (`0x005DF990`).
+    pub damage: u8,
 }
 
 impl Objects {
@@ -353,6 +358,8 @@ impl Objects {
                 lockable: r.int("Lockable").unwrap_or(0) != 0,
                 is_door: r.int("IsDoor").unwrap_or(0) != 0,
                 size: (r.int("SizeX").unwrap_or(0) as i32, r.int("SizeY").unwrap_or(0) as i32),
+                frame_counts: std::array::from_fn(|i| r.int(&format!("FrameCnt{i}")).unwrap_or(0) as i32),
+                damage: r.int("Damage").and_then(|v| u8::try_from(v).ok()).unwrap_or(0),
             })
             .collect();
         Self { rows }
