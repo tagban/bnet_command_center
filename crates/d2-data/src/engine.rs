@@ -103,6 +103,9 @@ mod address {
     /// by slot; the graphics table builder keeps weapons and armour out of each other's slots
     /// with it (`0x0063D710`).
     pub const RESERVED_GRAPHICS: u32 = 0x0074_4CA8;
+    /// The distance between two units under 8 subtiles apart on both axes, by `dx + dy * 8`
+    /// (`0x00641530`; -1 for touching).
+    pub const UNIT_DISTANCES: u32 = 0x006E_B180;
     /// The front end's own copy of that list, `{code, hand class, item type}` by slot, which the
     /// character-select screen draws from (`D2Comp.cpp`, `0x00506000`).
     pub const FRONT_END_GRAPHICS: u32 = 0x0072_E1E0;
@@ -166,6 +169,9 @@ pub struct EngineData {
     pub hell: HellTables,
     /// What Act V's wilderness generator looks up.
     pub siege: SiegeTables,
+    /// `0x00641530`'s distances close up, by `dx + dy * 8` (-1 for touching): how near a player
+    /// must stand to ask another to trade.
+    pub unit_distances: [i32; 64],
 }
 
 /// Act IV's wilderness tables (`0x0067E6A0`, `0x0067E840`).
@@ -345,6 +351,10 @@ impl EngineData {
         let jungle = JungleTables::read(&image).ok_or_else(|| out_of_range("jungle tables"))?;
         let hell = HellTables::read(&image).ok_or_else(|| out_of_range("Act IV tables"))?;
         let siege = SiegeTables::read(&image).ok_or_else(|| out_of_range("Act V tables"))?;
+        let mut unit_distances = [0i32; 64];
+        image.i32s(address::UNIT_DISTANCES, &mut unit_distances).ok_or_else(|| out_of_range("unit distances"))?;
+        // Touching close up, growing along both axes.
+        let distances_ok = unit_distances[0] == -1 && (0..7).all(|i| unit_distances[i] <= unit_distances[i + 1] && unit_distances[i * 8] <= unit_distances[i * 8 + 8]);
 
         // GAMELOGON 37, ENTERGAME 1, ping 13; GameFlags 8, LoadAct 12, AssignPlayer 26.
         let sizes_ok = client_packet_sizes[0x68] == 37
@@ -392,7 +402,7 @@ impl EngineData {
             && siege.frame_steps.iter().all(|&(x, y)| x.abs() + y.abs() == 1)
             && siege.rules.iter().all(|r| r[0] == 0x30 || r[0] == 0x31)
             && siege.presets.iter().all(|p| (110..=120).contains(&p[0]));
-        if !sizes_ok || !presets_ok || !clock_ok || !outdoor_ok || !graphics_ok || !tiles_ok || !jungle_ok || !hell_ok || !siege_ok {
+        if !sizes_ok || !presets_ok || !clock_ok || !outdoor_ok || !graphics_ok || !tiles_ok || !jungle_ok || !hell_ok || !siege_ok || !distances_ok {
             return Err(bad("tables do not look like 1.14d's".into()));
         }
         Ok(Self {
@@ -409,6 +419,7 @@ impl EngineData {
             jungle,
             hell,
             siege,
+            unit_distances,
         })
     }
 
