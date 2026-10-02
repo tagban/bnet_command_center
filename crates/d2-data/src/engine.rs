@@ -134,6 +134,11 @@ mod address {
     pub const TILE_MAPPING_TRANSITIONS: u32 = 0x006E_F574;
     /// `gnRoomTileMappingByTypeAndLayer`: a seam cell's tile type to a transition row.
     pub const TILE_MAPPING_BY_TYPE: u32 = 0x006E_F620;
+    /// The Gloam's think (`0x005F39B0`) lays its dance's figures out on its stack before
+    /// anything else: the stores from here, this many bytes, are only `mov reg, imm32`,
+    /// `xor reg, reg`, `mov [ebp+disp], reg|imm32` and one `cmp [ebp+8], 0`.
+    pub const WISP_DANCE_CODE: u32 = 0x005F_39D1;
+    pub const WISP_DANCE_CODE_LEN: usize = 0x439;
     /// `VS_FIXEDFILEINFO` 1.14.3.71.
     pub const FILE_VERSION: (u32, u32) = (0x0001_000E, 0x0003_0047);
 }
@@ -172,6 +177,83 @@ pub struct EngineData {
     /// `0x00641530`'s distances close up, by `dx + dy * 8` (-1 for touching): how near a player
     /// must stand to ask another to trade.
     pub unit_distances: [i32; 64],
+    /// The Gloams' dance (`0x005F39B0`).
+    pub wisp_dance: WispDance,
+}
+
+/// The Gloams' dance figures, offsets from the target in subtiles, as `0x005F39B0` builds them
+/// on its stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WispDance {
+    /// Four dancers' spots, seven figures of four (`[ebp-0x22C]`): figure `p` (6..=12), dancer
+    /// `k` (1..=4) reads `[k + 4p - 25]`.
+    pub spots: [(i32, i32); 28],
+    /// Where each of them shoots from there, alike (`[ebp-0x14C]`); `(0, 0)` holds its fire.
+    pub shots: [(i32, i32); 28],
+    /// Five dancers' spots, dancer `k` (1..=5) reading `[k - 1]` (`[ebp-0x30]`).
+    pub pentagon: [(i32, i32); 5],
+    /// Where each of the five shoots (`[ebp-0x5C]`).
+    pub star: [(i32, i32); 5],
+}
+
+impl WispDance {
+    /// Decode the think's stores from its code (see [`address::WISP_DANCE_CODE`]): each stack
+    /// slot's last value by its `ebp` offset; `None` for any other instruction.
+    fn read(code: &[u8]) -> Option<Self> {
+        let mut regs = [None::<i32>; 8];
+        let mut slots = std::collections::BTreeMap::new();
+        let int = |at: usize| code.get(at..at + 4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        let disp = |modrm: u8, at: usize| -> Option<(i32, usize)> {
+            match modrm >> 6 {
+                1 => Some((i32::from(*code.get(at)? as i8), 1)),
+                2 => Some((int(at)?, 4)),
+                _ => None,
+            }
+        };
+        let mut i = 0;
+        while i < code.len() {
+            let op = code[i];
+            match op {
+                0xB8..=0xBF => {
+                    regs[usize::from(op - 0xB8)] = Some(int(i + 1)?);
+                    i += 5;
+                }
+                0x31 | 0x33 if code.get(i + 1).is_some_and(|m| m >> 6 == 3 && (m >> 3) & 7 == m & 7) => {
+                    regs[usize::from(code[i + 1] & 7)] = Some(0);
+                    i += 2;
+                }
+                0x89 | 0xC7 => {
+                    let modrm = *code.get(i + 1)?;
+                    if modrm & 7 != 5 || (op == 0xC7 && (modrm >> 3) & 7 != 0) {
+                        return None;
+                    }
+                    let (offset, len) = disp(modrm, i + 2)?;
+                    let value = if op == 0x89 { regs[usize::from((modrm >> 3) & 7)] } else { Some(int(i + 2 + len)?) };
+                    if let Some(v) = value {
+                        slots.insert(offset, v);
+                    } else {
+                        slots.remove(&offset);
+                    }
+                    i += 2 + len + if op == 0xC7 { 4 } else { 0 };
+                }
+                0x83 if code.get(i + 1) == Some(&0x7D) => i += 4,
+                _ => return None,
+            }
+        }
+        let pairs = |base: i32, out: &mut [(i32, i32)]| -> Option<()> {
+            for (j, pair) in out.iter_mut().enumerate() {
+                let at = base + 8 * j as i32;
+                *pair = (*slots.get(&at)?, *slots.get(&(at + 4))?);
+            }
+            Some(())
+        };
+        let mut dance = Self { spots: [(0, 0); 28], shots: [(0, 0); 28], pentagon: [(0, 0); 5], star: [(0, 0); 5] };
+        pairs(-0x22C, &mut dance.spots)?;
+        pairs(-0x14C, &mut dance.shots)?;
+        pairs(-0x30, &mut dance.pentagon)?;
+        pairs(-0x5C, &mut dance.star)?;
+        Some(dance)
+    }
 }
 
 /// Act IV's wilderness tables (`0x0067E6A0`, `0x0067E840`).
@@ -354,6 +436,7 @@ impl EngineData {
         let mut unit_distances = [0i32; 64];
         image.i32s(address::UNIT_DISTANCES, &mut unit_distances).ok_or_else(|| out_of_range("unit distances"))?;
         // Touching close up, growing along both axes.
+        let wisp_dance = image.bytes(address::WISP_DANCE_CODE, address::WISP_DANCE_CODE_LEN).and_then(WispDance::read).ok_or_else(|| out_of_range("the Gloams' dance"))?;
         let distances_ok = unit_distances[0] == -1 && (0..7).all(|i| unit_distances[i] <= unit_distances[i + 1] && unit_distances[i * 8] <= unit_distances[i * 8 + 8]);
 
         // GAMELOGON 37, ENTERGAME 1, ping 13; GameFlags 8, LoadAct 12, AssignPlayer 26.
@@ -420,6 +503,7 @@ impl EngineData {
             hell,
             siege,
             unit_distances,
+            wisp_dance,
         })
     }
 

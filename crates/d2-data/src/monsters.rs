@@ -148,6 +148,9 @@ pub struct CombatStats {
     pub low_undead: bool,
     /// `demon` (`+0xD` bit 5).
     pub demon: bool,
+    /// `threat` (record `+0x4E`): how much a boss weighing its foes makes of it; below 2 it scores
+    /// nothing (Diablo's `0x005E8530`, Baal's `0x005FBB00`).
+    pub threat: i32,
     /// `MonStats2.txt` `mDT`…`mRN`: the modes it has an animation for, bit `i` for mode `i` (DT,
     /// NU, WL, GH, A1, A2, BL, SC, S1, S2, S3, S4, DD, KB, SQ, RN); all of them for a class the
     /// table lacks.
@@ -199,6 +202,12 @@ pub struct SpawnRules {
     pub base: i32,
     /// `NextInClass` (record `+4`): the next class of its kind, -1 at the end.
     pub next_in_class: i32,
+    /// `SetBoss` (record `+0xC` bit 4): it leads its party — its `minion1`/`minion2` follow it as
+    /// a pack (`0x005B2830`).
+    pub set_boss: bool,
+    /// `BossXfer` (record `+0xC` bit 5): when such a leader dies, a minion takes the pack over
+    /// (`0x0058F530`).
+    pub boss_xfer: bool,
 }
 
 /// Monster classes by id (`hcIdx`).
@@ -292,6 +301,8 @@ impl Monsters {
                     sparse: int("sparsePopulate"),
                     base: class_of(row.get("BaseId")),
                     next_in_class: class_of(row.get("NextInClass")),
+                    set_boss: flag("SetBoss"),
+                    boss_xfer: flag("BossXfer"),
                 };
                 let per = |a: &str, b: &str, c: &str| [int(a), int(b), int(c)];
                 let range = |lo: [&str; 3], hi: [&str; 3]| [(int(lo[0]), int(hi[0])), (int(lo[1]), int(hi[1])), (int(lo[2]), int(hi[2]))];
@@ -349,6 +360,7 @@ impl Monsters {
                     undead: flag("lUndead") || flag("hUndead"),
                     low_undead: flag("lUndead"),
                     demon: flag("demon"),
+                    threat: int("threat"),
                     skill_modes: (1..=8).filter(|n| row.get(&format!("Skill{n}")).is_some_and(|s| !s.is_empty())).map(|n| row.get(&format!("Sk{n}mode")).unwrap_or_default().to_string()).collect(),
                 };
                 Some((class, MonsterClass {
