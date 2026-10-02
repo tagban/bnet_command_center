@@ -369,6 +369,14 @@ impl Mcp {
         }
     }
 
+    /// Whether the character this connection plays is a hardcore one that has died.
+    async fn selected_is_dead(&self) -> bool {
+        match &self.selected {
+            Some(selected) => self.own_character(selected).await.is_some_and(|c| is_dead_hardcore(&c)),
+            None => false,
+        }
+    }
+
     /// One of this account's characters that this client can use, by name.
     async fn own_character(&self, name: &str) -> Option<Character> {
         self.node.character_by_name(name).await.filter(|c| {
@@ -476,6 +484,9 @@ impl Mcp {
         let password = String::from_utf8_lossy(r.cstr(STR_MAX).unwrap_or_default()).into_owned();
         let (token, result) = if name.is_empty() || name.len() > 15 {
             (0, create_game_result::INVALID_NAME)
+        } else if self.selected_is_dead().await {
+            info!(peer = %self.peer, character = ?self.selected, game = %name, "game creation refused: a dead hardcore character");
+            (0, create_game_result::DEAD_HARDCORE)
         } else if let Some(game_server) = &self.realm.game_server {
             match game_server.create(&name, &password, ((flags >> 12) & 3) as u8).await {
                 Ok(Ok(id)) => {
@@ -520,6 +531,11 @@ impl Mcp {
             None => None,
         };
         let staged = match (&self.realm.game_server, character, ip) {
+            // A dead hardcore character stays on the list but plays no more (status 0x0C).
+            (_, Some(character), _) if is_dead_hardcore(&character) => {
+                info!(peer = %self.peer, character = %character.name, game = %name, "join refused: a dead hardcore character");
+                Err(join_result::DEAD_HARDCORE)
+            }
             (Some(game_server), Some(character), Some(ip)) => match game_server.join(&name, &password, character.account, &character.name).await {
                 Ok(Ok(joined)) => Ok((joined.token, joined.hash, ip)),
                 Ok(Err(e)) => Err(match e {
@@ -543,6 +559,13 @@ impl Mcp {
         }
         Frame::new(msg::JOINGAME, w.finish())
     }
+}
+
+/// Whether a stored character is a hardcore one that has died: the Diablo II game server marks it
+/// so (status `0x04` and `0x08`) when it dies, and it can create or join no game after.
+#[must_use]
+pub fn is_dead_hardcore(c: &Character) -> bool {
+    c.status & d2::status::HARDCORE != 0 && c.status & d2::status::DEAD != 0
 }
 
 /// The portrait a stored character is drawn with.

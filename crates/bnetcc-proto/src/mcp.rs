@@ -205,6 +205,8 @@ pub mod create_game_result {
     pub const NAME_TAKEN: u32 = 0x1F;
     /// "Server Down" — no game server could take the game.
     pub const SERVERS_DOWN: u32 = 0x20;
+    /// A dead hardcore character cannot create games (BNETDocs).
+    pub const DEAD_HARDCORE: u32 = 0x6E;
 }
 
 /// The token that ends an `MCP_GAMELIST` reply. Each game is its own `MCP_GAMELIST`
@@ -223,6 +225,8 @@ pub mod join_result {
     pub const FULL: u32 = 0x2B;
     /// Character does not meet the level requirement.
     pub const LEVEL_REQUIREMENT: u32 = 0x2C;
+    /// A dead hardcore character cannot join a game (BNETDocs).
+    pub const DEAD_HARDCORE: u32 = 0x6E;
 }
 
 #[cfg(test)]

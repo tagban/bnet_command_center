@@ -170,6 +170,7 @@ Wire layouts that matter and are easy to get wrong:
 | `MCP_CHARLOGON` refusal | `0x46` returns to character select *keeping* the realm connection. |
 | `MCP_GAMELIST` | One packet per game, then a terminator whose token is `0xFFFFFFFE`. |
 | `MCP_JOINGAME` failure | All six fields are still sent; the client reads them before the result. |
+| Dead hardcore character | Status `0x04` + `0x08`, set by the game server when it dies. It stays in `MCP_CHARLIST2`, drawn dead, and `MCP_CHARLOGON` still takes it (chat), but `MCP_CREATEGAME` and `MCP_JOINGAME` answer `0x6E` (BNETDocs' code; not yet checked against the client). |
 | `MCP_MOTD` | A pad byte, then the string. |
 
 ## 4. Configuration

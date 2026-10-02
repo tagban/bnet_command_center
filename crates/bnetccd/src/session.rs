@@ -4535,6 +4535,38 @@ mod tests {
         assert_eq!(jr.u32().unwrap(), join_result::OK);
     }
 
+    /// A hardcore character the game server saved dead (status `0x08`) stays on the list, drawn
+    /// dead, and can still be chosen — for chat — but cannot create or join a game (`0x6E`).
+    #[tokio::test]
+    async fn a_dead_hardcore_character_is_listed_but_plays_no_more() {
+        use bnetcc_proto::mcp::{create_game_result, join_result, msg};
+        let node = Arc::new(crate::node::test_node_with(|_| {}));
+        let addr = spawn_node(Arc::clone(&node)).await;
+        let mut bncs = d2_login(addr, product::D2XP, "Ghost", 9301).await;
+        let mut mcp = enter_realm(&mut bncs, "Ghost").await;
+        assert_eq!(create_char(&mut mcp, 3, 0x24, "Fallen").await, 0x00, "an expansion hardcore paladin");
+        let mut dead = node.character_by_name("Fallen").await.unwrap();
+        dead.status |= bnetcc_proto::d2::status::DEAD;
+        assert_eq!(node.update_character(dead).await, Ok(true));
+
+        let (total, chars) = char_list(&mut mcp).await;
+        assert_eq!(total, 1, "still listed");
+        assert_eq!(chars[0].1[26], 0x80 | 0x24 | 0x08, "drawn dead");
+        assert_eq!(char_logon(&mut mcp, "Fallen").await, 0x00, "and can be chosen");
+
+        let mut cg = Writer::new();
+        cg.u16(8).u32(0x800).u8(1).u8(0xFF).u8(8).cstr(b"hc run").cstr(b"").cstr(b"");
+        mcp_send(&mut mcp, msg::CREATEGAME, cg.finish()).await;
+        let created = mcp_recv(&mut mcp).await.body;
+        assert_eq!(u32::from_le_bytes(created[6..10].try_into().unwrap()), create_game_result::DEAD_HARDCORE);
+        let mut jg = Writer::new();
+        jg.u16(9).cstr(b"hc run").cstr(b"");
+        mcp_send(&mut mcp, msg::JOINGAME, jg.finish()).await;
+        let joined = mcp_recv(&mut mcp).await.body;
+        assert_eq!(joined.len(), 18, "every field even on failure");
+        assert_eq!(u32::from_le_bytes(joined[14..18].try_into().unwrap()), join_result::DEAD_HARDCORE);
+    }
+
     #[tokio::test]
     async fn realm_characters_belong_to_one_account() {
         let addr = spawn_server().await;
