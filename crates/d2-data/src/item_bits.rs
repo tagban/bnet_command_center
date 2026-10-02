@@ -6,7 +6,10 @@
 //! ground (modes 3 and 5) or body location 4, column 4, row 4 and page + 1 3, then the code 32.
 //! A simple item (`compactsave`, flag `0x200000`) ends there bar gold's amount, a quest item's
 //! difficulty (stat 356 in its 2 bits, for rows with `quest` and `questdiffcheck`) and a save's
-//! realm bit. A full item goes on: socketed items 3, the item's seed 32 (saves only), item level 7,
+//! realm bit. An ear (flag `0x10000`, always simple) carries no code: in its place the victim's
+//! class 3, level 7 and name in 7-bit characters ended by a 0, then a save's realm bit.
+//!
+//! A full item goes on: socketed items 3, the item's seed 32 (saves only), item level 7,
 //! quality 4, a picture index behind a present bit, an auto-affix id behind a present bit, the
 //! quality's ids (gated on identified in packets), a runeword id, a personalised name, a save's
 //! realm bit, defence and durability for armour and weapons, a stack's quantity, the socket count,
@@ -35,7 +38,9 @@ pub mod flags {
     pub const SLID_IN_BELT: u32 = 0x400;
     /// Just placed in the world: the client plays the fall.
     pub const DROPPED: u32 = 0x2000;
-    /// An ear.
+    /// On a hardcore character's ear (`0x00558D90`: the victim's client status bit 4).
+    pub const HARDCORE_EAR: u32 = 0x8000;
+    /// An ear: the victim's class, level and name in place of the code (`0x0062AF80`).
     pub const EAR: u32 = 0x1_0000;
     /// A starting item.
     pub const STARTER: u32 = 0x2_0000;
@@ -52,6 +57,12 @@ pub mod flags {
     /// A runeword: its id and a stat list follow.
     pub const RUNEWORD: u32 = 0x400_0000;
 }
+
+/// An ear's code (`0x0055A200` makes the `ear ` row; the bits never carry it).
+pub const EAR_CODE: Code = *b"ear ";
+
+/// The longest victim's name an ear carries: the item's 16-byte name buffer, less its terminator.
+pub const EAR_NAME_MAX: usize = 15;
 
 /// `questitemdifficulty`: the difficulty a quest item was made in (0 normal, 1 nightmare, 2 hell).
 /// The engine names it by number (`0x0062AF80` fails when `ItemStatCost.txt` is shorter).
@@ -228,8 +239,13 @@ pub struct Item {
     pub book: u8,
     /// Runeword id.
     pub runeword: u16,
-    /// A personalised name.
+    /// A personalised name, or an ear's victim (the engine keeps both in one buffer, item data
+    /// `+0x4A`).
     pub name: String,
+    /// An ear's victim's class (item data `+0x28`, which other items use for their quality's id).
+    pub ear_class: u8,
+    /// An ear's victim's level, 1–99 (item data `+0x48`).
+    pub ear_level: u8,
     /// Realm data (saves only): two words, when present.
     pub realm: Option<(u32, u32)>,
     /// Base defence (armour).
@@ -278,6 +294,8 @@ impl Item {
             book: 0,
             runeword: 0,
             name: String::new(),
+            ear_class: 0,
+            ear_level: 0,
             realm: None,
             defense: 0,
             max_durability: 0,
@@ -291,6 +309,25 @@ impl Item {
             filled: Vec::new(),
             unit: 0,
         }
+    }
+
+    /// The ear `0x0055A200` cuts from a player of `class` at `level` called `victim` (`0x00556D80`
+    /// sets the flag and the class, `0x00558D90` the name and level, flag `0x8000` for a hardcore
+    /// one): simple, normal, identified, item level the victim's.
+    #[must_use]
+    pub fn ear(version: u16, class: u8, level: u8, victim: &str, hardcore: bool, location: Location) -> Self {
+        let mut ear = Self::new(EAR_CODE, version, level, location);
+        ear.flags |= flags::EAR | flags::COMPACT | if hardcore { flags::HARDCORE_EAR } else { 0 };
+        ear.ear_class = class;
+        ear.ear_level = level;
+        ear.name = victim.chars().filter(char::is_ascii).take(EAR_NAME_MAX).collect();
+        ear
+    }
+
+    /// Whether it is an ear.
+    #[must_use]
+    pub fn is_ear(&self) -> bool {
+        self.flags & flags::EAR != 0
     }
 
     /// Whether it is identified.
@@ -320,8 +357,6 @@ pub enum ReadError {
     UnknownCode(Code),
     /// A stat id the table does not have.
     UnknownStat(u16),
-    /// An ear, which is not modelled.
-    Ear,
 }
 
 struct Writer {
@@ -485,8 +520,10 @@ fn write_as(item: &Item, items: &Items, stats: &ItemStats, target: Target, gambl
     let save = target == Target::Save;
     let gamble = gamble && !save && item.flags & flags::IDENTIFIED == 0 && (4..=9).contains(&item.quality.number());
     let mut w = Writer { bytes: Vec::new(), bit: 0 };
-    let kind = kind(items, &item.code);
-    let compact = kind.as_ref().is_some_and(|k| k.compact);
+    let ear = item.flags & flags::EAR != 0;
+    let kind = kind(items, if ear { &EAR_CODE } else { &item.code });
+    // An ear is always simple: `0x0062AF80` is the only writer that knows its fields.
+    let compact = ear || kind.as_ref().is_some_and(|k| k.compact);
     if save {
         w.put(0x4D4A, 16);
     }
@@ -530,7 +567,17 @@ fn write_as(item: &Item, items: &Items, stats: &ItemStats, target: Target, gambl
         w.put(u32::from_le_bytes(normal), 32);
         return w.bytes;
     }
-    w.put(u32::from_le_bytes(item.code), 32);
+    if ear {
+        // `0x0062AF80`: the class, the level (1 without item data) and the name with its 0, each
+        // clamped as the engine clamps.
+        w.clamped(u32::from(item.ear_class), 3);
+        w.clamped(u32::from(item.ear_level), 7);
+        for c in item.name.bytes().take(EAR_NAME_MAX).chain(std::iter::once(0)) {
+            w.clamped(u32::from(c), 7);
+        }
+    } else {
+        w.put(u32::from_le_bytes(item.code), 32);
+    }
     let Some(kind) = kind else { return w.bytes };
     if compact {
         if kind.gold {
@@ -676,7 +723,7 @@ fn write_realm(w: &mut Writer, realm: Option<(u32, u32)>) {
 ///
 /// # Errors
 ///
-/// [`ReadError`] if the bits run out, name what the tables lack, or are an ear.
+/// [`ReadError`] if the bits run out or name what the tables lack (an ear needs the `ear ` row).
 pub fn read(bytes: &[u8], items: &Items, stats: &ItemStats, target: Target) -> Result<(Item, usize), ReadError> {
     let save = target == Target::Save;
     let mut r = Reader { bytes, bit: 0 };
@@ -684,9 +731,6 @@ pub fn read(bytes: &[u8], items: &Items, stats: &ItemStats, target: Target) -> R
         return Err(ReadError::NoMarker);
     }
     let item_flags = r.get(32)?;
-    if item_flags & flags::EAR != 0 {
-        return Err(ReadError::Ear);
-    }
     let version = r.get(10)? as u16;
     let mode = r.get(3)?;
     let location = if mode == 3 || mode == 5 {
@@ -706,11 +750,28 @@ pub fn read(bytes: &[u8], items: &Items, stats: &ItemStats, target: Target) -> R
             _ => Location::Socketed { slot: col },
         }
     };
-    let code = r.get(32)?.to_le_bytes();
+    // An ear's fields stand in its code's place (`0x0062A970`); the game made it of the `ear ` row.
+    let ear = item_flags & flags::EAR != 0;
+    let mut ear_fields = (0, 0, String::new());
+    let code = if ear {
+        ear_fields.0 = r.get(3)? as u8;
+        ear_fields.1 = r.get(7)? as u8;
+        loop {
+            let c = r.get(7)? as u8;
+            if c == 0 {
+                break;
+            }
+            ear_fields.2.push(char::from(c));
+        }
+        EAR_CODE
+    } else {
+        r.get(32)?.to_le_bytes()
+    };
     let kind = kind(items, &code).ok_or(ReadError::UnknownCode(code))?;
     let mut item = Item::new(code, version, 1, location);
     item.flags = item_flags;
-    if item_flags & flags::COMPACT != 0 {
+    (item.ear_class, item.ear_level, item.name) = ear_fields;
+    if ear || item_flags & flags::COMPACT != 0 {
         item.quality = Quality::Normal;
         if kind.gold {
             let big = r.get(1)? != 0;
@@ -901,13 +962,15 @@ mod tests {
     fn rules() -> (Items, ItemStats) {
         let itemtypes = Table::parse(
             b"ItemType\tCode\tEquiv1\tEquiv2\tVarInvGfx\r\nNone\t\t\t\t0\r\nAny Armor\tarmo\t\t\t0\r\nHelm\thelm\tarmo\t\t0\r\nAny Shield\tshld\tarmo\t\t0\r\nShield\tshie\tshld\t\t0\r\n\
-              Weapon\tweap\t\t\t0\r\nAxe\taxe\tweap\t\t0\r\nBook\tbook\t\t\t0\r\nKey\tkey\t\t\t0\r\nGold\tgold\t\t\t0\r\nRing\tring\t\t\t5\r\n",
+              Weapon\tweap\t\t\t0\r\nAxe\taxe\tweap\t\t0\r\nBook\tbook\t\t\t0\r\nKey\tkey\t\t\t0\r\nGold\tgold\t\t\t0\r\nRing\tring\t\t\t5\r\n\
+              Body Part\tbody\t\t\t0\r\nPlayer Body Part\tplay\tbody\t\t0\r\n",
         );
         let weapons = Table::parse(b"name\tcode\ttype\tcompactsave\tstackable\r\nLarge Axe\tlax\taxe\t0\t0\r\n");
         let armor = Table::parse(b"name\tcode\ttype\tcompactsave\tstackable\r\nCap\tcap\thelm\t0\t0\r\nBuckler\tbuc\tshie\t0\t0\r\n");
         let misc = Table::parse(
             b"name\tcode\ttype\tcompactsave\tstackable\tquest\tquestdiffcheck\r\nTown Portal Book\ttbk\tbook\t0\t1\t\t\r\nIdentify Book\tibk\tbook\t0\t1\t\t\r\n\
-              Skeleton Key\tkey\tkey\t0\t1\t\t\r\ngold\tgld\tgold\t1\t1\t\t\r\nRing\trin\tring\t0\t0\t\t\r\nBark Scroll\tbks\tques\t1\t0\t5\t1\r\nChipped Ruby\tgcr\tgema\t1\t0\t\t\r\n",
+              Skeleton Key\tkey\tkey\t0\t1\t\t\r\ngold\tgld\tgold\t1\t1\t\t\r\nRing\trin\tring\t0\t0\t\t\r\nBark Scroll\tbks\tques\t1\t0\t5\t1\r\nChipped Ruby\tgcr\tgema\t1\t0\t\t\r\n\
+              Ear\tear\tplay\t1\t0\t\t\r\n",
         );
         let items = Items::from_tables(&itemtypes, &weapons, &armor, &misc).unwrap();
         let stats = ItemStats::from_table(&Table::parse(
@@ -1017,5 +1080,54 @@ mod tests {
         list.extend_from_slice(b"JM\0\0");
         let (read_back, end) = read_save_list(&list, &items, &stats).unwrap();
         assert_eq!((read_back.len(), read_back[1].location, &list[end..]), (2, Location::Stored { col: 2, row: 1, page: 0 }, &b"JM\0\0"[..]), "the corpse list follows");
+    }
+
+    /// An ear: its class, level and name stand where its code would (`0x0062AF80`), read back by
+    /// `0x0062A970` in a packet and in a save, among other items.
+    #[test]
+    fn an_ear_carries_its_victims_class_level_and_name_in_place_of_its_code() {
+        let (items, stats) = rules();
+        let ear = Item::ear(101, 3, 42, "Somebody", false, Location::Stored { col: 2, row: 1, page: 0 });
+        assert!(ear.is_ear() && ear.flags & flags::COMPACT != 0 && ear.identified());
+        assert_eq!((ear.code, ear.level, ear.quality), (EAR_CODE, 42, Quality::Normal));
+
+        // In a packet: 32 flag bits, 10 version, 3 mode, 15 of place, then 3 + 7 and nine names'
+        // worth of 7 bits (eight letters and the 0): 133 bits, 17 bytes. No code.
+        let sent = write(&ear, &items, &stats, Target::Network);
+        assert_eq!(sent.len(), 17);
+        let bits = |bytes: &[u8], at: usize, n: usize| (0..n).fold(0u32, |v, i| v | u32::from(bytes[(at + i) / 8] >> ((at + i) % 8) & 1) << i);
+        assert_eq!((bits(&sent, 60, 3), bits(&sent, 63, 7), bits(&sent, 70, 7)), (3, 42, u32::from(b'S')));
+        assert_eq!(bits(&sent, 0, 32) & (flags::EAR | flags::COMPACT | flags::WRITTEN), flags::EAR | flags::COMPACT | flags::WRITTEN);
+        let (seen, used) = read(&sent, &items, &stats, Target::Network).unwrap();
+        assert_eq!(used, sent.len());
+        assert_eq!((seen.code, seen.ear_class, seen.ear_level, seen.name.as_str()), (EAR_CODE, 3, 42, "Somebody"));
+        assert_eq!(write(&seen, &items, &stats, Target::Network), sent, "writes back byte for byte");
+
+        // In a save: `JM` first and the realm bit last.
+        let saved = write(&ear, &items, &stats, Target::Save);
+        assert_eq!(saved.len(), (16 + 133 + 1usize).div_ceil(8));
+        let (back, used) = read(&saved, &items, &stats, Target::Save).unwrap();
+        assert_eq!(used, saved.len());
+        let mut expect = ear.clone();
+        expect.flags |= flags::WRITTEN;
+        expect.level = 1;
+        assert_eq!(back, expect, "all but the item level, which a simple item does not carry");
+
+        // A hardcore victim's ear keeps its flag; a name is cut to fifteen letters; and an ear
+        // between other items leaves them where they were.
+        let hardcore = Item::ear(101, 6, 99, "Abcdefghijklmnopqrst", true, Location::Ground { x: 5000, y: 5100 });
+        assert_eq!((hardcore.flags & flags::HARDCORE_EAR, hardcore.name.as_str()), (flags::HARDCORE_EAR, "Abcdefghijklmno"));
+        let ring = Item::new(code("rin"), 101, 5, Location::Stored { col: 0, row: 0, page: 0 });
+        let mut stored = hardcore.clone();
+        stored.location = Location::Stored { col: 4, row: 0, page: 4 };
+        let list = write_save_list(&[ring.clone(), stored.clone(), ear.clone()], &items, &stats);
+        let (back, used) = read_save_list(&list, &items, &stats).unwrap();
+        assert_eq!(used, list.len());
+        assert_eq!(back.iter().map(Item::is_ear).collect::<Vec<_>>(), [false, true, true]);
+        assert_eq!((back[1].ear_class, back[1].ear_level, back[1].name.as_str(), back[1].location), (6, 99, "Abcdefghijklmno", stored.location));
+        assert_eq!(back[1].flags & flags::HARDCORE_EAR, flags::HARDCORE_EAR);
+        assert_eq!((back[2].name.as_str(), back[0].code), ("Somebody", code("rin")));
+        let (dropped, _) = read(&write(&hardcore, &items, &stats, Target::Network), &items, &stats, Target::Network).unwrap();
+        assert_eq!((dropped.location, dropped.ear_level), (Location::Ground { x: 5000, y: 5100 }, 99), "on the ground too");
     }
 }
