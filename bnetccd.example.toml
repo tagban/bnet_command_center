@@ -193,8 +193,11 @@ path = "bnetccd.db"
 # real classic clients (Diablo I, War2 BNE, old PowerPC Mac clients) need to pass
 # CheckRevision, plus icons.bni, tos.txt and ad images. The server advertises the
 # platform-matched name — IX86ver1.mpq / PMACver1.mpq / XMACver1.mpq — so supply the
-# platforms you want to admit. A stock PvPGN files/ directory has all of them. Empty
-# disables BNFTP serving (real classic clients then hang at "Checking versions").
+# platforms you want to admit. A stock PvPGN files/ directory has all of them. Diablo II and
+# newer WarCraft III use ver-<platform>-N.mpq instead: ver-<platform>-1.mpq if present, else
+# the lowest N (0–7) present. PvPGN ships only ver-IX86-1.mpq; a Mac Diablo II client needs
+# ver-XMAC-N.mpq (OS X) or ver-PMAC-N.mpq (Mac OS 9) from an archive of Battle.net's files.
+# Empty disables BNFTP serving (real classic clients then hang at "Checking versions").
 dir = ""
 
 [diablo2]

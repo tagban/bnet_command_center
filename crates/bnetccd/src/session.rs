@@ -252,6 +252,22 @@ fn version_mpq_name(
     }
 }
 
+/// The `ver-` CheckRevision MPQ to hand a client, given which files the operator has. Battle.net
+/// numbered these 0–7 and named the one it chose; [`version_mpq_name`] defaults to `-1`, but a
+/// platform's set may lack it (the archived Mac ones are `ver-XMAC-0.mpq` and `ver-PMAC-0.mpq`),
+/// and the number is the file's own, so a client is named a file that is there rather than one
+/// renamed to fit. With none of `ver-<platform>-0..7.mpq` present the default is kept, so the
+/// BNFTP log names what is missing. Other names pass through.
+fn served_version_mpq(name: String, has: impl Fn(&str) -> bool) -> String {
+    let Some(plat) = name.strip_prefix("ver-").and_then(|r| r.strip_suffix("-1.mpq")) else {
+        return name;
+    };
+    if has(&name) {
+        return name;
+    }
+    (0..=7).map(|n| format!("ver-{plat}-{n}.mpq")).find(|n| has(n)).unwrap_or(name)
+}
+
 /// The BNI icon file to advertise for a client's product. StarCraft/Brood War and
 /// WarCraft III have their own icon packs; everything else (Diablo, Warcraft II BNE, the
 /// old Mac clients) uses the shared `icons.bni`. An operator supplies these in the BNFTP
@@ -359,7 +375,8 @@ async fn bnftp_session(
     // version-check MPQ (the file we advertise in SID_AUTH_INFO).
     let requested = if is_v2 && requested.is_empty() {
         // The BNFTP request carries no game version byte, so fall back to the modern name.
-        version_mpq_name(Some(request.platform), Some(request.product), None).into_bytes()
+        let name = version_mpq_name(Some(request.platform), Some(request.product), None);
+        served_version_mpq(name, |n| node.file_mtime(n.as_bytes()).is_some()).into_bytes()
     } else {
         requested
     };
@@ -977,6 +994,12 @@ impl Bncs {
         }
     }
 
+    /// The CheckRevision MPQ to name to this client: its platform's, by the files at hand.
+    fn version_mpq(&self) -> String {
+        let name = version_mpq_name(self.platform, self.product, self.version_byte);
+        served_version_mpq(name, |n| self.node.file_mtime(n.as_bytes()).is_some())
+    }
+
     fn auth_info(&mut self, frame: &Frame) -> Step {
         let mut r = frame.reader();
         let parsed = (|| {
@@ -1037,7 +1060,7 @@ impl Bncs {
         let nls = srp && !self.node.wc3_legacy_logon;
         let logon_type: u32 = if nls { 0x02 } else { 0x00 };
 
-        let mpq = version_mpq_name(self.platform, self.product, self.version_byte);
+        let mpq = self.version_mpq();
         // The file's real modification time, so a client that caches the MPQ by filetime
         // (WarCraft III does) decides correctly whether to re-fetch it; 0 if we lack the file.
         let mpq_filetime = self.node.file_mtime(mpq.as_bytes()).map_or(0, unix_to_filetime);
@@ -1536,7 +1559,7 @@ impl Bncs {
                 "SID_STARTVERSIONING (legacy)"
             );
         }
-        let mpq = version_mpq_name(self.platform, self.product, self.version_byte);
+        let mpq = self.version_mpq();
         let mpq_filetime = self.node.file_mtime(mpq.as_bytes()).map_or(0, unix_to_filetime);
         let mut w = Writer::with_capacity(64);
         w.u64(mpq_filetime) // MPQ filetime
@@ -3964,6 +3987,24 @@ mod tests {
         assert_eq!(version_mpq_name(ix86, Some(product::SEXP), None), "IX86ver1.mpq");
         assert_eq!(version_mpq_name(ix86, Some(product::W2BN), None), "IX86ver1.mpq");
         assert_eq!(version_mpq_name(None, None, None), "IX86ver1.mpq");
+    }
+
+    #[test]
+    fn a_missing_ver_one_mpq_is_stood_in_for_by_a_number_the_operator_has() {
+        fn has<'a>(files: &'a [&str]) -> impl Fn(&str) -> bool + 'a {
+            move |n| files.contains(&n)
+        }
+        // The archived Mac sets have only `-0`: the client is named that, not a `-1` it can't fetch.
+        let mac = ["ver-XMAC-0.mpq", "ver-PMAC-0.mpq", "ver-IX86-1.mpq"];
+        assert_eq!(served_version_mpq("ver-XMAC-1.mpq".into(), has(&mac)), "ver-XMAC-0.mpq");
+        assert_eq!(served_version_mpq("ver-PMAC-1.mpq".into(), has(&mac)), "ver-PMAC-0.mpq");
+        // `-1` is kept wherever it is there, and when nothing of the platform's is.
+        assert_eq!(served_version_mpq("ver-IX86-1.mpq".into(), has(&mac)), "ver-IX86-1.mpq");
+        assert_eq!(served_version_mpq("ver-IX86-1.mpq".into(), has(&["ver-IX86-0.mpq", "ver-IX86-1.mpq"])), "ver-IX86-1.mpq");
+        assert_eq!(served_version_mpq("ver-IX86-1.mpq".into(), has(&["ver-IX86-5.mpq", "ver-IX86-3.mpq"])), "ver-IX86-3.mpq");
+        assert_eq!(served_version_mpq("ver-XMAC-1.mpq".into(), has(&[])), "ver-XMAC-1.mpq");
+        // The classic names are not numbered this way.
+        assert_eq!(served_version_mpq("XMACver1.mpq".into(), has(&["XMACver0.mpq"])), "XMACver1.mpq");
     }
 
     #[tokio::test]
