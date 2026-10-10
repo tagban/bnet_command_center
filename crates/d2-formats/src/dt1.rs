@@ -168,7 +168,7 @@ impl Block {
     /// (`left`, `top`). Pixels landing outside the buffer are dropped. Only the pixels the block
     /// codes are written; an RLE block's skipped pixels are left as they were.
     pub fn paint(&self, out: &mut [u8], stride: usize, left: i32, top: i32) {
-        let rows = if stride == 0 { 0 } else { out.len() / stride };
+        let rows = out.len().checked_div(stride).unwrap_or(0);
         let mut put = |x: i32, y: i32, p: u8| {
             if x >= 0 && y >= 0 && (x as usize) < stride && (y as usize) < rows {
                 out[y as usize * stride + x as usize] = p;
