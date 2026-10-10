@@ -4576,6 +4576,120 @@ mod tests {
         assert_eq!(jr.u32().unwrap(), join_result::OK);
     }
 
+    #[tokio::test]
+    async fn the_join_game_screen_lists_and_describes_the_game_servers_games() {
+        use bnetcc_gslink::{FromGameServer, GameSettings, Joined, LobbyGame, LobbyPlayer, ToGameServer};
+        use bnetcc_proto::mcp::{create_game_result, game_status, join_result, msg};
+
+        let (link, link_addr) = crate::gslink::tests::listening("s3cret").await;
+        let node = crate::node::test_node_with(|c| {
+            if let Some(realm) = c.d2_realm.as_mut() {
+                realm.game_server = Some(Arc::clone(&link));
+            }
+        });
+        let addr = spawn_node(Arc::new(node)).await;
+        let mut bncs = d2_login(addr, product::D2XP, "Lister", 9211).await;
+        let mut mcp = enter_realm(&mut bncs, "Lister").await;
+        assert_eq!(create_char(&mut mcp, 4, 0x20, "Wirt").await, 0x00, "an expansion barbarian, level 1");
+
+        let made = |expansion, hardcore| GameSettings {
+            description: "moo".into(),
+            max_players: 4,
+            level_difference: Some(3),
+            creator_level: 1,
+            expansion,
+            hardcore,
+            ladder: false,
+        };
+        let game = |token: u16, name: &str, difficulty: u8, settings: GameSettings| LobbyGame {
+            token,
+            name: name.into(),
+            private: token == 7,
+            difficulty,
+            settings: Some(settings),
+            players: vec![LobbyPlayer { name: "Akara".into(), class: 1, level: 2 }],
+            age_secs: 3725,
+        };
+        let games = vec![
+            game(7, "cows", 0, made(true, false)),
+            game(8, "hc", 0, made(true, true)),
+            game(9, "hell", 2, made(true, false)),
+            game(10, "classic", 0, made(false, false)),
+        ];
+        let _gs = crate::gslink::tests::fake_game_server_speaking(link_addr, "s3cret", bnetcc_gslink::VERSION, move |request| match request {
+            ToGameServer::CreateGame { id, settings, .. } => {
+                Some(FromGameServer::Created { id, result: if settings == made(true, false) { Ok(7) } else { Err(bnetcc_gslink::CreateError::NameTaken) } })
+            }
+            ToGameServer::ListGames { id } => Some(FromGameServer::GameList { id, games: games.clone() }),
+            ToGameServer::GameInfo { id, name } => Some(FromGameServer::GameInfo { id, game: games.iter().find(|g| g.name == name).cloned() }),
+            ToGameServer::Join { id, .. } => Some(FromGameServer::Joined { id, result: Ok(Joined { token: 7, hash: 1 }) }),
+            _ => None,
+        })
+        .await;
+        for _ in 0..200 {
+            if link.connected() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The create carries the description, the limits and the creator's kind and level.
+        let mut cg = Writer::new();
+        cg.u16(2).u32(0).u8(1).u8(3).u8(4).cstr(b"cows").cstr(b"pw").cstr(b"moo");
+        mcp_send(&mut mcp, msg::CREATEGAME, cg.finish()).await;
+        let created = mcp_recv(&mut mcp).await.body;
+        assert_eq!(u32::from_le_bytes(created[6..10].try_into().unwrap()), create_game_result::OK);
+
+        // Only the softcore expansion Normal game is this character's to join.
+        let mut gl = Writer::new();
+        gl.u16(3).u32(0).cstr(b"");
+        mcp_send(&mut mcp, msg::GAMELIST, gl.finish()).await;
+        let listed = mcp_recv(&mut mcp).await;
+        assert_eq!(listed.id, msg::GAMELIST);
+        let mut expected = Writer::new();
+        expected.u16(3).u32(7).u8(1).u32(0x0010_0004).cstr(b"cows").cstr(b"moo");
+        assert_eq!(listed.body, expected.finish());
+        let end = mcp_recv(&mut mcp).await;
+        assert_eq!(end.body, [3, 0, 0, 0, 0, 0, 0, 0xFE, 0xFF, 0xFF, 0xFF]);
+        let mut gl = Writer::new();
+        gl.u16(4).u32(0).cstr(b"pigs");
+        mcp_send(&mut mcp, msg::GAMELIST, gl.finish()).await;
+        assert_eq!(mcp_recv(&mut mcp).await.body[7..11], game_status::END.to_le_bytes(), "the filter leaves nothing");
+
+        let info = |id: u16, name: &[u8]| {
+            let mut w = Writer::new();
+            w.u16(id).cstr(name);
+            w.finish()
+        };
+        mcp_send(&mut mcp, msg::GAMEINFO, info(5, b"cows")).await;
+        let described = mcp_recv(&mut mcp).await.body;
+        assert_eq!(&described[..2], &[5, 0]);
+        assert_eq!(u32::from_le_bytes(described[6..10].try_into().unwrap()), 3725);
+        assert_eq!(&described[10..14], &[1, 3, 4, 1], "level 1, difference 3, up to 4 players, one character");
+        assert_eq!((described[14], described[30]), (1, 2), "a level 2 sorceress");
+        assert_eq!(&described[46..], b"moo\0Akara\0");
+        mcp_send(&mut mcp, msg::GAMEINFO, info(6, b"gone")).await;
+        let gone = mcp_recv(&mut mcp).await.body;
+        assert_eq!(gone[2..6], game_status::NONE.to_le_bytes());
+
+        // A join the list would not have offered is refused with the client's reason.
+        let join = |id: u16, name: &[u8]| {
+            let mut w = Writer::new();
+            w.u16(id).cstr(name).cstr(b"");
+            w.finish()
+        };
+        let result = |body: &[u8]| u32::from_le_bytes(body[14..18].try_into().unwrap());
+        for (id, name, expected) in [
+            (7, &b"hc"[..], join_result::NOT_HARDCORE),
+            (8, b"hell", join_result::NO_HELL),
+            (9, b"classic", join_result::NOT_CLASSIC),
+            (10, b"cows", join_result::OK),
+        ] {
+            mcp_send(&mut mcp, msg::JOINGAME, join(id, name)).await;
+            assert_eq!(result(&mcp_recv(&mut mcp).await.body), expected, "{}", String::from_utf8_lossy(name));
+        }
+    }
+
     /// A hardcore character the game server saved dead (status `0x08`) stays on the list, drawn
     /// dead, and can still be chosen — for chat — but cannot create or join a game (`0x6E`).
     #[tokio::test]

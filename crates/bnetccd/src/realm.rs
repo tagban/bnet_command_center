@@ -14,9 +14,16 @@
 //! [`crate::node::RealmTicket`].
 //!
 //! **Games are played on a separate game server.** Create and join are passed over the link
-//! (`crate::gslink`) to the Diablo II game server, its own program; while none is linked the lobby
-//! answers "Server Down" / "game does not exist", which the client shows as ordinary messages.
-//! Characters, selection and chat all work without it.
+//! (`crate::gslink`) to the Diablo II game server, its own program, and the Join Game screen's list
+//! and details come from it; while none is linked the lobby answers "Server Down" / "game does not
+//! exist" and an empty list, which the client shows as ordinary messages. Characters, selection and
+//! chat all work without it.
+//!
+//! The game list holds only the games the playing character could join, as the realm did: of its
+//! kind (expansion or classic, hardcore or softcore, ladder or not), a difficulty it has reached,
+//! within the game's level restriction, and not full. Games with a password are listed too — the
+//! Join Game screen has a password box. A join the list would not have offered is refused with the
+//! client's own reason.
 //!
 //! Wire layouts are from BNETDocs, cross-checked against the MIT-licensed
 //! `jaenster/d2-dedicated-server` realm (a retail 1.14d client renders its replies) — see
@@ -28,6 +35,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bnetcc_proto::buf::{RecvBuf, Writer};
 use bnetcc_proto::d2::{self, Portrait};
+use bnetcc_gslink::{GameSettings, LobbyGame};
 use bnetcc_proto::mcp::{
     self, char_create_result, char_delete_result, char_logon_result, create_game_result,
     join_result, msg, startup_result, Frame,
@@ -51,6 +59,14 @@ const IDLE: Duration = Duration::from_secs(24 * 3600);
 
 /// Result for a failed `MCP_CHARUPGRADE`.
 const UPGRADE_FAILED: u32 = 0x7A;
+
+/// The most games one `MCP_GAMELIST` reply lists: the 1.14d client keeps 1000 (`0x0077BDC8`, 59
+/// bytes each).
+const GAMELIST_MAX: usize = 1000;
+
+/// A level difference of this or more means none: the client shows no level line for it, and
+/// sends `0xFF` when the box is unticked.
+const NO_LEVEL_DIFFERENCE: u8 = 100;
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
@@ -204,15 +220,8 @@ impl Mcp {
                 w.u8(0).cstr(self.node.motd.as_bytes());
                 Some(Frame::new(msg::MOTD, w.finish()))
             }
-            msg::GAMELIST => Some(self.game_list(frame)),
-            msg::GAMEINFO => {
-                let mut r = frame.reader();
-                let request_id = r.u16().unwrap_or(0);
-                let mut w = Writer::with_capacity(16);
-                // Token -1: "no information", which the client reads before anything else.
-                w.u16(request_id).u32(0xFFFF_FFFF).bytes(&[0; 8]);
-                Some(Frame::new(msg::GAMEINFO, w.finish()))
-            }
+            msg::GAMELIST => return (self.game_list(frame).await, true),
+            msg::GAMEINFO => Some(self.game_info(frame).await),
             msg::CREATEGAME => Some(self.create_game(frame).await),
             msg::JOINGAME => Some(self.join_game(frame).await),
             msg::REQUESTLADDERDATA => Some(self.ladder_data(frame).await),
@@ -459,36 +468,92 @@ impl Mcp {
         Some(Frame::new(msg::CHARUPGRADE, w.finish()))
     }
 
-    /// `MCP_GAMELIST`: `u16 request id, u32 unknown, cstr filter`. Each game would be its own
-    /// packet; with no game server there are none, so the reply is only the end-of-list
-    /// marker: `u16 request id, u32 0, u8 0, u32 end token`.
-    fn game_list(&self, frame: &Frame) -> Frame {
-        let request_id = frame.reader().u16().unwrap_or(0);
-        let mut w = Writer::with_capacity(11);
-        w.u16(request_id).u32(0).u8(0).u32(mcp::GAMELIST_END_TOKEN);
-        Frame::new(msg::GAMELIST, w.finish())
+    /// The character this connection plays, if it has chosen or made one.
+    async fn playing(&self) -> Option<Character> {
+        match &self.selected {
+            Some(selected) => self.own_character(selected).await,
+            None => None,
+        }
     }
 
-    /// `MCP_CREATEGAME`: `u16 request id, u32 flags, u8, u8, u8, cstr name, cstr password,
-    /// cstr description`, difficulty in `(flags >> 12) & 3`. Reply: `u16 request id, u16 token,
-    /// u16 unknown, u32 result`.
+    /// `MCP_GAMELIST`: `u16 request id, u32 flags (0x800 for a hardcore character), cstr filter`.
+    /// The reply is one `MCP_GAMELIST` packet per game the playing character may join whose name
+    /// holds the filter ([`listable`]), then the end marker ([`mcp::gamelist_end`]). The 1.14d
+    /// client asks again every 15 seconds while the screen is open.
+    async fn game_list(&self, frame: &Frame) -> Vec<Frame> {
+        let mut r = frame.reader();
+        let request_id = r.u16().unwrap_or(0);
+        let _flags = r.u32().unwrap_or(0);
+        let filter = String::from_utf8_lossy(r.cstr(STR_MAX).unwrap_or_default()).into_owned();
+        let games = match (&self.realm.game_server, self.playing().await) {
+            (Some(game_server), Some(character)) => {
+                game_server.list_games().await.unwrap_or_default().into_iter().filter(|g| listable(&character, g, &filter)).collect()
+            }
+            _ => Vec::new(),
+        };
+        debug!(peer = %self.peer, games = games.len(), %filter, "game list");
+        let mut frames: Vec<Frame> = games
+            .iter()
+            .take(GAMELIST_MAX)
+            .map(|g| {
+                let description = g.settings.as_ref().map_or("", |s| s.description.as_str());
+                let players = u8::try_from(g.players.len()).unwrap_or(u8::MAX);
+                let body = mcp::gamelist_entry(request_id, u32::from(g.token), players, status_of(g), g.name.as_bytes(), description.as_bytes());
+                Frame::new(msg::GAMELIST, body)
+            })
+            .collect();
+        frames.push(Frame::new(msg::GAMELIST, mcp::gamelist_end(request_id)));
+        frames
+    }
+
+    /// `MCP_GAMEINFO`: `u16 request id, cstr name` — the Join Game screen asks about the game
+    /// selected in the list. The reply is [`mcp::gameinfo_reply`], or [`mcp::gameinfo_none`] for a
+    /// game that is gone.
+    async fn game_info(&self, frame: &Frame) -> Frame {
+        let mut r = frame.reader();
+        let request_id = r.u16().unwrap_or(0);
+        let name = String::from_utf8_lossy(r.cstr(STR_MAX).unwrap_or_default()).into_owned();
+        let game = match &self.realm.game_server {
+            Some(game_server) => game_server.game_info(&name).await.ok().flatten(),
+            None => None,
+        };
+        Frame::new(msg::GAMEINFO, game.map_or_else(|| mcp::gameinfo_none(request_id), |g| gameinfo_body(request_id, &g)))
+    }
+
+    /// `MCP_CREATEGAME`: `u16 request id, u32 flags, u8 1, u8 level difference (0xFF for none),
+    /// u8 max players, cstr name, cstr password, cstr description`, difficulty in
+    /// `(flags >> 12) & 3` (1.14d `0x0044A400`). Reply: `u16 request id, u16 token, u16 unknown,
+    /// u32 result`. The game is of the creating character's kind, and the lobby shows its level.
     async fn create_game(&self, frame: &Frame) -> Frame {
         let mut r = frame.reader();
         let request_id = r.u16().unwrap_or(0);
-        let (flags, name) = (|| {
+        let (flags, level_difference, max_players, name) = (|| {
             let flags = r.u32()?;
-            r.bytes(3)?;
-            Ok::<_, bnetcc_proto::ProtoError>((flags, r.cstr(STR_MAX)?))
+            let _ = r.u8()?;
+            let level_difference = r.u8()?;
+            let max_players = r.u8()?;
+            Ok::<_, bnetcc_proto::ProtoError>((flags, level_difference, max_players, r.cstr(STR_MAX)?))
         })()
-        .map_or((0, String::new()), |(f, n)| (f, String::from_utf8_lossy(n).into_owned()));
+        .map_or((0, 0xFF, 8, String::new()), |(f, l, m, n)| (f, l, m, String::from_utf8_lossy(n).into_owned()));
         let password = String::from_utf8_lossy(r.cstr(STR_MAX).unwrap_or_default()).into_owned();
+        let description = String::from_utf8_lossy(r.cstr(STR_MAX).unwrap_or_default()).into_owned();
+        let creator = self.playing().await;
+        let settings = GameSettings {
+            description: clip(&description, mcp::GAME_DESCRIPTION_MAX),
+            max_players: if (1..=8).contains(&max_players) { max_players } else { 8 },
+            level_difference: (level_difference < NO_LEVEL_DIFFERENCE).then_some(level_difference),
+            creator_level: creator.as_ref().map_or(1, |c| c.level.max(1)),
+            expansion: creator.as_ref().map_or(self.expansion_client(), |c| c.status & d2::status::EXPANSION != 0),
+            hardcore: creator.as_ref().is_some_and(|c| c.status & d2::status::HARDCORE != 0),
+            ladder: creator.as_ref().is_some_and(|c| c.status & d2::status::LADDER != 0),
+        };
         let (token, result) = if name.is_empty() || name.len() > 15 {
             (0, create_game_result::INVALID_NAME)
         } else if self.selected_is_dead().await {
             info!(peer = %self.peer, character = ?self.selected, game = %name, "game creation refused: a dead hardcore character");
             (0, create_game_result::DEAD_HARDCORE)
         } else if let Some(game_server) = &self.realm.game_server {
-            match game_server.create(&name, &password, ((flags >> 12) & 3) as u8).await {
+            match game_server.create(&name, &password, ((flags >> 12) & 3) as u8, &settings).await {
                 Ok(Ok(id)) => {
                     info!(peer = %self.peer, character = ?self.selected, game = %name, "game created");
                     (id, create_game_result::OK)
@@ -526,15 +591,25 @@ impl Mcp {
         let password = String::from_utf8_lossy(r.cstr(STR_MAX).unwrap_or_default()).into_owned();
 
         let ip = client_facing_ipv4(self.peer, self.local, &self.realm).await;
-        let character = match &self.selected {
-            Some(selected) => self.own_character(selected).await,
-            None => None,
+        let character = self.playing().await;
+        // What the game list would not have offered this character, refused for the client's own
+        // reason; a game the game server cannot describe (version 1) is left to it.
+        let refusal = match (&self.realm.game_server, &character) {
+            (Some(game_server), Some(c)) if !is_dead_hardcore(c) => match game_server.game_info(&name).await {
+                Ok(Some(game)) => join_refusal(c, &game),
+                _ => None,
+            },
+            _ => None,
         };
         let staged = match (&self.realm.game_server, character, ip) {
             // A dead hardcore character stays on the list but plays no more (status 0x0C).
             (_, Some(character), _) if is_dead_hardcore(&character) => {
                 info!(peer = %self.peer, character = %character.name, game = %name, "join refused: a dead hardcore character");
                 Err(join_result::DEAD_HARDCORE)
+            }
+            (_, Some(character), _) if refusal.is_some() => {
+                info!(peer = %self.peer, character = %character.name, game = %name, result = ?refusal, "join refused: not a game for this character");
+                Err(refusal.unwrap_or(join_result::NO_SUCH_GAME))
             }
             (Some(game_server), Some(character), Some(ip)) => match game_server.join(&name, &password, character.account, &character.name).await {
                 Ok(Ok(joined)) => Ok((joined.token, joined.hash, ip)),
@@ -559,6 +634,96 @@ impl Mcp {
         }
         Frame::new(msg::JOINGAME, w.finish())
     }
+}
+
+/// The hardest difficulty a character has reached: one per difficulty completed, from its act
+/// progress (`.d2s` `0x25`, four acts a difficulty in the classic game and five in the expansion).
+#[must_use]
+pub fn highest_difficulty(c: &Character) -> u8 {
+    let acts = if c.status & d2::status::EXPANSION != 0 { 5 } else { 4 };
+    (c.progression / acts).min(2)
+}
+
+/// Why `c` may not join `game`, as `MCP_JOINGAME` says it, or `None` when it may (as far as the
+/// lobby knows: the password and the room left are the game server's to check). A game created over
+/// link version 1 is known only by difficulty.
+#[must_use]
+pub fn join_refusal(c: &Character, game: &LobbyGame) -> Option<u32> {
+    let has = |bit: u8| c.status & bit != 0;
+    if let Some(s) = &game.settings {
+        // The client has a message for one side of each pair; the other side never sees the game.
+        match (s.hardcore, has(d2::status::HARDCORE)) {
+            (true, false) => return Some(join_result::NOT_HARDCORE),
+            (false, true) => return Some(join_result::NO_SUCH_GAME),
+            _ => {}
+        }
+        match (s.expansion, has(d2::status::EXPANSION)) {
+            (true, false) => return Some(join_result::NOT_EXPANSION),
+            (false, true) => return Some(join_result::NOT_CLASSIC),
+            _ => {}
+        }
+        match (s.ladder, has(d2::status::LADDER)) {
+            (true, false) => return Some(join_result::NOT_LADDER),
+            (false, true) => return Some(join_result::NO_SUCH_GAME),
+            _ => {}
+        }
+    }
+    if game.difficulty > highest_difficulty(c) {
+        return Some(if game.difficulty >= 2 { join_result::NO_HELL } else { join_result::NO_NIGHTMARE });
+    }
+    if let Some(s) = &game.settings {
+        if let Some(difference) = s.level_difference {
+            if c.level.abs_diff(s.creator_level) > difference {
+                return Some(join_result::LEVEL_REQUIREMENT);
+            }
+        }
+        if game.players.len() >= usize::from(s.max_players.clamp(1, 8)) {
+            return Some(join_result::FULL);
+        }
+    }
+    None
+}
+
+/// Whether the game list shows `game` to `c`: a game it could join ([`join_refusal`]) whose name
+/// holds `filter` (any case; an empty filter, which the 1.14d client always sends, holds every name).
+#[must_use]
+pub fn listable(c: &Character, game: &LobbyGame, filter: &str) -> bool {
+    join_refusal(c, game).is_none() && (filter.is_empty() || game.name.to_lowercase().contains(&filter.to_lowercase()))
+}
+
+/// A game's status in the lobby's replies: its flags ([`mcp::game_flags`]).
+fn status_of(game: &LobbyGame) -> u32 {
+    let s = game.settings.as_ref();
+    mcp::game_flags(game.difficulty, s.is_some_and(|s| s.hardcore), s.is_some_and(|s| s.expansion), s.is_some_and(|s| s.ladder))
+}
+
+/// The `MCP_GAMEINFO` reply describing `game` ([`mcp::gameinfo_reply`]).
+#[must_use]
+pub fn gameinfo_body(request_id: u16, game: &LobbyGame) -> Vec<u8> {
+    let characters: Vec<mcp::GameInfoCharacter<'_>> =
+        game.players.iter().map(|p| mcp::GameInfoCharacter { class: p.class, level: p.level, name: p.name.as_bytes() }).collect();
+    let s = game.settings.as_ref();
+    mcp::gameinfo_reply(
+        request_id,
+        &mcp::GameInfo {
+            status: status_of(game),
+            uptime_secs: u32::try_from(game.age_secs).unwrap_or(u32::MAX),
+            creator_level: s.map_or(0, |s| s.creator_level),
+            level_difference: s.and_then(|s| s.level_difference).unwrap_or(0xFF),
+            max_players: s.map_or(8, |s| s.max_players),
+            description: s.map_or(&b""[..], |s| s.description.as_bytes()),
+            characters: &characters,
+        },
+    )
+}
+
+/// `s` cut to at most `max` bytes, on a character boundary.
+fn clip(s: &str, max: usize) -> String {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 /// Whether a stored character is a hardcore one that has died: the Diablo II game server marks it
@@ -652,6 +817,86 @@ mod tests {
     fn hero(name: &str, account: u64, class: u8, status: u8, level: u8, experience: u32) -> Character {
         let save = d2_formats::d2s::Save::new(name, class, status, 0, &[(12, u32::from(level)), (13, experience)]);
         Character { account, name: name.into(), class, status, level, progression: 1, created_at: 0, last_played: 0, save: Some(save.to_bytes()) }
+    }
+
+    fn lobby_game(name: &str, difficulty: u8, settings: Option<GameSettings>, players: usize) -> LobbyGame {
+        LobbyGame {
+            token: 1,
+            name: name.into(),
+            private: false,
+            difficulty,
+            settings,
+            players: (0..players).map(|i| bnetcc_gslink::LobbyPlayer { name: format!("p{i}"), class: 0, level: 1 }).collect(),
+            age_secs: 0,
+        }
+    }
+
+    fn made_by(expansion: bool, hardcore: bool, ladder: bool) -> GameSettings {
+        GameSettings { description: String::new(), max_players: 8, level_difference: None, creator_level: 20, expansion, hardcore, ladder }
+    }
+
+    #[test]
+    fn the_list_offers_only_games_the_character_could_join() {
+        use d2::status::{EXPANSION, HARDCORE, LADDER};
+        let soft = hero("Soft", 1, 4, EXPANSION, 20, 0);
+        let lod = Some(made_by(true, false, false));
+        assert!(listable(&soft, &lobby_game("cows", 0, lod.clone(), 3), ""));
+        assert!(listable(&soft, &lobby_game("old", 0, None, 0), ""), "a version-1 game is known by difficulty alone");
+
+        assert_eq!(join_refusal(&soft, &lobby_game("hc", 0, Some(made_by(true, true, false)), 0)), Some(join_result::NOT_HARDCORE));
+        assert_eq!(join_refusal(&soft, &lobby_game("classic", 0, Some(made_by(false, false, false)), 0)), Some(join_result::NOT_CLASSIC));
+        assert_eq!(join_refusal(&soft, &lobby_game("ladder", 0, Some(made_by(true, false, true)), 0)), Some(join_result::NOT_LADDER));
+        let classic = hero("Classic", 1, 4, 0, 20, 0);
+        assert_eq!(join_refusal(&classic, &lobby_game("lod", 0, lod.clone(), 0)), Some(join_result::NOT_EXPANSION));
+        let hardcore_ladder = hero("Hcl", 1, 4, EXPANSION | HARDCORE | LADDER, 20, 0);
+        assert_eq!(join_refusal(&hardcore_ladder, &lobby_game("lod", 0, lod.clone(), 0)), Some(join_result::NO_SUCH_GAME));
+        assert_eq!(join_refusal(&hardcore_ladder, &lobby_game("same", 0, Some(made_by(true, true, true)), 0)), None);
+
+        // Difficulty: five acts a difficulty in the expansion, four in the classic game.
+        let mut nightmare = soft.clone();
+        nightmare.progression = 5;
+        assert_eq!((highest_difficulty(&soft), highest_difficulty(&nightmare)), (0, 1));
+        let mut classic_nightmare = classic.clone();
+        classic_nightmare.progression = 4;
+        assert_eq!(highest_difficulty(&classic_nightmare), 1);
+        assert_eq!(join_refusal(&soft, &lobby_game("nm", 1, lod.clone(), 0)), Some(join_result::NO_NIGHTMARE));
+        assert_eq!(join_refusal(&nightmare, &lobby_game("hell", 2, lod.clone(), 0)), Some(join_result::NO_HELL));
+        assert_eq!(join_refusal(&nightmare, &lobby_game("nm", 1, lod.clone(), 0)), None);
+        assert_eq!(join_refusal(&nightmare, &lobby_game("normal", 0, lod.clone(), 0)), None, "an easier difficulty is still open");
+
+        // The level restriction is around the creator's level (20 here), and a full game is not offered.
+        let restricted = |d| Some(GameSettings { level_difference: Some(d), ..made_by(true, false, false) });
+        assert_eq!(join_refusal(&soft, &lobby_game("r0", 0, restricted(0), 0)), None, "level 20 in a level-20 game");
+        let low = hero("Low", 1, 4, EXPANSION, 14, 0);
+        assert_eq!(join_refusal(&low, &lobby_game("r5", 0, restricted(5), 0)), Some(join_result::LEVEL_REQUIREMENT));
+        assert_eq!(join_refusal(&low, &lobby_game("r6", 0, restricted(6), 0)), None);
+        let four = Some(GameSettings { max_players: 4, ..made_by(true, false, false) });
+        assert_eq!(join_refusal(&soft, &lobby_game("four", 0, four.clone(), 4)), Some(join_result::FULL));
+        assert!(listable(&soft, &lobby_game("four", 0, four, 3), ""));
+
+        // The filter is any part of the name, in any case.
+        assert!(listable(&soft, &lobby_game("Baal Run", 0, lod.clone(), 0), "baal"));
+        assert!(listable(&soft, &lobby_game("Baal Run", 0, lod.clone(), 0), "RUN"));
+        assert!(!listable(&soft, &lobby_game("Baal Run", 0, lod, 0), "cows"));
+    }
+
+    #[test]
+    fn game_info_describes_the_game_and_its_characters() {
+        let settings = GameSettings { description: "chaos".into(), max_players: 6, level_difference: Some(10), ..made_by(true, false, true) };
+        let mut game = lobby_game("cs", 2, Some(settings), 0);
+        game.players = vec![bnetcc_gslink::LobbyPlayer { name: "Tyrael".into(), class: 3, level: 85 }];
+        game.age_secs = 61;
+        let body = gameinfo_body(4, &game);
+        assert_eq!(u32::from_le_bytes(body[2..6].try_into().unwrap()), mcp::game_flags(2, false, true, true));
+        assert_eq!(u32::from_le_bytes(body[6..10].try_into().unwrap()), 61);
+        assert_eq!(&body[10..14], &[20, 10, 6, 1], "creator level, difference, max players, characters");
+        assert_eq!((body[14], body[30]), (3, 85), "class and level");
+        assert_eq!(&body[46..], b"chaos\0Tyrael\0");
+
+        // A game made over link version 1: no level line, no player limit.
+        let body = gameinfo_body(4, &lobby_game("old", 0, None, 0));
+        assert_eq!(&body[10..14], &[0, 0xFF, 8, 0]);
+        assert_eq!(clip("ééé", 3), "é", "cut on a character boundary");
     }
 
     #[test]

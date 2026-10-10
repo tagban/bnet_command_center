@@ -3,8 +3,9 @@
 //! The game server runs as its own process, so the realm and the chat that shares its process can
 //! stay up while the game server restarts, and the other way round. The game server dials the
 //! realm (`diablo2.game_server_link`), proves itself with the shared token, and then answers the
-//! realm's requests: create a game, stage a join, describe its games for the admin map. Every few
-//! seconds it also pushes the list of its games for the public status page.
+//! realm's requests: create a game, stage a join, list its open games and describe one for the
+//! lobby's Join Game screen, describe its games for the admin map. Every few seconds it also pushes
+//! the list of its games for the public status page.
 //!
 //! While no game server is connected the realm answers game creation with "Server Down", the
 //! client's own message for it, and everything else keeps working.
@@ -13,6 +14,17 @@
 //! list and create characters, the game server to load the one joining and save it as it plays.
 //!
 //! Framing: a `u32` little-endian length, then that many bytes of JSON.
+//!
+//! # Versions
+//!
+//! The hello carries the link version the game server speaks. The realm accepts any from
+//! [`MIN_VERSION`] to [`VERSION`] and never sends a game server a message newer than the version it
+//! said hello with, so either side can be upgraded first:
+//!
+//! - **1**: `Create`, `Join`, the map requests and the pushed `Games`.
+//! - **2**: adds [`ToGameServer::CreateGame`] (a create carrying what the lobby shows about the
+//!   game), [`ToGameServer::ListGames`] and [`ToGameServer::GameInfo`]. A version-2 game server
+//!   refused by a realm that only knows version 1 says hello again as version 1.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -22,8 +34,16 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// biggest thing sent, well under this.
 pub const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 
-/// The link's version. The realm refuses a game server speaking another one.
-pub const VERSION: u32 = 1;
+/// The newest link version; what a game server offers in its hello.
+pub const VERSION: u32 = 2;
+
+/// The oldest link version the realm still accepts, and what a game server falls back to when a
+/// realm refuses [`VERSION`].
+pub const MIN_VERSION: u32 = 1;
+
+/// The first version with the lobby's messages ([`ToGameServer::CreateGame`],
+/// [`ToGameServer::ListGames`], [`ToGameServer::GameInfo`]).
+pub const LOBBY_VERSION: u32 = 2;
 
 /// What the realm sends a game server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +67,20 @@ pub enum ToGameServer {
         /// 0 Normal, 1 Nightmare, 2 Hell.
         difficulty: u8,
     },
+    /// Create a game, with what the lobby shows about it (link version 2; [`ToGameServer::Create`]
+    /// for a version-1 game server). Answered with [`FromGameServer::Created`].
+    CreateGame {
+        /// Matches the reply to the request.
+        id: u64,
+        /// The game's name, as typed.
+        name: String,
+        /// Its password, empty for none.
+        password: String,
+        /// 0 Normal, 1 Nightmare, 2 Hell.
+        difficulty: u8,
+        /// Its description, level restriction, player limit and the kind of character that made it.
+        settings: GameSettings,
+    },
     /// Stage a character's join: the next `GAMELOGON` naming it gets in.
     Join {
         /// Matches the reply to the request.
@@ -59,6 +93,20 @@ pub enum ToGameServer {
         account: u64,
         /// The character, by name; the game server loads it from the database.
         character: String,
+    },
+    /// The open games, for the lobby's game list (link version 2). Answered with
+    /// [`FromGameServer::GameList`]; the realm picks the ones a character may see.
+    ListGames {
+        /// Matches the reply to the request.
+        id: u64,
+    },
+    /// One game, by name, for the lobby's game details (link version 2). Answered with
+    /// [`FromGameServer::GameInfo`].
+    GameInfo {
+        /// Matches the reply to the request.
+        id: u64,
+        /// The game's name (any case).
+        name: String,
     },
     /// Every game, for the admin map (`/d2/games.json`).
     MapGames {
@@ -122,6 +170,71 @@ pub enum FromGameServer {
         /// Every game.
         games: Vec<PublicGame>,
     },
+    /// The answer to [`ToGameServer::ListGames`]: every open game, oldest first.
+    GameList {
+        /// The request's id.
+        id: u64,
+        /// The games.
+        games: Vec<LobbyGame>,
+    },
+    /// The answer to [`ToGameServer::GameInfo`]: the game, `None` when there is no such game.
+    GameInfo {
+        /// The request's id.
+        id: u64,
+        /// The game.
+        game: Option<LobbyGame>,
+    },
+}
+
+/// What the lobby shows about a game, fixed when it is created: what `MCP_CREATEGAME` carries,
+/// and the kind of character that made it (a game is played by characters of its creator's kind).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameSettings {
+    /// The description typed at creation (up to 31 bytes), empty for none.
+    pub description: String,
+    /// The most players it takes, 1 to 8.
+    pub max_players: u8,
+    /// How far from the creator's level a character joining may be, `None` for no restriction.
+    pub level_difference: Option<u8>,
+    /// The creator's character level when it made the game.
+    pub creator_level: u8,
+    /// Made by a Lord of Destruction character.
+    pub expansion: bool,
+    /// Made by a hardcore character.
+    pub hardcore: bool,
+    /// Made by a ladder character.
+    pub ladder: bool,
+}
+
+/// A game as the lobby lists and describes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LobbyGame {
+    /// The game's token (its id on the game server).
+    pub token: u16,
+    /// The game's name.
+    pub name: String,
+    /// It has a password.
+    pub private: bool,
+    /// 0 Normal, 1 Nightmare, 2 Hell.
+    pub difficulty: u8,
+    /// What it was created with; `None` for a game created over link version 1, which the lobby
+    /// knows only by name, difficulty and players.
+    pub settings: Option<GameSettings>,
+    /// The characters playing in it.
+    pub players: Vec<LobbyPlayer>,
+    /// Seconds since it was created.
+    pub age_secs: u64,
+}
+
+/// A character playing in a game.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LobbyPlayer {
+    /// The character's name.
+    pub name: String,
+    /// Its class, 0 Amazon to 6 Assassin.
+    pub class: u8,
+    /// Its character level.
+    pub level: u8,
 }
 
 /// Why a game could not be created.
@@ -233,6 +346,50 @@ mod tests {
         assert_eq!(read_message::<ToGameServer>(&mut b).await.unwrap(), Some(sent));
         assert_eq!(read_message::<FromGameServer>(&mut b).await.unwrap(), Some(reply));
         assert_eq!(read_message::<FromGameServer>(&mut b).await.unwrap(), None, "a clean close");
+    }
+
+    #[tokio::test]
+    async fn the_lobby_messages_round_trip() {
+        let (mut a, mut b) = tokio::io::duplex(1 << 16);
+        let settings = GameSettings {
+            description: "cows only".into(),
+            max_players: 4,
+            level_difference: Some(5),
+            creator_level: 30,
+            expansion: true,
+            hardcore: false,
+            ladder: true,
+        };
+        let create = ToGameServer::CreateGame { id: 1, name: "moo".into(), password: String::new(), difficulty: 2, settings: settings.clone() };
+        let game = LobbyGame {
+            token: 9,
+            name: "moo".into(),
+            private: false,
+            difficulty: 2,
+            settings: Some(settings),
+            players: vec![LobbyPlayer { name: "Tyrael".into(), class: 3, level: 31 }],
+            age_secs: 75,
+        };
+        let sent: Vec<FromGameServer> =
+            vec![FromGameServer::GameList { id: 2, games: vec![game.clone()] }, FromGameServer::GameInfo { id: 3, game: None }];
+        write_message(&mut a, &create).await.unwrap();
+        for m in &sent {
+            write_message(&mut a, m).await.unwrap();
+        }
+        drop(a);
+        assert_eq!(read_message::<ToGameServer>(&mut b).await.unwrap(), Some(create));
+        for m in sent {
+            assert_eq!(read_message::<FromGameServer>(&mut b).await.unwrap(), Some(m));
+        }
+    }
+
+    #[test]
+    fn version_one_messages_keep_their_wire_form() {
+        // A version-1 peer must still read and write these exactly as before.
+        let create = ToGameServer::Create { id: 4, name: "baal".into(), password: String::new(), difficulty: 1 };
+        assert_eq!(serde_json::to_string(&create).unwrap(), r#"{"type":"Create","id":4,"name":"baal","password":"","difficulty":1}"#);
+        let hello = FromGameServer::Hello { token: "t".into(), version: MIN_VERSION };
+        assert_eq!(serde_json::to_string(&hello).unwrap(), r#"{"type":"Hello","token":"t","version":1}"#);
     }
 
     #[tokio::test]

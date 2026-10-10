@@ -16,7 +16,7 @@
 //! `docs/ARCHITECTURE.md` §11 — so this is a gateway module's codec, not a wire protocol
 //! between our own processes.
 
-use crate::buf::{Reader, RecvBuf};
+use crate::buf::{Reader, RecvBuf, Writer};
 use crate::error::{ProtoError, Result};
 
 /// The MCP header size: `u16` length plus `u8` id.
@@ -209,9 +209,149 @@ pub mod create_game_result {
     pub const DEAD_HARDCORE: u32 = 0x6E;
 }
 
-/// The token that ends an `MCP_GAMELIST` reply. Each game is its own `MCP_GAMELIST`
-/// packet; this one, with no name, tells the client the list is complete.
-pub const GAMELIST_END_TOKEN: u32 = 0xFFFF_FFFE;
+/// The status that ends an `MCP_GAMELIST` reply ([`game_status::END`]). Each game is its own
+/// `MCP_GAMELIST` packet; this one, with no name, tells the client the list is complete.
+pub const GAMELIST_END_TOKEN: u32 = game_status::END;
+
+/// The `i32` status of an `MCP_GAMELIST` or `MCP_GAMEINFO` reply, the one field the client reads
+/// before deciding what the rest is (1.14d `Game.exe`: the list handler `0x0044B2D0`, the details
+/// handler `0x0044ACA0`). Any other value is a game, and the client does nothing more with it;
+/// Command Center sends the game's flags ([`game_flags`]).
+pub mod game_status {
+    /// "No information": no such game. The list handler drops the list's panel on it, so a list
+    /// never uses it.
+    pub const NONE: u32 = 0xFFFF_FFFF;
+    /// The end of a game list, which the client then shows.
+    pub const END: u32 = 0xFFFF_FFFE;
+}
+
+/// A game's flags, as in `MCP_CREATEGAME` and a listed game's status: `0x04`, the difficulty in
+/// bits 12–13 (as `MCP_CREATEGAME` sends it, 1.14d `0x004456D0`), hardcore `0x800` (what the
+/// client puts in `MCP_GAMELIST` for a hardcore character, `0x00445020`), expansion `0x100000`
+/// (the client's own game record, `0x0044585F`) and ladder `0x200000` (the realm convention behind
+/// BNETDocs' `0x00300004` for an open expansion ladder game; the client does not read it).
+#[must_use]
+pub fn game_flags(difficulty: u8, hardcore: bool, expansion: bool, ladder: bool) -> u32 {
+    let mut flags = 0x04 | (u32::from(difficulty.min(2)) << 12);
+    if hardcore {
+        flags |= 0x800;
+    }
+    if expansion {
+        flags |= 0x10_0000;
+    }
+    if ladder {
+        flags |= 0x20_0000;
+    }
+    flags
+}
+
+/// Longest game name the client keeps (`MCP_CREATEGAME` allows 15; the list and details copy it
+/// into 16-byte buffers).
+pub const GAME_NAME_MAX: usize = 15;
+/// Longest game description the client keeps (31 at creation; the details copy it into a 32-byte
+/// buffer with no bound, so a longer one would overrun into the classes).
+pub const GAME_DESCRIPTION_MAX: usize = 31;
+/// Character names in `MCP_GAMEINFO` go into 16-byte slots, again with no bound.
+const CHARACTER_NAME_MAX: usize = 15;
+/// `MCP_GAMEINFO` holds sixteen characters.
+pub const GAMEINFO_CHARACTERS: usize = 16;
+
+fn clipped(s: &[u8], max: usize) -> &[u8] {
+    let s = s.split(|&b| b == 0).next().unwrap_or_default();
+    &s[..s.len().min(max)]
+}
+
+/// One game of an `MCP_GAMELIST` reply: `u16 request id, u32 token, u8 players, u32 status,
+/// cstr name, cstr description` (1.14d `0x0044B2D0`). The packet must end with the description:
+/// the client adds the game only when nothing follows it, and otherwise just shows the list so far.
+/// It keeps one entry per token (the low 16 bits), so every game needs its own.
+#[must_use]
+pub fn gamelist_entry(request_id: u16, token: u32, players: u8, status: u32, name: &[u8], description: &[u8]) -> Vec<u8> {
+    let (name, description) = (clipped(name, GAME_NAME_MAX), clipped(description, GAME_DESCRIPTION_MAX));
+    let mut w = Writer::with_capacity(13 + name.len() + description.len());
+    w.u16(request_id).u32(token).u8(players).u32(status).cstr(name).cstr(description);
+    w.finish()
+}
+
+/// The packet that ends an `MCP_GAMELIST` reply: `u16 request id, u32 0, u8 0, u32`
+/// [`game_status::END`] and nothing more — the client stops reading at the status.
+#[must_use]
+pub fn gamelist_end(request_id: u16) -> Vec<u8> {
+    let mut w = Writer::with_capacity(11);
+    w.u16(request_id).u32(0).u8(0).u32(game_status::END);
+    w.finish()
+}
+
+/// One character in an `MCP_GAMEINFO` reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameInfoCharacter<'a> {
+    /// Class, 0 Amazon to 6 Assassin (the client writes "Level n Paladin" and so on).
+    pub class: u8,
+    /// Character level.
+    pub level: u8,
+    /// Name.
+    pub name: &'a [u8],
+}
+
+/// What an `MCP_GAMEINFO` reply describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameInfo<'a> {
+    /// The game's flags ([`game_flags`]).
+    pub status: u32,
+    /// Seconds since it was created ("Elapsed Time: h:mm:ss").
+    pub uptime_secs: u32,
+    /// The creator's level, the middle of the level range.
+    pub creator_level: u8,
+    /// The level difference allowed: 0 shows "Level n", 1–99 "Level n to m", and 100 or more
+    /// (`0xFF` for none) no line at all.
+    pub level_difference: u8,
+    /// The player limit; 1–7 show "Up to n Players", 0 or 8 no line.
+    pub max_players: u8,
+    /// The description, shown first when not empty.
+    pub description: &'a [u8],
+    /// The characters in it.
+    pub characters: &'a [GameInfoCharacter<'a>],
+}
+
+/// An `MCP_GAMEINFO` reply (1.14d `0x0044ACA0`, shown by `0x00442EB0`): `u16 request id,
+/// u32 status, u32 uptime, u8 creator level, u8 level difference, u8 max players, u8 characters,
+/// u8[16] classes, u8[16] levels, cstr description`, then a `cstr` name per character.
+#[must_use]
+pub fn gameinfo_reply(request_id: u16, info: &GameInfo<'_>) -> Vec<u8> {
+    let characters = &info.characters[..info.characters.len().min(GAMEINFO_CHARACTERS)];
+    let mut classes = [0u8; GAMEINFO_CHARACTERS];
+    let mut levels = [0u8; GAMEINFO_CHARACTERS];
+    for (i, c) in characters.iter().enumerate() {
+        classes[i] = c.class;
+        levels[i] = c.level;
+    }
+    let description = clipped(info.description, GAME_DESCRIPTION_MAX);
+    let mut w = Writer::with_capacity(47 + description.len() + characters.len() * 16);
+    w.u16(request_id)
+        .u32(info.status)
+        .u32(info.uptime_secs)
+        .u8(info.creator_level)
+        .u8(info.level_difference)
+        .u8(info.max_players)
+        .u8(characters.len() as u8)
+        .bytes(&classes)
+        .bytes(&levels)
+        .cstr(description);
+    for c in characters {
+        w.cstr(clipped(c.name, CHARACTER_NAME_MAX));
+    }
+    w.finish()
+}
+
+/// The `MCP_GAMEINFO` reply for a game that is gone: status [`game_status::NONE`] and the fields
+/// the client reads before it (it fills the details panel from them all the same), with no level
+/// restriction and no player limit so the panel shows nothing but a zero elapsed time.
+#[must_use]
+pub fn gameinfo_none(request_id: u16) -> Vec<u8> {
+    let mut w = Writer::with_capacity(14);
+    w.u16(request_id).u32(game_status::NONE).u32(0).u8(0).u8(0xFF).u8(0).u8(0);
+    w.finish()
+}
 
 /// `MCP_JOINGAME` result codes.
 pub mod join_result {
@@ -227,6 +367,19 @@ pub mod join_result {
     pub const LEVEL_REQUIREMENT: u32 = 0x2C;
     /// A dead hardcore character cannot join a game (BNETDocs).
     pub const DEAD_HARDCORE: u32 = 0x6E;
+    /// A softcore character cannot join a hardcore game. This and the codes below are the ones
+    /// 1.14d's join handler (`0x00441500`) knows; their meanings are BNETDocs'.
+    pub const NOT_HARDCORE: u32 = 0x71;
+    /// The character cannot play Nightmare yet.
+    pub const NO_NIGHTMARE: u32 = 0x73;
+    /// The character cannot play Hell yet.
+    pub const NO_HELL: u32 = 0x74;
+    /// A classic character cannot join an expansion game.
+    pub const NOT_EXPANSION: u32 = 0x78;
+    /// An expansion character cannot join a classic game.
+    pub const NOT_CLASSIC: u32 = 0x79;
+    /// A non-ladder character cannot join a ladder game.
+    pub const NOT_LADDER: u32 = 0x7D;
 }
 
 #[cfg(test)]
@@ -247,6 +400,72 @@ mod tests {
         encode_frame(&Frame::empty(msg::STARTUP), &mut wire).unwrap();
         assert_eq!(wire, vec![0x03, 0x00, 0x01]);
         assert_ne!(wire[0], crate::bncs::MAGIC, "MCP has no magic byte");
+    }
+
+    #[test]
+    fn a_listed_game_ends_with_its_description() {
+        let body = gamelist_entry(0x0102, 7, 3, game_flags(1, false, true, true), b"cows", b"moo");
+        #[rustfmt::skip]
+        let expected = [
+            0x02, 0x01,             // request id
+            7, 0, 0, 0,             // token
+            3,                      // players
+            0x04, 0x10, 0x30, 0x00, // 0x04 | Nightmare << 12 | expansion | ladder
+            b'c', b'o', b'w', b's', 0,
+            b'm', b'o', b'o', 0,
+        ];
+        assert_eq!(body, expected);
+        // The client adds the game only if the packet ends right after the description.
+        let mut r = Reader::new(&body);
+        r.bytes(11).unwrap();
+        r.cstr(64).unwrap();
+        r.cstr(64).unwrap();
+        assert!(r.rest().is_empty());
+
+        assert_eq!(gamelist_end(9), [9, 0, 0, 0, 0, 0, 0, 0xFE, 0xFF, 0xFF, 0xFF]);
+        let long = gamelist_entry(1, 1, 0, 4, b"0123456789abcdefgh", &[b'd'; 40]);
+        assert_eq!(long.len(), 11 + 16 + 32, "a name of 15 and a description of 31 at most");
+    }
+
+    #[test]
+    fn game_flags_follow_the_create_request() {
+        assert_eq!(game_flags(0, false, false, false), 0x04);
+        assert_eq!(game_flags(2, true, false, false), 0x2804);
+        assert_eq!(game_flags(0, false, true, true), 0x0030_0004, "BNETDocs' open expansion ladder game");
+        for d in 0..3 {
+            let f = game_flags(d, true, true, true);
+            assert_ne!(f, game_status::NONE);
+            assert_ne!(f, game_status::END);
+            assert_eq!((f >> 12) & 3, u32::from(d));
+        }
+    }
+
+    #[test]
+    fn game_info_lays_out_its_characters_in_three_columns() {
+        let characters =
+            [GameInfoCharacter { class: 3, level: 31, name: b"Tyrael" }, GameInfoCharacter { class: 6, level: 28, name: b"Natalya" }];
+        let body = gameinfo_reply(
+            5,
+            &GameInfo {
+                status: game_flags(2, false, true, false),
+                uptime_secs: 3725,
+                creator_level: 30,
+                level_difference: 5,
+                max_players: 4,
+                description: b"baal",
+                characters: &characters,
+            },
+        );
+        assert_eq!(&body[..2], &[5, 0], "request id");
+        assert_eq!(u32::from_le_bytes(body[2..6].try_into().unwrap()), 0x0010_2004);
+        assert_eq!(u32::from_le_bytes(body[6..10].try_into().unwrap()), 3725, "1:02:05");
+        assert_eq!(&body[10..14], &[30, 5, 4, 2], "creator level, level difference, max players, characters");
+        assert_eq!(&body[14..17], &[3, 6, 0], "classes");
+        assert_eq!(&body[30..33], &[31, 28, 0], "levels");
+        assert_eq!(&body[46..], b"baal\0Tyrael\0Natalya\0");
+
+        let none = gameinfo_none(6);
+        assert_eq!(none, [6, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0xFF, 0, 0]);
     }
 
     #[test]

@@ -168,7 +168,9 @@ Wire layouts that matter and are easy to get wrong:
 | `MCP_CHARLIST2` | `u16 requested, u32 total, u16 returned`, then `u32 expiry, cstr name, cstr portrait` each. Expiry `0xFFFFFFFF` = never. |
 | `MCP_CHARCREATE` request | `u32 class, u16 status, cstr name` — the `u16` is easy to miss. |
 | `MCP_CHARLOGON` refusal | `0x46` returns to character select *keeping* the realm connection. |
-| `MCP_GAMELIST` | One packet per game, then a terminator whose token is `0xFFFFFFFE`. |
+| `MCP_GAMELIST` | Request `u16 id, u32 (0x800 for a hardcore character), cstr filter`. One packet per game — `u16 id, u32 token, u8 players, i32 status, cstr name, cstr description` and **nothing after the description** (1.14d adds the game only then) — then a terminator, status `0xFFFFFFFE` (`-2`). Status `-1` drops the list panel; any other value is a game (we send its flags). One entry per token. Only games the character could join are listed, password ones included. |
+| `MCP_GAMEINFO` | Request `u16 id, cstr name`. Reply `u16 id, i32 status, u32 uptime, u8 creator level, u8 level difference (≥ 100 none), u8 max players, u8 count, u8[16] classes, u8[16] levels, cstr description`, then a name per character (1.14d `0x0044ACA0`, shown by `0x00442EB0`). A gone game: status `-1`. |
+| `MCP_JOINGAME` refusals | Besides `0x29`–`0x2C`: `0x71` softcore into hardcore, `0x73`/`0x74` Nightmare/Hell not reached, `0x78` classic into expansion, `0x79` expansion into classic, `0x7D` non-ladder into ladder (codes in 1.14d's handler `0x00441500`, meanings BNETDocs'). |
 | `MCP_JOINGAME` failure | All six fields are still sent; the client reads them before the result. |
 | Dead hardcore character | Status `0x04` + `0x08`, set by the game server when it dies. It stays in `MCP_CHARLIST2`, drawn dead, and `MCP_CHARLOGON` still takes it (chat), but `MCP_CREATEGAME` and `MCP_JOINGAME` answer `0x6E` (BNETDocs' code; not yet checked against the client). |
 | `MCP_MOTD` | A pad byte, then the string. |
