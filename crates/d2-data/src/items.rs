@@ -311,6 +311,9 @@ pub struct ItemDef {
     pub two_hand_damage: (i32, i32),
     /// `minmisdam`, `maxmisdam` (`+0x100`, `+0x101`).
     pub missile_damage: (i32, i32),
+    /// `rangeadder` (`+0x104`): how much further than bare hands a weapon reaches in melee
+    /// (`0x006288D0`, used by the reach test `0x00622C40`).
+    pub range_adder: i32,
     /// `missiletype` (`+0xFA`): the missile a thrown weapon flies as (a `Missiles.txt` row), 0 for
     /// none.
     pub missile_type: i32,
@@ -430,6 +433,7 @@ impl Items {
                     damage: (int("mindam"), int("maxdam")),
                     two_hand_damage: (int("2handmindam"), int("2handmaxdam")),
                     missile_damage: (int("minmisdam"), int("maxmisdam")),
+                    range_adder: int("rangeadder"),
                     missile_type: int("missiletype"),
                     requirements: (int("reqstr"), int("reqdex")),
                     gem_sockets: int("gemsockets"),
