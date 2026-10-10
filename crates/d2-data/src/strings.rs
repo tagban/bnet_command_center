@@ -40,6 +40,14 @@ impl Strings {
         self.tables.iter().zip(&self.firsts).find_map(|(t, &first)| t.index(key).map(|i| first + i))
     }
 
+    /// The string the game numbers `id` (the numbers [`Self::id`] gives), from the table whose
+    /// range holds it. Only for tables built with [`Self::from_named`].
+    #[must_use]
+    pub fn by_id(&self, id: u16) -> Option<&str> {
+        let (table, first) = self.tables.iter().zip(&self.firsts).filter(|(_, &first)| first <= id).max_by_key(|(_, &first)| first)?;
+        table.by_number(id - first)
+    }
+
     /// The string for a key, trimmed.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&str> {

@@ -29,6 +29,7 @@ const ENTRY_LEN: usize = 17;
 #[derive(Debug, Clone, Default)]
 pub struct StringTable {
     by_key: HashMap<String, (u16, String)>,
+    by_number: Vec<Option<String>>,
 }
 
 impl StringTable {
@@ -61,7 +62,19 @@ impl StringTable {
             let index = u16_at(at + 1)?;
             by_key.entry(key).or_insert((index, value));
         }
-        Some(Self { by_key })
+        // The index maps each number to its hash slot; many strings share the key "x", so only
+        // the number reaches them all.
+        let by_number = (0..count)
+            .map(|n| {
+                let slot = usize::from(u16_at(HEADER_LEN + n * 2)?);
+                let at = entries + slot * ENTRY_LEN;
+                if slot >= hash_size || bytes[at] == 0 {
+                    return None;
+                }
+                cstr(u32_at(at + 11)?)
+            })
+            .collect();
+        Some(Self { by_key, by_number })
     }
 
     /// The string for a key.
@@ -74,6 +87,17 @@ impl StringTable {
     #[must_use]
     pub fn index(&self, key: &str) -> Option<u16> {
         self.by_key.get(key).map(|&(i, _)| i)
+    }
+
+    /// The string numbered `n` within this table.
+    #[must_use]
+    pub fn by_number(&self, n: u16) -> Option<&str> {
+        self.by_number.get(usize::from(n))?.as_deref()
+    }
+
+    /// Every `(key, string)`, in no particular order.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.by_key.iter().map(|(k, (_, s))| (k.as_str(), s.as_str()))
     }
 
     /// Entries with a key.
