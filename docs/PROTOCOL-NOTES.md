@@ -104,24 +104,26 @@ punctuation · `0x08` too much punctuation — this project has only confirmed `
 `0x04` against its own tests. Do not extend `bnetccd::session::create_account`'s status
 mapping past those two without checking a real client's reaction first.
 
-### `SID_AUTH_CHECK` (`0x51`) request — 🛑 unverified layout
+### `SID_AUTH_CHECK` (`0x51`) request
 
-Never captured against a real client here; this is `bnetcc-crypto`/`session.rs`'s
-best-confidence reconstruction of the commonly-cited BNETDocs layout:
+Confirmed against 1.14d `Game.exe` (the D2-Native client's builder, read in Ghidra and
+emulated; see the D2GS docs' "Logging on as 1.14d does"). **The key blocks come before the
+EXE information string** — the commonly-cited BNETDocs layout has them after it, and is wrong
+for Diablo II:
 
 ```
 (UINT32) Client Token
 (UINT32) EXE Version
 (UINT32) EXE Hash
-(UINT32) Number of CD keys           1 normally, 2 for D2XP/W3XP (base + expansion)
+(UINT32) Number of CD keys           1 for D2DV, 2 for D2XP (base + expansion)
 (UINT32) Using Spawn (bool)
-(STRING) EXE Information
 For each key:
     (UINT32) Key Length
     (UINT32) Key Product Value
     (UINT32) Key Public Value
     (UINT32) Unknown (0)
     (VOID×20) Key Hash               session-specific, see below — not a stable id
+(STRING) EXE Information
 (STRING) CD Key Owner
 ```
 
@@ -133,9 +135,8 @@ session per key" — must be derived from the session-independent `Key Product V
 Using the wire `Hash` directly would make every session look like a different key and
 silently defeat the whole feature.
 
-`bnetccd`'s parser fails **open** (accepts, no key check) rather than closed if this
-layout doesn't match what arrives, specifically because it is unverified — see
-`session::auth_check`'s doc comment.
+`bnetccd`'s parser reads this layout and fails **open** (accepts, no key check) rather
+than closed if a message does not match it — see `session::auth_check`'s doc comment.
 
 ### XSHA-1 itself
 
