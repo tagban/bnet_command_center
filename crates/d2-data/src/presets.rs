@@ -19,6 +19,10 @@ pub struct LvlPrest {
     pub level_id: i32,
     /// `Populate`: whether rooms spawn their populate objects.
     pub populate: bool,
+    /// `Logicals`: the map's walls split its rooms into logic zones, which decide which walls a
+    /// client fades out when they stand between the player and the camera. With 0 each room is
+    /// one zone and no wall fades. The record holds it at `+0x0C`.
+    pub logicals: bool,
     /// `SizeX`/`SizeY`, in tiles.
     pub size: (i32, i32),
     /// `Files`: how many map files the preset rotates through.
@@ -66,6 +70,7 @@ impl LvlPrests {
                 name: row.get("Name").unwrap_or_default().to_string(),
                 level_id: row.int("LevelId").unwrap_or(0) as i32,
                 populate: row.int("Populate").unwrap_or(0) != 0,
+                logicals: row.int("Logicals").unwrap_or(0) != 0,
                 size: (row.int("SizeX").unwrap_or(0) as i32, row.int("SizeY").unwrap_or(0) as i32),
                 file_count: row.int("Files").unwrap_or(0) as i32,
                 scan: row.int("Scan").unwrap_or(0) != 0,
@@ -443,5 +448,21 @@ impl Shrines {
     #[must_use]
     pub fn of_class(&self, effect_class: i32) -> Vec<usize> {
         (0..self.rows.len()).filter(|&i| self.rows[i].effect_class == effect_class).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_preset_row_says_whether_its_walls_make_logic_zones() {
+        let t = Table::parse(b"Name\tDef\tLevelId\tPopulate\tLogicals\tFile1\r\nTown\t1\t1\t1\t0\tA/Town.ds1\r\nCrypt\t2\t0\t1\t1\tA/Crypt.ds1\r\n");
+        let rows = LvlPrests::from_table(&t).unwrap();
+        assert!(!rows.by_def(1).unwrap().logicals);
+        assert!(rows.by_def(2).unwrap().logicals);
+        // A table without the column (an older or trimmed file) reads as one zone per room.
+        let t = Table::parse(b"Name\tDef\tLevelId\tFile1\r\nCrypt\t2\t0\tA/Crypt.ds1\r\n");
+        assert!(!LvlPrests::from_table(&t).unwrap().by_def(2).unwrap().logicals);
     }
 }
