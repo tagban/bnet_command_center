@@ -79,6 +79,47 @@ pub fn rows(image: &Image, top: u32, height: u32) -> Option<Vec<u8>> {
     image.pixels.get(start..end).map(<[u8]>::to_vec)
 }
 
+/// RGB pixels (top row first) as a TGA type 10: 24-bit, top-down, run-length encoded, with
+/// no packet crossing a row, as the format asks.
+#[must_use]
+pub fn encode(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; 18];
+    out[2] = bnetcc_proto::bni::TGA_RLE_TRUECOLOR;
+    out[12..14].copy_from_slice(&(width as u16).to_le_bytes());
+    out[14..16].copy_from_slice(&(height as u16).to_le_bytes());
+    out[16] = 24;
+    out[17] = 0x20;
+    let (w, h) = (width as usize, height as usize);
+    for y in 0..h {
+        let row: Vec<[u8; 3]> = (0..w).map(|x| {
+            let i = (y * w + x) * 3;
+            [rgb[i + 2], rgb[i + 1], rgb[i]]
+        }).collect();
+        let mut x = 0;
+        while x < w {
+            let mut run = 1;
+            while x + run < w && run < 128 && row[x + run] == row[x] {
+                run += 1;
+            }
+            if run > 1 {
+                out.push(0x80 | (run - 1) as u8);
+                out.extend_from_slice(&row[x]);
+                x += run;
+            } else {
+                let start = x;
+                while x < w && x - start < 128 && (x + 1 >= w || row[x + 1] != row[x]) {
+                    x += 1;
+                }
+                out.push((x - start - 1) as u8);
+                for p in &row[start..x] {
+                    out.extend_from_slice(p);
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +135,18 @@ mod tests {
         t.extend_from_slice(&[0x81, 0xFF, 0x00, 0x00]); // run of 2: BGR blue
         t.extend_from_slice(&[0x01, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00]); // red, green
         t
+    }
+
+    #[test]
+    fn what_is_encoded_decodes_the_same() {
+        // Runs, single pixels and a run that reaches the row's end.
+        let mut rgb = Vec::new();
+        for p in [[1, 2, 3], [1, 2, 3], [1, 2, 3], [9, 9, 9], [4, 5, 6], [7, 7, 7], [7, 7, 7], [7, 7, 7]] {
+            rgb.extend_from_slice(&p);
+        }
+        let image = decode(&encode(4, 2, &rgb)).expect("decodes");
+        assert_eq!((image.width, image.height), (4, 2));
+        assert_eq!(image.pixels, rgb);
     }
 
     #[test]

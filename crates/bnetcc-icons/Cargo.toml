@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Write the icons in an icons.bni out as PNGs, for the tracker page."
+description = "Write the icons in an icons.bni out as PNGs (for the tracker page, or to redraw), and pack redrawn PNGs back into an icons.bni."
 
 [[bin]]
 name = "bnetcc-icons"
@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 bnetcc-proto = { path = "../bnetcc-proto" }
+# Reading back icons redrawn in an image editor, which may compress them any way PNG allows.
+png = "0.17"
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -14,7 +14,15 @@
 //!
 //! One `CODE.png` per icon, named for the product codes the icon serves (`W3XP.png`), which
 //! is what the page looks for.
+//!
+//! To redraw a server's icons ([`pack`] has the rules):
+//!
+//! ```text
+//! bnetcc-icons export <icons.bni> <folder>     every icon as a numbered PNG, and icons.txt
+//! bnetcc-icons pack <folder> <new icons.bni>   the PNGs, redrawn, back into a BNI
+//! ```
 
+mod pack;
 mod png;
 mod tga;
 
@@ -24,8 +32,27 @@ use bnetcc_proto::bni;
 
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let pack_result = match args.as_slice() {
+        [cmd, source, folder] if cmd == "export" => Some(pack::export(Path::new(source), Path::new(folder))),
+        [cmd, folder, out] if cmd == "pack" => Some(pack::pack(Path::new(folder), Path::new(out))),
+        _ => None,
+    };
+    if let Some(result) = pack_result {
+        return match result {
+            Ok(said) => {
+                println!("{said}");
+                std::process::ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     let [source, out_dir] = args.as_slice() else {
         eprintln!("usage: bnetcc-icons <icons.bni> <output directory>");
+        eprintln!("       bnetcc-icons export <icons.bni> <folder>");
+        eprintln!("       bnetcc-icons pack <folder> <new icons.bni>");
         return std::process::ExitCode::from(2);
     };
     match run(Path::new(source), Path::new(out_dir)) {

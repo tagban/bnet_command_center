@@ -124,3 +124,22 @@ startup**. If it is below 2,000 it warns, loudly, with the fix.
 PvPGN ships a hard-coded `max_connections = 1000` and refuses connections past it in
 silence. That is most of why people concluded it could not scale, and it is the reason this
 number is logged rather than assumed.
+
+## 6. Redrawing the chat icons
+
+`icons.bni` and `icons_STAR.bni` hold the little pictures beside each name in the classic
+clients' chat. To redraw them:
+
+```text
+bnetcc-icons export <files dir>/icons.bni icons/      every icon as a numbered PNG, and icons.txt
+  … redraw the PNGs …
+bnetcc-icons pack icons/ icons-new.bni                 back into a BNI, checked
+```
+
+Keep each picture **28 × 14** (the classic clients draw icons in slots that size and do not
+scale them; `pack` refuses any other size) and opaque (a BNI has no transparency: see-through
+pixels are laid on black). `icons.txt` says which chat flag or product code each picture
+answers to: leave its lines alone, so the icons keep their order, flags and codes. Then put the
+new file in the files directory under the old name; clients fetch it again when its date
+changes (`SID_GETFILETIME`). Keep the original: it is the operator's own game data, never
+committed here.
